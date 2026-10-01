@@ -26,7 +26,8 @@ embassy = ["dep:embassy-sync"]
 worker = ["std", "dep:tokio", "dep:serde", "dep:serde_json", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys", "dep:js-sys", "dep:gloo-timers"]
 
 [dependencies]
-aktor-macros = { version = "=0.0.1", path = "../aktor-macros", optional = true }
+aktor-macros = { version = "=0.0.2", path = "../aktor-macros", optional = true }
+er = { version = "0.5.3", default-features = false, features = ["macros"] }
 parking_lot = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }

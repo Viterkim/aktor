@@ -1,6 +1,6 @@
 use actor::listener::spawn_local;
 use actor::*;
-use std::error::Error;
+use er::*;
 
 #[derive(Default)]
 pub struct State {
@@ -14,17 +14,20 @@ pub async fn add(state: &mut State, value: usize) -> usize {
     state.value
 }
 
+#[derive(Er)]
+struct MainError;
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), ErReport<MainError>> {
     let executor = tokio::task::LocalSet::new();
 
     executor
         .run_until(async {
-            let (state, actor) = spawn_local(&executor, State::default(), 8)?;
+            let (state, actor) = spawn_local(&executor, State::default(), 8).er(())?;
             assert_eq!(add(&state, 2).await, 2);
 
             drop(state);
-            actor.await?;
+            actor.await.er(())?;
 
             Ok(())
         })

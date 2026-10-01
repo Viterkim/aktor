@@ -13,6 +13,7 @@ use core::{
     task::{Poll, Waker},
 };
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel as Queue};
+use er::Er;
 
 mod event;
 mod impls;
@@ -65,10 +66,13 @@ pub struct CheckedReply<O>(Reply<O>);
 pub type Channel<S, const N: usize, E = core::convert::Infallible> =
     (Handle<S, N, E>, Owner<S, N, E>);
 
-#[derive(Debug)]
+#[derive(Er)]
 pub enum OwnerError<E> {
-    Setup(E),
-    Cleanup(E),
+    #[er(format = "actor setup failed: {0:?}")]
+    Setup(#[er(source)] E),
+    #[er(format = "actor cleanup failed: {0:?}")]
+    Cleanup(#[er(source)] E),
+    #[er(format = "actor owner stopped before cleanup completed")]
     Cancelled,
 }
 

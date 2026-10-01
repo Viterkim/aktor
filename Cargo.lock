@@ -4,10 +4,11 @@ version = 4
 
 [[package]]
 name = "aktor"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aktor-macros",
  "embassy-sync",
+ "er",
  "futures-util",
  "gloo-timers",
  "js-sys",
@@ -23,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "aktor-macros"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -105,6 +106,26 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "er"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d9eab7b9dc5dada6391729f6be155c5d8ececcec5e356f5b46e2111968c387f"
+dependencies = [
+ "er-macros",
+]
+
+[[package]]
+name = "er-macros"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36c2bd5d0dd2c640accd85ae2e0aa9cc6916b535bd26e63a6db07fa1515f8b92"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "fallible-iterator"

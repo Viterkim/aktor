@@ -1,5 +1,5 @@
 use super::*;
-use core::{fmt, future::poll_fn};
+use core::future::poll_fn;
 
 /// Capacity bounds queued work. One operation can also be running.
 pub fn channel<S, const N: usize, E>() -> Result<Channel<S, N, E>, ActorError> {
@@ -235,23 +235,5 @@ impl<E> Completion<E> {
             }
         })
         .await
-    }
-}
-
-impl<E: fmt::Display> fmt::Display for OwnerError<E> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Setup(error) => write!(formatter, "actor setup failed: {error}"),
-            Self::Cleanup(error) => write!(formatter, "actor cleanup failed: {error}"),
-            Self::Cancelled => formatter.write_str("actor owner stopped before cleanup completed"),
-        }
-    }
-}
-impl<E: core::error::Error + 'static> core::error::Error for OwnerError<E> {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Setup(error) | Self::Cleanup(error) => Some(error),
-            Self::Cancelled => None,
-        }
     }
 }

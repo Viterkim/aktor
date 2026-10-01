@@ -12,7 +12,7 @@ You can do whichever structure you want, with functions living in like `things::
 
 ```toml
 [dependencies]
-aktor = "0.0.1"
+aktor = { version = "0.0.2", features = ["tokio"] }
 ```
 
 Anything up to 0.1 will not have a stable api.
@@ -20,7 +20,7 @@ Anything up to 0.1 will not have a stable api.
 ## Example
 
 ```toml
-aktor = { version = "0.0.1", features = ["tokio"] }
+aktor = { version = "0.0.2", features = ["tokio"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 ```
 
@@ -103,13 +103,13 @@ It gets its own thread, and capacity is how many calls can wait in the queue. Th
 
 ```toml
 [dependencies]
-aktor = { version = "0.0.1", features = ["tokio"] }
+aktor = { version = "0.0.2", features = ["tokio"] }
 ```
 
 ### Browser / webassembly
 
 ```toml
-aktor = { version = "0.0.1", features = ["worker"] }
+aktor = { version = "0.0.2", features = ["worker"] }
 ```
 
 [Browser readme](integrations/worker/README.md)
@@ -117,7 +117,7 @@ aktor = { version = "0.0.1", features = ["worker"] }
 ### Embassy + allocator
 
 ```toml
-aktor = { version = "0.0.1", features = ["embassy"] }
+aktor = { version = "0.0.2", features = ["embassy"] }
 ```
 
 [Embassy readme](integrations/embassy/README.md)

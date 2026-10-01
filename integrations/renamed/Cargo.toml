@@ -6,4 +6,5 @@ publish = false
 
 [dependencies]
 actor = { package = "aktor", path = "../../aktor", features = ["tokio"] }
+er = "0.5"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }

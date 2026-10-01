@@ -43,20 +43,3 @@ impl FailurePolicy {
         panic::resume_unwind(failure.payload)
     }
 }
-
-impl<E: fmt::Display> fmt::Display for RunError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Failed(error) => error.fmt(f),
-            Self::Panicked => f.write_str("actor serving loop panicked"),
-        }
-    }
-}
-impl<E: core::error::Error + 'static> core::error::Error for RunError<E> {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Failed(error) => Some(error),
-            Self::Panicked => None,
-        }
-    }
-}

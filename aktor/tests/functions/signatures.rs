@@ -107,6 +107,18 @@ mod relative {
     }
 }
 
+mod shadowed {
+    use super::aktor;
+
+    pub const NAME: usize = 4;
+    pub struct Send;
+
+    #[aktor]
+    pub async fn length(_: &Send, bytes: [u8; NAME]) -> usize {
+        bytes.len()
+    }
+}
+
 #[aktor]
 async fn r#type(_: &usize, __aktor_state: usize, __aktor_input: usize) -> usize {
     let _size = std::mem::size_of::<__AktorTarget>();
@@ -134,6 +146,18 @@ async fn names() {
     );
 
     assert_eq!(relative::queries::own(&relative::queries::Own(4)).await, 4);
+
+    assert_eq!(
+        shadowed::length(&shadowed::Send, [0; shadowed::NAME]).await,
+        4
+    );
+
+    let (handle, actor) = spawn_thread(shadowed::Send, 1).unwrap();
+
+    assert_eq!(shadowed::length(&handle, [0; shadowed::NAME]).await, 4);
+
+    drop(handle);
+    actor.join().unwrap();
 }
 
 #[aktor]
