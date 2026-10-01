@@ -1,4 +1,5 @@
 use super::{Dedicated, DedicatedStartError, Handle, Listener, SpawnArgs, channel};
+use er::Er;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -21,18 +22,24 @@ pub enum AbandonedSetup<E> {
     Replace(E),
 }
 
-#[derive(Debug)]
+#[derive(Er)]
 pub enum LifecycleError<E> {
+    #[er(format = "actor stopped")]
     Closed,
+    #[er(format = "actor is already running")]
     AlreadyRunning,
-    Failed(E),
+    #[er(format = "actor lifecycle operation failed: {0:?}")]
+    Failed(#[er(source)] E),
 }
 
-#[derive(Debug)]
+#[derive(Er)]
 pub enum ReplaceError<E, C> {
+    #[er(format = "actor stopped")]
     Closed,
-    Cleanup(Arc<C>),
-    Setup(E),
+    #[er(format = "replacement cleanup failed: {0:?}")]
+    Cleanup(#[er(source)] Arc<C>),
+    #[er(format = "replacement setup failed: {0:?}")]
+    Setup(#[er(source)] E),
 }
 
 #[derive(Debug)]

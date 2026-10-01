@@ -3,7 +3,9 @@ use syn::{
     visit_mut::{self, VisitMut},
 };
 
-pub struct Child;
+pub struct Child {
+    pub shadowed: &'static [&'static str],
+}
 impl VisitMut for Child {
     fn visit_type_path_mut(&mut self, ty: &mut syn::TypePath) {
         let before = ty.path.segments.len();
@@ -36,7 +38,7 @@ impl VisitMut for Child {
 
         if first.ident == "self" {
             first.ident = syn::Ident::new("super", first.ident.span());
-        } else if first.ident == "super" {
+        } else if first.ident == "super" || self.shadowed.iter().any(|name| first.ident == *name) {
             path.segments.insert(0, parse_quote!(super));
         }
     }

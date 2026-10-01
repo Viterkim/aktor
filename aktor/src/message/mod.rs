@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use core::{future::Future, pin::Pin};
+use er::Er;
 
 mod error;
 #[cfg(feature = "tokio")]
@@ -10,26 +11,35 @@ pub use error::{consumed, stopped};
 #[cfg(feature = "tokio")]
 pub use native::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Er, PartialEq, Eq)]
 pub enum ActorError {
+    #[er(format = "actor capacity is outside the supported range")]
     InvalidCapacity,
+    #[er(format = "actor closed")]
     Closed,
 }
 
 pub type ActorResult<T> = Result<T, ActorError>;
 
 #[cfg_attr(feature = "worker", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Er, PartialEq, Eq)]
 pub enum CallError {
+    #[er(format = "actor did not admit the request")]
     NotAdmitted,
+    #[er(format = "actor discarded the request before execution")]
     Discarded,
+    #[er(format = "actor failed after the request started; the outcome is unknown")]
     OutcomeUnknown,
+    #[er(format = "newer queued work superseded the request")]
     Superseded,
 }
 
 /// Failed immediate submission preserves the request.
+#[derive(Er)]
 pub enum TrySendError<R> {
+    #[er(format = "actor mailbox is full")]
     Full(R),
+    #[er(format = "actor closed")]
     Closed(R),
 }
 

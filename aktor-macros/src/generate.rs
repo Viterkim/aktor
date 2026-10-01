@@ -102,7 +102,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     let mut request = signature.clone();
     request.ident = parse_quote!(request);
-    let mut scope = signature::scope::Child;
+    let mut scope = signature::scope::Child { shadowed: &[] };
     scope.visit_signature_mut(&mut request);
 
     let mut state_type = state_type.clone();

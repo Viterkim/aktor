@@ -1,4 +1,5 @@
 use core::fmt;
+use er::Er;
 use std::{
     any::Any,
     io::Write,
@@ -45,8 +46,9 @@ pub struct FailurePanic {
     pub payload: Box<dyn Any + Send>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Er, PartialEq, Eq)]
 pub enum RunError<E> {
-    Failed(E),
+    Failed(#[er(source)] E),
+    #[er(format = "actor serving loop panicked")]
     Panicked,
 }

@@ -1,14 +1,17 @@
 use crate::message::CallError;
+use er::Er;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::fmt;
 
-pub mod error;
 mod impls;
 
+#[derive(Er)]
 pub enum TrySendError<R> {
+    #[er(format = "actor mailbox is full")]
     Full(R),
+    #[er(format = "actor closed")]
     Closed(R),
-    Rejected(R, WorkerError),
+    #[er(format = "{1}")]
+    Rejected(R, #[er(source)] WorkerError),
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -32,7 +35,8 @@ pub struct Options {
     pub max_outstanding_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Er, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[er(format = "worker call {outcome:?}: {cause:?}")]
 pub struct WorkerError {
     pub outcome: CallError,
     pub cause: WorkerCause,

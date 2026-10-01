@@ -29,19 +29,3 @@ impl Default for Options {
         }
     }
 }
-
-impl WorkerError {
-    pub fn new(outcome: CallError, cause: WorkerCause) -> Self {
-        Self { outcome, cause }
-    }
-}
-impl fmt::Display for WorkerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "worker call {:?}: {:?}",
-            self.outcome, self.cause
-        )
-    }
-}
-impl std::error::Error for WorkerError {}

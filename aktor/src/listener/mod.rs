@@ -1,6 +1,7 @@
 use crate::message::Message;
 use crate::queue::{Admission, HandleInner, mailbox};
 use core::marker::PhantomData;
+use er::Er;
 use std::{
     io,
     sync::{Arc, Weak},
@@ -72,14 +73,20 @@ pub struct DedicatedJoinError {
     pub payload: parking_lot::Mutex<Box<dyn std::any::Any + Send>>,
 }
 
-#[derive(Debug)]
+#[derive(Er)]
 pub enum DedicatedStartError<E> {
+    #[er(format = "an owned actor needs a Tokio runtime")]
     NoRuntime,
+    #[er(format = "actor capacity is outside Tokio's supported range")]
     InvalidCapacity,
-    Thread(io::Error),
-    Init(E),
+    #[er(format = "could not spawn actor thread: {0}")]
+    Thread(#[er(source)] io::Error),
+    #[er(format = "could not initialize actor: {0:?}")]
+    Init(#[er(source)] E),
+    #[er(format = "actor {actor:?} panicked while initializing: {cause}")]
     Panicked {
         actor: String,
+        #[er(source)]
         cause: DedicatedJoinError,
     },
 }

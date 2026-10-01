@@ -107,7 +107,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let visibility = &function.visibility;
     let attributes = &function.attributes;
 
-    let mut scope = signature::scope::Child;
+    let mut scope = signature::scope::Child {
+        shadowed: &["NAME", "request", "export"],
+    };
     let mut state_type = state_type.clone();
     scope.visit_type_mut(&mut state_type);
     let mut input_type = input_type.clone();
@@ -155,7 +157,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 #mode,
                 #state_parameter: 'static,
                 #input_parameter,
-                #output_parameter: Send + 'static,
+                #output_parameter: ::core::marker::Send + 'static,
                 #role_parameter
             > {
                 type Request: ::core::future::Future<Output = #output_parameter>;
@@ -170,14 +172,14 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #function_parameter: for<'s> ::core::ops::AsyncFnOnce(
                         #state_reference_generic,
                         #input_parameter
-                    ) -> #output_parameter + Send + 'static;
+                    ) -> #output_parameter + ::core::marker::Send + 'static;
             }
 
             impl<
                 #target,
                 #state_parameter: 'static,
                 #input_parameter,
-                #output_parameter: Send + 'static,
+                #output_parameter: ::core::marker::Send + 'static,
                 #role_parameter
             > #dispatch_trait<
                 #aktor::target::Native,
@@ -205,7 +207,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #function_parameter: for<'s> ::core::ops::AsyncFnOnce(
                         #state_reference_generic,
                         #input_parameter
-                    ) -> #output_parameter + Send + 'static
+                    ) -> #output_parameter + ::core::marker::Send + 'static
                 {
                     <#target as #dispatch<#state_parameter, #input_parameter, #role_parameter>>::dispatch(
                         self,
@@ -219,7 +221,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 #target,
                 #state_parameter: 'static,
                 #input_parameter,
-                #output_parameter: Send + 'static,
+                #output_parameter: ::core::marker::Send + 'static,
                 #role_parameter
             > #dispatch_trait<
                 #aktor::target::Remote,
@@ -253,7 +255,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #function_parameter: for<'s> ::core::ops::AsyncFnOnce(
                         #state_reference_generic,
                         #input_parameter
-                    ) -> #output_parameter + Send + 'static
+                    ) -> #output_parameter + ::core::marker::Send + 'static
                 {
                     #aktor::target::Transport::request(self, operation, input)
                 }

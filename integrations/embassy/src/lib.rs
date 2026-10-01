@@ -17,7 +17,6 @@ pub struct Sensor {
 }
 
 #[derive(Er)]
-#[er(no_constructors)]
 pub struct SensorError {
     pub value: u32,
 }
