@@ -1,0 +1,4 @@
+/target/
+/integrations/target/
+/integrations/worker/web/pkg/
+/integrations/worker/node_modules/

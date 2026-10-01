@@ -1,0 +1,85 @@
+use crate::message::Message;
+use crate::queue::{Admission, HandleInner, mailbox};
+use core::marker::PhantomData;
+use std::{
+    io,
+    sync::{Arc, Weak},
+    thread,
+};
+use tokio::sync::{mpsc, watch};
+
+pub mod failure;
+mod impls;
+mod lifecycle;
+mod running;
+mod spawn;
+mod teardown;
+#[cfg(test)]
+mod tests;
+
+use failure::Failures;
+pub use failure::{Failure, FailureKind, FailurePolicy, Operation, RunError};
+pub use lifecycle::spawn::{spawn, spawn_async};
+pub use lifecycle::{AbandonedSetup, Actor, CleanupErrors, LifecycleError, ReplaceError};
+use spawn::startup_cause;
+pub use spawn::{
+    channel, spawn_local, spawn_local_with_policy, spawn_runner, spawn_thread,
+    spawn_thread_with_policy,
+};
+
+/// Setup and cleanup run on the actor thread.
+pub struct SpawnArgs<Setup, Cleanup> {
+    pub name: String,
+    pub capacity: usize,
+    pub failure: FailurePolicy,
+    pub setup: Setup,
+    pub cleanup: Cleanup,
+}
+
+pub struct Handle<S, Role = ()> {
+    // Submission needs this across modules; callers must go through requests.
+    pub(crate) inner: Arc<HandleInner<S>>,
+    role: PhantomData<fn() -> Role>,
+}
+
+pub struct WeakHandle<S, Role = ()> {
+    inner: Weak<HandleInner<S>>,
+    role: PhantomData<fn() -> Role>,
+}
+
+pub struct Listener<S> {
+    pub name: String,
+    receiver: mailbox::Receiver<S>,
+    pub failure: FailurePolicy,
+    admission: Arc<Admission>,
+    handles: watch::Receiver<()>,
+    // Held until cleanup and the queued messages have been dropped.
+    _finished: watch::Sender<()>,
+}
+
+pub struct Dedicated<S> {
+    thread: thread::JoinHandle<Option<S>>,
+    finished: watch::Receiver<()>,
+}
+
+#[derive(Clone)]
+pub struct CompletionObserver {
+    finished: watch::Receiver<()>,
+}
+
+#[derive(Debug)]
+pub struct DedicatedJoinError {
+    pub payload: parking_lot::Mutex<Box<dyn std::any::Any + Send>>,
+}
+
+#[derive(Debug)]
+pub enum DedicatedStartError<E> {
+    NoRuntime,
+    InvalidCapacity,
+    Thread(io::Error),
+    Init(E),
+    Panicked {
+        actor: String,
+        cause: DedicatedJoinError,
+    },
+}

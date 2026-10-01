@@ -1,0 +1,29 @@
+[package]
+name = "aktor-worker-proof"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aktor = { path = "../../aktor", features = ["worker", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+rusqlite = "0.40"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+gloo-timers = { version = "0.4", features = ["futures"] }
+sqlite-wasm-rs = "0.5"
+sqlite-wasm-vfs = "0.2"
+
+[features]
+wrong-role = []

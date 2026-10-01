@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>aktor worker proof</title>
+<p>Worker owns SQLite. Open the console to try window.client.read('volume').</p>
+<script type="module">
+import init, { Client } from './pkg/aktor_worker_proof.js';
+await init();
+window.Client = Client;
+window.client = new Client(new URL('./worker.js', location.href).href, 5000);
+window.setup = JSON.parse(await window.client.ready());
+window.ready = true;
+</script>

@@ -1,0 +1,25 @@
+[package]
+name = "aktor-embassy-proof"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[dependencies]
+aktor = { path = "../../aktor", features = ["embassy"] }
+er = "0.5"
+embassy-time = "0.5"
+embassy-sync = "0.8"
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+embassy-executor = { version = "0.10", features = ["platform-std", "executor-thread"] }
+embassy-time = { version = "0.5", features = ["std"] }
+
+[target.'cfg(target_os = "none")'.dependencies]
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+
+[dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
+
+[lints.rust]
+unsafe_code = "deny"
