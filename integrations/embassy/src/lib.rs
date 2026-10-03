@@ -24,7 +24,7 @@ pub struct SensorError {
 #[aktor]
 pub async fn record(sensor: &mut Sensor, value: u32) -> ErResult<usize, SensorError> {
     if value == 0 {
-        return Err(SensorError { value }.into());
+        er_bail!(|_| value);
     }
 
     sensor.readings.borrow_mut().push(value);

@@ -27,7 +27,7 @@ worker = ["std", "dep:tokio", "dep:serde", "dep:serde_json", "dep:wasm-bindgen",
 
 [dependencies]
 aktor-macros = { version = "=0.0.2", path = "../aktor-macros", optional = true }
-er = { version = "0.5.3", default-features = false, features = ["macros"] }
+er = { version = "0.6", default-features = false, features = ["macros"] }
 parking_lot = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }

@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 aktor = { path = "../../aktor", features = ["embassy"] }
-er = "0.5"
+er = "0.6"
 embassy-time = "0.5"
 embassy-sync = "0.8"
 
