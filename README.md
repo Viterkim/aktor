@@ -77,25 +77,56 @@ database.shutdown().await?;
 
 ## Opening / starting / spawning
 
-Inside your async:
+Keep the actors with the application:
 
 ```rust
-let database = Aktor::spawn(SpawnArgs {
-    name: "users".into(),
-    capacity: 32,
-    failure: FailurePolicy::Unwind,
-    setup: || {
-        let db = Connection::open("users.sqlite")?;
-        db.execute("CREATE TABLE IF NOT EXISTS user (name TEXT NOT NULL)", [])?;
+let setup = || {
+    let e = |error: rusqlite::Error| AktorSetupError::new(error.to_string());
+    let db = Connection::open("users.sqlite").map_err(e)?;
+    db.execute("CREATE TABLE IF NOT EXISTS user (name TEXT NOT NULL)", []).map_err(e)?;
 
-        Ok::<_, rusqlite::Error>(db)
-    },
-    cleanup: |db: Connection| db.close().map_err(|(_, error)| error),
-})
-.await?;
+    Ok(db)
+};
+
+let cleanup = |db: Connection| {
+    db.close().map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
+};
+
+let after = async |report: ShutdownReport| {
+    if report.failed() { eprintln!("{report}"); }
+
+    Ok::<_, AktorCleanupError>(())
+};
+
+let run = async move |app: &mut AktorGroup| -> Result<(), AktorError> {
+    let database = app.spawn(ActorArgs {
+        name: "users".into(),
+        capacity: 32,
+        setup,
+        cleanup,
+    }).await.map_err(|error| AktorError::new(error.to_string()))?;
+
+    run_application(database).await.map_err(|error| AktorError::new(error.to_string()))?;
+    Ok(())
+};
+
+let application = AktorGroup::new();
+let kill = application.killswitch();
+
+let outcome = application.run(run, after).await;
 ```
 
 It gets its own thread, and capacity is how many calls can wait in the queue. That means that callers will wait if its full. Errors from your function come back as usual.
+
+Put `kill.stop()` in your Ctrl+C or Close handler. If an actor dies it starts closing too, each actor cleans up its own resource, then the last closure gets the reports.
+
+If the database dies, we're closing the app anyway, your queries don't need another Result for that.
+
+Setup and cleanup return the text you want printed, [you can keep the error itself too](aktor/docs/examples.md#setup--cleanup-errors). With er, use `error.er_report_string()`.
+
+The group gets five seconds to close by default, `AktorGroup::with_grace(duration)` changes that. Your own spawned tasks still need closing too, see the [runtime notes](aktor/docs/runtime.md#application-shutdown).
+
+The [group example](aktor/examples/group.rs) hooks up Ctrl+C and flushes its file before the application cleanup runs. The low level `Aktor::spawn` is still available if you need to own the lifetime yourself.
 
 ## Setups
 
@@ -106,13 +137,13 @@ It gets its own thread, and capacity is how many calls can wait in the queue. Th
 aktor = { version = "0.0.2", features = ["tokio"] }
 ```
 
-### Browser / webassembly
+### Browser workers
 
 ```toml
-aktor = { version = "0.0.2", features = ["worker"] }
+aktor = { version = "0.0.2", features = ["wasm_browser_workers"] }
 ```
 
-[Browser readme](integrations/worker/README.md)
+Runs in Web Workers, [browser readme](integrations/worker/README.md) has a SQLite example.
 
 ### Embassy + allocator
 
@@ -122,15 +153,13 @@ aktor = { version = "0.0.2", features = ["embassy"] }
 
 [Embassy readme](integrations/embassy/README.md)
 
+This is the local backend, it also runs in [plain WASM hosts](integrations/wasm/README.md).
+
 ## Docs
 
 ### Repo links
 
 [Extra examples](aktor/docs/examples.md)
-
-[Browser setup](integrations/worker/README.md) uses the worker feature with persistent SQLite in OPFS.
-
-[Embassy setup](integrations/embassy/README.md) uses embassy with an allocator.
 
 [Runtime details](aktor/docs/runtime.md)
 

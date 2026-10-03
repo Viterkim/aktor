@@ -5,16 +5,31 @@ mod inner;
 mod reply;
 mod request;
 
-impl<S, Role> Worker<S, Role> {
-    pub async fn open(url: &str, options: Options) -> Result<Self, WorkerError> {
-        let worker = Self::with_options(url, options)?;
+impl<S, Role, E> Worker<S, Role, E> {
+    #[doc(hidden)]
+    pub fn manage(&self, name: String, group: crate::group::KillSwitch) {
+        *self.inner.group.borrow_mut() = Some((name, group));
+    }
+
+    pub async fn open(url: &str, options: Options) -> Result<Self, WorkerError<E>>
+    where
+        S: 'static,
+        Role: 'static,
+        E: DeserializeOwned,
+    {
+        let worker = Self::with_options(url, options).map_err(|error| error.without_data())?;
         worker.ready().await?;
 
         Ok(worker)
     }
 
-    pub async fn ready(&self) -> Result<(), WorkerError> {
-        observe(self.inner.ready.subscribe()).await
+    pub async fn ready(&self) -> Result<(), WorkerError<E>>
+    where
+        E: DeserializeOwned,
+    {
+        observe(self.inner.ready.subscribe())
+            .await
+            .map_err(completion::typed)
     }
 
     pub fn new_handle(&self) -> Self {
@@ -26,14 +41,15 @@ impl<S, Role> Worker<S, Role> {
         }
     }
 
-    pub fn shutdown(&self) -> Completion {
+    pub fn shutdown(&self) -> Completion<E> {
         self.inner.shutdown();
         self.completion()
     }
 
-    pub fn completion(&self) -> Completion {
+    pub fn completion(&self) -> Completion<E> {
         Completion {
             result: self.inner.finished.subscribe(),
+            data: PhantomData,
         }
     }
 
@@ -55,12 +71,12 @@ impl<S, Role> Worker<S, Role> {
     pub fn request<O: DeserializeOwned>(
         &self,
         operation: &str,
-        input: Result<String, WorkerError>,
+        input: Result<Vec<u8>, WorkerError>,
     ) -> WorkerRequest<'_, S, O, Role> {
         WorkerRequest::new(self, operation, input)
     }
 }
-impl<S, Role> Drop for Worker<S, Role> {
+impl<S, Role, E> Drop for Worker<S, Role, E> {
     fn drop(&mut self) {
         let handles = self.inner.handles.get() - 1;
         self.inner.handles.set(handles);
@@ -70,16 +86,21 @@ impl<S, Role> Drop for Worker<S, Role> {
         }
     }
 }
-impl<'a, S, I: Serialize, O: DeserializeOwned, Role> Transport<S, I, O, Role>
-    for &'a Worker<S, Role>
+impl<'a, S, I: Serialize + DeserializeOwned + 'a, O: Serialize + DeserializeOwned, Role, E>
+    Transport<S, I, O, Role> for &'a Worker<S, Role, E>
 {
     type Request = WorkerRequest<'a, S, O, Role>;
 
     fn request(self, operation: Operation, input: I) -> Self::Request {
-        self.request(operation.name, encode(&input))
+        let mut request = self.request(operation.name, Ok(Vec::new()));
+        request.input = None;
+        request.encoder = Some(Box::new(move || {
+            encode(&input).map_err(|error| error.without_data())
+        }));
+        request
     }
 }
 
-pub fn fatal(error: WorkerError) -> ! {
+pub fn fatal(error: WireError) -> ! {
     std::panic::resume_unwind(Box::new(error))
 }

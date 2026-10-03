@@ -2,6 +2,7 @@ postMessage(
     JSON.stringify({
         Ready: {
             version: 0,
+            operations: [],
             options: {
                 build: 'old bundle',
                 timeout_ms: 5000,

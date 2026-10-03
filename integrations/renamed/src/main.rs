@@ -19,6 +19,10 @@ struct MainError;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), ErReport<MainError>> {
+    let operations = actor::worker::Operations::for_actor::<State, ()>();
+    assert_eq!(operations.0.len(), 1);
+    assert!(operations.0[0].contains("renamed::add"));
+
     let executor = tokio::task::LocalSet::new();
 
     executor

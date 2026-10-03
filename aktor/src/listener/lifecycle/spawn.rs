@@ -1,4 +1,5 @@
 use super::*;
+use crate::FailurePolicy;
 use std::thread;
 use tokio::{runtime, task};
 
@@ -33,6 +34,9 @@ where
     let actor_name = name.clone();
     let (handle, mut listener) =
         channel(capacity).map_err(|_| DedicatedStartError::InvalidCapacity)?;
+    if let FailurePolicy::Group(group) = &failure {
+        listener.admission.manage(name.clone(), group.clone());
+    }
     listener.failure = failure;
     listener.name = name.clone();
 
@@ -42,14 +46,24 @@ where
         .map_err(DedicatedStartError::Thread)?;
 
     let (commands, receiver) = mpsc::channel(1);
+    let (force, forced) = watch::channel(false);
     let (status, running) = watch::channel(false);
     let abandoned_setup = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let retained_setup = abandoned_setup.clone();
+    let failed_cleanup = Arc::new(Mutex::new(FailedCleanup { errors: Vec::new() }));
+    let retained_cleanup = failed_cleanup.clone();
     let (started, ready) = oneshot::channel();
+    #[cfg(not(target_family = "wasm"))]
+    let lifetime = match &listener.failure {
+        FailurePolicy::Group(group) => Some(group.track_thread(actor_name.clone())),
+        _ => None,
+    };
 
     let thread = thread::Builder::new()
         .name(name)
         .spawn(move || {
+            #[cfg(not(target_family = "wasm"))]
+            let _lifetime = lifetime;
             Some(match runtime.block_on(async { setup().await }) {
                 Ok(state) => run::run(
                     &runtime,
@@ -60,6 +74,8 @@ where
                     started,
                     cleanup,
                     retained_setup,
+                    retained_cleanup,
+                    forced,
                 ),
                 Err(error) => {
                     drop(listener);
@@ -73,12 +89,16 @@ where
     match ready.await {
         Ok(Ok(())) => {
             let finished = handle.inner.finished.clone();
+            let admission = handle.inner.admission.clone();
             Ok((
                 handle,
                 Actor {
+                    admission,
                     commands,
+                    force,
                     running,
                     abandoned_setup,
+                    failed_cleanup,
                 },
                 Dedicated { thread, finished },
             ))

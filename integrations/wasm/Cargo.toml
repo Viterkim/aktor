@@ -1,0 +1,20 @@
+[package]
+name = "aktor-wasm-proof"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+test = false
+doctest = false
+
+[dependencies]
+aktor = { path = "../../aktor", default-features = false, features = ["macros", "embassy"] }
+er = { version = "0.6", default-features = false, features = ["macros"] }
+embassy-sync = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
+
+embassy-time = {version="0.5",features=["tick-hz-1_000_000"]}
+embassy-time-driver = {version="0.2",features=["tick-hz-1_000_000"]}

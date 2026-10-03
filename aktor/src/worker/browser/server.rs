@@ -6,6 +6,20 @@ use web_sys::DedicatedWorkerGlobalScope;
 pub struct Server {
     scope: DedicatedWorkerGlobalScope,
     _callback: Closure<dyn FnMut(MessageEvent)>,
+    finished: oneshot::Receiver<Result<(), WireError>>,
+}
+impl Server {
+    /// Keep serving until shutdown and cleanup finish.
+    pub async fn wait(mut self) -> Result<(), WorkerError> {
+        let result = (&mut self.finished).await.unwrap_or_else(|_| {
+            Err(WireError::new(
+                CallError::OutcomeUnknown,
+                WorkerCause::Closed,
+            ))
+        });
+        drop(self);
+        result.map_err(WireError::without_data)
+    }
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -13,83 +27,101 @@ impl Drop for Server {
     }
 }
 
-fn respond(scope: &DedicatedWorkerGlobalScope, output: Outgoing) -> Result<(), WorkerError> {
-    let output = encode(&output)?;
-
+fn respond(scope: &DedicatedWorkerGlobalScope, output: Outgoing) -> Result<(), WireError> {
+    let output = postcard::to_allocvec(&output).map_err(|error| {
+        WireError::new(
+            CallError::OutcomeUnknown,
+            WorkerCause::Codec(error.to_string()),
+        )
+    })?;
+    let array = js_sys::Uint8Array::from(output.as_slice());
+    let buffer = array.buffer();
+    let transfers = js_sys::Array::new();
+    transfers.push(&buffer);
     scope
-        .post_message(&JsValue::from_str(&output))
+        .post_message_with_transfer(&buffer, &transfers)
         .map_err(|error| {
-            WorkerError::new(
+            WireError::new(
                 CallError::OutcomeUnknown,
                 WorkerCause::Codec(format!("{error:?}")),
             )
         })
 }
 
-fn scope() -> Result<DedicatedWorkerGlobalScope, WorkerError> {
+fn scope() -> Result<DedicatedWorkerGlobalScope, WireError> {
     JsValue::from(js_sys::global())
         .dyn_into::<DedicatedWorkerGlobalScope>()
         .map_err(|_| {
-            WorkerError::new(
+            WireError::new(
                 CallError::NotAdmitted,
                 WorkerCause::Setup("serve needs a Dedicated Worker".into()),
             )
         })
 }
 
-pub fn setup_failed(error: impl std::fmt::Display) -> Result<(), WorkerError> {
+pub fn setup_failed<T: Serialize>(error: crate::AktorSetupError<T>) -> Result<(), WireError> {
     respond(
         &scope()?,
-        Outgoing::SetupFailed(WorkerError::new(
+        Outgoing::SetupFailed(lifecycle_error(
             CallError::NotAdmitted,
-            WorkerCause::Setup(error.to_string()),
+            WorkerCause::Setup(error.diagnostics),
+            &error.data,
         )),
     )
 }
 
-pub fn serve<S: 'static, F>(state: S, dispatch: F) -> Result<Server, WorkerError>
-where
-    F: for<'a> FnMut(&'a mut S, String, String) -> LocalFuture<'a, Result<String, WorkerError>>
-        + 'static,
-{
+pub fn serve<S: 'static>(state: S) -> Result<Server, WireError> {
     serve_with(
         state,
-        dispatch,
         async |state| {
             drop(state);
-            Ok(())
+            Ok::<_, crate::AktorCleanupError>(())
         },
         Options::default(),
     )
 }
 
-pub fn serve_with<S: 'static, F, C, CF>(
-    mut state: S,
-    mut dispatch: F,
+pub fn serve_with<S: 'static, C, CF, E: Serialize + 'static>(
+    state: S,
     cleanup: C,
     options: Options,
-) -> Result<Server, WorkerError>
+) -> Result<Server, WireError>
 where
-    F: for<'a> FnMut(&'a mut S, String, String) -> LocalFuture<'a, Result<String, WorkerError>>
-        + 'static,
     C: FnOnce(S) -> CF + 'static,
-    CF: Future<Output = Result<(), WorkerError>> + 'static,
+    CF: Future<Output = Result<(), crate::AktorCleanupError<E>>> + 'static,
+{
+    serve_for::<(), _, _, _, E>(state, cleanup, options)
+}
+
+/// Pick the marker used by #[aktor(actor = ...)] when actors share a state type.
+pub fn serve_for<Role: 'static, S: 'static, C, CF, E: Serialize + 'static>(
+    mut state: S,
+    cleanup: C,
+    options: Options,
+) -> Result<Server, WireError>
+where
+    C: FnOnce(S) -> CF + 'static,
+    CF: Future<Output = Result<(), crate::AktorCleanupError<E>>> + 'static,
 {
     let scope = scope()?;
-    options.validate()?;
+    options.validate().map_err(|error| error.without_data())?;
 
     let (sender, mut receiver) = mpsc::channel::<Incoming>(options.capacity);
     let (stopping, mut stopped) = watch::channel(false);
     let closing = Rc::new(Cell::new(false));
     let replies = scope.clone();
-    let limit = options.max_payload_bytes;
 
     let callback = Closure::new(move |event: MessageEvent| {
         let input = event
             .data()
-            .as_string()
-            .ok_or_else(|| WorkerError::new(CallError::Discarded, WorkerCause::Protocol))
-            .and_then(|data| decode::<Incoming>(&data));
+            .dyn_into::<js_sys::ArrayBuffer>()
+            .map_err(|_| WireError::new(CallError::Discarded, WorkerCause::Protocol))
+            .and_then(|buffer| {
+                postcard::from_bytes::<Incoming>(&js_sys::Uint8Array::new(&buffer).to_vec())
+                    .map_err(|error| {
+                        WireError::new(CallError::Discarded, WorkerCause::Codec(error.to_string()))
+                    })
+            });
 
         match input {
             Ok(Incoming::Shutdown) => {
@@ -98,28 +130,22 @@ where
             }
 
             Ok(input @ Incoming::Call { .. }) => {
-                let (id, size) = match &input {
-                    Incoming::Call {
-                        id,
-                        operation,
-                        input,
-                    } => (*id, operation.len().saturating_add(input.len())),
+                let id = match &input {
+                    Incoming::Call { id, .. } => *id,
                     _ => return,
                 };
 
                 let cause = if closing.get() {
                     Some(WorkerCause::Closed)
-                } else if size > limit {
-                    Some(WorkerCause::PayloadTooLarge)
                 } else {
                     None
                 };
 
                 let result = if let Some(cause) = cause {
-                    Err(WorkerError::new(CallError::Discarded, cause))
+                    Err(WireError::new(CallError::Discarded, cause))
                 } else {
                     sender.try_send(input).map_err(|error| {
-                        WorkerError::new(
+                        WireError::new(
                             CallError::Discarded,
                             if matches!(error, mpsc::error::TrySendError::Full(_)) {
                                 WorkerCause::Full
@@ -148,7 +174,7 @@ where
     scope.set_onmessage(Some(callback.as_ref().unchecked_ref()));
 
     let replies = scope.clone();
-    let max_output = options.max_payload_bytes;
+    let (finished, completion) = oneshot::channel();
     wasm_bindgen_futures::spawn_local(async move {
         loop {
             let input = tokio::select! {
@@ -170,28 +196,27 @@ where
                 fatal(error);
             }
 
-            let output = dispatch(&mut state, operation, input)
+            let output = registry::dispatch::<S, Role>(&mut state, operation, input)
                 .await
-                .and_then(|output| {
-                    if output.len() > max_output {
-                        Err(WorkerError::new(
-                            CallError::OutcomeUnknown,
-                            WorkerCause::PayloadTooLarge,
-                        ))
-                    } else {
-                        Ok(output)
-                    }
-                });
+                .map_err(|error| error.without_data());
 
             if let Err(error) = respond(&replies, Outgoing::Answer { id, output }) {
                 fatal(error);
             }
         }
 
-        let result = cleanup(state).await;
-        if let Err(error) = respond(&replies, Outgoing::Finished(result)) {
+        let result = match cleanup(state).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(lifecycle_error(
+                CallError::OutcomeUnknown,
+                WorkerCause::Cleanup(error.diagnostics),
+                &error.data,
+            )),
+        };
+        if let Err(error) = respond(&replies, Outgoing::Finished(result.clone())) {
             fatal(error);
         }
+        let _sent = finished.send(result);
     });
 
     respond(
@@ -199,11 +224,22 @@ where
         Outgoing::Ready {
             version: VERSION,
             options,
+            operations: Operations::for_actor::<S, Role>(),
         },
     )?;
 
     Ok(Server {
         scope,
         _callback: callback,
+        finished: completion,
     })
+}
+
+fn lifecycle_error<E: Serialize>(outcome: CallError, cause: WorkerCause, data: &E) -> WireError {
+    let mut error = WireError::new(outcome, cause);
+    match encode(data) {
+        Ok(data) => error.data = Some(data),
+        Err(codec) => error = error.data_error(codec),
+    }
+    error
 }

@@ -1,5 +1,47 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    future::Future,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Wake, Waker},
+};
+
+struct BrokenWake;
+impl Wake for BrokenWake {
+    fn wake(self: Arc<Self>) {
+        panic!("completion waker failed");
+    }
+}
+
+#[tokio::test]
+async fn completion() {
+    let (handle, actor, thread) = spawn(SpawnArgs {
+        name: "completion teardown".into(),
+        capacity: 1,
+        failure: FailurePolicy::Unwind,
+        setup: || Ok::<_, std::convert::Infallible>(()),
+        cleanup: |_| Err("cleanup failed"),
+    })
+    .await
+    .unwrap();
+
+    let mut completion = handle.completion();
+    let mut observing = Box::pin(completion.wait());
+    let waker = Waker::from(Arc::new(BrokenWake));
+    assert!(
+        observing
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+
+    let _result = actor.shutdown().await;
+    let error = thread.join_async().await.unwrap_err();
+
+    assert_eq!(error.to_string(), "completion waker failed");
+    let cleanup = actor.cleanup_errors();
+    assert_eq!(cleanup.errors.len(), 1);
+    assert_eq!(*cleanup.errors[0], "cleanup failed");
+}
 
 struct BrokenState {
     handle: Handle<BrokenState>,

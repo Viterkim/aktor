@@ -22,6 +22,8 @@ let id = insert_user(&database, "Katten".into()).await?;
 
 Calls run one after the other, and your function's errors come back as usual. Functions can live wherever you want, go to definition takes you to the one you wrote.
 
+Keep the actors with your application in an AktorGroup. If one dies, the group starts closing, your queries don't need another Result for that.
+
 ## Calling another query (nested)
 
 Pass the connection you already have. You can put those calls in a transaction too:

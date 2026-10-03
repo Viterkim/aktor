@@ -61,27 +61,23 @@ async fn resume() {
     assert_eq!(before.await, 5);
     assert!(!actor.is_running());
 
-    assert_eq!(add(&handle, 1).checked().await, Err(CallError::NotAdmitted));
-    assert_eq!(add(&other, 3).checked().await, Err(CallError::NotAdmitted));
-
-    let legacy = handle.new_handle();
-    let rejected = tokio::spawn(async move { add(&legacy, 1).await });
+    let mut parked = Box::pin(add(&handle, 1));
+    assert!(poll(parked.as_mut()).is_pending());
     assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), rejected)
+        add(&other, 3)
+            .timeout(Duration::from_millis(1))
             .await
-            .unwrap()
-            .unwrap_err()
-            .is_panic()
+            .is_err()
     );
 
     assert!(matches!(
         actor.resume(|| Err("not yet")).await,
         Err(LifecycleError::Failed("not yet"))
     ));
-    assert_eq!(add(&handle, 1).checked().await, Err(CallError::NotAdmitted));
+    assert!(poll(parked.as_mut()).is_pending());
 
     controller.resume(|| Ok(100)).await.unwrap();
-    assert_eq!(add(&handle, 1).await, 101);
+    assert_eq!(parked.await, 101);
     assert_eq!(add(&other, 3).await, 104);
 
     actor.shutdown().await.unwrap();

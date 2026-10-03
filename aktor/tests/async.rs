@@ -1,6 +1,6 @@
 #![cfg(feature = "macros")]
 
-use aktor::message::{CallError, call};
+use aktor::message::call;
 use aktor::owner::OwnerError;
 use aktor::*;
 use std::{cell::RefCell, rc::Rc, sync::Arc, thread, time::Duration};
@@ -58,7 +58,7 @@ async fn ownership() {
                 };
                 tokio::time::sleep(Duration::from_millis(1)).await;
 
-                Ok::<_, ()>(state)
+                Ok::<_, aktor::AktorError>(state)
             },
             cleanup: move |state: State| {
                 let observed = observed.clone();
@@ -67,7 +67,7 @@ async fn ownership() {
                     assert_eq!(thread::current().id(), state.owner);
                     *observed.lock() = Some(state.values.borrow().clone());
 
-                    Ok::<_, ()>(())
+                    Ok::<_, aktor::AktorError>(())
                 }
             },
         })
@@ -89,7 +89,7 @@ async fn ownership() {
     );
 
     let closing = database.clone();
-    let completion = database.completion.new_observer();
+    let completion = database.completion();
     let mut shutdown = tokio::spawn(async move { closing.shutdown().await });
     assert!(
         tokio::time::timeout(Duration::from_millis(10), &mut shutdown)
@@ -125,7 +125,7 @@ async fn panic_after_await() {
         capacity: 1,
         failure: FailurePolicy::Unwind,
         setup: async || {
-            Ok::<_, ()>(State {
+            Ok::<_, aktor::AktorError>(State {
                 values: Rc::new(RefCell::new(Vec::new())),
                 owner: thread::current().id(),
                 timer: Box::pin(tokio::time::sleep(Duration::from_millis(1))),
@@ -137,27 +137,34 @@ async fn panic_after_await() {
                 tokio::task::yield_now().await;
                 *observed.lock() = Some(state.values.borrow().clone());
 
-                Ok::<_, ()>(())
+                Err(aktor::AktorCleanupError::new("cleanup failed too"))
             }
         },
     })
     .await
     .unwrap();
 
-    assert_eq!(
-        fail::request(&database).checked().await,
-        Err(CallError::OutcomeUnknown)
+    use futures_util::FutureExt;
+    assert!(
+        std::panic::AssertUnwindSafe(fail(&database))
+            .catch_unwind()
+            .await
+            .is_err()
     );
 
     let error = database.completion.wait().await.unwrap_err();
 
-    let OwnerError::Panicked(error) = &*error else {
-        panic!("expected operation panic")
+    let OwnerError::PanickedWithCleanup { cause, cleanup } = &*error else {
+        panic!("expected operation panic and cleanup failure")
     };
     assert_eq!(
-        error.payload.lock().downcast_ref::<&str>(),
+        cause.payload.lock().downcast_ref::<&str>(),
         Some(&"after await")
     );
+    assert_eq!(cleanup.errors[0].diagnostics, "cleanup failed too");
+    let report = error.to_string();
+    assert!(report.contains("after await"));
+    assert!(report.contains("cleanup failed too"));
     assert_eq!(*cleaned.lock(), Some(vec![9]));
 }
 
@@ -167,8 +174,12 @@ async fn completion() {
         name: "owned cleanup".into(),
         capacity: 1,
         failure: FailurePolicy::Unwind,
-        setup: || Ok::<_, ()>(0usize),
-        cleanup: |_| Err("database connection stayed open"),
+        setup: || Ok::<_, aktor::AktorError>(0usize),
+        cleanup: |_| {
+            Err(aktor::AktorCleanupError::new(
+                "database connection stayed open",
+            ))
+        },
     })
     .await
     .unwrap();
@@ -199,7 +210,10 @@ async fn completion() {
     let OwnerError::Cleanup(error) = &*first else {
         panic!("expected cleanup error")
     };
-    assert_eq!(error.errors[0].as_ref(), &"database connection stayed open");
+    assert_eq!(
+        error.errors[0].diagnostics,
+        "database connection stayed open"
+    );
     assert!(
         first
             .to_string()

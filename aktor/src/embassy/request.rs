@@ -31,14 +31,30 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role> Request<'a, S, N, E, O
                     answer: answer.clone(),
                 }),
             }),
-            reply: Reply { answer },
+            reply: Reply {
+                parked: false,
+                answer,
+                group: handle
+                    .inner
+                    .group
+                    .borrow()
+                    .as_ref()
+                    .map(|(_, group)| group.clone()),
+            },
             closed: handle.inner.closed.listen(),
             submitted: false,
         }
     }
 
-    pub fn checked(self) -> CheckedRequest<'a, S, N, E, O, Role> {
-        CheckedRequest(self)
+    pub fn timeout(self, duration: core::time::Duration) -> crate::Timeout<Self> {
+        crate::Timeout::local(self, duration, |request| crate::timeout::WaitStatus {
+            admitted: request.submitted,
+            stopping: request
+                .reply
+                .group
+                .as_ref()
+                .is_some_and(KillSwitch::is_stopping),
+        })
     }
 
     pub async fn send(mut self) -> Reply<O> {
@@ -47,14 +63,6 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role> Request<'a, S, N, E, O
         }
 
         self.reply
-    }
-
-    pub async fn checked_send(mut self) -> Result<CheckedReply<O>, CallError> {
-        if !poll_fn(|context| self.poll_submit(context)).await {
-            return Err(CallError::NotAdmitted);
-        }
-
-        Ok(self.reply.checked())
     }
 
     pub fn try_send(mut self) -> Result<Reply<O>, TrySendError<Self>> {
@@ -89,6 +97,9 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role> Request<'a, S, N, E, O
         }
 
         if !self.handle.inner.open.get() {
+            if self.handle.inner.lost() {
+                return Poll::Pending;
+            }
             return Poll::Ready(false);
         }
 
@@ -122,41 +133,18 @@ impl<S: 'static, const N: usize, E, O: 'static, Role> Future for Request<'_, S, 
             stopped();
         }
 
-        let output = ready!(this.reply.answer.poll(context));
-        this.submitted = false;
-        match output {
-            Ok(output) => Poll::Ready(output),
-            Err(_) => stopped(),
-        }
-    }
-}
-
-impl<S: 'static, const N: usize, E, O: 'static, Role> Future
-    for CheckedRequest<'_, S, N, E, O, Role>
-{
-    type Output = Result<O, CallError>;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = &mut self.get_mut().0;
-
-        if !ready!(this.poll_submit(context)) {
-            return Poll::Ready(Err(CallError::NotAdmitted));
+        let output = Pin::new(&mut this.reply).poll(context);
+        if output.is_ready() {
+            this.submitted = false;
         }
 
-        let output = ready!(this.reply.answer.poll(context));
-        this.submitted = false;
-        Poll::Ready(output)
+        output
     }
 }
 
 impl<S: 'static, const N: usize, E, Role> Request<'_, S, N, E, (), Role> {
     pub async fn cast(self) {
         drop(self.send().await);
-    }
-
-    pub async fn checked_cast(self) -> Result<(), CallError> {
-        drop(self.checked_send().await?);
-        Ok(())
     }
 
     pub fn try_cast(self) -> Result<(), TrySendError<Self>> {
@@ -223,26 +211,36 @@ impl<F, I, O> Drop for Call<F, I, O> {
 }
 
 impl<O> Reply<O> {
-    pub fn checked(self) -> CheckedReply<O> {
-        CheckedReply(self)
+    pub fn timeout(&mut self, duration: core::time::Duration) -> crate::Timeout<&mut Self> {
+        crate::Timeout::local(self, duration, |reply| crate::timeout::WaitStatus {
+            admitted: true,
+            stopping: reply.group.as_ref().is_some_and(KillSwitch::is_stopping),
+        })
     }
 }
 impl<O> Future for Reply<O> {
     type Output = O;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<O> {
-        match ready!(self.answer.poll(context)) {
-            Ok(output) => Poll::Ready(output),
-            Err(_) => stopped(),
+        let this = self.get_mut();
+        if this.parked {
+            return Poll::Pending;
         }
-    }
-}
-
-impl<O> Future for CheckedReply<O> {
-    type Output = Result<O, CallError>;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.answer.poll(context)
+        match ready!(this.answer.poll(context)) {
+            Ok(output) => Poll::Ready(output),
+            Err(_) => {
+                if let Some(group) = &this.group {
+                    group.fail(crate::ActorFailure {
+                        actor: "actor".into(),
+                        phase: "call".into(),
+                        message: "actor stopped without an output".into(),
+                    });
+                    this.parked = true;
+                    return Poll::Pending;
+                }
+                stopped()
+            }
+        }
     }
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::queue::{key::LatestKey, mailbox};
+use crate::queue::mailbox;
 use core::{
     future::Future,
     pin::Pin,
@@ -11,6 +11,8 @@ use tokio::sync::{mpsc, watch};
 
 mod call;
 mod impls;
+mod latest;
+pub use latest::{LatestResults, LatestSender};
 #[cfg(test)]
 mod tests;
 
@@ -22,11 +24,9 @@ pub struct Request<'a, S, O> {
     sender: &'a mailbox::Sender<S>,
     admission: &'a Arc<crate::queue::Admission>,
     submission: Submission<'a, S>,
+    available: Option<Pin<Box<dyn Future<Output = ()> + Send + 'a>>>,
     reply: Reply<O>,
 }
-
-#[must_use = "await the checked request to submit it and receive its result"]
-pub struct CheckedRequest<'a, S, O>(Request<'a, S, O>);
 
 enum Submission<'a, S> {
     Unsent(Message<S>),
@@ -46,14 +46,14 @@ type Admission<'a, S> =
 /// A reply to await later. Only handles keep the actor alive.
 #[must_use = "await the reply to receive the operation's result"]
 pub struct Reply<O> {
+    admission: Arc<crate::queue::Admission>,
     answer: Arc<dyn Answer<O>>,
     finished: watch::Receiver<()>,
     closing: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     error: Option<CallError>,
+    group: Option<crate::group::KillSwitch>,
+    parked: bool,
 }
-
-#[must_use = "await the checked reply to receive the operation's result"]
-pub struct CheckedReply<O>(Reply<O>);
 
 trait Answer<O>: Send + Sync {
     fn poll(&self, context: &mut Context<'_>) -> Poll<Result<O, CallError>>;
@@ -64,13 +64,12 @@ pub struct Message<S> {
     pub operation: crate::listener::Operation,
     job: Arc<dyn Job<S>>,
     finished: bool,
-    latest: Option<LatestKey>,
+    counted: bool,
 }
 
 trait Job<S>: Send + Sync {
     fn run<'a>(&'a self, state: &'a mut S) -> LocalFuture<'a, ()>;
     fn close(&self);
-    fn supersede(&self);
 }
 
 struct AsyncJob<F, I, O>(Arc<Packet<F, I, O>>);

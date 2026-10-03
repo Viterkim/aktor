@@ -3,10 +3,13 @@
 <title>aktor worker proof</title>
 <p>Worker owns SQLite. Open the console to try window.client.read('volume').</p>
 <script type="module">
-import init, { Client } from './pkg/aktor_worker_proof.js';
+import init, { Client, group_check, registration_check, typed_setup_check } from './pkg/aktor_worker_proof.js';
 await init();
 window.Client = Client;
-window.client = new Client(new URL('./worker.js', location.href).href, 5000);
+window.groupCheck = group_check;
+window.registrationCheck = registration_check;
+window.typedSetupCheck = typed_setup_check;
+window.client = new Client(new URL('./worker.js', location.href).href);
 window.setup = JSON.parse(await window.client.ready());
 window.ready = true;
 </script>

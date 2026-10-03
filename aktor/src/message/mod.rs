@@ -21,7 +21,10 @@ pub enum ActorError {
 
 pub type ActorResult<T> = Result<T, ActorError>;
 
-#[cfg_attr(feature = "worker", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "wasm_browser_workers",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Clone, Copy, Er, PartialEq, Eq)]
 pub enum CallError {
     #[er(format = "actor did not admit the request")]
@@ -30,8 +33,6 @@ pub enum CallError {
     Discarded,
     #[er(format = "actor failed after the request started; the outcome is unknown")]
     OutcomeUnknown,
-    #[er(format = "newer queued work superseded the request")]
-    Superseded,
 }
 
 /// Failed immediate submission preserves the request.

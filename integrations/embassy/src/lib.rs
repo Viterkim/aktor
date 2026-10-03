@@ -81,3 +81,8 @@ pub async fn sensor_owner(owner: embassy::Owner<Sensor, 2, &'static str>) {
         )
         .await;
 }
+
+#[aktor::aktor]
+pub async fn local_search(_: &Sensor, text: impl AsRef<str>) -> alloc::string::String {
+    text.as_ref().into()
+}

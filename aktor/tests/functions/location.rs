@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::FutureExt;
 
 #[aktor]
 async fn explode(_: &()) {
@@ -24,7 +25,10 @@ async fn caller() {
 
             let task = tokio::task::spawn_local(listener.run(()));
             let expected = line!() + 1;
-            explode::request(&db).cast().await;
+            let failed = std::panic::AssertUnwindSafe(explode(&db))
+                .catch_unwind()
+                .await;
+            assert!(failed.is_err());
 
             assert!(matches!(task.await, Err(error) if error.is_panic()));
 

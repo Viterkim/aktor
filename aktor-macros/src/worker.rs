@@ -90,6 +90,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let input_parameter = names::binding(&mut names.reserved, "__AktorInput");
     let output_parameter = names::binding(&mut names.reserved, "__AktorOutput");
     let role_parameter = names::binding(&mut names.reserved, "__AktorRole");
+    let latest_inner = names::binding(&mut names.reserved, "__AktorLatestInner");
     let function_parameter = names::binding(&mut names.reserved, "__AktorFunction");
     let state_reference_generic = if state.mutable {
         quote!(&'s mut #state_parameter)
@@ -103,12 +104,14 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     );
     function.signature.generics.params.push(parse_quote!(#mode));
 
+    function.signature.asyncness = None;
+    function.signature.output = parse_quote!(-> <#target as #name::#dispatch_trait<#mode, #state_type, #input_type, #output, #role>>::Request);
     let signature = &function.signature;
     let visibility = &function.visibility;
     let attributes = &function.attributes;
 
     let mut scope = signature::scope::Child {
-        shadowed: &["NAME", "request", "export"],
+        shadowed: &["NAME", "request", "export", "latest", "LatestSender"],
     };
     let mut state_type = state_type.clone();
     scope.visit_type_mut(&mut state_type);
@@ -139,8 +142,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     Ok(quote! {
         #(#attributes)*
+        #[track_caller]
         #visibility #signature {
-            #name::request(#parameter, #(#bindings),*).await
+            #name::request(#parameter, #(#bindings),*)
         }
 
         #(#attributes)*
@@ -152,7 +156,39 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
             pub const NAME: &str = ::core::module_path!();
 
+            #[derive(Clone)]
+            pub struct LatestSender<#latest_inner> {
+                pub inner: #latest_inner,
+            }
+            impl<#latest_inner: #aktor::latest::SendLatest<#input_type>> LatestSender<#latest_inner> {
+                pub fn send(&self, #(#bindings: #input_types),*) {
+                    #aktor::latest::SendLatest::send(&self.inner, (#(#bindings,)*));
+                }
+            }
+
+            #[track_caller]
+            pub fn latest<#target>(#parameter: #target) -> (
+                LatestSender<<#target as #aktor::latest::Session<#state_type, #input_type, #output, #role>>::Sender>,
+                <#target as #aktor::latest::Session<#state_type, #input_type, #output, #role>>::Results
+            )
+            where
+                #target: #aktor::latest::Session<#state_type, #input_type, #output, #role>,
+            {
+                let (inner, results) = #aktor::latest::Session::session(
+                    #parameter,
+                    #aktor::operation::Operation { name: NAME, caller: ::core::panic::Location::caller() },
+                    async move |#state_name: &mut #state_type, #input_name| {
+                        let (#(#bindings,)*) = #input_name;
+                        super::#invoke(#state_name, #(#bindings),*).await
+                    },
+                );
+                (LatestSender { inner }, results)
+            }
+
             #[doc(hidden)]
+            #[diagnostic::on_unimplemented(
+                note = "Check the actor's state type and actor marker. Browser worker arguments and results must implement Serialize and DeserializeOwned."
+            )]
             pub trait #dispatch_trait<
                 #mode,
                 #state_parameter: 'static,
@@ -280,6 +316,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             }
 
             #[doc(hidden)]
+            #[derive(Default)]
             struct #adapter;
             impl #aktor::target::Export for #adapter {
                 type State = #state_type;
@@ -307,6 +344,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             > {
                 #adapter
             }
+
+            #aktor::__aktor_register!(#adapter, NAME);
         }
     })
 }

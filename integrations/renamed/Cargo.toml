@@ -5,6 +5,6 @@ edition = "2024"
 publish = false
 
 [dependencies]
-actor = { package = "aktor", path = "../../aktor", features = ["tokio"] }
+actor = { package = "aktor", path = "../../aktor", features = ["tokio", "wasm_browser_workers"] }
 er = "0.6"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }

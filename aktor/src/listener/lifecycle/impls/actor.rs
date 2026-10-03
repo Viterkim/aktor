@@ -1,6 +1,26 @@
 use super::super::*;
 
 impl<S, E, C> Actor<S, E, C> {
+    pub fn close_admission(&self) {
+        self.admission.shutdown();
+    }
+
+    /// Cancel running async work and cleanup after the shutdown budget is spent.
+    pub fn cancel(&self) {
+        if self
+            .admission
+            .group()
+            .is_some_and(|group| !group.is_stopping())
+        {
+            self.admission.lost();
+        }
+        self.force.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.force.borrow()
+    }
+
     pub fn is_running(&self) -> bool {
         self.running.has_changed().is_ok() && *self.running.borrow()
     }
@@ -20,7 +40,7 @@ impl<S, E, C> Actor<S, E, C> {
         }
     }
 
-    /// Finish the work already queued and clean up. Calls are rejected while paused.
+    /// Finish the work already queued and clean up. Calls wait while paused.
     pub async fn pause(&self) -> Result<(), LifecycleError<Arc<C>>> {
         let (reply, answer) = oneshot::channel();
 
@@ -121,15 +141,25 @@ impl<S, E, C> Actor<S, E, C> {
 
     pub fn new_controller(&self) -> Self {
         Self {
+            admission: self.admission.clone(),
             commands: self.commands.clone(),
+            force: self.force.clone(),
             running: self.running.clone(),
             abandoned_setup: self.abandoned_setup.clone(),
+            failed_cleanup: self.failed_cleanup.clone(),
         }
     }
 
     /// Setup errors whose callers stopped waiting after admission.
     pub fn take_abandoned_setup(&self) -> Vec<AbandonedSetup<E>> {
         std::mem::take(&mut *self.abandoned_setup.lock())
+    }
+
+    /// Cleanup errors retained after a panic.
+    pub fn cleanup_errors(&self) -> CleanupErrors<C> {
+        CleanupErrors {
+            errors: self.failed_cleanup.lock().errors.clone(),
+        }
     }
 }
 impl<S, E, C> Clone for Actor<S, E, C> {

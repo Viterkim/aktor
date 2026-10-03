@@ -3,7 +3,11 @@ use futures_util::FutureExt;
 
 impl Failures {
     pub fn new(actor: String) -> Self {
-        Self { actor, first: None }
+        Self {
+            actor,
+            first: None,
+            group: None,
+        }
     }
 
     pub fn capture<T>(&mut self, kind: FailureKind, action: impl FnOnce() -> T) -> Option<T> {
@@ -21,6 +25,13 @@ impl Failures {
                         kind,
                         payload,
                     });
+                    if let (Some(group), Some(failure)) = (&self.group, &self.first) {
+                        group.fail(crate::group::ActorFailure {
+                            actor: failure.actor.clone(),
+                            phase: format!("{:?}", failure.kind),
+                            message: failure.to_string(),
+                        });
+                    }
                 } else {
                     dispose_secondary(payload);
                 }

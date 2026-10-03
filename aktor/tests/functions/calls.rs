@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::FutureExt;
 
 type DbResult<T> = Result<T, QueryError>;
 
@@ -48,29 +49,32 @@ async fn typed() {
     drop(db);
     actor.join().unwrap();
 
-    let (db, listener) = channel::<Db>(2).unwrap();
-    let old = find::request(&db, 0)
-        .latest("panel")
-        .checked_send()
-        .await
-        .unwrap();
+    let (db, mut listener) = channel::<Db>(2).unwrap();
+    struct Panel {
+        search: find::LatestSender<aktor::message::LatestSender<(usize,)>>,
+    }
+    let (search, mut results) = find::latest(&db);
+    let panel = Panel { search };
+    let (other, mut other_results) = fail::latest(&db);
+    panel.search.send(0);
+    panel.search.send(1);
+    other.send();
 
-    let other = fail::request(&db)
-        .latest("panel")
-        .checked_send()
-        .await
-        .unwrap();
-
-    let newest = find::request(&db, 0).latest("panel").try_send().unwrap();
-    assert_eq!(old.await, Err(CallError::Superseded));
-
-    drop(db);
-    listener
-        .run(Db {
-            rows: vec!["BingoManden".into()],
-        })
-        .await;
-
-    assert_eq!(other.await, Ok(Err(QueryError)));
-    assert_eq!(newest.await.as_deref(), Some("BingoManden"));
+    let mut state = Db {
+        rows: vec!["BingoManden".into(), "BingoKvinde".into()],
+    };
+    listener.recv().await.unwrap().run(&mut state).await;
+    listener.recv().await.unwrap().run(&mut state).await;
+    panel.search.send(0);
+    assert!(results.next().now_or_never().is_none());
+    listener.recv().await.unwrap().run(&mut state).await;
+    assert_eq!(
+        results.next().await.flatten().as_deref(),
+        Some("BingoManden")
+    );
+    assert_eq!(other_results.next().await, Some(Err(QueryError)));
+    drop(panel);
+    assert_eq!(results.next().await, None);
+    drop(other);
+    assert_eq!(other_results.next().await, None);
 }

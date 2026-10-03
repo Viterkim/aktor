@@ -8,6 +8,9 @@ fi
 if [[ "${1:-}" == embassy ]]; then
     exec bash checks/embassy.sh
 fi
+if [[ "${1:-}" == wasm ]]; then
+    exec bash checks/wasm.sh
+fi
 
 bash checks/core.sh
 bash checks/integrations.sh

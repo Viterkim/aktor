@@ -33,6 +33,9 @@ pub trait Export {
 }
 
 /// A shared local state reference or a handle to that state.
+#[diagnostic::on_unimplemented(
+    note = "Browser workers require concrete owned argument and output types. Generic or borrowed operations can run locally or through native and Embassy handles."
+)]
 pub trait Read<S: 'static, I, Role = ()> {
     type Output<O: Send + 'static>: Future<Output = O>;
 
@@ -43,6 +46,9 @@ pub trait Read<S: 'static, I, Role = ()> {
 }
 
 /// An exclusive local state reference or a handle to that state.
+#[diagnostic::on_unimplemented(
+    note = "Browser workers require concrete owned argument and output types. Generic or borrowed operations can run locally or through native and Embassy handles."
+)]
 pub trait Write<S: 'static, I, Role = ()> {
     type Output<O: Send + 'static>: Future<Output = O>;
 

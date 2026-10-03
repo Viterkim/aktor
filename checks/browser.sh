@@ -2,8 +2,8 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
-cargo +1.89.0 check -p aktor --no-default-features --features macros,worker --target wasm32-unknown-unknown
-cargo clippy -p aktor --no-default-features --features macros,worker --target wasm32-unknown-unknown -- -D warnings
+cargo +1.89.0 check -p aktor --no-default-features --features macros,wasm_browser_workers --target wasm32-unknown-unknown
+cargo clippy -p aktor --no-default-features --features macros,wasm_browser_workers --target wasm32-unknown-unknown -- -D warnings
 cargo +1.89.0 check --manifest-path integrations/Cargo.toml -p aktor-worker-proof --target wasm32-unknown-unknown
 cargo clippy --manifest-path integrations/Cargo.toml -p aktor-worker-proof --target wasm32-unknown-unknown -- -D warnings
 bash integrations/worker/build.sh

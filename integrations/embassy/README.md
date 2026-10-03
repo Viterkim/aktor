@@ -1,6 +1,6 @@
 # Embassy + alloc
 
-Enable embassy and supply an allocator. One task runs the owner:
+Enable embassy and supply an allocator. The owner stays on your executor:
 
 ```rust
 let (sensor, owner) = embassy::channel::<Sensor, 2, &'static str>()?;
@@ -8,10 +8,14 @@ spawner.spawn(sensor_owner(owner)?);
 sensor.ready().await?;
 
 let count = record_many(&sensor, [4, 5]).await?;
-sensor.shutdown().wait().await?;
+sensor.shutdown().await?;
 ```
 
 The 2 is queue capacity. [sensor_owner](src/lib.rs) runs setup and cleanup, record_many calls record with its local sensor. Handles stay on the owner's executor, state and arguments can contain Rc. Outputs still need Send + 'static.
+
+embassy::AktorGroup owns its local owners and application future together, with the same killswitch and cleanup records. The host supplies embassy-time for timeout() and the shutdown budget.
+
+It also runs on other local executors, [including isolated WASM hosts](../wasm/README.md).
 
 ## Try it
 
@@ -29,4 +33,4 @@ rustup +1.89.0 target add thumbv6m-none-eabi thumbv7em-none-eabihf
 bash scripts/check.sh embassy
 ```
 
-On a board you'll need your panic handler and timer driver too. Latest and pause/resume/replace aren't implemented here yet.
+On a board you'll need your panic handler and timer driver too. pause/resume/replace aren't implemented here yet.

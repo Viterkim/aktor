@@ -192,6 +192,16 @@ async fn inputs() {
     .await
     .unwrap();
 
+    let (sender, mut results) = by_name::latest(&handle);
+    sender.send(String::from("search"));
+    assert_eq!(results.next().await, Some(String::from("search")));
+    let cloned = sender.clone();
+    cloned.send(String::from("new search"));
+    assert_eq!(results.next().await, Some(String::from("new search")));
+    drop(cloned);
+    drop(sender);
+    drop(results);
+
     let reply = by_name::request(&handle, text).send().await;
     drop(handle);
     assert_eq!(tokio::spawn(reply).await.unwrap(), "name");
@@ -262,4 +272,23 @@ async fn mapped(
 ) -> usize {
     let text = text.into();
     first(std::borrow::Cow::Borrowed(&text)) + second(text)
+}
+
+struct Inner(u32);
+
+#[aktor]
+async fn put(_: &mut usize, value: Inner) -> u32 {
+    value.0
+}
+
+#[tokio::test]
+async fn latest_names() {
+    let (handle, owner) = spawn_thread(0usize, 1).unwrap();
+    let (sender, mut results) = put::latest(&handle);
+    sender.send(Inner(17));
+    assert_eq!(results.next().await, Some(17));
+    drop(sender);
+    drop(results);
+    drop(handle);
+    owner.join().unwrap();
 }

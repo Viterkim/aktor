@@ -138,9 +138,8 @@ async fn discard() {
             },
             (),
         )
-        .checked_send()
-        .await
-        .unwrap();
+        .send()
+        .await;
         running.await.unwrap();
 
         call(&handle, |_, input| drop(input), Bomb).cast().await;

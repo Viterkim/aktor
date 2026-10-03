@@ -31,19 +31,19 @@ async fn counters(executor: &tokio::task::LocalSet) -> Result<()> {
     let n = add(&handle, 2).await;
     assert_eq!(n, 2);
 
-    let reply = add::request(&handle, 3).send().await;
+    let reply = add(&handle, 3).send().await;
 
     // do something else
 
     let n: u32 = reply.await;
     assert_eq!(n, 5);
 
-    clear::request(&handle).cast().await;
+    clear(&handle).cast().await;
 
-    let admitted = clear::request(&handle).try_cast();
+    let admitted = clear(&handle).try_cast();
     admitted.map_err(|error| error.to_string())?;
 
-    let reply = match add::request(&handle, 3).try_send() {
+    let reply = match add(&handle, 3).try_send() {
         Ok(reply) => reply,
         Err(TrySendError::Full(request)) => request.send().await,
         Err(error) => return Err(error.to_string().into()),
@@ -53,10 +53,9 @@ async fn counters(executor: &tokio::task::LocalSet) -> Result<()> {
     assert_eq!(n, 3);
 
     use std::time::Duration;
-    use tokio::time::timeout;
 
-    let mut reply = add::request(&handle, 3).send().await;
-    let n = match timeout(Duration::from_millis(20), &mut reply).await {
+    let mut reply = add(&handle, 3).send().await;
+    let n = match reply.timeout(Duration::from_millis(20)).await {
         Ok(n) => n,
         Err(_) => reply.await,
     };
@@ -76,12 +75,14 @@ async fn counters(executor: &tokio::task::LocalSet) -> Result<()> {
 async fn lifecycle() -> Result<()> {
     use rusqlite::Connection;
 
+    let cleanup = |db: Connection| db.close().map_err(|(_, error)| error);
+
     let (database, actor, thread) = spawn(SpawnArgs {
         name: "sqlite".into(),
         capacity: 128,
         failure: FailurePolicy::Abort,
         setup: Connection::open_in_memory,
-        cleanup: |db: Connection| db.close().map_err(|(_, error)| error),
+        cleanup,
     })
     .await?;
 

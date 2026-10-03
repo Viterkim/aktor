@@ -1,7 +1,6 @@
 use super::*;
 use crate::{message::LocalFuture, operation::Operation};
 use core::{future::Future, marker::PhantomData};
-use gloo_timers::future::TimeoutFuture;
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
@@ -14,52 +13,58 @@ use web_sys::{ErrorEvent, MessageEvent};
 
 mod completion;
 mod impls;
+mod latest;
 mod open;
 mod server;
 use completion::observe;
 use impls::fatal;
-pub use server::{Server, serve, serve_with, setup_failed};
+pub use latest::{LatestResults, LatestSender};
+pub use server::{Server, serve, serve_for, serve_with, setup_failed};
 
-pub struct Worker<S, Role = ()> {
+type State<S, Role, E> = PhantomData<fn() -> (S, Role, E)>;
+type EncodeInput<'a> = Box<dyn FnOnce() -> Result<Vec<u8>, WireError> + 'a>;
+
+pub struct Worker<S, Role = (), E = ()> {
     inner: Rc<Inner>,
-    state: PhantomData<fn() -> (S, Role)>,
+    state: State<S, Role, E>,
 }
 
-pub struct Completion {
-    result: watch::Receiver<Option<Result<(), WorkerError>>>,
+pub struct Completion<E = ()> {
+    data: PhantomData<fn() -> E>,
+    result: watch::Receiver<Option<Result<(), WireError>>>,
 }
 
 #[must_use = "await the request, or explicitly send or cast it"]
 pub struct WorkerRequest<'a, S, O, Role = ()> {
-    worker: &'a Worker<S, Role>,
+    inner: &'a Rc<Inner>,
+    state: PhantomData<fn() -> (S, Role)>,
     operation: String,
-    input: Option<Result<String, WorkerError>>,
+    input: Option<Result<Vec<u8>, WireError>>,
+    encoder: Option<EncodeInput<'a>>,
     admission:
-        Option<LocalFuture<'a, Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), WorkerError>>>,
+        Option<LocalFuture<'a, Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), WireError>>>,
     reply: Option<WorkerReply<O>>,
-    latest: Option<String>,
+    parked: bool,
 }
 
 #[must_use = "await the reply to receive the operation's result"]
 pub struct WorkerReply<O> {
-    response: oneshot::Receiver<Result<String, WorkerError>>,
+    response: oneshot::Receiver<Result<Vec<u8>, WireError>>,
     inner: Weak<Inner>,
+    group: Option<(String, crate::group::KillSwitch)>,
     id: u64,
-    timeout: TimeoutFuture,
+    parked: bool,
     output: PhantomData<fn() -> O>,
 }
-
-#[must_use = "await the checked reply to receive the operation's result"]
-pub struct CheckedWorkerReply<O>(WorkerReply<O>);
 
 type Callback<Event> = RefCell<Option<Closure<dyn FnMut(Event)>>>;
 
 struct Work {
-    answer: Option<oneshot::Sender<Result<String, WorkerError>>>,
+    answer: Option<oneshot::Sender<Result<Vec<u8>, WireError>>>,
     input: Option<Incoming>,
-    latest: Option<(String, String)>,
-    _count: OwnedSemaphorePermit,
-    _bytes: OwnedSemaphorePermit,
+    service: Option<Box<dyn latest::Service>>,
+    _count: Option<OwnedSemaphorePermit>,
+    _bytes: Option<OwnedSemaphorePermit>,
 }
 
 struct Inner {
@@ -72,11 +77,14 @@ struct Inner {
     next: Cell<u64>,
     handles: Cell<usize>,
     closed: Cell<bool>,
+    failed: Cell<bool>,
     options: Options,
+    group: RefCell<Option<(String, crate::group::KillSwitch)>>,
+    sessions: RefCell<Vec<Rc<dyn Fn() -> bool>>>,
     count: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
-    ready: watch::Sender<Option<Result<(), WorkerError>>>,
-    finished: watch::Sender<Option<Result<(), WorkerError>>>,
+    ready: watch::Sender<Option<Result<(), WireError>>>,
+    finished: watch::Sender<Option<Result<(), WireError>>>,
     retained: RefCell<Option<Rc<Inner>>>,
     message: Callback<MessageEvent>,
     error: Callback<ErrorEvent>,

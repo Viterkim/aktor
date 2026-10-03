@@ -1,5 +1,7 @@
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod browser;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod group;
 pub mod preferences;
 
 #[cfg(test)]

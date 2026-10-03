@@ -18,6 +18,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let (implementation, invoke) =
         signature::implementation(&function.signature, &mut names, &output);
     let output = signature::dispatch_output(output);
+    let mut opaque_output = OpaqueOutput(false);
+    syn::visit::Visit::visit_type(&mut opaque_output, &output);
+    let latest_inner = names::binding(&mut names.reserved, "__AktorLatestInner");
     signature::normalize(&mut function.signature, &mut names);
 
     let state = input::parse::state(&function.signature.inputs[0])?;
@@ -46,7 +49,6 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         _ => state_name.clone(),
     };
     let body = &function.body;
-    let written_output = output.clone();
 
     function.signature.asyncness = None;
     function
@@ -79,10 +81,6 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let visibility = &function.visibility;
     let signature = &function.signature;
     let name = &signature.ident;
-    let mut normal = signature.clone();
-    normal.asyncness = Some(parse_quote!(async));
-    normal.output = parse_quote!(-> #written_output);
-
     let generic_arguments: Vec<_> = signature
         .generics
         .params
@@ -102,7 +100,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     let mut request = signature.clone();
     request.ident = parse_quote!(request);
-    let mut scope = signature::scope::Child { shadowed: &[] };
+    let mut scope = signature::scope::Child {
+        shadowed: &["request", "latest", "LatestSender"],
+    };
     scope.visit_signature_mut(&mut request);
 
     let mut state_type = state_type.clone();
@@ -125,11 +125,121 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         quote!(&#state_type)
     };
 
+    let latest = if opaque_output.0 {
+        TokenStream::new()
+    } else {
+        let mut session_output = output.clone();
+        scope.visit_type_mut(&mut session_output);
+        let input_types: Vec<_> = request
+            .inputs
+            .iter()
+            .skip(1)
+            .filter_map(|argument| match argument {
+                FnArg::Typed(argument) => Some(&argument.ty),
+                _ => None,
+            })
+            .collect();
+        let mut user_generics = request.generics.clone();
+        user_generics.params.pop();
+        let arguments: Vec<_> = user_generics
+            .params
+            .iter()
+            .map(|parameter| match parameter {
+                syn::GenericParam::Lifetime(parameter) => {
+                    let lifetime = &parameter.lifetime;
+                    quote!(#lifetime)
+                }
+                syn::GenericParam::Type(parameter) => {
+                    let name = &parameter.ident;
+                    quote!(#name)
+                }
+                syn::GenericParam::Const(parameter) => {
+                    let name = &parameter.ident;
+                    quote!(#name)
+                }
+            })
+            .collect();
+        let markers: Vec<_> = user_generics
+            .params
+            .iter()
+            .filter_map(|parameter| match parameter {
+                syn::GenericParam::Lifetime(parameter) => {
+                    let lifetime = &parameter.lifetime;
+                    Some(quote!(&#lifetime ()))
+                }
+                syn::GenericParam::Type(parameter) => {
+                    let name = &parameter.ident;
+                    Some(quote!(*const #name))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut sender_generics = user_generics.clone();
+        sender_generics.params.push(parse_quote!(#latest_inner));
+        let (sender_impl, sender_type, sender_where) = sender_generics.split_for_impl();
+        let mut send_generics = sender_generics.clone();
+        send_generics
+            .make_where_clause()
+            .predicates
+            .push(parse_quote!(#latest_inner: #aktor::latest::SendLatest<#input_type>));
+        let (send_impl, _, send_where) = send_generics.split_for_impl();
+        let mut clone_generics = sender_generics.clone();
+        clone_generics
+            .make_where_clause()
+            .predicates
+            .push(parse_quote!(#latest_inner: ::core::clone::Clone));
+        let (clone_impl, _, clone_where) = clone_generics.split_for_impl();
+        let mut latest_signature = request.clone();
+        latest_signature.ident = parse_quote!(latest);
+        latest_signature.inputs = latest_signature.inputs.into_iter().take(1).collect();
+        latest_signature.generics = user_generics;
+        latest_signature.generics.params.push(parse_quote!(#target));
+        let predicates = &mut latest_signature.generics.make_where_clause().predicates;
+        predicates.push(parse_quote!(#target: #aktor::latest::Session<#state_type, #input_type, #session_output, #role>));
+        predicates.push(parse_quote!(#input_type: 'static));
+        predicates.push(parse_quote!(#session_output: ::core::marker::Send + 'static));
+        latest_signature.output = parse_quote!(-> (
+            LatestSender<#(#arguments,)* <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Sender>,
+            <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Results
+        ));
+
+        quote! {
+            pub struct LatestSender #sender_impl #sender_where {
+                pub inner: #latest_inner,
+                marker: ::core::marker::PhantomData<fn(#(#markers),*)>,
+            }
+            impl #send_impl LatestSender #sender_type #send_where {
+                pub fn send(&self, #(#bindings: #input_types),*) {
+                    #aktor::latest::SendLatest::send(&self.inner, (#(#bindings,)*));
+                }
+            }
+            impl #clone_impl ::core::clone::Clone for LatestSender #sender_type #clone_where {
+                fn clone(&self) -> Self {
+                    Self { inner: self.inner.clone(), marker: ::core::marker::PhantomData }
+                }
+            }
+
+            #[track_caller]
+            pub #latest_signature {
+                let (inner, results) = #aktor::latest::Session::session(
+                    #parameter,
+                    #aktor::operation::Operation { name: ::core::module_path!(), caller: ::core::panic::Location::caller() },
+                    async move |#state_name: &mut #state_type, #input_name| {
+                        let (#(#bindings,)*) = #input_name;
+                        super::#invoke(#state_name, #(#bindings),*).await
+                    },
+                );
+                (LatestSender { inner, marker: ::core::marker::PhantomData }, results)
+            }
+        }
+    };
+
     Ok(quote! {
         #(#attributes)*
         #[allow(clippy::extra_unused_lifetimes)]
-        #visibility #normal {
-            #name::request::<#(#generic_arguments),*>(#parameter, #(#bindings),*).await
+        #[track_caller]
+        #visibility #signature {
+            #name::request::<#(#generic_arguments),*>(#parameter, #(#bindings),*)
         }
 
         #(#attributes)*
@@ -139,6 +249,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
         #visibility mod #name {
             use super::*;
+
+            #latest
 
             #[track_caller]
             #[allow(clippy::extra_unused_lifetimes)]
@@ -158,4 +270,11 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             }
         }
     })
+}
+
+struct OpaqueOutput(bool);
+impl<'ast> syn::visit::Visit<'ast> for OpaqueOutput {
+    fn visit_type_impl_trait(&mut self, _: &'ast syn::TypeImplTrait) {
+        self.0 = true;
+    }
 }

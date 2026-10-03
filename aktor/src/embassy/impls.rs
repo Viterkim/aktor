@@ -1,5 +1,5 @@
 use super::*;
-use core::future::poll_fn;
+use core::future::{IntoFuture, poll_fn};
 
 /// Capacity bounds queued work. One operation can also be running.
 pub fn channel<S, const N: usize, E>() -> Result<Channel<S, N, E>, ActorError> {
@@ -9,6 +9,10 @@ pub fn channel<S, const N: usize, E>() -> Result<Channel<S, N, E>, ActorError> {
 
     let inner = Rc::new(Inner {
         queue: Queue::new(),
+        services: RefCell::new(VecDeque::new()),
+        prefer_service: Cell::new(false),
+        group: RefCell::new(None),
+        sessions: RefCell::new(alloc::vec::Vec::new()),
         open: Cell::new(true),
         handles: Cell::new(1),
         closed: Event::default(),
@@ -32,10 +36,48 @@ impl<S, const N: usize, E> Inner<S, N, E> {
     fn close(&self) {
         if self.open.replace(false) {
             self.closed.notify();
+            let callbacks = self.sessions.borrow().clone();
+            let expired: alloc::vec::Vec<_> =
+                callbacks.into_iter().filter(|wake| !wake()).collect();
+            self.sessions
+                .borrow_mut()
+                .retain(|wake| !expired.iter().any(|dead| Rc::ptr_eq(wake, dead)));
         }
     }
 
+    pub(super) fn lost(&self) -> bool {
+        if let Some((name, group)) = &*self.group.borrow() {
+            group.fail(crate::ActorFailure {
+                actor: name.clone(),
+                phase: "call".into(),
+                message: "actor stopped without an output".into(),
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn service(&self, message: Message<S>) {
+        self.services.borrow_mut().push_back(message);
+        self.closed.notify();
+    }
+
     fn finish(&self, result: Result<(), Rc<OwnerError<E>>>) {
+        if let Err(error) = &result
+            && let Some((name, group)) = &*self.group.borrow()
+        {
+            group.fail(crate::ActorFailure {
+                actor: name.clone(),
+                phase: match &**error {
+                    OwnerError::Setup(_) => "setup",
+                    OwnerError::Cleanup(_) => "cleanup",
+                    OwnerError::Cancelled => "owner",
+                }
+                .into(),
+                message: alloc::format!("{error}"),
+            });
+        }
         self.close();
 
         if self.completion.result.borrow().is_some() {
@@ -47,6 +89,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
             drop(message);
         }
 
+        self.services.borrow_mut().clear();
         if self.completion.ready.borrow().is_none() {
             *self.completion.ready.borrow_mut() = Some(result.clone());
         }
@@ -63,7 +106,7 @@ impl<S, const N: usize, E, Role> Handle<S, N, E, Role> {
         }
     }
 
-    /// Wait until the owning task has built its state, retaining any setup failure.
+    /// Wait for setup, or get its error.
     pub async fn ready(&self) -> Result<(), Rc<OwnerError<E>>> {
         let changed = self.inner.completion.changed.listen();
 
@@ -97,7 +140,7 @@ impl<S, const N: usize, E, Role> Handle<S, N, E, Role> {
         }
     }
 
-    /// Close admission now. The owning task drains work and runs cleanup.
+    /// Start closing now, queued calls finish before cleanup.
     pub fn shutdown(&self) -> Completion<E> {
         self.inner.close();
         self.completion()
@@ -151,7 +194,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         }
     }
 
-    /// Setup is created and awaited on the application's owning task.
+    /// Run setup here on the owner's task.
     pub async fn run_with<Setup, SetupFuture, Cleanup, CleanupFuture>(
         self,
         setup: Setup,
@@ -159,9 +202,9 @@ impl<S, const N: usize, E> Owner<S, N, E> {
     ) -> Result<(), Rc<OwnerError<E>>>
     where
         Setup: FnOnce() -> SetupFuture,
-        SetupFuture: Future<Output = Result<S, E>>,
+        SetupFuture: Future<Output = Result<S, crate::AktorSetupError<E>>>,
         Cleanup: FnOnce(S) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), E>>,
+        CleanupFuture: Future<Output = Result<(), crate::AktorCleanupError<E>>>,
     {
         match setup().await {
             Ok(state) => self.run(state, cleanup).await,
@@ -181,7 +224,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
     ) -> Result<(), Rc<OwnerError<E>>>
     where
         Cleanup: FnOnce(S) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), E>>,
+        CleanupFuture: Future<Output = Result<(), crate::AktorCleanupError<E>>>,
     {
         *self.inner.completion.ready.borrow_mut() = Some(Ok(()));
         self.inner.completion.changed.notify();
@@ -189,17 +232,43 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         let closing = self.inner.closed.listen();
         loop {
             let message = poll_fn(|context| {
-                if !self.inner.open.get() && self.inner.queue.is_empty() {
+                if !self.inner.open.get()
+                    && self.inner.queue.is_empty()
+                    && self.inner.services.borrow().is_empty()
+                {
                     return Poll::Ready(None);
                 }
 
                 closing.register(context);
-                self.inner.queue.poll_receive(context).map(Some)
+                if (self.inner.prefer_service.get() || self.inner.queue.is_empty())
+                    && let Some(message) = self.inner.services.borrow_mut().pop_front()
+                {
+                    self.inner.prefer_service.set(false);
+                    return Poll::Ready(Some(message));
+                }
+                match self.inner.queue.poll_receive(context) {
+                    Poll::Ready(message) => {
+                        self.inner.prefer_service.set(true);
+                        Poll::Ready(Some(message))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
             })
             .await;
 
             let Some(mut message) = message else { break };
             message.job.run(&mut state).await;
+            let mut yielded = false;
+            poll_fn(|cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
         }
 
         let result = cleanup(state)
@@ -235,5 +304,44 @@ impl<E> Completion<E> {
             }
         })
         .await
+    }
+}
+impl<E: 'static> IntoFuture for Completion<E> {
+    type Output = Result<(), Rc<OwnerError<E>>>;
+    type IntoFuture = LocalFuture<'static, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.wait().await })
+    }
+}
+impl<'a, E: 'a> IntoFuture for &'a Completion<E> {
+    type Output = Result<(), Rc<OwnerError<E>>>;
+    type IntoFuture = LocalFuture<'a, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.wait())
+    }
+}
+
+impl<E> core::fmt::Display for OwnerError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Setup(error) => write!(f, "actor setup failed: {error}"),
+            Self::Cleanup(error) => write!(f, "actor cleanup failed: {error}"),
+            Self::Cancelled => f.write_str("actor owner stopped before cleanup completed"),
+        }
+    }
+}
+impl<E> core::fmt::Debug for OwnerError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
+}
+impl<E: 'static> core::error::Error for OwnerError<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Setup(error) | Self::Cleanup(error) => Some(error),
+            Self::Cancelled => None,
+        }
     }
 }

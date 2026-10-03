@@ -42,12 +42,6 @@ where
         })
     }
 
-    fn supersede(&self) {
-        let function = self.data.lock().function.take();
-        self.finish(Err(CallError::Superseded));
-        drop(function);
-    }
-
     fn close(&self) {
         let function = self.data.lock().function.take();
         let error = if function.is_some() {
@@ -109,12 +103,6 @@ where
                 self.0.finish(Ok(function(state, input).await));
             }
         })
-    }
-
-    fn supersede(&self) {
-        let function = self.0.data.lock().function.take();
-        self.0.finish(Err(CallError::Superseded));
-        drop(function);
     }
 
     fn close(&self) {

@@ -2,15 +2,9 @@ use super::*;
 use wasm_bindgen::JsCast;
 use web_sys::{WorkerOptions, WorkerType};
 
-impl<S, Role> Worker<S, Role> {
-    pub fn new(url: &str, timeout_ms: u32) -> Result<Self, WorkerError> {
-        Self::with_options(
-            url,
-            Options {
-                timeout_ms,
-                ..Options::default()
-            },
-        )
+impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
+    pub fn new(url: &str) -> Result<Self, WorkerError> {
+        Self::with_options(url, Options::default())
     }
 
     pub fn with_options(url: &str, options: Options) -> Result<Self, WorkerError> {
@@ -37,9 +31,12 @@ impl<S, Role> Worker<S, Role> {
             next: Cell::new(0),
             handles: Cell::new(1),
             closed: Cell::new(false),
+            failed: Cell::new(false),
             count: Arc::new(Semaphore::new(options.capacity)),
             bytes: Arc::new(Semaphore::new(options.max_outstanding_bytes)),
             options,
+            group: RefCell::new(None),
+            sessions: RefCell::new(Vec::new()),
             ready,
             finished,
             retained: RefCell::new(None),
@@ -48,6 +45,7 @@ impl<S, Role> Worker<S, Role> {
         });
 
         let weak = Rc::downgrade(&inner);
+        let expected = Operations::for_actor::<S, Role>();
         let message = Closure::new(move |event: MessageEvent| {
             let Some(inner) = weak.upgrade() else {
                 return;
@@ -55,28 +53,45 @@ impl<S, Role> Worker<S, Role> {
 
             let output = event
                 .data()
-                .as_string()
-                .ok_or_else(|| WorkerError::new(CallError::OutcomeUnknown, WorkerCause::Protocol))
-                .and_then(|data| decode::<Outgoing>(&data));
+                .dyn_into::<js_sys::ArrayBuffer>()
+                .map_err(|_| WireError::new(CallError::OutcomeUnknown, WorkerCause::Protocol))
+                .and_then(|buffer| {
+                    postcard::from_bytes::<Outgoing>(&js_sys::Uint8Array::new(&buffer).to_vec())
+                        .map_err(|error| {
+                            WireError::new(
+                                CallError::OutcomeUnknown,
+                                WorkerCause::Codec(error.to_string()),
+                            )
+                        })
+                });
 
             match output {
-                Ok(Outgoing::Ready { version, options }) => {
+                Ok(Outgoing::Ready {
+                    version,
+                    options,
+                    operations,
+                }) => {
                     if version != VERSION
                         || options.build != inner.options.build
                         || inner.options.capacity > options.capacity
-                        || inner.options.max_payload_bytes > options.max_payload_bytes
                         || inner.options.max_outstanding_bytes > options.max_outstanding_bytes
                         || inner.ready.borrow().is_some()
                     {
                         inner.fail(WorkerCause::Protocol);
+                    } else if operations != expected {
+                        inner.fail(WorkerCause::Operations {
+                            expected: expected.0.clone(),
+                            actual: operations.0,
+                        });
                     } else {
                         inner.ready.send_replace(Some(Ok(())));
+                        inner.pump();
                     }
                 }
 
                 Ok(Outgoing::SetupFailed(error)) => {
                     inner.ready.send_replace(Some(Err(error.clone())));
-                    inner.fail(error.cause);
+                    inner.fail_error(error);
                 }
 
                 Ok(Outgoing::Started { id }) => {
@@ -87,19 +102,14 @@ impl<S, Role> Worker<S, Role> {
                     }
                 }
 
-                Ok(Outgoing::Answer { id, mut output }) => {
-                    if output
-                        .as_ref()
-                        .is_ok_and(|output| output.len() > inner.options.max_payload_bytes)
-                    {
-                        output = Err(WorkerError::new(
-                            CallError::OutcomeUnknown,
-                            WorkerCause::PayloadTooLarge,
-                        ));
-                    }
-
+                Ok(Outgoing::Answer { id, output }) => {
                     if inner.active.get() != Some(id) {
                         inner.fail(WorkerCause::Protocol);
+                        return;
+                    }
+
+                    if let Err(error) = output {
+                        inner.fail_error(error);
                         return;
                     }
 
@@ -107,6 +117,9 @@ impl<S, Role> Worker<S, Role> {
                     inner.executing.set(false);
                     let work = inner.outstanding.borrow_mut().remove(&id);
                     if let Some(work) = work {
+                        if let Some(service) = work.service {
+                            service.answer(output.clone());
+                        }
                         if let Some(answer) = work.answer {
                             let _sent = answer.send(output);
                         }
@@ -147,18 +160,6 @@ impl<S, Role> Worker<S, Role> {
             .worker
             .set_onerror(Some(error.as_ref().unchecked_ref()));
         *inner.error.borrow_mut() = Some(error);
-
-        let weak = Rc::downgrade(&inner);
-        let timeout = inner.options.timeout_ms;
-        wasm_bindgen_futures::spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(timeout).await;
-
-            if let Some(inner) = weak.upgrade()
-                && inner.ready.borrow().is_none()
-            {
-                inner.fail(WorkerCause::Timeout);
-            }
-        });
 
         Ok(Self {
             inner,

@@ -3,14 +3,16 @@ use crate::listener::{DedicatedStartError, SpawnArgs, WeakHandle, spawn_async};
 use core::{fmt, future::Future};
 use std::sync::atomic::Ordering;
 
-impl<S: 'static, E: Send + 'static, C: Send + Sync + 'static> Aktor<S, E, C> {
+impl<S: 'static, E: Send + 'static, C: Send + Sync + 'static>
+    Aktor<S, crate::AktorSetupError<E>, crate::AktorCleanupError<C>>
+{
     /// Start the actor on its own thread. Returns after setup succeeds.
     pub async fn spawn<Setup, Cleanup>(
         args: SpawnArgs<Setup, Cleanup>,
-    ) -> Result<Self, DedicatedStartError<E>>
+    ) -> Result<Self, DedicatedStartError<crate::AktorSetupError<E>>>
     where
-        Setup: FnOnce() -> Result<S, E> + Send + 'static,
-        Cleanup: FnMut(S) -> Result<(), C> + Send + 'static,
+        Setup: FnOnce() -> Result<S, crate::AktorSetupError<E>> + Send + 'static,
+        Cleanup: FnMut(S) -> Result<(), crate::AktorCleanupError<C>> + Send + 'static,
     {
         let SpawnArgs {
             name,
@@ -33,22 +35,33 @@ impl<S: 'static, E: Send + 'static, C: Send + Sync + 'static> Aktor<S, E, C> {
     /// Async setup and cleanup run on the actor's thread too.
     pub async fn spawn_async<Setup, SetupFuture, Cleanup, CleanupFuture>(
         args: SpawnArgs<Setup, Cleanup>,
-    ) -> Result<Self, DedicatedStartError<E>>
+    ) -> Result<Self, DedicatedStartError<crate::AktorSetupError<E>>>
     where
         Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, E>>,
+        SetupFuture: Future<Output = Result<S, crate::AktorSetupError<E>>>,
         Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
-        CleanupFuture: Future<Output = Result<(), C>>,
+        CleanupFuture: Future<Output = Result<(), crate::AktorCleanupError<C>>>,
     {
         let runtime = runtime::Handle::try_current().map_err(|_| DedicatedStartError::NoRuntime)?;
         let (handle, actor, thread) = spawn_async(args).await?;
         let (completed, result) = watch::channel(None);
+        let observer = actor.new_controller();
 
         runtime.spawn(async move {
             let outcome = match thread.join_async().await {
+                Ok(Ok(())) if observer.is_cancelled() => Err(Arc::new(OwnerError::Cancelled)),
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => Err(Arc::new(OwnerError::Cleanup(error))),
-                Err(error) => Err(Arc::new(OwnerError::Panicked(error))),
+                Err(cause) => {
+                    let cleanup = observer.cleanup_errors();
+                    let error = if cleanup.errors.is_empty() {
+                        OwnerError::Panicked(cause)
+                    } else {
+                        OwnerError::PanickedWithCleanup { cause, cleanup }
+                    };
+
+                    Err(Arc::new(error))
+                }
             };
             completed.send_replace(Some(outcome));
         });
@@ -64,6 +77,10 @@ impl<S: 'static, E: Send + 'static, C: Send + Sync + 'static> Aktor<S, E, C> {
 }
 
 impl<S, E, C, Role> Aktor<S, E, C, Role> {
+    pub fn completion(&self) -> OwnerCompletion<C> {
+        self.completion.new_observer()
+    }
+
     pub fn new_handle(&self) -> Handle<S, Role> {
         self.handle.new_handle()
     }
@@ -85,15 +102,16 @@ impl<S, E, C, Role> Aktor<S, E, C, Role> {
 impl<S: 'static, E: Send + 'static, C: Send + Sync + 'static, Role> Aktor<S, E, C, Role> {
     /// Finish queued calls and cleanup. Once started, it keeps going if you stop awaiting it.
     /// Keep your Tokio runtime running until it's done.
-    pub async fn shutdown(&self) -> Result<(), Arc<OwnerError<C>>> {
+    pub fn shutdown(&self) -> OwnerCompletion<C> {
         if !self.shutdown_started.swap(true, Ordering::AcqRel) {
+            self.actor.close_admission();
             let actor = self.actor.new_controller();
             self.runtime.spawn(async move {
                 let _result = actor.shutdown().await;
             });
         }
 
-        self.completion.wait().await
+        self.completion.new_observer()
     }
 }
 
@@ -137,6 +155,16 @@ impl<C: fmt::Debug> fmt::Display for OwnerError<C> {
                 Ok(())
             }
             Self::Panicked(error) => write!(formatter, "actor thread failed: {error}"),
+            Self::PanickedWithCleanup { cause, cleanup } => {
+                write!(formatter, "actor thread failed: {cause}; cleanup failed")?;
+
+                for error in &cleanup.errors {
+                    write!(formatter, ": {error:?}")?;
+                }
+
+                Ok(())
+            }
+            Self::Cancelled => formatter.write_str("actor work was cancelled during shutdown"),
             Self::RuntimeStopped => formatter.write_str("owner runtime stopped before completion"),
         }
     }
@@ -145,7 +173,25 @@ impl<C: fmt::Debug> core::error::Error for OwnerError<C> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Panicked(error) => Some(error),
-            Self::Cleanup(_) | Self::RuntimeStopped => None,
+            Self::PanickedWithCleanup { cause, .. } => Some(cause),
+            Self::Cleanup(_) | Self::RuntimeStopped | Self::Cancelled => None,
         }
+    }
+}
+
+impl<C: Send + Sync + 'static> core::future::IntoFuture for OwnerCompletion<C> {
+    type Output = Result<(), Arc<OwnerError<C>>>;
+    type IntoFuture = core::pin::Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.wait().await })
+    }
+}
+impl<'a, C: Send + Sync + 'static> core::future::IntoFuture for &'a OwnerCompletion<C> {
+    type Output = Result<(), Arc<OwnerError<C>>>;
+    type IntoFuture = core::pin::Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.wait())
     }
 }

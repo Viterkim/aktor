@@ -30,12 +30,20 @@ pub struct Owner {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::result::Result<(), Box<dyn core::error::Error>> {
+    let setup = || {
+        Connection::open_in_memory().map_err(|error| aktor::AktorSetupError::new(error.to_string()))
+    };
+    let cleanup = |db: Connection| {
+        db.close()
+            .map_err(|(_, error)| aktor::AktorCleanupError::new(error.to_string()))
+    };
+
     let database = Aktor::spawn(SpawnArgs {
         name: "sqlite".into(),
         capacity: 128,
         failure: FailurePolicy::Abort,
-        setup: Connection::open_in_memory,
-        cleanup: |db: Connection| db.close().map_err(|(_, error)| error),
+        setup,
+        cleanup,
     })
     .await?;
 

@@ -1,13 +1,14 @@
 # Browser SQLite
 
-The [preferences](src/preferences) queries use #[aktor], running in a worker so SQLite can be busy while the page keeps going. Enable the worker feature, then in your page:
+The [preferences](src/preferences) queries use #[aktor], running in a worker so SQLite can be busy while the page keeps going. Enable wasm_browser_workers, then inside your application's [AktorGroup](../../README.md#opening--starting--spawning):
 
 ```rust
 use aktor::*;
-use worker::{Options, Worker};
+use worker::Options;
 use rusqlite::Connection;
 
-let database = Worker::<Connection>::open(
+let database = app.worker::<Connection>(
+    "preferences",
     "worker.js",
     Options {
         build: "preferences-v1".into(),
@@ -17,23 +18,26 @@ let database = Worker::<Connection>::open(
 .await?;
 
 let volume = read(&database, "volume".into()).await?;
-
-database.shutdown().wait().await?;
 ```
 
-In the worker, list the functions it can receive:
+SQLite runs inside that same worker, open the connection there and start serving:
 
 ```rust
-worker_routes!(
-    routes,
-    Connection,
-    [crate::preferences::read::read, crate::preferences::write::write]
-);
+let cleanup = async |connection: Connection| {
+    connection.close()
+        .map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
+};
+let options = Options {
+    build: "preferences-v1".into(),
+    ..Options::default()
+};
+
+worker::serve_with(connection, cleanup, options)?.wait().await?;
 ```
 
-Those arguments and results need Serde. Calls inside the worker use the connection directly. Use the same build name on both sides.
+Just put #[aktor] above the functions, they're picked up automatically. Arguments and results need Serde to get across, calls inside the worker use the connection directly. Use the same build name on both sides.
 
-[Startup](src/browser.rs) opens SQLite in OPFS (browser storage that survives reloading) and passes routes to serve_with. [worker.js](web/worker.js) loads the WASM.
+[Startup](src/browser.rs) opens SQLite in OPFS (browser storage that survives reloading) and keeps the server alive with wait() while it handles calls. [worker.js](web/worker.js) loads the WASM.
 
 ## Try it
 

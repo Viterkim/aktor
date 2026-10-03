@@ -1,4 +1,5 @@
 use super::*;
+use crate::FailurePolicy;
 use crate::listener::{FailureKind, Failures};
 
 #[allow(clippy::too_many_arguments)]
@@ -11,12 +12,17 @@ pub fn run<S, E, C, CleanupFuture>(
     started: oneshot::Sender<Result<(), E>>,
     mut cleanup: impl FnMut(S) -> CleanupFuture,
     abandoned_setup: Arc<parking_lot::Mutex<Vec<AbandonedSetup<E>>>>,
+    failed_cleanup: Arc<parking_lot::Mutex<FailedCleanup<C>>>,
+    force: watch::Receiver<bool>,
 ) -> Result<(), CleanupErrors<C>>
 where
     CleanupFuture: core::future::Future<Output = Result<(), C>>,
 {
     let policy = listener.failure.clone();
     let mut failures = Failures::new(listener.name.clone());
+    if let FailurePolicy::Group(group) = &policy {
+        failures.group = Some(group.clone());
+    }
     let mut errors = Vec::new();
     let mut state = Some(state);
 
@@ -29,24 +35,24 @@ where
 
         let mut controls_open = true;
         loop {
-            let event = runtime.block_on(async {
+            let Some(event) = execute(runtime, &force, async {
                 tokio::select! {
                     biased;
                     command = commands.recv(), if controls_open => Event::Command(command),
                     message = listener.receiver.recv(), if state.is_some() => Event::Message(message),
                     _ = listener.handles.changed(), if state.is_none() => Event::NoHandles,
                 }
-            });
+            }) else { break; };
 
             match event {
                 Event::Command(Some(Command::Pause(reply))) => {
                     listener.admission.close();
                     if let Some(state) = &mut state {
-                        drain(runtime, &mut listener, state);
+                        drain(runtime, &force, &mut listener, state);
                     }
 
                     status.send_replace(false);
-                    let result = clean(runtime, &mut state, &mut cleanup, &mut errors).map_err(LifecycleError::Failed);
+                    let result = clean(runtime, &force, &mut state, &mut cleanup, &mut errors).map_err(LifecycleError::Failed);
                     let _sent = reply.send(result);
                 }
 
@@ -54,14 +60,15 @@ where
                     let result = if state.is_some() {
                         Err(LifecycleError::AlreadyRunning)
                     } else {
-                        match runtime.block_on(async { setup().await }) {
-                            Ok(next) => {
+                        match execute(runtime, &force, async { setup().await }) {
+                            Some(Ok(next)) => {
                                 state = Some(next);
                                 listener.admission.open();
                                 status.send_replace(true);
                                 Ok(())
                             }
-                            Err(error) => Err(LifecycleError::Failed(error)),
+                            Some(Err(error)) => Err(LifecycleError::Failed(error)),
+                            None => Err(LifecycleError::Closed),
                         }
                     };
 
@@ -77,20 +84,21 @@ where
                 Event::Command(Some(Command::Replace { setup, reply })) => {
                     listener.admission.close();
                     if let Some(state) = &mut state {
-                        drain(runtime, &mut listener, state);
+                        drain(runtime, &force, &mut listener, state);
                     }
 
                     status.send_replace(false);
-                    let result = match clean(runtime, &mut state, &mut cleanup, &mut errors) {
+                    let result = match clean(runtime, &force, &mut state, &mut cleanup, &mut errors) {
                         Err(error) => Err(ReplaceError::Cleanup(error)),
-                        Ok(()) => match runtime.block_on(async { setup().await }) {
-                            Ok(next) => {
+                        Ok(()) => match execute(runtime, &force, async { setup().await }) {
+                            Some(Ok(next)) => {
                                 state = Some(next);
                                 listener.admission.open();
                                 status.send_replace(true);
                                 Ok(())
                             }
-                            Err(error) => Err(ReplaceError::Setup(error)),
+                            Some(Err(error)) => Err(ReplaceError::Setup(error)),
+                            None => Err(ReplaceError::Closed),
                         },
                     };
 
@@ -106,11 +114,11 @@ where
                 Event::Command(Some(Command::Shutdown(reply))) => {
                     listener.close();
                     if let Some(state) = &mut state {
-                        runtime.block_on(listener.serve(state));
+                        execute(runtime, &force, listener.serve(state));
                     }
 
                     status.send_replace(false);
-                    let result = clean(runtime, &mut state, &mut cleanup, &mut errors).map_err(LifecycleError::Failed);
+                    let result = clean(runtime, &force, &mut state, &mut cleanup, &mut errors).map_err(LifecycleError::Failed);
                     let _sent = reply.send(result);
 
                     break;
@@ -125,8 +133,10 @@ where
                 }
 
                 Event::Message(Some(message)) => {
-                    if let Some(state) = &mut state {
-                        runtime.block_on(message.run(state));
+                    if let Some(state) = &mut state
+                        && execute(runtime, &force, message.run(state)).is_none()
+                    {
+                        break;
                     }
                 }
                 Event::Message(None) | Event::NoHandles => break,
@@ -140,7 +150,7 @@ where
     });
 
     failures.capture(FailureKind::Cleanup, || {
-        let _result = clean(runtime, &mut state, &mut cleanup, &mut errors);
+        let _result = clean(runtime, &force, &mut state, &mut cleanup, &mut errors);
     });
 
     // Queued setup closures can panic on drop too.
@@ -153,13 +163,12 @@ where
     let finished = listener.discard(&mut failures);
     failures.capture(FailureKind::Teardown, || drop(cleanup));
 
+    failures.capture(FailureKind::Teardown, || drop((finished, status)));
+
     if failures.first.is_some() {
-        for error in errors.drain(..) {
-            failures.capture(FailureKind::Teardown, || drop(error));
-        }
+        failed_cleanup.lock().errors = std::mem::take(&mut errors);
     }
 
-    failures.capture(FailureKind::Teardown, || drop((finished, status)));
     failures.finish(&policy);
 
     if errors.is_empty() {
@@ -171,6 +180,7 @@ where
 
 pub fn clean<S, C, CleanupFuture>(
     runtime: &tokio::runtime::Runtime,
+    force: &watch::Receiver<bool>,
     state: &mut Option<S>,
     cleanup: &mut impl FnMut(S) -> CleanupFuture,
     errors: &mut Vec<Arc<C>>,
@@ -179,8 +189,8 @@ where
     CleanupFuture: core::future::Future<Output = Result<(), C>>,
 {
     if let Some(state) = state.take()
-        && let Err(error) =
-            FailureKind::Cleanup.during(|| runtime.block_on(async { cleanup(state).await }))
+        && let Some(Err(error)) =
+            FailureKind::Cleanup.during(|| execute(runtime, force, async { cleanup(state).await }))
     {
         let error = Arc::new(error);
         errors.push(error.clone());
@@ -190,12 +200,41 @@ where
     Ok(())
 }
 
-pub fn drain<S>(runtime: &tokio::runtime::Runtime, listener: &mut Listener<S>, state: &mut S) {
+pub fn drain<S>(
+    runtime: &tokio::runtime::Runtime,
+    force: &watch::Receiver<bool>,
+    listener: &mut Listener<S>,
+    state: &mut S,
+) {
     let queued = listener.receiver.len();
     for _ in 0..queued {
         match listener.receiver.try_recv() {
-            Ok(message) => runtime.block_on(message.run(state)),
+            Ok(message) => {
+                if execute(runtime, force, message.run(state)).is_none() {
+                    break;
+                }
+            }
             Err(_) => break,
         }
     }
+}
+
+fn execute<F: core::future::Future>(
+    runtime: &tokio::runtime::Runtime,
+    force: &watch::Receiver<bool>,
+    future: F,
+) -> Option<F::Output> {
+    let mut force = force.clone();
+    runtime.block_on(async move {
+        tokio::select! {
+            biased;
+            _ = async {
+                loop {
+                    if *force.borrow_and_update() { return; }
+                    if force.changed().await.is_err() { core::future::pending::<()>().await; }
+                }
+            } => None,
+            output = future => Some(output),
+        }
+    })
 }

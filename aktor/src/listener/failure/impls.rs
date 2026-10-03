@@ -34,6 +34,11 @@ impl FailurePolicy {
                     std::process::abort();
                 }
             }
+            Self::Group(group) => group.fail(crate::group::ActorFailure {
+                actor: failure.actor.clone(),
+                phase: format!("{:?}", failure.kind),
+                message: failure.to_string(),
+            }),
             Self::Unwind => {}
         }
     }

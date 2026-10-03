@@ -1,9 +1,11 @@
+use crate::{AktorCleanupError, AktorSetupError};
 use crate::{
     message::{ActorError, CallError, LocalFuture},
     operation::Operation,
 };
 use alloc::{
     boxed::Box,
+    collections::VecDeque,
     rc::{Rc, Weak},
 };
 use core::{
@@ -13,12 +15,15 @@ use core::{
     task::{Poll, Waker},
 };
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel as Queue};
-use er::Er;
 
 mod event;
+mod group;
 mod impls;
+mod latest;
 mod request;
 mod target;
+pub use group::{ActorArgs, AktorGroup, KillSwitch, ShutdownReport};
+pub use latest::{LatestResults, LatestSender};
 
 use event::Event;
 pub use impls::channel;
@@ -52,32 +57,28 @@ pub struct Request<'a, S, const N: usize, E, O, Role = ()> {
     submitted: bool,
 }
 
-#[must_use = "await the checked request to submit it and receive its result"]
-pub struct CheckedRequest<'a, S, const N: usize, E, O, Role = ()>(Request<'a, S, N, E, O, Role>);
-
 #[must_use = "await the reply to receive the operation's result"]
 pub struct Reply<O> {
+    parked: bool,
+    group: Option<KillSwitch>,
     answer: Rc<Answer<O>>,
 }
-
-#[must_use = "await the checked reply to receive the operation's result"]
-pub struct CheckedReply<O>(Reply<O>);
 
 pub type Channel<S, const N: usize, E = core::convert::Infallible> =
     (Handle<S, N, E>, Owner<S, N, E>);
 
-#[derive(Er)]
 pub enum OwnerError<E> {
-    #[er(format = "actor setup failed: {0:?}")]
-    Setup(#[er(source)] E),
-    #[er(format = "actor cleanup failed: {0:?}")]
-    Cleanup(#[er(source)] E),
-    #[er(format = "actor owner stopped before cleanup completed")]
+    Setup(AktorSetupError<E>),
+    Cleanup(AktorCleanupError<E>),
     Cancelled,
 }
 
 struct Inner<S, const N: usize, E> {
     queue: Queue<NoopRawMutex, Message<S>, N>,
+    services: RefCell<VecDeque<Message<S>>>,
+    prefer_service: Cell<bool>,
+    group: RefCell<Option<(alloc::string::String, KillSwitch)>>,
+    sessions: RefCell<alloc::vec::Vec<Rc<dyn Fn() -> bool>>>,
     open: Cell<bool>,
     handles: Cell<usize>,
     closed: Event,

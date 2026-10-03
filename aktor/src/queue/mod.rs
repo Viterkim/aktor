@@ -3,7 +3,6 @@ use std::{cell::RefCell, sync::Arc};
 use tokio::sync::watch;
 
 mod impls;
-pub mod key;
 pub mod mailbox;
 
 pub struct HandleInner<S> {
@@ -21,4 +20,14 @@ pub struct Admission {
 struct AdmissionState {
     open: bool,
     epoch: u64,
+    group: Option<(String, crate::group::KillSwitch)>,
+    phase: Phase,
+    sessions: Vec<Arc<dyn Fn(Phase) -> bool + Send + Sync>>,
+}
+
+#[derive(Clone, Copy)]
+pub enum Phase {
+    Running,
+    Paused,
+    Closing { paused: bool },
 }

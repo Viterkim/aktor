@@ -34,9 +34,11 @@ async fn cancel() {
     cleaned.await.unwrap();
     drop(replacing);
 
-    assert_eq!(
-        call(&handle, |s, ()| *s, ()).checked().await,
-        Err(CallError::NotAdmitted)
+    assert!(
+        call(&handle, |s, ()| *s, ())
+            .timeout(Duration::from_millis(1))
+            .await
+            .is_err()
     );
 
     release.send(()).unwrap();
@@ -60,9 +62,11 @@ async fn cancel() {
     ));
     assert!(!actor.is_running());
     assert!(actor.take_abandoned_setup().is_empty());
-    assert_eq!(
-        call(&handle, |state, ()| *state, ()).checked().await,
-        Err(CallError::NotAdmitted)
+    assert!(
+        call(&handle, |state, ()| *state, ())
+            .timeout(Duration::from_millis(1))
+            .await
+            .is_err()
     );
 
     actor.replace(|| Ok(20)).await.unwrap();
@@ -95,9 +99,11 @@ async fn error() {
         matches!(actor.replace(|| panic!("setup must not run")).await, Err(ReplaceError::Cleanup(error)) if *error == "cleanup failed")
     );
     assert!(!actor.is_running());
-    assert_eq!(
-        call(&handle, |state, ()| *state, ()).checked().await,
-        Err(CallError::NotAdmitted)
+    assert!(
+        call(&handle, |state, ()| *state, ())
+            .timeout(Duration::from_millis(1))
+            .await
+            .is_err()
     );
 
     actor.replace(|| Ok(2)).await.unwrap();
