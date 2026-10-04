@@ -9,6 +9,7 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
 
     pub fn with_options(url: &str, options: Options) -> Result<Self, WorkerError> {
         options.validate()?;
+        let expected = registry::Registry::for_actor::<S, Role>()?.operations();
 
         let js_options = WorkerOptions::new();
         js_options.set_type(WorkerType::Module);
@@ -27,6 +28,7 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
             queue: RefCell::new(VecDeque::new()),
             active: Cell::new(None),
             executing: Cell::new(false),
+            pump_scheduled: Cell::new(false),
             shutdown_sent: Cell::new(false),
             next: Cell::new(0),
             handles: Cell::new(1),
@@ -45,7 +47,6 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
         });
 
         let weak = Rc::downgrade(&inner);
-        let expected = Operations::for_actor::<S, Role>();
         let message = Closure::new(move |event: MessageEvent| {
             let Some(inner) = weak.upgrade() else {
                 return;

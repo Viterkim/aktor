@@ -39,8 +39,11 @@ type WireError = WorkerError<Vec<u8>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
+    /// Same on both sides. Change it when the wire data format changes.
     pub build: String,
+    /// Ordinary calls waiting for replies, including the running call.
     pub capacity: usize,
+    /// Ordinary admission budget. Oversized calls take the whole budget, latest sessions bypass it.
     pub max_outstanding_bytes: usize,
 }
 

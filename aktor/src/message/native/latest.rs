@@ -78,6 +78,7 @@ struct Slot<I, O> {
     senders: usize,
     receiver: bool,
     failed: bool,
+    finished: bool,
     closing: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     phase: Phase,
     wake: Option<Waker>,
@@ -90,28 +91,50 @@ where
     Role: 'static,
     F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
 {
-    fn schedule(&self, slot: &mut Slot<I, O>) {
-        if slot.scheduled
-            || slot.running
-            || !slot.receiver
-            || slot.pending.is_none()
-            || matches!(slot.phase, Phase::Paused)
-        {
-            return;
-        }
-
-        if let Some(this) = self.this.upgrade() {
+    fn schedule(&self) {
+        let (publication, wake) = {
+            let mut slot = self.state.lock();
+            if slot.scheduled
+                || slot.running
+                || !slot.receiver
+                || slot.failed
+                || slot.pending.is_none()
+                || matches!(slot.phase, Phase::Paused)
+            {
+                return;
+            }
+            let Some(this) = self.this.upgrade() else {
+                return;
+            };
             slot.scheduled = true;
-            if let Err(mut message) = self.handle.inner.sender.service(Message {
+            let publication = self.handle.inner.sender.commit_service(Message {
                 operation: self.operation,
                 job: Arc::new(LatestJob(this)),
                 finished: false,
                 counted: false,
-            }) {
+            });
+            let wake = if publication.is_err() {
                 slot.scheduled = false;
                 slot.failed = true;
+                slot.wake.take()
+            } else {
+                None
+            };
+            (publication, wake)
+        };
+
+        #[cfg(test)]
+        super::tests::before_service();
+
+        match publication {
+            Ok(ready) => ready.notify_one(),
+            Err(mut message) => {
                 message.finished = true;
+                drop(message);
             }
+        }
+        if let Some(wake) = wake {
+            wake.wake();
         }
     }
 
@@ -125,11 +148,11 @@ where
         } else {
             None
         };
-        self.schedule(&mut slot);
         let wake = slot.wake.take();
 
         drop(slot);
         drop(pending);
+        self.schedule();
 
         if let Some(wake) = wake {
             wake.wake();
@@ -151,12 +174,12 @@ where
         slot.revision = slot.revision.wrapping_add(1);
         let previous = slot.pending.replace(input);
         let unread = slot.output.take();
-        self.schedule(&mut slot);
         let wake = slot.wake.take();
 
         drop(slot);
         drop(previous);
         drop(unread);
+        self.schedule();
 
         if let Some(wake) = wake {
             wake.wake();
@@ -181,27 +204,47 @@ where
 }
 impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> {
     fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>> {
+        let replacement = cx.waker().clone();
         let mut slot = self.state.lock();
 
-        if slot.failed {
-            let closing = slot.closing.get_or_insert_with(|| {
+        if !slot.finished {
+            let mut closing = slot.closing.take().unwrap_or_else(|| {
                 let mut finished = self.handle.inner.finished.clone();
                 Box::pin(async move {
                     let _result = finished.changed().await;
                 })
             });
-            if closing.as_mut().poll(cx).is_pending() {
+            drop(slot);
+            let result = closing.as_mut().poll(cx);
+            slot = self.state.lock();
+            if result.is_pending() {
+                slot.closing = Some(closing);
+            } else {
+                slot.finished = true;
+                drop(slot);
+                drop(closing);
+                slot = self.state.lock();
+            }
+        }
+
+        if !slot.failed
+            && let Some(output) = slot.output.take()
+        {
+            return Poll::Ready(Some(output));
+        }
+
+        if slot.failed || (slot.finished && !matches!(slot.phase, Phase::Closing { .. })) {
+            let finished = slot.finished;
+            drop(slot);
+            if !finished {
                 return Poll::Pending;
             }
+
             if self.handle.inner.admission.group().is_some() {
                 self.handle.inner.admission.lost();
                 return Poll::Pending;
             }
             stopped();
-        }
-
-        if let Some(output) = slot.output.take() {
-            return Poll::Ready(Some(output));
         }
 
         if (slot.senders == 0 || matches!(slot.phase, Phase::Closing { .. }))
@@ -212,7 +255,9 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> 
             return Poll::Ready(None);
         }
 
-        slot.wake = Some(cx.waker().clone());
+        let previous = slot.wake.replace(replacement);
+        drop(slot);
+        drop(previous);
         Poll::Pending
     }
 
@@ -254,12 +299,15 @@ where
 
             let mut slot = self.0.state.lock();
             slot.running = false;
-            if slot.receiver && slot.revision == request.0 {
-                slot.output = Some(output);
-            }
-            self.0.schedule(&mut slot);
+            let discarded = if slot.receiver && slot.revision == request.0 {
+                slot.output.replace(output)
+            } else {
+                Some(output)
+            };
             let wake = slot.wake.take();
             drop(slot);
+            drop(discarded);
+            self.0.schedule();
             if let Some(wake) = wake {
                 wake.wake();
             }
@@ -308,6 +356,7 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static> Session<S,
                 senders: 1,
                 receiver: true,
                 failed: false,
+                finished: false,
                 closing: None,
                 phase: Phase::Running,
                 wake: None,

@@ -10,7 +10,8 @@
         group_listener_check,
         group_startup_check,
         registration_check,
-        typed_setup_check
+        typed_setup_check,
+        serialization_shutdown_check
     } from './pkg/aktor_worker_proof.js';
 
     await init();
@@ -22,6 +23,7 @@
     window.groupStartupCheck = group_startup_check;
     window.registrationCheck = registration_check;
     window.typedSetupCheck = typed_setup_check;
+    window.serializationShutdownCheck = serialization_shutdown_check;
 
     window.client = new Client(new URL('./worker.js', location.href).href);
     window.setup = JSON.parse(await window.client.ready());

@@ -51,7 +51,7 @@ impl<T> WorkerError<T> {
         }
     }
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-    pub(crate) fn without_data<U>(self) -> WorkerError<U> {
+    pub fn without_data<U>(self) -> WorkerError<U> {
         WorkerError {
             outcome: self.outcome,
             cause: self.cause,

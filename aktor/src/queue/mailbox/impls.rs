@@ -1,16 +1,16 @@
 use super::*;
 
-impl<S> Permit<'_, S> {
-    pub fn submit(self, message: Message<S>) -> Result<(), Message<S>> {
+impl<'a, S> Permit<'a, S> {
+    pub fn commit(self, message: Message<S>) -> Result<&'a Notify, (Self, Message<S>)> {
         let mut entries = self.queue.entries.lock();
         if self.is_closed() {
-            return Err(message);
+            drop(entries);
+            return Err((self, message));
         }
         entries.messages.push_back(message);
         self.permit.forget();
         drop(entries);
-        self.queue.ready.notify_one();
-        Ok(())
+        Ok(&self.queue.ready)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -19,16 +19,16 @@ impl<S> Permit<'_, S> {
 }
 
 impl<S> Sender<S> {
-    pub fn service(&self, message: Message<S>) -> Result<(), Message<S>> {
+    pub fn commit_service(&self, message: Message<S>) -> Result<&Notify, Message<S>> {
         let mut entries = self.0.entries.lock();
         if !entries.receiving {
             return Err(message);
         }
         entries.messages.push_back(message);
         drop(entries);
-        self.0.ready.notify_one();
-        Ok(())
+        Ok(&self.0.ready)
     }
+
     pub async fn reserve(&self) -> Result<Permit<'_, S>, tokio::sync::AcquireError> {
         tokio::task::coop::consume_budget().await;
         let permit = self.0.permits.acquire().await?;

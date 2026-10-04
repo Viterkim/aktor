@@ -10,6 +10,8 @@ use std::{
 use tokio::sync::watch;
 
 mod impls;
+mod run;
+mod shutdown;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
 #[cfg(target_family = "wasm")]
@@ -61,6 +63,7 @@ struct Control {
 struct State {
     report: ShutdownReport,
     listening: bool,
+    deadline: Option<Instant>,
     finished: bool,
     force_exit: bool,
     #[cfg(not(target_family = "wasm"))]

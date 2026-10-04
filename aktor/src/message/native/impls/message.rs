@@ -5,6 +5,7 @@ impl<S> Message<S> {
     pub fn counted(&self) -> bool {
         self.counted
     }
+
     pub async fn run(mut self, state: &mut S) {
         let outcome = std::panic::AssertUnwindSafe(async { self.job.run(state).await })
             .catch_unwind()

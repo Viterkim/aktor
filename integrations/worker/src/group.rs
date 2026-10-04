@@ -12,6 +12,45 @@ use std::{
 use wasm_bindgen::prelude::*;
 
 thread_local! { static SERVER: RefCell<Option<Server>> = const { RefCell::new(None) }; }
+thread_local! { static CLOSING: RefCell<Option<worker::Worker<u32>>> = const { RefCell::new(None) }; }
+
+#[derive(Deserialize)]
+struct ClosingInput;
+impl Serialize for ClosingInput {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let worker = CLOSING.with(|worker| worker.borrow_mut().take()).unwrap();
+        drop(worker.shutdown());
+        (7u32,).serialize(serializer)
+    }
+}
+
+#[wasm_bindgen]
+pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> {
+    use aktor::{operation::Operation, target::Transport, worker::TrySendError};
+
+    let worker = worker::Worker::<u32>::open(&url, options())
+        .await
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    assert_eq!(worker.outstanding(), (0, 0));
+    CLOSING.with(|stored| *stored.borrow_mut() = Some(worker.new_handle()));
+    let request =
+        <&worker::Worker<u32> as Transport<u32, ClosingInput, Result<u32, String>>>::request(
+            &worker,
+            Operation {
+                name: operation::NAME,
+                caller: std::panic::Location::caller(),
+            },
+            ClosingInput,
+        );
+    let closed = matches!(request.try_send(), Err(TrySendError::Closed(_)));
+    assert_eq!(worker.outstanding(), (0, 0));
+    worker
+        .completion()
+        .wait()
+        .await
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    Ok(closed)
+}
 
 #[aktor::aktor]
 async fn operation(_: &u32, mode: u32) -> Result<u32, String> {
@@ -357,7 +396,14 @@ pub async fn group_listener_check(url: String) -> Result<bool, JsValue> {
     let _closing = closing;
 
     let storage = actors
-        .worker::<u32>("storage", &url, options())
+        .worker::<u32>(
+            "storage",
+            &url,
+            Options {
+                capacity: 1,
+                ..options()
+            },
+        )
         .await
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let audio = actors
@@ -366,7 +412,9 @@ pub async fn group_listener_check(url: String) -> Result<bool, JsValue> {
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let mut reply = operation(&storage, 0).send().await;
     let ordinary_error = loop {
-        if let Some(result) = reply.try_take() { break result.is_err(); }
+        if let Some(result) = reply.try_take() {
+            break result.is_err();
+        }
         gloo_timers::future::TimeoutFuture::new(1).await;
     };
     assert!(reply.try_take().is_none());
@@ -375,19 +423,70 @@ pub async fn group_listener_check(url: String) -> Result<bool, JsValue> {
     assert!(pending.await.is_err());
     assert!(!kill.is_stopping());
     assert_eq!(other_operation(&audio).await, 17);
-    drop(operation(&storage, 1).send().await);
+    let occupied = operation(&storage, 2).send().await;
+    let mut sending = Box::pin(operation(&storage, 0).send());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(sending.as_mut().poll(&mut context).is_pending());
+    storage.terminate();
+    for _ in 0..4 {
+        assert!(sending.as_mut().poll(&mut context).is_pending());
+    }
+    drop(sending);
+    drop(occupied);
 
     kill.wait_stopping().await;
     let report = (&completed).await;
     assert_eq!(completed.await.actors.len(), report.actors.len());
 
     let mut plain = AktorGroup::new();
-    let closing = plain.start().map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let _audio = plain.worker_for::<Other, u32>("audio", &format!("{url}?other"), options()).await.map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let closing = plain
+        .start()
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let _audio = plain
+        .worker_for::<Other, u32>("audio", &format!("{url}?other"), options())
+        .await
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let shutdown = plain.shutdown();
     assert!(plain.killswitch().is_stopping());
     assert!(!(&closing).await.failed());
     assert_eq!(closing.await.actors.len(), shutdown.await.actors.len());
+
+    let cancelled = AktorGroup::new();
+    let observed = cancelled.completion();
+    let ready = Rc::new(Cell::new(false));
+    let started = ready.clone();
+    let driver = cancelled.run(
+        async |group| -> Result<(), AktorError> {
+            let _worker = group
+                .worker::<u32>("cancelled driver", &url, options())
+                .await
+                .unwrap();
+            started.set(true);
+            core::future::pending().await
+        },
+        async |_| Ok::<_, AktorError>(()),
+    );
+    let mut driver = Box::pin(driver);
+    futures_util::future::poll_fn(|context| {
+        assert!(driver.as_mut().poll(context).is_pending());
+        if ready.get() {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    drop(driver);
+    let cancelled = observed.wait().await;
+    assert_eq!(cancelled.actors.len(), 1);
+    assert!(!cancelled.timed_out);
+    assert!(
+        cancelled
+            .application
+            .iter()
+            .any(|error| error.diagnostics.contains("cancelled"))
+    );
+
     Ok(ordinary_error
         && hooks.get() == 1
         && report.actors.len() == 2

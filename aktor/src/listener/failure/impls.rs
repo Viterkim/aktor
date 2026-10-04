@@ -21,7 +21,9 @@ impl FailurePolicy {
     }
 
     pub fn report(&self, failure: &Failure) {
-        let _written = writeln!(std::io::stderr().lock(), "{failure}");
+        if !matches!(self, Self::Group(_)) {
+            let _written = writeln!(std::io::stderr().lock(), "{failure}");
+        }
 
         match self {
             Self::Abort => std::process::abort(),

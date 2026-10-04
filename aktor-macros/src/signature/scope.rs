@@ -5,6 +5,24 @@ use syn::{
 
 pub struct Child {
     pub shadowed: &'static [&'static str],
+    pub binders: Vec<String>,
+}
+impl Child {
+    pub fn new(shadowed: &'static [&'static str], generics: &syn::Generics) -> Self {
+        Self {
+            shadowed,
+            binders: generics
+                .params
+                .iter()
+                .filter_map(|parameter| match parameter {
+                    syn::GenericParam::Type(parameter) => Some(&parameter.ident),
+                    syn::GenericParam::Const(parameter) => Some(&parameter.ident),
+                    syn::GenericParam::Lifetime(_) => None,
+                })
+                .map(|name| name.to_string().trim_start_matches("r#").to_owned())
+                .collect(),
+        }
+    }
 }
 impl VisitMut for Child {
     fn visit_type_path_mut(&mut self, ty: &mut syn::TypePath) {
@@ -36,9 +54,13 @@ impl VisitMut for Child {
             return;
         };
 
-        if first.ident == "self" {
+        let written = first.ident.to_string();
+        let name = written.trim_start_matches("r#");
+        if name == "self" {
             first.ident = syn::Ident::new("super", first.ident.span());
-        } else if first.ident == "super" || self.shadowed.iter().any(|name| first.ident == *name) {
+        } else if name == "super"
+            || (self.shadowed.contains(&name) && !self.binders.iter().any(|binder| binder == name))
+        {
             path.segments.insert(0, parse_quote!(super));
         }
     }

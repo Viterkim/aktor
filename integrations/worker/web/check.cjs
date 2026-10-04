@@ -3,6 +3,11 @@ const playwright = require('playwright');
 const engine = process.env.AKTOR_BROWSER || 'chromium';
 
 (async () => {
+    if (process.env.AKTOR_PROOF_TOKEN) {
+        const response = await fetch(process.env.AKTOR_PROOF_URL + '/__aktor_check');
+        assert.equal(await response.text(), process.env.AKTOR_PROOF_TOKEN);
+    }
+
     const browser = await playwright[engine].launch({ headless: true });
 
     try {
@@ -48,6 +53,13 @@ const engine = process.env.AKTOR_BROWSER || 'chromium';
         assert.match(registration.signature.Err.cause.Operations.actual[0], /u64/);
         assert.equal(registration.role, 17);
         assert.deepEqual(await page.evaluate(() => window.setup), { Ok: null });
+
+        assert.equal(
+            await page.evaluate(() =>
+                window.serializationShutdownCheck(new URL('./group-worker.js', location.href).href)
+            ),
+            true
+        );
 
         for (const mode of [0, 1, 2, 3, 4, 5, 6, 7, 8]) {
             const result = await page.evaluate(async mode => {
@@ -162,6 +174,7 @@ const engine = process.env.AKTOR_BROWSER || 'chromium';
                     b.addIceCandidate(event.candidate);
                 }
             };
+
             b.onicecandidate = event => {
                 if (event.candidate) {
                     a.addIceCandidate(event.candidate);
@@ -224,19 +237,24 @@ const engine = process.env.AKTOR_BROWSER || 'chromium';
 
         assert.deepEqual(result.occupied, 700);
         assert.ok(result.ticks >= 15, JSON.stringify(result));
-        assert.equal(result.during, result.ticks, JSON.stringify(result));
+        assert.equal(result.received, result.ticks, JSON.stringify(result));
+        assert.ok(result.during >= 15, JSON.stringify(result));
         assert.ok(result.worstLatency < 200, JSON.stringify(result));
         console.log('OPFS reload and DataChannel during blocking SQLite owner:', result);
 
         const order = await page.evaluate(async () => {
             const result = [];
+
             const first = client
                 .pause(150)
                 .then(value => result.push(['pause', JSON.parse(value)]));
+
             await new Promise(resolve => setTimeout(resolve, 20));
+
             const second = client
                 .read('volume')
                 .then(value => result.push(['read', JSON.parse(value)]));
+
             await Promise.all([first, second]);
 
             return result;
@@ -266,6 +284,7 @@ const engine = process.env.AKTOR_BROWSER || 'chromium';
                 finished = true;
                 return value;
             });
+
             await new Promise(resolve => setTimeout(resolve, 20));
             const waited = !finished;
             await occupied;

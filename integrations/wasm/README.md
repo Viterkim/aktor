@@ -12,4 +12,6 @@ target/wasm-host-env/bin/python -m pip install -r integrations/wasm/requirements
 bash scripts/check.sh wasm
 ```
 
+prepare.sh runs this too, so set up that Python env first. AKTOR_WASMTIME_PYTHON can point to an existing one.
+
 Real timers need an embassy-time driver connected to your host, the proof uses a little test clock. The host also has to stop it if code stops yielding.

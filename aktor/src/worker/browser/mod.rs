@@ -74,6 +74,7 @@ struct Inner {
     queue: RefCell<VecDeque<u64>>,
     active: Cell<Option<u64>>,
     executing: Cell<bool>,
+    pump_scheduled: Cell<bool>,
     shutdown_sent: Cell<bool>,
     next: Cell<u64>,
     handles: Cell<usize>,

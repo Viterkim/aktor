@@ -39,6 +39,7 @@ impl<O> LatestResults<O> {
 }
 impl<O> futures_util::Stream for LatestResults<O> {
     type Item = O;
+
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<O>> {
         self.output.poll(cx)
     }
@@ -58,7 +59,7 @@ trait Output<O> {
     fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>>;
     fn close_receiver(&self);
 }
-pub(super) trait Service {
+pub trait Service {
     fn operation(&self) -> &str;
     fn take(&self) -> Result<Option<Vec<u8>>, WireError>;
     fn answer(&self, output: Result<Vec<u8>, WireError>);
@@ -118,6 +119,7 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Shared<I, O> {
         self.inner.queue.borrow_mut().push_back(id);
         self.inner.pump();
     }
+
     fn wake(&self) {
         let wake = self.slot.borrow_mut().wake.take();
         if let Some(wake) = wake {
@@ -130,6 +132,7 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Service for ServiceC
     fn operation(&self) -> &str {
         self.0.operation.name
     }
+
     fn take(&self) -> Result<Option<Vec<u8>>, WireError> {
         let input = {
             let mut slot = self.0.slot.borrow_mut();
@@ -147,6 +150,7 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Service for ServiceC
             .map(Some)
             .map_err(|error| error.without_data())
     }
+
     fn answer(&self, output: Result<Vec<u8>, WireError>) {
         let output = output.and_then(|bytes| decode(&bytes).map_err(|error| error.without_data()));
         let (discarded, pending) = {
@@ -188,9 +192,11 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Input<I> for Shared<
         drop(unread);
         self.schedule();
     }
+
     fn clone_sender(&self) {
         self.slot.borrow_mut().senders += 1;
     }
+
     fn close_sender(&self) {
         let mut slot = self.slot.borrow_mut();
         slot.senders = slot.senders.saturating_sub(1);
@@ -200,6 +206,7 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Input<I> for Shared<
 }
 impl<I, O> Output<O> for Shared<I, O> {
     fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>> {
+        let replacement = cx.waker().clone();
         let mut slot = self.slot.borrow_mut();
 
         if let Some(error) = slot.failed.clone() {
@@ -230,9 +237,12 @@ impl<I, O> Output<O> for Shared<I, O> {
             return Poll::Ready(None);
         }
 
-        slot.wake = Some(cx.waker().clone());
+        let previous = slot.wake.replace(replacement);
+        drop(slot);
+        drop(previous);
         Poll::Pending
     }
+
     fn close_receiver(&self) {
         let mut slot = self.slot.borrow_mut();
         slot.receiver = false;
@@ -251,6 +261,7 @@ impl<S, I: Serialize + 'static, O: DeserializeOwned + 'static, Role, E> Session<
 {
     type Sender = LatestSender<I>;
     type Results = LatestResults<O>;
+
     fn session<F>(self, operation: Operation, _function: F) -> (Self::Sender, Self::Results)
     where
         F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,

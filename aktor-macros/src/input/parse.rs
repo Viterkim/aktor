@@ -14,6 +14,13 @@ impl Function {
             ));
         }
 
+        if let syn::Safety::Unsafe(unsafety) = function.sig.safety {
+            return Err(syn::Error::new(
+                unsafety.span,
+                "#[aktor] functions must be safe",
+            ));
+        }
+
         let mut output = OutputVisitor { error: None };
         output.visit_return_type(&function.sig.output);
 

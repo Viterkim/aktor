@@ -8,7 +8,7 @@ pub fn channel<S, const N: usize, E>() -> Result<Channel<S, N, E>, ActorError> {
     }
 
     let inner = Rc::new(Inner {
-        queue: Queue::new(),
+        queue: RefCell::new(VecDeque::new()),
         services: RefCell::new(VecDeque::new()),
         prefer_service: Cell::new(false),
         group: RefCell::new(None),
@@ -36,16 +36,19 @@ impl<S, const N: usize, E> Inner<S, N, E> {
     fn close(&self) {
         if self.open.replace(false) {
             self.closed.notify();
-            let callbacks = self.sessions.borrow().clone();
-            let expired: alloc::vec::Vec<_> =
-                callbacks.into_iter().filter(|wake| !wake()).collect();
-            self.sessions
-                .borrow_mut()
-                .retain(|wake| !expired.iter().any(|dead| Rc::ptr_eq(wake, dead)));
+            self.wake_sessions();
         }
     }
 
-    pub(super) fn lost(&self) -> bool {
+    fn wake_sessions(&self) {
+        let callbacks = self.sessions.borrow().clone();
+        let expired: alloc::vec::Vec<_> = callbacks.into_iter().filter(|wake| !wake()).collect();
+        self.sessions
+            .borrow_mut()
+            .retain(|wake| !expired.iter().any(|dead| Rc::ptr_eq(wake, dead)));
+    }
+
+    pub fn lost(&self) -> bool {
         if let Some((name, group)) = &*self.group.borrow() {
             group.fail(crate::ActorFailure {
                 actor: name.clone(),
@@ -58,9 +61,20 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         }
     }
 
-    pub(super) fn service(&self, message: Message<S>) {
+    pub fn service(&self, message: Message<S>) {
         self.services.borrow_mut().push_back(message);
         self.closed.notify();
+    }
+
+    pub fn enqueue(&self, message: Message<S>) -> Result<(), Message<S>> {
+        let mut queue = self.queue.borrow_mut();
+        if queue.len() == N {
+            return Err(message);
+        }
+        queue.push_back(message);
+        drop(queue);
+        self.closed.notify();
+        Ok(())
     }
 
     fn finish(&self, result: Result<(), Rc<OwnerError<E>>>) {
@@ -84,17 +98,16 @@ impl<S, const N: usize, E> Inner<S, N, E> {
             return;
         }
 
-        // Drop payloads outside the channel lock before publishing completion.
-        while let Ok(message) = self.queue.try_receive() {
-            drop(message);
-        }
-
-        self.services.borrow_mut().clear();
+        let queued = core::mem::take(&mut *self.queue.borrow_mut());
+        let services = core::mem::take(&mut *self.services.borrow_mut());
+        drop(queued);
+        drop(services);
         if self.completion.ready.borrow().is_none() {
             *self.completion.ready.borrow_mut() = Some(result.clone());
         }
         *self.completion.result.borrow_mut() = Some(result);
         self.completion.changed.notify();
+        self.wake_sessions();
     }
 }
 
@@ -110,15 +123,13 @@ impl<S, const N: usize, E, Role> Handle<S, N, E, Role> {
     pub async fn ready(&self) -> Result<(), Rc<OwnerError<E>>> {
         let changed = self.inner.completion.changed.listen();
 
-        poll_fn(
-            |context| match self.inner.completion.ready.borrow().clone() {
+        poll_fn(|context| {
+            changed.register(context);
+            match self.inner.completion.ready.borrow().clone() {
                 Some(result) => Poll::Ready(result),
-                None => {
-                    changed.register(context);
-                    Poll::Pending
-                }
-            },
-        )
+                None => Poll::Pending,
+            }
+        })
         .await
     }
 
@@ -233,25 +244,27 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         loop {
             let message = poll_fn(|context| {
                 if !self.inner.open.get()
-                    && self.inner.queue.is_empty()
+                    && self.inner.queue.borrow().is_empty()
                     && self.inner.services.borrow().is_empty()
                 {
                     return Poll::Ready(None);
                 }
 
                 closing.register(context);
-                if (self.inner.prefer_service.get() || self.inner.queue.is_empty())
+                if (self.inner.prefer_service.get() || self.inner.queue.borrow().is_empty())
                     && let Some(message) = self.inner.services.borrow_mut().pop_front()
                 {
                     self.inner.prefer_service.set(false);
                     return Poll::Ready(Some(message));
                 }
-                match self.inner.queue.poll_receive(context) {
-                    Poll::Ready(message) => {
+                let message = self.inner.queue.borrow_mut().pop_front();
+                match message {
+                    Some(message) => {
                         self.inner.prefer_service.set(true);
+                        self.inner.closed.notify();
                         Poll::Ready(Some(message))
                     }
-                    Poll::Pending => Poll::Pending,
+                    None => Poll::Pending,
                 }
             })
             .await;
@@ -296,11 +309,11 @@ impl<E> Completion<E> {
     pub async fn wait(&self) -> Result<(), Rc<OwnerError<E>>> {
         let changed = self.inner.changed.listen();
 
-        poll_fn(|context| match self.inner.result.borrow().clone() {
-            Some(result) => Poll::Ready(result),
-            None => {
-                changed.register(context);
-                Poll::Pending
+        poll_fn(|context| {
+            changed.register(context);
+            match self.inner.result.borrow().clone() {
+                Some(result) => Poll::Ready(result),
+                None => Poll::Pending,
             }
         })
         .await

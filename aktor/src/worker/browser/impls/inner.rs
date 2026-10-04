@@ -84,16 +84,26 @@ impl Inner {
         self.retained.borrow_mut().take();
     }
 
-    pub fn pump(&self) {
-        if self.active.get().is_some()
+    pub fn pump(self: &Rc<Self>) {
+        if self.pump_scheduled.get()
+            || self.active.get().is_some()
             || !matches!(*self.ready.borrow(), Some(Ok(())))
             || self.finished.borrow().is_some()
         {
             return;
         }
 
-        let next = self.queue.borrow_mut().pop_front();
-        if let Some(id) = next {
+        for _ in 0..64 {
+            let next = self.queue.borrow_mut().pop_front();
+            let Some(id) = next else {
+                if self.closed.get()
+                    && !self.shutdown_sent.replace(true)
+                    && let Err(error) = post(&self.worker, &Incoming::Shutdown)
+                {
+                    self.fail(error.cause);
+                }
+                return;
+            };
             self.active.set(Some(id));
             let work = self.outstanding.borrow_mut().remove(&id);
             let Some(mut work) = work else {
@@ -119,23 +129,24 @@ impl Inner {
             if self.failed.get() {
                 return;
             }
-            self.outstanding.borrow_mut().insert(id, work);
             if let Some(input) = input {
-                self.active.set(Some(id));
+                self.outstanding.borrow_mut().insert(id, work);
                 if let Err(error) = post(&self.worker, &input) {
                     self.fail(error.cause);
                 }
-            } else {
-                self.outstanding.borrow_mut().remove(&id);
-                self.active.set(None);
-                self.pump();
+                return;
             }
-        } else if self.closed.get()
-            && !self.shutdown_sent.replace(true)
-            && let Err(error) = post(&self.worker, &Incoming::Shutdown)
-        {
-            self.fail(error.cause);
+            self.active.set(None);
+            drop(work);
         }
+
+        self.pump_scheduled.set(true);
+        let inner = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(0).await;
+            inner.pump_scheduled.set(false);
+            inner.pump();
+        });
     }
 
     pub fn shutdown(self: &Rc<Self>) {

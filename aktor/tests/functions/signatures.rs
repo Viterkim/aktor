@@ -49,6 +49,69 @@ async fn nested(_: &usize) -> usize {
     1
 }
 
+mod state_borrows {
+    use super::*;
+
+    pub struct State(pub String);
+
+    #[aktor]
+    pub async fn length<'a>(state: &'a State) -> usize {
+        let text: &'a str = &state.0;
+        text.len()
+    }
+
+    #[aktor]
+    pub async fn append<'a>(state: &'a mut State) -> usize {
+        let text: &'a mut String = &mut state.0;
+        text.push('!');
+        text.len()
+    }
+}
+
+mod siblings {
+    use super::*;
+
+    pub fn __aktor_read_body() -> usize {
+        99
+    }
+
+    pub fn __aktor_generic_body() -> usize {
+        17
+    }
+
+    #[aktor]
+    pub async fn read(state: &usize) -> usize {
+        *state
+    }
+
+    #[aktor]
+    pub async fn generic<T: Into<usize> + Send + 'static>(state: &usize, value: T) -> usize {
+        *state + value.into()
+    }
+}
+
+mod named_parameters {
+    use super::*;
+
+    #[allow(non_snake_case)]
+    #[aktor]
+    pub async fn echo(NAME: &usize, value: usize) -> usize {
+        *NAME + value
+    }
+
+    #[allow(non_snake_case)]
+    #[aktor]
+    pub async fn value(_: &usize, NAME: usize) -> usize {
+        NAME
+    }
+
+    #[allow(non_snake_case)]
+    #[aktor]
+    pub async fn generic<T: Into<usize> + Send + 'static>(NAME: &usize, value: T) -> usize {
+        *NAME + value.into()
+    }
+}
+
 #[tokio::test]
 async fn signatures() {
     assert_eq!(
@@ -58,6 +121,36 @@ async fn signatures() {
     assert_eq!(generic::<u8, 2, _, _>(&vec![1], "x").await, (3, "x".into()));
     assert_eq!(lifetimes(&0, "static").await, "static");
     assert_eq!(nested(&0).await, 1);
+    assert_eq!(named_parameters::echo(&7, 1).await, 8);
+    assert_eq!(named_parameters::value(&7, 17).await, 17);
+    assert_eq!(named_parameters::generic(&7, 1usize).await, 8);
+
+    let (handle, owner) = spawn_thread(7usize, 1).unwrap();
+    assert_eq!(named_parameters::echo(&handle, 1).await, 8);
+    assert_eq!(named_parameters::value(&handle, 17).await, 17);
+    assert_eq!(named_parameters::generic(&handle, 1usize).await, 8);
+
+    let (sender, mut results) = named_parameters::value(&handle, 27).latest();
+    assert_eq!(results.next().await, Some(27));
+    drop((sender, results));
+    let (sender, mut results) = named_parameters::echo(&handle, 2).latest();
+    assert_eq!(results.next().await, Some(9));
+    drop((sender, results, handle));
+    owner.join().unwrap();
+
+    assert_eq!(siblings::__aktor_read_body(), 99);
+    assert_eq!(siblings::__aktor_generic_body(), 17);
+    assert_eq!(siblings::read(&7).await, 7);
+    assert_eq!(siblings::generic(&7, 1usize).await, 8);
+
+    let mut state = state_borrows::State("kat".into());
+    assert_eq!(state_borrows::length(&state).await, 3);
+    assert_eq!(state_borrows::append(&mut state).await, 4);
+    let (handle, owner) = spawn_thread(state, 1).unwrap();
+    assert_eq!(state_borrows::length(&handle).await, 4);
+    assert_eq!(state_borrows::append(&handle).await, 5);
+    drop(handle);
+    owner.join().unwrap();
 }
 
 #[aktor]
@@ -125,8 +218,40 @@ async fn r#type(_: &usize, __aktor_state: usize, __aktor_input: usize) -> usize 
     __aktor_state + __aktor_input
 }
 
+#[aktor]
+async fn locals(
+    function: &mut usize,
+    operation: usize,
+    inner: usize,
+    sender: usize,
+    results: usize,
+    input: usize,
+    r#state: usize,
+) -> usize {
+    *function = operation + inner + sender + results + input + r#state;
+    *function
+}
+
+#[aktor]
+async fn generic_locals<T: Into<usize> + Send + 'static>(
+    operation: &mut usize,
+    inner: T,
+    sender: usize,
+    results: usize,
+    input: usize,
+    function: usize,
+    state: usize,
+) -> usize {
+    *operation = inner.into() + sender + results + input + function + state;
+    *operation
+}
+
 #[tokio::test]
 async fn names() {
+    let mut state = 0;
+    assert_eq!(locals(&mut state, 1, 2, 3, 4, 5, 6).await, 21);
+    assert_eq!(generic_locals(&mut state, 1usize, 2, 3, 4, 5, 6).await, 21);
+
     assert_eq!(r#type(&0, 1, 2).await, 3);
     assert_eq!(identity(&0).await("text"), "text");
     assert_eq!(collision(&Target(1), T(2), M(3)).await, 6);
@@ -285,9 +410,55 @@ async fn keep<Latest: Send + 'static>(_: &usize, value: Latest) -> Latest {
     value
 }
 
+#[aktor]
+async fn echo<LatestSender: Send + 'static>(_: &usize, value: LatestSender) -> LatestSender {
+    value
+}
+
+#[allow(non_camel_case_types, non_upper_case_globals)]
+mod helpers {
+    use super::*;
+
+    pub struct LatestSender(pub u8);
+
+    #[aktor]
+    pub async fn concrete(_: &usize, value: LatestSender) -> u8 {
+        value.0
+    }
+
+    #[aktor]
+    pub async fn binders<r#request, const r#latest: usize>(
+        _: &usize,
+        value: request,
+    ) -> (Option<<request as IntoIterator>::Item>, usize)
+    where
+        request: IntoIterator + Send + 'static,
+        <request as IntoIterator>::Item: Send + 'static,
+    {
+        (value.into_iter().next(), latest)
+    }
+}
+
 #[tokio::test]
 async fn latest_names() {
     let (handle, owner) = spawn_thread(0usize, 1).unwrap();
+
+    assert_eq!(locals(&handle, 1, 2, 3, 4, 5, 6).await, 21);
+    assert_eq!(
+        generic_locals::request(&handle, 1usize, 2, 3, 4, 5, 6).await,
+        21
+    );
+
+    let (sender, mut output) = locals(&handle, 1, 2, 3, 4, 5, 6).latest();
+    assert_eq!(output.next().await, Some(21));
+    drop(sender);
+    drop(output);
+
+    let (sender, mut output) = generic_locals(&handle, 1usize, 2, 3, 4, 5, 6).latest();
+    assert_eq!(output.next().await, Some(21));
+    drop(sender);
+    drop(output);
+
     assert_eq!(
         put(&handle, Inner(12, std::marker::PhantomPinned)).await,
         12
@@ -297,6 +468,24 @@ async fn latest_names() {
     let (generic, mut found) = keep(&handle, String::from("query")).latest();
     assert_eq!(found.next().await.as_deref(), Some("query"));
     drop(generic);
+    drop(found);
+
+    assert_eq!(echo(&0usize, 7u8).await, 7);
+    assert_eq!(echo::request(&handle, 8u8).await, 8);
+    let (echo_sender, mut found) = echo(&handle, 9u8).latest();
+    assert_eq!(found.next().await, Some(9));
+    drop(echo_sender);
+    drop(found);
+
+    assert_eq!(
+        helpers::concrete(&handle, helpers::LatestSender(7)).await,
+        7
+    );
+    let (bound_sender, mut found) = helpers::binders::<_, 17, _>(&handle, [8u8]).latest();
+    assert_eq!(found.next().await, Some((Some(8), 17)));
+    bound_sender.send([9]);
+    assert_eq!(found.next().await, Some((Some(9), 17)));
+    drop(bound_sender);
     drop(found);
 
     let (pattern, mut matched) = patterns(&handle, (1, 2), "a".into(), "b".into(), ()).latest();

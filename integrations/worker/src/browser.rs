@@ -3,6 +3,7 @@ use aktor::message::CallError;
 use aktor::*;
 use rusqlite::Connection;
 use std::{
+    cell::RefCell,
     fmt::Display,
     future::Future,
     pin::Pin,
@@ -33,6 +34,23 @@ async fn timer(_: &Connection, millis: Rc<u32>) -> u32 {
     gloo_timers::future::TimeoutFuture::new(*millis).await;
 
     *millis
+}
+
+thread_local! {
+    static LATEST: RefCell<Option<worker::LatestSender<(String,)>>> = const { RefCell::new(None) };
+}
+
+struct LatestWake;
+// The destructor is what this check needs.
+#[allow(clippy::manual_noop_waker)]
+impl std::task::Wake for LatestWake {
+    fn wake(self: std::sync::Arc<Self>) {}
+}
+impl Drop for LatestWake {
+    fn drop(&mut self) {
+        let sender = LATEST.with(|sender| sender.borrow_mut().take());
+        drop(sender);
+    }
 }
 
 fn js_error(error: impl Display) -> JsValue {
@@ -203,12 +221,35 @@ impl Client {
         }
         other.send("absent".into());
         let bounded = self.worker.outstanding().0;
+        for _ in 0..20_000 {
+            let (sender, results) = read(&self.worker, "absent".into()).latest();
+            drop(results);
+            drop(sender);
+        }
+
         running.await;
         write
             .await
             .map_err(|error| js_error(format!("{error:?}")))?;
         let current = results.next().await;
         let independent = other_results.next().await;
+
+        LATEST.with(|sender| *sender.borrow_mut() = Some(panel.inner.clone()));
+        let waker = std::task::Waker::from(std::sync::Arc::new(LatestWake));
+        let mut next = Box::pin(results.next());
+        assert!(
+            next.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(waker);
+        assert!(
+            next.as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        drop(next);
+
         panel.send("volume".into());
         drop(panel);
         let final_result = results.next().await;

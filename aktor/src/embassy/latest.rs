@@ -81,7 +81,30 @@ struct Slot<I, O> {
     wake: Option<Waker>,
 }
 
-struct LatestJob<S, I, O, F, Role, const N: usize, E>(Rc<Shared<S, I, O, F, Role, N, E>>);
+struct LatestJob<S, I, O, F, Role, const N: usize, E> {
+    shared: Rc<Shared<S, I, O, F, Role, N, E>>,
+    finished: bool,
+}
+impl<S, I, O, F, Role, const N: usize, E> Drop for LatestJob<S, I, O, F, Role, N, E> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut slot = self.shared.state.borrow_mut();
+        slot.scheduled = false;
+        slot.running = false;
+        slot.failed = true;
+        let pending = slot.pending.take();
+        let output = slot.output.take();
+        let wake = slot.wake.take();
+        drop(slot);
+        drop(pending);
+        drop(output);
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+}
 
 impl<S: 'static, I: 'static, O: 'static, Role, F, const N: usize, E: 'static>
     Shared<S, I, O, F, Role, N, E>
@@ -89,18 +112,30 @@ where
     Role: 'static,
     F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + 'static,
 {
-    fn schedule(&self, slot: &mut Slot<I, O>) {
-        if slot.scheduled || slot.running || !slot.receiver || slot.pending.is_none() {
-            return;
-        }
-
-        if let Some(this) = self.this.upgrade() {
+    fn schedule(&self) {
+        let this = {
+            let mut slot = self.state.borrow_mut();
+            if slot.scheduled
+                || slot.running
+                || !slot.receiver
+                || slot.failed
+                || slot.pending.is_none()
+            {
+                return;
+            }
+            let Some(this) = self.this.upgrade() else {
+                return;
+            };
             slot.scheduled = true;
-            self.handle.inner.service(Message {
-                _operation: self.operation,
-                job: Box::new(LatestJob(this)),
-            });
-        }
+            this
+        };
+        self.handle.inner.service(Message {
+            _operation: self.operation,
+            job: Box::new(LatestJob {
+                shared: this,
+                finished: false,
+            }),
+        });
     }
 }
 impl<S: 'static, I: 'static, O: 'static, Role: 'static, F, const N: usize, E: 'static> Input<I>
@@ -118,10 +153,10 @@ where
         slot.revision = slot.revision.wrapping_add(1);
         let previous = slot.pending.replace(input);
         let unread = slot.output.take();
-        self.schedule(&mut slot);
         drop(slot);
         drop(previous);
         drop(unread);
+        self.schedule();
     }
 
     fn clone_sender(&self) {
@@ -142,6 +177,7 @@ where
 }
 impl<S, I, O, F, Role, const N: usize, E> Output<O> for Shared<S, I, O, F, Role, N, E> {
     fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>> {
+        let replacement = cx.waker().clone();
         let mut slot = self.state.borrow_mut();
 
         if self
@@ -153,6 +189,7 @@ impl<S, I, O, F, Role, const N: usize, E> Output<O> for Shared<S, I, O, F, Role,
             .as_ref()
             .is_some_and(Result::is_err)
         {
+            drop(slot);
             if self.handle.inner.lost() {
                 return Poll::Pending;
             }
@@ -163,7 +200,8 @@ impl<S, I, O, F, Role, const N: usize, E> Output<O> for Shared<S, I, O, F, Role,
             return Poll::Ready(Some(output));
         }
 
-        if (slot.senders == 0 || !self.handle.inner.open.get())
+        if !slot.failed
+            && (slot.senders == 0 || !self.handle.inner.open.get())
             && slot.pending.is_none()
             && !slot.running
             && !slot.scheduled
@@ -171,7 +209,9 @@ impl<S, I, O, F, Role, const N: usize, E> Output<O> for Shared<S, I, O, F, Role,
             return Poll::Ready(None);
         }
 
-        slot.wake = Some(cx.waker().clone());
+        let previous = slot.wake.replace(replacement);
+        drop(slot);
+        drop(previous);
         Poll::Pending
     }
 
@@ -196,29 +236,35 @@ where
     fn run<'a>(&'a mut self, state: &'a mut S) -> LocalFuture<'a, ()> {
         Box::pin(async move {
             let request = {
-                let mut slot = self.0.state.borrow_mut();
+                let mut slot = self.shared.state.borrow_mut();
                 slot.scheduled = false;
                 if !slot.receiver {
+                    self.finished = true;
                     return;
                 }
                 let Some(input) = slot.pending.take() else {
+                    self.finished = true;
                     return;
                 };
                 slot.running = true;
                 (slot.revision, input)
             };
 
-            let function = self.0.function.borrow().clone();
+            let function = self.shared.function.borrow().clone();
             let output = function(state, request.1).await;
+            self.finished = true;
 
-            let mut slot = self.0.state.borrow_mut();
+            let mut slot = self.shared.state.borrow_mut();
             slot.running = false;
-            if slot.receiver && slot.revision == request.0 {
-                slot.output = Some(output);
-            }
-            self.0.schedule(&mut slot);
+            let discarded = if slot.receiver && slot.revision == request.0 {
+                slot.output.replace(output)
+            } else {
+                Some(output)
+            };
             let wake = slot.wake.take();
             drop(slot);
+            drop(discarded);
+            self.shared.schedule();
             if let Some(wake) = wake {
                 wake.wake();
             }

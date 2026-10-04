@@ -38,9 +38,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     let state = input::parse::state(&function.signature.inputs[0])?;
     let state_type = &state.ty;
-    let (implementation, invoke) =
-        signature::implementation(&function.signature, &mut names, &output);
-    let body = &function.body;
+    let (implementation, invoke) = signature::implementation(&function, &mut names, &output);
+    let body_type = &names.body;
 
     let input_type = signature::inputs(&function.signature);
     let input_types: Vec<_> = function
@@ -73,6 +72,11 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let target = &names.target;
     let state_name = &names.state;
     let input_name = &names.input;
+    let operation_name = &names.operation;
+    let inner_name = &names.inner;
+    let results_name = &names.results;
+    let sender_name = &names.sender;
+    let function_name = &names.function;
     let parameter = match &state.pattern {
         syn::Pat::Ident(pattern) if pattern.subpat.is_none() => pattern.ident.clone(),
         _ => state_name.clone(),
@@ -115,8 +119,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let visibility = &function.visibility;
     let attributes = &function.attributes;
 
-    let mut scope = signature::scope::Child {
-        shadowed: &[
+    let mut scope = signature::scope::Child::new(
+        &[
             "NAME",
             "request",
             "export",
@@ -124,7 +128,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             "LatestSender",
             "Latest",
         ],
-    };
+        &function.signature.generics,
+    );
     let mut state_type = state_type.clone();
     scope.visit_type_mut(&mut state_type);
     let mut input_type = input_type.clone();
@@ -152,19 +157,27 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         quote!(&#state_type)
     };
 
-    Ok(quote! {
+    let wrapper = quote! {
         #(#attributes)*
         #[track_caller]
         #visibility #signature {
             #name::request(#parameter, #(#bindings),*)
         }
 
-        #(#attributes)*
-        #[doc(hidden)]
-        #implementation #body
+    };
+    let bindings = &names.arguments;
+    let parameter = state_name;
+
+    Ok(quote! {
+        #wrapper
+        #implementation
 
         #visibility mod #name {
             use super::*;
+
+            #[allow(non_camel_case_types)]
+            #[doc(hidden)]
+            pub struct #body_type;
 
             pub const NAME: &str = ::core::module_path!();
 
@@ -189,18 +202,18 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 type Sender = LatestSender<<#target as #aktor::latest::Session<#state_type, #input_type, #output, #role>>::Sender>;
                 type Results = <#target as #aktor::latest::Session<#state_type, #input_type, #output, #role>>::Results;
 
-                fn start(self, #parameter: #target, #input_name: #input_type, operation: #aktor::operation::Operation) -> (Self::Sender, Self::Results) {
+                fn start(self, #parameter: #target, #input_name: #input_type, #operation_name: #aktor::operation::Operation) -> (Self::Sender, Self::Results) {
                     let (#(#bindings,)*) = #input_name;
-                    let (inner, results) = #aktor::latest::Session::session(
-                        #parameter, operation,
+                    let (#inner_name, #results_name) = #aktor::latest::Session::session(
+                        #parameter, #operation_name,
                         async move |#state_name: &mut #state_type, #input_name| {
                             let (#(#bindings,)*) = #input_name;
-                            super::#invoke(#state_name, #(#bindings),*).await
+                            #invoke(#state_name, #(#bindings),*).await
                         },
                     );
-                    let sender = LatestSender { inner };
-                    sender.send(#(#bindings),*);
-                    (sender, results)
+                    let #sender_name = LatestSender { inner: #inner_name };
+                    #sender_name.send(#(#bindings),*);
+                    (#sender_name, #results_name)
                 }
             }
 
@@ -212,15 +225,15 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             where
                 #target: #aktor::latest::Session<#state_type, #input_type, #output, #role>,
             {
-                let (inner, results) = #aktor::latest::Session::session(
+                let (#inner_name, #results_name) = #aktor::latest::Session::session(
                     #parameter,
                     #aktor::operation::Operation { name: NAME, caller: ::core::panic::Location::caller() },
                     async move |#state_name: &mut #state_type, #input_name| {
                         let (#(#bindings,)*) = #input_name;
-                        super::#invoke(#state_name, #(#bindings),*).await
+                        #invoke(#state_name, #(#bindings),*).await
                     },
                 );
-                (LatestSender { inner }, results)
+                (LatestSender { inner: #inner_name }, #results_name)
             }
 
             #[doc(hidden)]
@@ -238,9 +251,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
                 fn request<#function_parameter>(
                     self,
-                    input: #input_parameter,
-                    operation: #aktor::operation::Operation,
-                    function: #function_parameter
+                    #input_name: #input_parameter,
+                    #operation_name: #aktor::operation::Operation,
+                    #function_name: #function_parameter
                 ) -> Self::Request
                 where
                     #function_parameter: for<'s> ::core::ops::AsyncFnOnce(
@@ -273,9 +286,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
                 fn request<#function_parameter>(
                     self,
-                    input: #input_parameter,
-                    operation: #aktor::operation::Operation,
-                    function: #function_parameter
+                    #input_name: #input_parameter,
+                    #operation_name: #aktor::operation::Operation,
+                    #function_name: #function_parameter
                 ) -> Self::Request
                 where
                     #function_parameter: for<'s> ::core::ops::AsyncFnOnce(
@@ -285,9 +298,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 {
                     <#target as #dispatch<#state_parameter, #input_parameter, #role_parameter>>::dispatch(
                         self,
-                        operation,
-                        function,
-                        input
+                        #operation_name,
+                        #function_name,
+                        #input_name
                     )
                 }
             }
@@ -321,8 +334,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
                 fn request<#function_parameter>(
                     self,
-                    input: #input_parameter,
-                    operation: #aktor::operation::Operation,
+                    #input_name: #input_parameter,
+                    #operation_name: #aktor::operation::Operation,
                     _: #function_parameter
                 ) -> Self::Request
                 where
@@ -331,7 +344,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                         #input_parameter
                     ) -> #output_parameter + ::core::marker::Send + 'static
                 {
-                    #aktor::target::Transport::request(self, operation, input)
+                    #aktor::target::Transport::request(self, #operation_name, #input_name)
                 }
             }
 
@@ -343,11 +356,11 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 #aktor::call::Call::new(
                     #parameter, (#(#bindings,)*),
                     #aktor::operation::Operation { name: NAME, caller: ::core::panic::Location::caller() },
-                    |#parameter, #input_name, operation| #parameter.request(
-                        #input_name, operation,
+                    |#parameter, #input_name, #operation_name| #parameter.request(
+                        #input_name, #operation_name,
                         async move |#state_name: #state_reference, #input_name| {
                             let (#(#bindings,)*) = #input_name;
-                            super::#invoke(#state_name, #(#bindings),*).await
+                            #invoke(#state_name, #(#bindings),*).await
                         },
                     ),
                     #latest_factory { marker: ::core::marker::PhantomData },
@@ -365,12 +378,12 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
                 fn run(
                     self,
-                    state: &mut #state_type,
-                    input: #input_type
+                    #state_name: &mut #state_type,
+                    #input_name: #input_type
                 ) -> #aktor::message::LocalFuture<'_, #output> {
                     #aktor::message::boxed(async move {
-                        let (#(#bindings,)*) = input;
-                        super::#invoke(state, #(#bindings),*).await
+                        let (#(#bindings,)*) = #input_name;
+                        #invoke(#state_name, #(#bindings),*).await
                     })
                 }
             }

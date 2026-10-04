@@ -62,18 +62,10 @@ impl<F> Timeout<F> {
     #[doc(hidden)]
     pub fn browser(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Self {
         Self::new(future, duration, status, |duration| {
-            Box::pin(async move {
-                let mut remaining =
-                    duration.as_millis() + u128::from(duration.subsec_nanos() % 1_000_000 != 0);
-                loop {
-                    let chunk = remaining.min(u128::from(u32::MAX)) as u32;
-                    gloo_timers::future::TimeoutFuture::new(chunk).await;
-                    remaining -= u128::from(chunk);
-                    if remaining == 0 {
-                        return;
-                    }
-                }
-            })
+            Box::pin(browser_timer(
+                duration,
+                gloo_timers::future::TimeoutFuture::new,
+            ))
         })
     }
 
@@ -82,10 +74,8 @@ impl<F> Timeout<F> {
     pub fn local(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Self {
         Self::new(future, duration, status, |duration| {
             Box::pin(async move {
-                let duration = embassy_time::Duration::from_micros(
-                    duration.as_micros().min(u128::from(u64::MAX)) as u64,
-                );
-                embassy_time::Timer::after(duration).await;
+                let deadline = embassy_deadline(embassy_time::Instant::now(), duration);
+                embassy_time::Timer::at(deadline).await;
             })
         })
     }
@@ -130,5 +120,104 @@ impl<F: Future> Future for Timeout<F> {
             }));
         }
         Poll::Pending
+    }
+}
+
+#[cfg(any(
+    all(
+        target_family = "wasm",
+        any(feature = "tokio", feature = "wasm_browser_workers")
+    ),
+    all(test, feature = "tokio")
+))]
+pub fn browser_millis(duration: Duration) -> u32 {
+    let millis = duration.as_nanos().div_ceil(1_000_000);
+    millis.min(i32::MAX as u128) as u32
+}
+
+#[cfg(any(
+    all(
+        target_family = "wasm",
+        any(feature = "tokio", feature = "wasm_browser_workers")
+    ),
+    all(test, feature = "tokio")
+))]
+async fn browser_timer<F: Future<Output = ()>>(
+    duration: Duration,
+    mut schedule: impl FnMut(u32) -> F,
+) {
+    let mut remaining = duration;
+    loop {
+        let chunk = browser_millis(remaining);
+        schedule(chunk).await;
+        remaining = remaining.saturating_sub(Duration::from_millis(u64::from(chunk)));
+        if remaining.is_zero() {
+            return;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn browser_delays() {
+        let max = i32::MAX as u64;
+        for (duration, expected) in [
+            (Duration::ZERO, vec![0]),
+            (Duration::from_nanos(1), vec![1]),
+            (Duration::from_micros(1500), vec![2]),
+            (Duration::from_millis(max), vec![max as u32]),
+            (Duration::from_millis(max + 1), vec![max as u32, 1]),
+            (
+                Duration::from_millis(2 * max + 17),
+                vec![max as u32, max as u32, 17],
+            ),
+        ] {
+            let mut scheduled = Vec::new();
+            browser_timer(duration, |chunk| {
+                assert!(i32::try_from(chunk).is_ok());
+                scheduled.push(chunk);
+                core::future::ready(())
+            })
+            .await;
+            assert_eq!(scheduled, expected);
+        }
+    }
+}
+
+#[cfg(feature = "embassy")]
+pub fn embassy_deadline(now: embassy_time::Instant, grace: Duration) -> embassy_time::Instant {
+    let ticks = grace
+        .as_nanos()
+        .saturating_mul(u128::from(embassy_time::TICK_HZ))
+        .div_ceil(1_000_000_000)
+        .min(u128::from(u64::MAX)) as u64;
+    embassy_time::Instant::from_ticks(now.as_ticks().saturating_add(ticks))
+}
+
+#[cfg(all(test, feature = "embassy"))]
+mod embassy_tests {
+    use super::*;
+    use embassy_time::Instant;
+
+    #[test]
+    fn deadlines() {
+        let now = Instant::from_ticks(17);
+        assert_eq!(embassy_deadline(now, Duration::ZERO), now);
+        assert_eq!(
+            embassy_deadline(now, Duration::from_nanos(1)).as_ticks(),
+            18
+        );
+        assert_eq!(
+            embassy_deadline(now, Duration::from_secs(5)),
+            now + embassy_time::Duration::from_secs(5)
+        );
+        assert_eq!(embassy_deadline(now, Duration::MAX).as_ticks(), u64::MAX);
+        assert_eq!(
+            embassy_deadline(Instant::from_ticks(u64::MAX - 1), Duration::from_secs(1)).as_ticks(),
+            u64::MAX
+        );
     }
 }

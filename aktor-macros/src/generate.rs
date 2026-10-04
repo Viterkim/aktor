@@ -15,8 +15,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         .map_or_else(|| quote!(()), |role| quote!(#role));
     let mut names = names::Names::new(&function.signature, &function.body, quote!(#aktor #role));
     let output = signature::output(&function.signature);
-    let (implementation, invoke) =
-        signature::implementation(&function.signature, &mut names, &output);
+    let (implementation, invoke) = signature::implementation(&function, &mut names, &output);
     let output = signature::dispatch_output(output);
     let mut opaque_output = OpaqueOutput(false);
     syn::visit::Visit::visit_type(&mut opaque_output, &output);
@@ -27,6 +26,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let latest_role = names::binding(&mut names.reserved, "__AktorLatestRole");
     let latest_inner = names::binding(&mut names.reserved, "__AktorLatestInner");
     signature::normalize(&mut function.signature, &mut names);
+    let body_type = &names.body;
 
     let state = input::parse::state(&function.signature.inputs[0])?;
     let state_type = &state.ty;
@@ -40,6 +40,10 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let target = &names.target;
     let state_name = &names.state;
     let input_name = &names.input;
+    let operation_name = &names.operation;
+    let inner_name = &names.inner;
+    let results_name = &names.results;
+    let sender_name = &names.sender;
     let bindings: Vec<_> = function
         .inputs
         .iter()
@@ -53,7 +57,6 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         syn::Pat::Ident(pattern) if pattern.subpat.is_none() => pattern.ident.clone(),
         _ => state_name.clone(),
     };
-    let body = &function.body;
 
     function.signature.asyncness = None;
     function
@@ -103,7 +106,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             }
             syn::GenericParam::Const(parameter) => {
                 let name = &parameter.ident;
-                quote!(#name)
+                quote!({ #name })
             }
         })
         .collect();
@@ -134,17 +137,36 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             }
             syn::GenericParam::Const(parameter) => {
                 let name = &parameter.ident;
-                Some(quote!(#name))
+                Some(quote!({ #name }))
             }
             _ => None,
         })
         .collect();
 
+    let wrapper = quote! {
+        #(#attributes)*
+        #[allow(clippy::extra_unused_lifetimes)]
+        #[track_caller]
+        #visibility #signature {
+            #name::request::<#(#generic_arguments),*>(#parameter, #(#bindings),*)
+        }
+    };
+    let bindings = &names.arguments;
+    let parameter = state_name;
+
     let mut request = signature.clone();
     request.ident = parse_quote!(request);
-    let mut scope = signature::scope::Child {
-        shadowed: &["request", "latest", "LatestSender"],
-    };
+    for (argument, binding) in request
+        .inputs
+        .iter_mut()
+        .zip(::core::iter::once(parameter).chain(bindings.iter()))
+    {
+        if let FnArg::Typed(argument) = argument {
+            *argument.pat = parse_quote!(#binding);
+        }
+    }
+    let mut scope =
+        signature::scope::Child::new(&["request", "latest", "LatestSender"], &request.generics);
     scope.visit_signature_mut(&mut request);
     if !opaque_output.0
         && let syn::ReturnType::Type(_, ty) = &mut request.output
@@ -208,7 +230,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 }
                 syn::GenericParam::Const(parameter) => {
                     let name = &parameter.ident;
-                    quote!(#name)
+                    quote!({ #name })
                 }
             })
             .collect();
@@ -229,7 +251,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             .collect();
         let mut sender_generics = user_generics.clone();
         sender_generics.params.push(parse_quote!(#latest_inner));
-        let (sender_impl, sender_type, sender_where) = sender_generics.split_for_impl();
+        let (sender_impl, _, sender_where) = sender_generics.split_for_impl();
+        let sender_type = quote!(<#(#arguments,)* #latest_inner>);
         let mut send_generics = sender_generics.clone();
         send_generics
             .make_where_clause()
@@ -270,7 +293,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         let (factory_impl, _, factory_where) = factory_generics.split_for_impl();
         let (latest_impl, _, latest_where) = latest_signature.generics.split_for_impl();
         latest_signature.output = parse_quote!(-> (
-            LatestSender<#(#arguments,)* <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Sender>,
+            self::LatestSender<#(#arguments,)* <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Sender>,
             <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Results
         ));
 
@@ -280,21 +303,21 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 pub marker: ::core::marker::PhantomData<fn(#(#markers),*) -> (#latest_state, #latest_input, #latest_output, #latest_role)>,
             }
             impl #latest_impl #aktor::latest::Factory<#target, #input_type> for #latest_factory<#(#arguments,)* #state_type, #input_type, #session_output, #role> #latest_where {
-                type Sender = LatestSender<#(#arguments,)* <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Sender>;
+                type Sender = self::LatestSender<#(#arguments,)* <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Sender>;
                 type Results = <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Results;
 
-                fn start(self, #parameter: #target, #input_name: #input_type, operation: #aktor::operation::Operation) -> (Self::Sender, Self::Results) {
+                fn start(self, #parameter: #target, #input_name: #input_type, #operation_name: #aktor::operation::Operation) -> (Self::Sender, Self::Results) {
                     let (#(#bindings,)*) = #input_name;
-                    let (inner, results) = #aktor::latest::Session::session(
-                        #parameter, operation,
+                    let (#inner_name, #results_name) = #aktor::latest::Session::session(
+                        #parameter, #operation_name,
                         async move |#state_name: &mut #state_type, #input_name| {
                             let (#(#bindings,)*) = #input_name;
-                            super::#invoke(#state_name, #(#bindings),*).await
+                            #invoke(#state_name, #(#bindings),*).await
                         },
                     );
-                    let sender = LatestSender { inner, marker: ::core::marker::PhantomData };
-                    sender.send(#(#bindings),*);
-                    (sender, results)
+                    let #sender_name = self::LatestSender { inner: #inner_name, marker: ::core::marker::PhantomData };
+                    #sender_name.send(#(#bindings),*);
+                    (#sender_name, #results_name)
                 }
             }
 
@@ -302,12 +325,12 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 pub inner: #latest_inner,
                 marker: ::core::marker::PhantomData<fn(#(#markers),*)>,
             }
-            impl #send_impl LatestSender #sender_type #send_where {
+            impl #send_impl self::LatestSender #sender_type #send_where {
                 pub fn send(&self, #(#bindings: #input_types),*) {
                     #aktor::latest::SendLatest::send(&self.inner, (#(#bindings,)*));
                 }
             }
-            impl #clone_impl ::core::clone::Clone for LatestSender #sender_type #clone_where {
+            impl #clone_impl ::core::clone::Clone for self::LatestSender #sender_type #clone_where {
                 fn clone(&self) -> Self {
                     Self { inner: self.inner.clone(), marker: ::core::marker::PhantomData }
                 }
@@ -315,25 +338,25 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
             #[track_caller]
             pub #latest_signature {
-                let (inner, results) = #aktor::latest::Session::session(
+                let (#inner_name, #results_name) = #aktor::latest::Session::session(
                     #parameter,
                     #aktor::operation::Operation { name: ::core::module_path!(), caller: ::core::panic::Location::caller() },
                     async move |#state_name: &mut #state_type, #input_name| {
                         let (#(#bindings,)*) = #input_name;
-                        super::#invoke(#state_name, #(#bindings),*).await
+                        #invoke(#state_name, #(#bindings),*).await
                     },
                 );
-                (LatestSender { inner, marker: ::core::marker::PhantomData }, results)
+                (self::LatestSender { inner: #inner_name, marker: ::core::marker::PhantomData }, #results_name)
             }
         }
     };
 
     let dispatch_body = quote! {
         <#target as #dispatch<#state_type, #input_type, #role>>::dispatch(
-            #parameter, operation,
+            #parameter, #operation_name,
             async move |#state_name: #state_reference, #input_name| {
                 let (#(#bindings,)*) = #input_name;
-                super::#invoke(#state_name, #(#bindings),*).await
+                #invoke(#state_name, #(#bindings),*).await
             },
             #input_name,
         )
@@ -342,32 +365,28 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         name: ::core::module_path!(), caller: ::core::panic::Location::caller(),
     });
     let request_body = if opaque_output.0 {
-        quote! { let operation = #operation; let #input_name = (#(#bindings,)*); #dispatch_body }
+        quote! { let #operation_name = #operation; let #input_name = (#(#bindings,)*); #dispatch_body }
     } else {
         quote! {
             #aktor::call::Call::new(
                 #parameter, (#(#bindings,)*), #operation,
-                |#parameter, #input_name, operation| { #dispatch_body },
+                |#parameter, #input_name, #operation_name| { #dispatch_body },
                 #latest_factory { marker: ::core::marker::PhantomData },
             )
         }
     };
 
     Ok(quote! {
-        #(#attributes)*
-        #[allow(clippy::extra_unused_lifetimes)]
-        #[track_caller]
-        #visibility #signature {
-            #name::request::<#(#generic_arguments),*>(#parameter, #(#bindings),*)
-        }
+        #wrapper
 
-        #(#attributes)*
-        #[doc(hidden)]
-        #[allow(clippy::extra_unused_lifetimes)]
-        #implementation #body
+        #implementation
 
         #visibility mod #name {
             use super::*;
+
+            #[allow(non_camel_case_types)]
+            #[doc(hidden)]
+            pub struct #body_type;
 
             #latest
 

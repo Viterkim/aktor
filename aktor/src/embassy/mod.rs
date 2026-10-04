@@ -14,7 +14,6 @@ use core::{
     marker::PhantomData,
     task::{Poll, Waker},
 };
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel as Queue};
 
 mod event;
 mod group;
@@ -75,7 +74,7 @@ pub enum OwnerError<E> {
 }
 
 struct Inner<S, const N: usize, E> {
-    queue: Queue<NoopRawMutex, Message<S>, N>,
+    queue: RefCell<VecDeque<Message<S>>>,
     services: RefCell<VecDeque<Message<S>>>,
     prefer_service: Cell<bool>,
     group: RefCell<Option<(alloc::string::String, KillSwitch)>>,

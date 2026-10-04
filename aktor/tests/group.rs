@@ -15,6 +15,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
+#[path = "support/mod.rs"]
+pub mod support;
+
 #[derive(Er)]
 #[er(format = "Flush the settings")]
 struct FlushErr;
@@ -371,10 +374,64 @@ impl Drop for StartupDrop {
 #[test]
 fn blocking_shutdown_exits() {
     if let Ok(mode) = std::env::var("AKTOR_GROUP_BLOCKING_PROOF") {
+        if mode == "exit handler" {
+            unsafe extern "C" {
+                fn atexit(callback: extern "C" fn()) -> core::ffi::c_int;
+            }
+            extern "C" fn wait_forever() {
+                loop {
+                    std::thread::sleep(Duration::from_secs(10));
+                }
+            }
+
+            // The callback has static lifetime and the C calling convention.
+            assert_eq!(unsafe { atexit(wait_forever) }, 0);
+        }
+        #[cfg(unix)]
+        if mode == "abort handler" {
+            unsafe extern "C" {
+                fn signal(
+                    number: core::ffi::c_int,
+                    handler: extern "C" fn(core::ffi::c_int),
+                ) -> usize;
+            }
+            extern "C" fn wait_forever(_: core::ffi::c_int) {
+                loop {
+                    std::hint::spin_loop();
+                }
+            }
+
+            // The handler only spins, without calling anything unsafe in a signal.
+            assert_ne!(unsafe { signal(6, wait_forever) }, usize::MAX);
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        if mode == "stderr failure" {
+            std::panic::set_hook(Box::new(|_| {}));
+            runtime.block_on(async {
+                let mut group = AktorGroup::with_grace(Duration::from_millis(200));
+                let closing = group.start().unwrap();
+                let actor = group.spawn_value("reporting", 0usize).await.unwrap();
+                let (ready, acquired) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let stderr = std::io::stderr();
+                    let _locked = stderr.lock();
+                    ready.send(()).unwrap();
+                    std::thread::sleep(Duration::from_secs(10));
+                });
+                acquired.recv().unwrap();
+
+                aktor::message::call(&actor.handle, |_, ()| panic!("report failure"), ())
+                    .cast()
+                    .await;
+                let report = closing.wait().await;
+                assert!(report.failure.unwrap().message.contains("report failure"));
+                assert!(!report.timed_out);
+            });
+            return;
+        }
         if mode == "pending setup" {
             runtime.block_on(async {
                 let mut group = AktorGroup::with_grace(Duration::from_millis(200));
@@ -415,7 +472,20 @@ fn blocking_shutdown_exits() {
         runtime.block_on(async {
             let group = AktorGroup::with_grace(Duration::from_millis(200));
             let kill = group.killswitch();
-            let actor_blocks = mode == "actor";
+            if mode == "stderr" {
+                let (ready, acquired) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let stderr = std::io::stderr();
+                    let _locked = stderr.lock();
+                    ready.send(()).unwrap();
+                    std::thread::sleep(Duration::from_secs(10));
+                });
+                acquired.recv().unwrap();
+            }
+            let actor_blocks = matches!(
+                &*mode,
+                "actor" | "stderr" | "exit handler" | "abort handler"
+            );
             let setup_blocks = mode == "setup";
             if setup_blocks {
                 let kill = kill.clone();
@@ -470,7 +540,17 @@ fn blocking_shutdown_exits() {
         return;
     }
 
-    for mode in ["actor", "application", "setup", "pending setup"] {
+    for mode in [
+        "actor",
+        "application",
+        "setup",
+        "pending setup",
+        "stderr",
+        "stderr failure",
+        "exit handler",
+        #[cfg(unix)]
+        "abort handler",
+    ] {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "blocking_shutdown_exits", "--nocapture"])
             .env("AKTOR_GROUP_BLOCKING_PROOF", mode)
@@ -485,22 +565,30 @@ fn blocking_shutdown_exits() {
             }
             if std::time::Instant::now() >= deadline {
                 child.kill().unwrap();
+                child.wait().unwrap();
                 panic!("shutdown watchdog did not stop blocking {mode}");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         let output = child.wait_with_output().unwrap();
-        let forced_exit = mode != "pending setup";
-        assert_eq!(
-            output.status.code(),
-            Some(i32::from(forced_exit)),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr).contains("Shutdown deadline reached"),
-            forced_exit
-        );
+        let forced_exit = !matches!(mode, "pending setup" | "stderr failure");
+        if forced_exit {
+            assert!(!output.status.success());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(output.status.signal(), Some(9));
+            }
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if !forced_exit {
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("Shutdown deadline reached"));
+        }
     }
 }
 
@@ -777,6 +865,31 @@ async fn latest_keeps_the_original_failure() {
             .message
             .contains("search handler exploded")
     );
+
+    let mut actors = AktorGroup::new();
+    let closing = actors.start().unwrap();
+    let owner = actors.spawn_value("latest output", 0usize).await.unwrap();
+    let (sender, mut results) = (&owner.handle).session(
+        aktor::operation::Operation {
+            name: "failed output",
+            caller: std::panic::Location::caller(),
+        },
+        async |_: &mut usize, ()| -> usize { panic!("original latest failure") },
+    );
+    sender.send(());
+    let report = closing.wait().await;
+
+    for _ in 0..4 {
+        let mut next = Box::pin(results.next());
+        assert!(
+            next.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+    }
+    let failure = report.failure.unwrap().message;
+    assert!(failure.contains("original latest failure"));
+    assert_eq!(closing.wait().await.failure.unwrap().message, failure);
 }
 
 #[tokio::test]
@@ -881,6 +994,48 @@ async fn default_group() {
     assert!(!(&closing).await.failed());
     assert_eq!(closing.await.to_string(), shutdown.await.to_string());
     assert!(actor.completion().wait().await.is_ok());
+
+    let count = std::rc::Rc::new(std::cell::Cell::new(0));
+    AktorGroup::new()
+        .run(
+            async |_| Ok::<_, AktorError>(()),
+            async |_| {
+                count.set(count.get() + 1);
+                Ok::<_, AktorError>(())
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(count.get(), 1);
+}
+
+#[tokio::test]
+async fn application_creation() {
+    use futures_util::FutureExt;
+    use std::{future::Ready, panic::AssertUnwindSafe};
+
+    fn application(_: &mut AktorGroup) -> Ready<Result<(), AktorError>> {
+        panic!("application creation failed");
+    }
+
+    let group = AktorGroup::new();
+    let completed = group.completion();
+    let cleanup = Arc::new(AtomicBool::new(false));
+    let cleaned = cleanup.clone();
+    let result = AssertUnwindSafe(group.run(application, async move |_| {
+        cleaned.store(true, Ordering::SeqCst);
+        Ok::<_, AktorError>(())
+    }))
+    .catch_unwind()
+    .await;
+    let report = completed.wait().await;
+
+    assert!(result.is_ok(), "application creation escaped run()");
+    assert_eq!(
+        report.failure.unwrap().message,
+        "application creation failed"
+    );
+    assert!(cleanup.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -1113,4 +1268,244 @@ async fn terminal_cleanup_closes_group() {
         panic!("typed cleanup error was lost");
     };
     assert_eq!(errors.errors[0].data.0, 31);
+}
+
+struct StopWake {
+    kill: aktor::KillSwitch,
+    actor: Option<aktor::listener::Actor<(), AktorError, AktorError>>,
+}
+impl std::task::Wake for StopWake {
+    fn wake(self: Arc<Self>) {
+        if let Some(actor) = &self.actor {
+            actor.close_admission();
+        } else {
+            self.kill.stop();
+        }
+    }
+}
+
+#[test]
+fn shutdown_ownership() {
+    if let Ok(mode) = std::env::var("AKTOR_CHILD") {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let group = AktorGroup::with_grace(Duration::from_millis(500));
+                let kill = group.killswitch();
+                let completed = group.completion();
+
+                let ready = Arc::new(Notify::new());
+                let entered = ready.clone();
+                let cleaned = Arc::new(AtomicBool::new(false));
+                let cleanup = cleaned.clone();
+
+                let actor_ready = Arc::new(Notify::new());
+                let actor_entered = actor_ready.clone();
+                let release = Arc::new(Notify::new());
+                let actor_release = release.clone();
+                let actor_mode = mode.clone();
+
+                let hook_ready = Arc::new(Notify::new());
+                let hook_entered = hook_ready.clone();
+                let app_mode = mode.clone();
+                let hook_mode = mode.clone();
+                let stopping = kill.clone();
+
+                let task = tokio::spawn(group.run(
+                    async move |app| -> Result<(), AktorError<BrokenDrop>> {
+                        let _actor = app
+                            .spawn_async(ActorArgs::new(
+                                "resource",
+                                async || Ok::<_, AktorError>(()),
+                                move |_| {
+                                    let waiting = actor_mode == "actor driver";
+                                    let entered = actor_entered.clone();
+                                    let release = actor_release.clone();
+                                    let cleanup = cleanup.clone();
+                                    async move {
+                                        if waiting {
+                                            entered.notify_one();
+                                            release.notified().await;
+                                        }
+                                        cleanup.store(true, Ordering::SeqCst);
+                                        Ok::<_, AktorError>(())
+                                    }
+                                },
+                            ))
+                            .await
+                            .unwrap();
+
+                        entered.notify_one();
+                        if app_mode == "application payload" {
+                            std::panic::panic_any(BrokenDrop);
+                        }
+                        if app_mode == "application error" {
+                            return Err(AktorError {
+                                diagnostics: "original application error".into(),
+                                data: BrokenDrop,
+                            });
+                        }
+                        if app_mode == "driver" {
+                            core::future::pending::<()>().await;
+                        }
+                        stopping.stop();
+                        Ok(())
+                    },
+                    async move |_| -> Result<(), AktorError<BrokenDrop>> {
+                        hook_entered.notify_one();
+                        if hook_mode == "hook payload" {
+                            std::panic::panic_any(BrokenDrop);
+                        }
+                        if hook_mode == "hook error" {
+                            return Err(AktorError {
+                                diagnostics: "original hook error".into(),
+                                data: BrokenDrop,
+                            });
+                        }
+                        if hook_mode == "hook driver" {
+                            core::future::pending::<()>().await;
+                        }
+                        Ok(())
+                    },
+                ));
+
+                ready.notified().await;
+                if mode == "driver" {
+                    task.abort();
+                } else if mode == "actor driver" {
+                    actor_ready.notified().await;
+                    task.abort();
+                    release.notify_one();
+                } else if mode == "hook driver" {
+                    hook_ready.notified().await;
+                    task.abort();
+                } else if mode == "reentrant stop" || mode == "reentrant failure" {
+                    use std::{
+                        future::Future,
+                        task::{Context, Waker},
+                    };
+                    // Use a fresh group so the waiter is registered before stopping.
+                    let mut fresh = AktorGroup::with_grace(Duration::from_millis(500));
+                    let stopping = fresh.killswitch();
+                    let fresh_done = fresh.start().unwrap();
+                    let actor = fresh.spawn_value("reentrant", ()).await.unwrap();
+                    let failure = mode == "reentrant failure";
+                    let waker = Waker::from(Arc::new(StopWake {
+                        kill: stopping.clone(),
+                        actor: failure.then(|| actor.actor.new_controller()),
+                    }));
+                    let mut waiting = Box::pin(stopping.wait_stopping());
+                    assert!(
+                        waiting
+                            .as_mut()
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                    if failure {
+                        actor.actor.cancel();
+                    }
+                    let racers: Vec<_> = (0..2)
+                        .map(|_| {
+                            let stop = stopping.clone();
+                            std::thread::spawn(move || stop.stop())
+                        })
+                        .collect();
+                    for racer in racers {
+                        racer.join().unwrap();
+                    }
+                    assert_eq!(fresh_done.wait().await.failed(), failure);
+                    drop(waiting);
+                }
+                let result = task.await;
+                if mode.ends_with("driver") {
+                    assert!(result.unwrap_err().is_cancelled());
+                } else {
+                    assert!(result.is_ok());
+                }
+
+                let report = completed.wait().await;
+                assert!(cleaned.load(Ordering::SeqCst));
+                assert_eq!(report.actors.len(), 1);
+                assert!(!report.timed_out);
+                if mode.ends_with("driver") {
+                    assert!(
+                        report
+                            .application
+                            .iter()
+                            .any(|error| error.diagnostics.contains("cancelled"))
+                    );
+                }
+                if mode.ends_with("payload") {
+                    assert_eq!(
+                        report.failure.as_ref().unwrap().message,
+                        "panic payload had no message"
+                    );
+                }
+                if mode.ends_with("error") {
+                    assert!(
+                        report
+                            .application
+                            .iter()
+                            .any(|error| error.diagnostics.contains("original"))
+                    );
+                }
+            });
+        return;
+    }
+
+    for mode in [
+        "driver",
+        "actor driver",
+        "hook driver",
+        "application payload",
+        "hook payload",
+        "application error",
+        "hook error",
+        "reentrant stop",
+        "reentrant failure",
+    ] {
+        let output = support::child("shutdown_ownership", mode);
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn stop_before_start() {
+    if std::env::var_os("AKTOR_CHILD").is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for shutdown in [false, true] {
+                    let mut group = AktorGroup::with_grace(Duration::from_millis(20));
+                    let completion = group.completion();
+                    let kill = group.killswitch();
+                    if shutdown {
+                        drop(group.shutdown());
+                    } else {
+                        kill.stop();
+                    }
+                    kill.stop();
+                    assert!(!completion.wait().await.failed());
+                    assert!(!group.shutdown().await.failed());
+                    assert!(group.start().is_err());
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            });
+        return;
+    }
+
+    let output = support::child("stop_before_start", "early stop");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

@@ -24,25 +24,8 @@ Calls run one after the other, and your function's errors come back as usual. Fu
 
 Keep the actors with your application in an AktorGroup. If one dies, the group starts closing, your queries don't need another Result for that.
 
-## Calling another query (nested)
+Inside another query, pass the connection you already have and it runs right there. Passing the handle again queues it behind yourself. The [examples](examples.md#calling-another-query) shows a transaction doing that.
 
-Pass the connection you already have. You can put those calls in a transaction too:
-
-```rust
-#[aktor]
-pub async fn insert_users(db: &mut Connection, names: Vec<String>) -> Result<()> {
-    let transaction = db.transaction()?;
-
-    for name in names {
-        insert_user(&*transaction, name).await?;
-    }
-
-    transaction.commit()
-}
-```
-
-Calling insert_users with a handle queues the whole thing once.
-
-[Opening / spawning](../../README.md#opening--starting--spawning)
+[Opening / spawning](../../README.md#example)
 
 [Extra examples](examples.md)

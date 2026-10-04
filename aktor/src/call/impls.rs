@@ -40,7 +40,7 @@ impl<T, I, R, L> Call<T, I, R, L> {
             target_os = "unknown"
         )
     ))]
-    pub(super) fn into_request(mut self) -> R
+    pub fn into_request(mut self) -> R
     where
         R: Unpin,
     {

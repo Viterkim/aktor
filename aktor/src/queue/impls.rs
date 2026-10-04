@@ -56,13 +56,22 @@ impl Admission {
         if !valid {
             return Err(message);
         }
-        permit.submit(message)
+        let result = permit.commit(message);
+        drop(lock);
+        match result {
+            Ok(ready) => {
+                ready.notify_one();
+                Ok(())
+            }
+            Err((_permit, message)) => Err(message),
+        }
     }
 
     pub fn lost(&self) {
-        if let Some((name, group)) = &self.state.lock().borrow().group {
+        let group = self.state.lock().borrow().group.clone();
+        if let Some((name, group)) = group {
             group.fail(crate::group::ActorFailure {
-                actor: name.clone(),
+                actor: name,
                 phase: "call".into(),
                 message: "actor stopped without returning the operation's output".into(),
             });
@@ -70,11 +79,11 @@ impl Admission {
     }
 
     pub fn close(&self) {
-        self.set(Phase::Paused);
+        self.set(|_| Phase::Paused);
     }
 
     pub fn open(&self) {
-        self.set(Phase::Running);
+        self.set(|_| Phase::Running);
     }
 
     pub fn register_session(&self, callback: Box<dyn Fn(Phase) -> bool + Send + Sync>) {
@@ -93,17 +102,19 @@ impl Admission {
     }
 
     pub fn shutdown(&self) {
-        let paused = matches!(self.state.lock().borrow().phase, Phase::Paused);
-        self.set(Phase::Closing { paused });
+        self.set(|phase| Phase::Closing {
+            paused: matches!(phase, Phase::Paused),
+        });
     }
 
-    fn set(&self, phase: Phase) {
-        let open = matches!(phase, Phase::Running);
+    fn set(&self, transition: impl FnOnce(Phase) -> Phase) {
         let lock = self.state.lock();
         let mut state = lock.borrow_mut();
         if matches!(state.phase, Phase::Closing { .. }) {
             return;
         }
+        let phase = transition(state.phase);
+        let open = matches!(phase, Phase::Running);
         state.phase = phase;
         state.open = open;
         state.epoch = state.epoch.wrapping_add(1);
@@ -128,6 +139,43 @@ impl Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AdmissionWake(Arc<Admission>);
+    impl std::task::Wake for AdmissionWake {
+        fn wake(self: Arc<Self>) {
+            let admission = self.0.clone();
+            assert!(
+                std::thread::spawn(move || admission.state.try_lock().is_some())
+                    .join()
+                    .unwrap(),
+                "receiver woke under the admission lock"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_releases_admission() {
+        use core::{
+            future::Future,
+            task::{Context, Waker},
+        };
+
+        let (handle, mut listener) = crate::listener::channel::<usize>(1).unwrap();
+        let waker = Waker::from(Arc::new(AdmissionWake(handle.inner.admission.clone())));
+        let mut receiver = Box::pin(listener.recv());
+        assert!(
+            receiver
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        crate::message::call(&handle, |_, ()| (), ())
+            .try_cast()
+            .unwrap();
+        drop(receiver);
+        listener.try_recv().unwrap().run(&mut 0).await;
+    }
 
     #[test]
     fn session_churn() {

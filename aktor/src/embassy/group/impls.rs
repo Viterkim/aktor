@@ -1,46 +1,13 @@
+use super::driver::poll_owners;
 use super::*;
-pub use crate::{ActorArgs, ShutdownReport};
-use crate::{ActorFailure, ActorOutcome, AktorError};
-use alloc::{string::String, vec::Vec};
-use core::{future::poll_fn, ops::AsyncFnOnce, time::Duration};
-
-pub struct AktorGroup {
-    stop_on_drop: bool,
-    control: Rc<Control>,
-    owners: Rc<RefCell<Vec<Entry>>>,
-}
-
-pub struct GroupCompletion {
-    control: Rc<Control>,
-}
-
-#[derive(Clone)]
-pub struct KillSwitch {
-    control: Rc<Control>,
-}
-
-struct Control {
-    stopping: Cell<bool>,
-    listening: Cell<bool>,
-    grace: Duration,
-    deadline: Cell<Option<embassy_time::Instant>>,
-    failure: RefCell<Option<ActorFailure>>,
-    completed: RefCell<Option<ShutdownReport>>,
-    changed: Event,
-}
-
-struct Entry {
-    name: String,
-    shutdown: Box<dyn Fn()>,
-    owner: LocalFuture<'static, Option<AktorCleanupError>>,
-    finished: bool,
-}
+use crate::timeout::embassy_deadline;
 
 impl AktorGroup {
     pub fn new() -> Self {
         Self::with_grace(Duration::from_secs(5))
     }
 
+    /// Unrepresentable deadlines clamp to the clock's last supported instant.
     pub fn with_grace(grace: Duration) -> Self {
         Self {
             stop_on_drop: false,
@@ -51,6 +18,7 @@ impl AktorGroup {
                 deadline: Cell::new(None),
                 failure: RefCell::new(None),
                 completed: RefCell::new(None),
+                report: RefCell::new(ShutdownReport::default()),
                 changed: Event::default(),
             }),
             owners: Rc::new(RefCell::new(Vec::new())),
@@ -99,11 +67,11 @@ impl AktorGroup {
             impl AsyncFnOnce(S) -> Result<(), AktorCleanupError<E>> + 'static,
         >,
     ) -> Result<Handle<S, N, E>, ActorError> {
-        if !self.control.listening.get() {
-            return Err(ActorError::NotStarted);
-        }
         if self.killswitch().is_stopping() {
             return Err(ActorError::Closed);
+        }
+        if !self.control.listening.get() {
+            return Err(ActorError::NotStarted);
         }
         if args.capacity != N {
             return Err(ActorError::InvalidCapacity);
@@ -139,6 +107,7 @@ impl AktorGroup {
     }
 
     /// Move this future onto your local executor to drive the actors.
+    /// Dropping it cancels the actors and publishes a failed report.
     pub fn listen_with<'a, Cleanup, CleanupFuture, E>(
         &mut self,
         cleanup: Cleanup,
@@ -150,6 +119,10 @@ impl AktorGroup {
     {
         self.claim_listener()?;
         self.stop_on_drop = true;
+        let driver = Driver {
+            control: self.control.clone(),
+            owners: self.owners.clone(),
+        };
         let group = Self {
             stop_on_drop: false,
             control: self.control.clone(),
@@ -158,10 +131,9 @@ impl AktorGroup {
 
         Ok(Box::pin(async move {
             let changed = group.control.changed.listen();
-            let mut report = ShutdownReport::default();
             poll_fn(|cx| {
                 changed.register(cx);
-                poll_owners(&group.owners, cx, &mut report);
+                poll_owners(&group.owners, cx, &group.control);
                 if group.killswitch().is_stopping() {
                     Poll::Ready(())
                 } else {
@@ -171,11 +143,16 @@ impl AktorGroup {
             .await;
 
             drop(changed);
-            group.finish(cleanup, report).await
+            let report = group.finish(cleanup).await;
+            drop(driver);
+            report
         }))
     }
 
-    fn claim_listener(&self) -> Result<(), AktorError> {
+    pub(super) fn claim_listener(&self) -> Result<(), AktorError> {
+        if self.control.stopping.get() {
+            return Err(AktorError::new("this group has already stopped"));
+        }
         if self.control.listening.replace(true) {
             Err(AktorError::new(
                 "this group already has a shutdown listener",
@@ -184,123 +161,10 @@ impl AktorGroup {
             Ok(())
         }
     }
-
-    pub async fn run<O, A, Application, Cleanup, CleanupFuture, E>(
-        mut self,
-        application: Application,
-        cleanup: Cleanup,
-    ) -> Result<Option<O>, Box<ShutdownReport>>
-    where
-        Application: AsyncFnOnce(&mut AktorGroup) -> Result<O, AktorError<A>>,
-        Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
-    {
-        if let Err(error) = self.claim_listener() {
-            return Err(Box::new(ShutdownReport {
-                application: alloc::vec![error],
-                ..ShutdownReport::default()
-            }));
-        }
-        let owners = self.owners.clone();
-        let kill = self.killswitch();
-        let changed = kill.control.changed.listen();
-        let mut report = ShutdownReport::default();
-        let output = {
-            let mut app = Box::pin(application(&mut self));
-            poll_fn(|cx| {
-                changed.register(cx);
-                poll_owners(&owners, cx, &mut report);
-                if kill.is_stopping() {
-                    return Poll::Ready(None);
-                }
-                match app.as_mut().poll(cx) {
-                    Poll::Ready(Ok(value)) => Poll::Ready(Some(value)),
-                    Poll::Ready(Err(error)) => {
-                        report.application.push(error.report());
-                        Poll::Ready(None)
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
-            })
-            .await
-        };
-        let report = self.finish(cleanup, report).await;
-        if report.failed() {
-            Err(Box::new(report))
-        } else {
-            Ok(output)
-        }
-    }
-
-    async fn finish<Cleanup, CleanupFuture, E>(
-        self,
-        cleanup: Cleanup,
-        mut report: ShutdownReport,
-    ) -> ShutdownReport
-    where
-        Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
-    {
-        let owners = self.owners.clone();
-        let kill = self.killswitch();
-        kill.stop();
-        for entry in owners.borrow().iter().rev() {
-            (entry.shutdown)();
-        }
-        let mut timer = Box::pin(embassy_time::Timer::at(
-            kill.control
-                .deadline
-                .get()
-                .unwrap_or_else(embassy_time::Instant::now),
-        ));
-        poll_fn(|cx| {
-            poll_owners(&owners, cx, &mut report);
-            if owners.borrow().iter().all(|entry| entry.finished) {
-                return Poll::Ready(());
-            }
-            if timer.as_mut().poll(cx).is_ready() {
-                report.timed_out = true;
-                return Poll::Ready(());
-            }
-            Poll::Pending
-        })
-        .await;
-        for entry in owners.borrow().iter().filter(|entry| !entry.finished) {
-            report.actors.push(ActorOutcome {
-                actor: entry.name.clone(),
-                diagnostics: Vec::new(),
-                timed_out: true,
-            });
-        }
-        owners.borrow_mut().clear();
-        report.failure = kill.control.failure.borrow().clone();
-        let mut hook = Box::pin(cleanup(report.clone()));
-        poll_fn(|cx| match hook.as_mut().poll(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(()),
-            Poll::Ready(Err(error)) => {
-                report.application.push(error.report());
-                Poll::Ready(())
-            }
-            Poll::Pending => {
-                if timer.as_mut().poll(cx).is_ready() {
-                    report.timed_out = true;
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            }
-        })
-        .await;
-        drop(hook);
-        report.failure = kill.control.failure.borrow().clone();
-        *kill.control.completed.borrow_mut() = Some(report.clone());
-        kill.control.changed.notify();
-        report
-    }
 }
 impl Drop for AktorGroup {
     fn drop(&mut self) {
-        if self.stop_on_drop {
+        if self.stop_on_drop || !self.control.listening.get() {
             self.killswitch().stop();
         }
     }
@@ -313,16 +177,23 @@ impl Default for AktorGroup {
 impl KillSwitch {
     pub fn stop(&self) {
         if !self.control.stopping.replace(true) {
-            let micros = self.control.grace.as_micros().min(u128::from(u64::MAX)) as u64;
-            self.control.deadline.set(Some(
-                embassy_time::Instant::now() + embassy_time::Duration::from_micros(micros),
-            ));
+            self.control.deadline.set(Some(embassy_deadline(
+                embassy_time::Instant::now(),
+                self.control.grace,
+            )));
+            if !self.control.listening.get() {
+                let mut report = self.control.report.borrow().clone();
+                report.failure = self.control.failure.borrow().clone();
+                *self.control.completed.borrow_mut() = Some(report);
+            }
         }
         self.control.changed.notify();
     }
+
     pub fn is_stopping(&self) -> bool {
         self.control.stopping.get()
     }
+
     pub async fn wait_stopping(&self) {
         let changed = self.control.changed.listen();
         poll_fn(|cx| {
@@ -335,31 +206,12 @@ impl KillSwitch {
         })
         .await
     }
-    pub(crate) fn fail(&self, reason: ActorFailure) {
+
+    pub fn fail(&self, reason: ActorFailure) {
         if self.control.failure.borrow().is_none() {
             *self.control.failure.borrow_mut() = Some(reason);
         }
         self.stop();
-    }
-}
-
-fn poll_owners(
-    owners: &RefCell<Vec<Entry>>,
-    cx: &mut core::task::Context<'_>,
-    report: &mut ShutdownReport,
-) {
-    let mut entries = owners.borrow_mut();
-    for entry in entries.iter_mut() {
-        if !entry.finished
-            && let Poll::Ready(error) = entry.owner.as_mut().poll(cx)
-        {
-            entry.finished = true;
-            report.actors.push(ActorOutcome {
-                actor: entry.name.clone(),
-                diagnostics: error.into_iter().collect(),
-                timed_out: false,
-            });
-        }
     }
 }
 

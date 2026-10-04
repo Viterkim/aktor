@@ -55,12 +55,14 @@ async fn yield_once() {
 
 #[cfg(target_family = "wasm")]
 struct Clock;
+#[cfg(target_family = "wasm")]
 static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(target_family = "wasm")]
 impl embassy_time_driver::Driver for Clock {
     fn now(&self) -> u64 {
         TICKS.load(std::sync::atomic::Ordering::Relaxed)
     }
+
     fn schedule_wake(&self, _: u64, waker: &Waker) {
         waker.wake_by_ref();
     }
@@ -169,7 +171,97 @@ async fn grouped() -> Result<(), &'static str> {
     Ok(())
 }
 
+async fn timeout_limits() -> Result<(), &'static str> {
+    while embassy_time::Instant::now().as_ticks() == 0 {
+        yield_once().await;
+    }
+    let (actor, owner) = embassy::channel::<State, 1, ()>().map_err(|_| "timeout channel")?;
+    let mut reply = append::request(&actor, Line("kept".into()))
+        .try_send()
+        .map_err(|_| "timeout admission")?;
+    let mut context = Context::from_waker(Waker::noop());
+
+    let mut request =
+        Box::pin(append(&actor, Line("unqueued".into())).timeout(std::time::Duration::MAX));
+    for _ in 0..2 {
+        if request.as_mut().poll(&mut context).is_ready() {
+            return Err("huge request timeout expired");
+        }
+    }
+    drop(request);
+
+    let mut timeout = Box::pin(reply.timeout(std::time::Duration::MAX));
+    for _ in 0..2 {
+        if timeout.as_mut().poll(&mut context).is_ready() {
+            return Err("huge reply timeout expired");
+        }
+    }
+    drop(timeout);
+
+    #[cfg(target_family = "wasm")]
+    for duration in [
+        std::time::Duration::from_nanos(1),
+        std::time::Duration::from_millis(1),
+    ] {
+        let ticks = duration
+            .as_nanos()
+            .saturating_mul(u128::from(embassy_time::TICK_HZ))
+            .div_ceil(1_000_000_000) as u64;
+        let mut timeout = Box::pin(reply.timeout(duration));
+        if timeout.as_mut().poll(&mut context).is_ready() {
+            return Err("positive timeout expired on first poll");
+        }
+        TICKS.fetch_add(ticks - 1, std::sync::atomic::Ordering::Relaxed);
+        if timeout.as_mut().poll(&mut context).is_ready() {
+            return Err("positive timeout lost its clock tick");
+        }
+        TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Poll::Ready(Err(error)) = timeout.as_mut().poll(&mut context) else {
+            return Err("positive timeout did not expire");
+        };
+        if !error.admitted {
+            return Err("reply admission lost");
+        }
+    }
+
+    let error = append(&actor, Line("unqueued".into()))
+        .timeout(std::time::Duration::ZERO)
+        .await
+        .err()
+        .ok_or("zero request timeout")?;
+    if error.admitted {
+        return Err("full request was admitted");
+    }
+    let error = reply
+        .timeout(std::time::Duration::ZERO)
+        .await
+        .err()
+        .ok_or("zero reply timeout")?;
+    if !error.admitted {
+        return Err("reply was not admitted");
+    }
+    drop(reply);
+    drop(actor.shutdown());
+    owner
+        .run(
+            State {
+                text: String::new(),
+            },
+            async |state| {
+                if state.text == "kept" {
+                    Ok(())
+                } else {
+                    Err(AktorCleanupError::new("timed out operation was lost"))
+                }
+            },
+        )
+        .await
+        .map_err(|_| "timeout ownership")?;
+    Ok(())
+}
+
 async fn exercise() -> Result<(), &'static str> {
+    timeout_limits().await?;
     let (actor, owner) = embassy::channel::<State, 1, &'static str>().map_err(|_| "channel")?;
     let cleaned = Rc::new(Cell::new(false));
     let cleanup = cleaned.clone();
@@ -275,6 +367,7 @@ async fn exercise() -> Result<(), &'static str> {
     Ok(())
 }
 
+#[cfg(target_family = "wasm")]
 pub fn check() -> Result<(), &'static str> {
     let mut exercise = Box::pin(exercise());
     let mut context = Context::from_waker(Waker::noop());
@@ -290,6 +383,38 @@ pub fn check() -> Result<(), &'static str> {
     Err("executor did not finish")
 }
 
+#[cfg(not(target_family = "wasm"))]
+pub fn check() -> Result<(), &'static str> {
+    use std::{
+        sync::Arc,
+        task::Wake,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    struct Wakeup(thread::Thread);
+    impl Wake for Wakeup {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let waker = Waker::from(Arc::new(Wakeup(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut exercise = Box::pin(exercise());
+    loop {
+        if let Poll::Ready(result) = exercise.as_mut().poll(&mut context) {
+            return result;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("executor did not finish");
+        }
+        thread::park_timeout(remaining);
+    }
+}
+
 #[cfg(target_family = "wasm")]
 #[unsafe(no_mangle)]
 pub extern "C" fn aktor_check() -> u32 {
@@ -300,6 +425,8 @@ pub extern "C" fn aktor_check() -> u32 {
 mod tests {
     #[test]
     fn local() {
-        assert_eq!(super::check(), Ok(()));
+        for _ in 0..4 {
+            assert_eq!(super::check(), Ok(()));
+        }
     }
 }

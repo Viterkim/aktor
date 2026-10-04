@@ -7,7 +7,7 @@ use crate::{
 
 pub fn watchdog(kill: &KillSwitch) {
     let control = kill.control.clone();
-    let deadline = kill.control.changed.borrow().unwrap_or_else(Instant::now);
+    let deadline = kill.control.lock().deadline.unwrap_or_else(Instant::now);
     let watchdog = std::thread::Builder::new()
         .name("aktor shutdown".into())
         .spawn(move || {
@@ -19,8 +19,9 @@ pub fn watchdog(kill: &KillSwitch) {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     state.report.timed_out = true;
-                    eprintln!("{}", state.report);
-                    std::process::exit(1);
+                    drop(state);
+                    control.wake.notify_all();
+                    terminate();
                 }
                 let (next, _) = control
                     .wake
@@ -29,10 +30,46 @@ pub fn watchdog(kill: &KillSwitch) {
                 state = next;
             }
         });
-    if let Err(error) = watchdog {
-        eprintln!("Could not start the shutdown watchdog: {error}");
-        std::process::exit(1);
+    if watchdog.is_err() {
+        terminate();
     }
+
+    let control = kill.control.clone();
+    let reserve = (kill.control.grace / 10).min(Duration::from_millis(100));
+    let reporting_at = deadline.checked_sub(reserve / 8).unwrap_or(deadline);
+    let _ = std::thread::Builder::new()
+        .name("aktor shutdown report".into())
+        .spawn(move || {
+            let report = {
+                let mut state = control.lock();
+                loop {
+                    if state.finished && !state.force_exit && state.running.is_empty() {
+                        return;
+                    }
+                    let remaining = reporting_at.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break state.report.clone();
+                    }
+                    let (next, _) = control
+                        .wake
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(|error| error.into_inner());
+                    state = next;
+                }
+            };
+            eprintln!("Shutdown still pending:\n{report}");
+        });
+}
+
+fn terminate() -> ! {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Signal, getpid, kill_process};
+
+        // Even a stuck abort handler cannot catch SIGKILL.
+        let _ = kill_process(getpid(), Signal::KILL);
+    }
+    std::process::abort();
 }
 
 impl KillSwitch {
@@ -126,13 +163,13 @@ impl AktorGroup {
             cleanup,
         } = args;
 
-        if !self.control.lock().listening {
-            return Err(DedicatedStartError::NotStarted);
-        }
         let kill = self.killswitch();
         if kill.is_stopping() {
             self.completion().wait().await;
             return Err(DedicatedStartError::Closed);
+        }
+        if !self.control.lock().listening {
+            return Err(DedicatedStartError::NotStarted);
         }
         let runtime = match tokio::runtime::Handle::try_current() {
             Ok(runtime) => runtime,
@@ -248,8 +285,19 @@ impl AktorGroup {
 
                 tokio::select! {
                     result = completion.wait() => break result,
-                    _ = closed.changed(), if !stopping => {},
-                    _ = forced.changed(), if !cancelling => {},
+                    changed = closed.changed(), if !stopping => {
+                        if changed.is_err() {
+                            stopping = true;
+                            let shutdown = actor.new_controller();
+                            tokio::spawn(async move { let _result = shutdown.shutdown().await; });
+                        }
+                    },
+                    changed = forced.changed(), if !cancelling => {
+                        if changed.is_err() {
+                            cancelling = true;
+                            actor.cancel();
+                        }
+                    },
                 }
             };
 

@@ -16,7 +16,7 @@ impl<O: DeserializeOwned> WorkerReply<O> {
         }
     }
 
-    pub(super) fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<O, WireError>> {
+    pub fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<O, WireError>> {
         match Pin::new(&mut self.response).poll(context) {
             Poll::Ready(Ok(Ok(output))) => {
                 return Poll::Ready(decode(&output).map_err(|error| {

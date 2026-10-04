@@ -105,6 +105,9 @@ where
 {
     let scope = scope()?;
     options.validate().map_err(|error| error.without_data())?;
+    let registry =
+        registry::Registry::for_actor::<S, Role>().map_err(|error| error.without_data())?;
+    let operations = registry.operations();
 
     let (sender, mut receiver) = mpsc::channel::<Incoming>(options.capacity);
     let (stopping, mut stopped) = watch::channel(false);
@@ -196,7 +199,8 @@ where
                 fatal(error);
             }
 
-            let output = registry::dispatch::<S, Role>(&mut state, operation, input)
+            let output = registry
+                .dispatch(&mut state, operation, input)
                 .await
                 .map_err(|error| error.without_data());
 
@@ -224,7 +228,7 @@ where
         Outgoing::Ready {
             version: VERSION,
             options,
-            operations: Operations::for_actor::<S, Role>(),
+            operations,
         },
     )?;
 

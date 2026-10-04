@@ -7,8 +7,12 @@ publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
-test = false
 doctest = false
+
+[features]
+default = ["clock-1m"]
+clock-1m = ["embassy-time/tick-hz-1_000_000", "embassy-time-driver/tick-hz-1_000_000"]
+clock-32k = ["embassy-time/tick-hz-32_768", "embassy-time-driver/tick-hz-32_768"]
 
 [dependencies]
 aktor = { path = "../../aktor", default-features = false, features = ["macros", "embassy"] }
@@ -16,5 +20,8 @@ er = { version = "0.6", default-features = false, features = ["macros"] }
 embassy-sync = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 
-embassy-time = {version="0.5",features=["tick-hz-1_000_000"]}
-embassy-time-driver = {version="0.2",features=["tick-hz-1_000_000"]}
+embassy-time = "0.5"
+embassy-time-driver = "0.2"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }

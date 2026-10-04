@@ -4,6 +4,9 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 cargo fmt --all --check
 
+bash checks/macros.sh 1.89.0
+bash checks/macros.sh
+
 cargo +1.89.0 check --workspace --all-features --all-targets
 cargo +1.89.0 check -p aktor --no-default-features --lib
 cargo +1.89.0 check -p aktor --no-default-features --features wasm_browser_workers --lib

@@ -31,7 +31,7 @@ let count = record_many(&sensor, [4, 5]).await?;
 kill.stop();
 ```
 
-The listener drives the owners as well as shutdown. Use ActorArgs when your sensor needs setup or cleanup, listen_with(after) adds your final application closure. The host supplies embassy-time for timeout() and the shutdown budget.
+The listener drives the owners as well as shutdown, dropping it cancels them and gives you a failed report. Use ActorArgs when your sensor needs setup or cleanup, listen_with(after) adds your final application closure. The host supplies embassy-time for timeout() and the shutdown budget.
 
 It also runs on other local executors, [including isolated WASM hosts](../wasm/README.md).
 

@@ -6,6 +6,11 @@ use syn::{Block, Ident, Signature};
 pub struct Names {
     pub state: Ident,
     pub input: Ident,
+    pub operation: Ident,
+    pub inner: Ident,
+    pub results: Ident,
+    pub sender: Ident,
+    pub function: Ident,
     pub target: Ident,
     pub body: Ident,
     pub arguments: Vec<Ident>,
@@ -22,6 +27,11 @@ impl Names {
         Self {
             state: binding(&mut reserved, "__aktor_state"),
             input: binding(&mut reserved, "__aktor_input"),
+            operation: binding(&mut reserved, "__aktor_operation"),
+            inner: binding(&mut reserved, "__aktor_inner"),
+            results: binding(&mut reserved, "__aktor_results"),
+            sender: binding(&mut reserved, "__aktor_sender"),
+            function: binding(&mut reserved, "__aktor_function"),
             target: binding(&mut reserved, "__AktorTarget"),
             body: binding(
                 &mut reserved,
@@ -42,7 +52,7 @@ pub fn collect(tokens: TokenStream, reserved: &mut HashSet<String>) {
     for token in tokens {
         match token {
             TokenTree::Ident(ident) => {
-                reserved.insert(ident.to_string());
+                reserved.insert(ident.to_string().trim_start_matches("r#").to_owned());
             }
             TokenTree::Group(group) => collect(group.stream(), reserved),
             _ => {}

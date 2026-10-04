@@ -11,7 +11,7 @@ use core::{
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
-    task::{Context, Waker},
+    task::{Context, Poll, Waker},
 };
 use embassy_executor::{Executor, Spawner};
 use futures_util::{FutureExt, future::select};
@@ -53,6 +53,9 @@ async fn run_owner(
 
 #[embassy_executor::task]
 async fn exercise(spawner: Spawner) {
+    latest_callbacks().await;
+    driver_cancellation().await;
+
     for close_first in [false, true] {
         let (sensor, owner) = embassy::channel::<Sensor, 2, &'static str>().unwrap();
         let mut request = record::request(&sensor, 1);
@@ -366,7 +369,11 @@ async fn listening(spawner: Spawner) {
         let kill = actors.killswitch();
         let closing = actors.listen().unwrap();
         let completed = actors.completion();
-        assert!(actors.listen_with(async |_| Ok::<_, AktorError>(())).is_err());
+        assert!(
+            actors
+                .listen_with(async |_| Ok::<_, AktorError>(()))
+                .is_err()
+        );
         let readings = Rc::new(RefCell::new(Vec::new()));
         let values = readings.clone();
         let cleaned = Rc::new(Cell::new(false));
@@ -415,4 +422,463 @@ async fn listening(spawner: Spawner) {
         assert_eq!(Rc::strong_count(&plain_readings), 1);
         assert!(kill.is_stopping());
     }
+}
+
+std::thread_local! {
+    static LATEST: RefCell<Option<embassy::LatestSender<(u32,)>>> = const { RefCell::new(None) };
+    static QUEUED: RefCell<Option<embassy::Handle<Sensor, 2, ()>>> = const { RefCell::new(None) };
+}
+
+struct QueueWake(AtomicBool);
+impl std::task::Wake for QueueWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        if !self.0.swap(true, Ordering::SeqCst) {
+            QUEUED.with(|handle| {
+                drop(
+                    record::request(handle.borrow().as_ref().unwrap(), 2)
+                        .try_send()
+                        .unwrap(),
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn queue_callbacks() {
+    let readings = Rc::new(RefCell::new(Vec::new()));
+    let (handle, owner) = embassy::channel::<Sensor, 2, ()>().unwrap();
+    QUEUED.with(|stored| *stored.borrow_mut() = Some(handle.new_handle()));
+    let waker = Waker::from(std::sync::Arc::new(QueueWake(AtomicBool::new(false))));
+    let mut owner = Box::pin(owner.run(
+        Sensor {
+            readings: readings.clone(),
+        },
+        async |_| Ok(()),
+    ));
+    assert!(
+        owner
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+
+    let mut first = record::request(&handle, 1).try_send().unwrap();
+    handle.shutdown();
+    let mut finished = false;
+    for _ in 0..8 {
+        if let Poll::Ready(result) = owner.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            result.unwrap();
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "queued calls did not finish");
+    assert_eq!(*readings.borrow(), [1, 2]);
+    assert_eq!(first.try_take().unwrap().unwrap_report(), 1);
+    QUEUED.with(|stored| drop(stored.borrow_mut().take()));
+}
+
+#[test]
+#[allow(unsafe_code)]
+fn reply_callbacks() {
+    use core::task::{RawWaker, RawWakerVTable};
+
+    type Run = LocalFuture<'static, Result<(), Rc<embassy::OwnerError<()>>>>;
+    std::thread_local! {
+        static OWNER: RefCell<Option<Run>> = const { RefCell::new(None) };
+    }
+
+    fn clone(_: *const ()) -> RawWaker {
+        OWNER.with(|owner| {
+            if let Some(owner) = owner.borrow_mut().as_mut() {
+                let _ = owner.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            }
+        });
+        RawWaker::new(core::ptr::null(), &CALLBACKS)
+    }
+
+    fn noop(_: *const ()) {}
+
+    const CALLBACKS: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+
+    let readings = Rc::new(RefCell::new(Vec::new()));
+    let (handle, owner) = embassy::channel::<Sensor, 2, ()>().unwrap();
+    let mut reply = record(&handle, 1).try_send().unwrap();
+    OWNER.with(|stored| {
+        *stored.borrow_mut() = Some(Box::pin(owner.run(Sensor { readings }, async |_| Ok(()))));
+    });
+
+    // No pointer data or ownership, cloning drives this thread's owner once.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &CALLBACKS)) };
+    let result = Pin::new(&mut reply).poll(&mut Context::from_waker(&waker));
+    OWNER.with(|stored| drop(stored.borrow_mut().take()));
+    let Poll::Ready(result) = result else {
+        panic!("completion during waker clone was lost")
+    };
+    assert_eq!(result.unwrap_report(), 1);
+}
+
+struct LatestWake(AtomicBool);
+impl std::task::Wake for LatestWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        if !self.0.swap(true, Ordering::SeqCst) {
+            LATEST.with(|sender| {
+                aktor::latest::SendLatest::send(sender.borrow().as_ref().unwrap(), (2,))
+            });
+        }
+    }
+}
+impl Drop for LatestWake {
+    fn drop(&mut self) {
+        let sender = LATEST.with(|sender| sender.borrow_mut().take());
+        drop(sender);
+    }
+}
+
+async fn latest_callbacks() {
+    let readings = Rc::new(RefCell::new(Vec::new()));
+    let (handle, owner) = embassy::channel::<Sensor, 2, ()>().unwrap();
+    let (sender, mut results) = record::latest(&handle);
+    LATEST.with(|stored| *stored.borrow_mut() = Some(sender.inner.clone()));
+    let wake = std::sync::Arc::new(LatestWake(AtomicBool::new(false)));
+    let waker = Waker::from(wake.clone());
+    let mut owner = Box::pin(owner.run(
+        Sensor {
+            readings: readings.clone(),
+        },
+        async |_| Ok(()),
+    ));
+    assert!(
+        owner
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+
+    sender.send(1);
+    assert!(wake.0.load(Ordering::SeqCst));
+    assert!(
+        owner
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    assert_eq!(results.next().await.unwrap().unwrap_report(), 1);
+    assert_eq!(*readings.borrow(), vec![2]);
+
+    let mut next = Box::pin(results.next());
+    assert!(
+        next.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+    drop(wake);
+    assert!(
+        next.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    drop(next);
+    drop(results);
+    drop(sender);
+    drop(handle);
+    owner.await.unwrap();
+}
+
+struct CountWake(core::sync::atomic::AtomicUsize);
+impl std::task::Wake for CountWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+std::thread_local! {
+    static CANCEL_OWNER: RefCell<Option<embassy::Owner<u32, 1, ()>>> = const { RefCell::new(None) };
+}
+
+struct CancelWake;
+#[allow(clippy::manual_noop_waker, reason = "its destructor cancels the owner")]
+impl std::task::Wake for CancelWake {
+    fn wake(self: std::sync::Arc<Self>) {}
+}
+impl Drop for CancelWake {
+    fn drop(&mut self) {
+        let owner = CANCEL_OWNER.with(|owner| owner.borrow_mut().take());
+        drop(owner);
+    }
+}
+
+#[test]
+fn completion_callbacks() {
+    for ready in [false, true] {
+        let (handle, owner) = embassy::channel::<u32, 1, ()>().unwrap();
+        CANCEL_OWNER.with(|stored| *stored.borrow_mut() = Some(owner));
+        let completion = handle.completion();
+        let mut waiting: LocalFuture<'_, Result<(), Rc<embassy::OwnerError<()>>>> = if ready {
+            Box::pin(handle.ready())
+        } else {
+            Box::pin(completion.wait())
+        };
+        let waker = Waker::from(std::sync::Arc::new(CancelWake));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(waker);
+
+        let Poll::Ready(Err(error)) = waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("owner cancellation did not reach its observer")
+        };
+        assert!(matches!(&*error, embassy::OwnerError::Cancelled));
+    }
+}
+
+#[test]
+fn latest_cancellation_wakes() {
+    for running in [false, true] {
+        let (handle, owner) = embassy::channel::<Sensor, 2, ()>().unwrap();
+        let started = Rc::new(Signal::new());
+        let release = Rc::new(Signal::new());
+        let (sender, mut results) = hold(&handle, started, release).latest();
+        let mut owner = Box::pin(owner.run(
+            Sensor {
+                readings: Rc::new(RefCell::new(Vec::new())),
+            },
+            async |_| Ok(()),
+        ));
+        if running {
+            assert!(
+                owner
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        }
+
+        let wake = std::sync::Arc::new(CountWake(core::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut next = Box::pin(results.next());
+        assert!(
+            next.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        handle.shutdown();
+        assert!(
+            next.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let before = wake.0.load(Ordering::SeqCst);
+        drop(owner);
+        assert!(
+            wake.0.load(Ordering::SeqCst) > before,
+            "owner cancellation lost its wake"
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                next.as_mut().poll(&mut Context::from_waker(&waker))
+            }))
+            .is_err()
+        );
+        drop(next);
+        drop(sender);
+    }
+}
+
+async fn driver_cancellation() {
+    let waker = core::future::poll_fn(|cx| core::task::Poll::Ready(cx.waker().clone())).await;
+    for shutdown in [false, true] {
+        let mut group = embassy::AktorGroup::new();
+        if shutdown {
+            drop(group.shutdown());
+        } else {
+            group.killswitch().stop();
+        }
+        assert!(!group.shutdown().await.failed());
+        assert!(group.listen().is_err());
+        assert!(matches!(
+            group.spawn_value::<u32, 1>("late", 7),
+            Err(aktor::message::ActorError::Closed)
+        ));
+    }
+
+    for stage in 0..5 {
+        let mut group = embassy::AktorGroup::new();
+        let completion = group.completion();
+        let hook = Rc::new(Cell::new(false));
+        let entered = hook.clone();
+        let mut driver = group
+            .listen_with(async move |_| {
+                entered.set(true);
+                if stage == 4 {
+                    core::future::pending::<()>().await;
+                }
+                Ok::<_, AktorError>(())
+            })
+            .unwrap();
+        let handle = group
+            .spawn::<Sensor, 2, ()>(ActorArgs {
+                name: "sensor".into(),
+                capacity: 2,
+                setup: async move || {
+                    if stage == 1 {
+                        core::future::pending::<()>().await;
+                    }
+                    Ok(Sensor {
+                        readings: Rc::new(RefCell::new(Vec::new())),
+                    })
+                },
+                cleanup: async move |_| {
+                    if stage == 3 {
+                        core::future::pending::<()>().await;
+                    }
+                    Ok(())
+                },
+            })
+            .unwrap();
+        if stage != 0 {
+            assert!(
+                driver
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+        }
+        if stage == 2 {
+            let _reply = hold(&handle, Rc::new(Signal::new()), Rc::new(Signal::new()))
+                .try_send()
+                .unwrap();
+            assert!(
+                driver
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+        }
+        if stage >= 3 {
+            drop(group.shutdown());
+            assert!(
+                driver
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+        }
+        let count = std::sync::Arc::new(CountWake(core::sync::atomic::AtomicUsize::new(0)));
+        let observer_waker = Waker::from(count.clone());
+        let mut observed = Box::pin(completion.wait());
+        assert!(
+            observed
+                .as_mut()
+                .poll(&mut Context::from_waker(&observer_waker))
+                .is_pending()
+        );
+        drop(group.completion());
+        drop(driver);
+        assert!(count.0.load(Ordering::SeqCst) > 0);
+        let report = observed.now_or_never().expect("driver stranded completion");
+        assert!(report.failed());
+        assert!(group.listen().is_err());
+        assert!(matches!(
+            group.spawn_value::<u32, 1>("late", 7),
+            Err(aktor::message::ActorError::Closed)
+        ));
+        assert_eq!(hook.get(), stage == 4);
+    }
+
+    let group = embassy::AktorGroup::new();
+    let completion = group.completion();
+    let mut driver = Box::pin(group.run(
+        async |app| -> Result<(), AktorError> {
+            let _handle = app.spawn_value::<u32, 1>("counter", 0).unwrap();
+            core::future::pending().await
+        },
+        async |_| Ok::<_, AktorError>(()),
+    ));
+    assert!(
+        driver
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(driver);
+    assert!(
+        completion
+            .wait()
+            .now_or_never()
+            .expect("run stranded completion")
+            .failed()
+    );
+}
+
+#[test]
+fn registration_from_actor() {
+    let group = Rc::new(RefCell::new(embassy::AktorGroup::new()));
+    let mut driver = group.borrow_mut().listen().unwrap();
+    let weak = Rc::downgrade(&group);
+    let handle = group
+        .borrow_mut()
+        .spawn::<u32, 1, ()>(ActorArgs {
+            name: "first".into(),
+            capacity: 1,
+            setup: async move || {
+                let _second = weak
+                    .upgrade()
+                    .unwrap()
+                    .borrow_mut()
+                    .spawn_value::<u32, 1>("second", 7)
+                    .unwrap();
+                Ok(0)
+            },
+            cleanup: async |_| Ok(()),
+        })
+        .unwrap();
+    assert!(
+        driver
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+
+    let weak = Rc::downgrade(&group);
+    let reply = embassy::Request::new(
+        &handle,
+        aktor::operation::Operation {
+            name: "register",
+            caller: core::panic::Location::caller(),
+        },
+        async move |_, ()| {
+            let _third = weak
+                .upgrade()
+                .unwrap()
+                .borrow_mut()
+                .spawn_value::<u32, 1>("third", 17)
+                .unwrap();
+            17
+        },
+        (),
+    )
+    .try_send()
+    .unwrap();
+    assert!(
+        driver
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    assert_eq!(reply.now_or_never(), Some(17));
+
+    drop(handle);
+    drop(group.borrow().shutdown());
+    let report = driver.now_or_never().unwrap();
+    assert!(!report.failed());
+    assert_eq!(report.actors.len(), 3);
 }

@@ -2,8 +2,9 @@ use super::super::*;
 use core::{
     future::poll_fn,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
+use tokio::sync::TryAcquireError;
 
 impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
     pub fn new(
@@ -129,7 +130,25 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
                 self.admission = None;
                 Poll::Ready(self.submit(count, bytes))
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Err(error)) => {
+                self.admission = None;
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.parked {
+            return Poll::Pending;
+        }
+        match self.poll_submit(cx) {
+            Poll::Ready(Err(error)) => {
+                self.parked = true;
+                self.admission = None;
+                self.inner.lost(error)
+            }
+            Poll::Ready(Ok(())) => Poll::Ready(()),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -147,12 +166,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
     }
 
     pub async fn send(mut self) -> WorkerReply<O> {
-        poll_fn(|cx| match self.poll_submit(cx) {
-            Poll::Ready(Err(error)) => self.inner.lost(error),
-            other => other,
-        })
-        .await
-        .ok();
+        poll_fn(|cx| self.poll_send(cx)).await;
         match self.reply.take() {
             Some(reply) => reply,
             None => {
@@ -184,12 +198,16 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
             Err(error) => return Err(TrySendError::Rejected(self, error.without_data())),
         };
 
-        let Ok(count) = inner.count.clone().try_acquire_owned() else {
-            return Err(TrySendError::Full(self));
+        let count = match inner.count.clone().try_acquire_owned() {
+            Ok(count) => count,
+            Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(self)),
+            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(self)),
         };
 
-        let Ok(bytes) = inner.bytes.clone().try_acquire_many_owned(size as u32) else {
-            return Err(TrySendError::Full(self));
+        let bytes = match inner.bytes.clone().try_acquire_many_owned(size as u32) {
+            Ok(bytes) => bytes,
+            Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(self)),
+            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(self)),
         };
 
         match self.submit(count, bytes) {
@@ -217,14 +235,7 @@ impl<S, O: DeserializeOwned, Role> Future for WorkerRequest<'_, S, O, Role> {
             return Poll::Pending;
         }
 
-        match this.poll_submit(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(error)) => {
-                this.parked = true;
-                return this.inner.lost(error);
-            }
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(this.poll_send(cx));
 
         match this.reply.as_mut().map(|reply| reply.poll_result(cx)) {
             Some(Poll::Ready(Ok(output))) => Poll::Ready(output),

@@ -83,9 +83,9 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role> Request<'a, S, N, E, O
             consumed()
         };
 
-        match self.handle.inner.queue.try_send(message) {
+        match self.handle.inner.enqueue(message) {
             Ok(()) => Ok(self.reply),
-            Err(embassy_sync::channel::TrySendError::Full(message)) => {
+            Err(message) => {
                 self.message = Some(message);
                 Err(TrySendError::Full(self))
             }
@@ -97,6 +97,7 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role> Request<'a, S, N, E, O
             return Poll::Ready(true);
         }
 
+        self.closed.register(context);
         if !self.handle.inner.open.get() {
             if self.handle.inner.lost() {
                 return Poll::Pending;
@@ -104,21 +105,17 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role> Request<'a, S, N, E, O
             return Poll::Ready(false);
         }
 
-        self.closed.register(context);
-        ready!(self.handle.inner.queue.poll_ready_to_send(context));
-
         let Some(message) = self.message.take() else {
             consumed()
         };
 
-        match self.handle.inner.queue.try_send(message) {
+        match self.handle.inner.enqueue(message) {
             Ok(()) => {
                 self.submitted = true;
                 Poll::Ready(true)
             }
-            Err(embassy_sync::channel::TrySendError::Full(message)) => {
+            Err(message) => {
                 self.message = Some(message);
-                context.waker().wake_by_ref();
                 Poll::Pending
             }
         }
@@ -172,6 +169,7 @@ impl<O> Answer<O> {
     }
 
     fn poll(&self, context: &mut Context<'_>) -> Poll<Result<O, CallError>> {
+        let replacement = context.waker().clone();
         let previous = {
             let mut result = self.result.borrow_mut();
             core::mem::replace(&mut *result, AnswerState::Consumed)
@@ -180,7 +178,7 @@ impl<O> Answer<O> {
         match previous {
             AnswerState::Ready(output) => Poll::Ready(output),
             AnswerState::Waiting(previous) => {
-                *self.result.borrow_mut() = AnswerState::Waiting(Some(context.waker().clone()));
+                *self.result.borrow_mut() = AnswerState::Waiting(Some(replacement));
                 drop(previous);
                 Poll::Pending
             }

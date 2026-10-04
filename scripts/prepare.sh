@@ -10,6 +10,7 @@ fi
 bash scripts/check.sh
 bash scripts/check.sh browser
 bash scripts/check.sh embassy
+bash scripts/check.sh wasm
 
 # !Checks can update lockfiles! DONT export an older committed version by accident.
 if [[ -n "$(git status --porcelain)" ]]; then

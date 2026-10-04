@@ -25,10 +25,9 @@ dependencies = [
 
 [[package]]
 name = "aktor"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aktor-macros",
- "embassy-sync",
  "embassy-time",
  "er",
  "futures-core",
@@ -39,6 +38,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "postcard",
+ "rustix",
  "serde",
  "tokio",
  "wasm-bindgen",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "aktor-macros"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -725,6 +725,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "litrs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1063,6 +1069,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustix"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1180,16 +1199,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "signal-hook-registry"
-version = "1.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
-dependencies = [
- "errno",
- "libc",
-]
 
 [[package]]
 name = "slab"
@@ -1313,7 +1322,6 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys",
