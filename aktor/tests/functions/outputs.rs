@@ -27,6 +27,12 @@ async fn precise<'a>(state: &'a usize) -> impl Iterator<Item = usize> + Send + u
     0..*state
 }
 
+#[aktor]
+async fn named<'a>(state: &'a usize) -> impl Iterator<Item = usize> + Send {
+    let count: &'a usize = state;
+    0..*count
+}
+
 #[tokio::test]
 async fn replies() {
     let executor = tokio::task::LocalSet::new();
@@ -50,6 +56,7 @@ async fn replies() {
             let nested = fallible::request(&handle).send().await;
             let generic = supplied::request(&handle, vec!["a", "b"]).send().await;
             let captured = precise::request(&handle).send().await;
+            let named = named::request(&handle).send().await;
             let nested_inputs = lengths::request(&handle, vec![String::from("Haandboldfuglen")])
                 .send()
                 .await;
@@ -84,6 +91,7 @@ async fn replies() {
             );
 
             assert_eq!(nested_inputs.await.collect::<Vec<_>>(), [15]);
+            assert_eq!(named.await.collect::<Vec<_>>(), [0, 1, 2]);
             task.await.unwrap();
         })
         .await

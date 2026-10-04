@@ -67,17 +67,13 @@ async fn waiting_admission() {
         },
         (),
     )
-    .checked_send()
-    .await
-    .unwrap();
+    .send()
+    .await;
     running.await.unwrap();
 
-    let second = call(&handle, |state, ()| *state += 1, ())
-        .checked_send()
-        .await
-        .unwrap();
+    let second = call(&handle, |state, ()| *state += 1, ()).send().await;
 
-    let mut waiting = Box::pin(call(&handle, |state, ()| *state += 100, ()).checked());
+    let mut waiting = Box::pin(call(&handle, |state, ()| *state += 100, ()));
     assert!(poll(waiting.as_mut()).is_pending());
 
     let mut stopping = Box::pin(actor.shutdown());
@@ -86,9 +82,9 @@ async fn waiting_admission() {
     release.send(()).unwrap();
     stopping.await.unwrap();
 
-    assert_eq!(first.await, Ok(()));
-    assert_eq!(second.await, Ok(()));
-    assert_eq!(waiting.await, Err(CallError::NotAdmitted));
+    first.await;
+    second.await;
+    assert!(AssertUnwindSafe(waiting).catch_unwind().await.is_err());
     thread.join_async().await.unwrap().unwrap();
 }
 
@@ -105,11 +101,11 @@ async fn paused() {
     .unwrap();
 
     actor.pause().await.unwrap();
-    assert_eq!(
+    assert!(
         call(&handle, |_: &mut (), ()| panic!("paused work ran"), ())
-            .checked()
-            .await,
-        Err(CallError::NotAdmitted)
+            .timeout(Duration::from_millis(1))
+            .await
+            .is_err()
     );
 
     actor.shutdown().await.unwrap();
@@ -140,16 +136,12 @@ async fn failed_cleanup() {
     .unwrap();
 
     call(&handle, |_, ()| -> () { panic!("operation failed") }, ())
-        .checked_cast()
-        .await
-        .unwrap();
+        .cast()
+        .await;
     cleaning.await.unwrap();
 
     assert!(!actor.is_running());
-    assert_eq!(
-        call(&handle, |_, ()| (), ()).checked().await,
-        Err(CallError::NotAdmitted)
-    );
+    assert!(call(&handle, |_, ()| (), ()).try_send().is_err());
 
     release.send(()).unwrap();
     assert!(thread.join_async().await.is_err());

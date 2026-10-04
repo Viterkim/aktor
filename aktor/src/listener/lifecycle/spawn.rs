@@ -1,4 +1,5 @@
 use super::*;
+use crate::FailurePolicy;
 use std::thread;
 use tokio::{runtime, task};
 
@@ -33,6 +34,9 @@ where
     let actor_name = name.clone();
     let (handle, mut listener) =
         channel(capacity).map_err(|_| DedicatedStartError::InvalidCapacity)?;
+    if let FailurePolicy::Group(group) = &failure {
+        listener.admission.manage(name.clone(), group.clone());
+    }
     listener.failure = failure;
     listener.name = name.clone();
 
@@ -41,17 +45,44 @@ where
         .build()
         .map_err(DedicatedStartError::Thread)?;
 
+    let group = match &listener.failure {
+        FailurePolicy::Group(group) => Some(group.clone()),
+        _ => None,
+    };
     let (commands, receiver) = mpsc::channel(1);
+    let (force, forced) = watch::channel(false);
     let (status, running) = watch::channel(false);
     let abandoned_setup = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let retained_setup = abandoned_setup.clone();
+    let failed_cleanup = Arc::new(Mutex::new(FailedCleanup { errors: Vec::new() }));
+    let retained_cleanup = failed_cleanup.clone();
     let (started, ready) = oneshot::channel();
+    #[cfg(not(target_family = "wasm"))]
+    let lifetime = match &listener.failure {
+        FailurePolicy::Group(group) => Some(group.track_thread(actor_name.clone())),
+        _ => None,
+    };
 
     let thread = thread::Builder::new()
         .name(name)
         .spawn(move || {
-            Some(match runtime.block_on(async { setup().await }) {
-                Ok(state) => run::run(
+            #[cfg(not(target_family = "wasm"))]
+            let _lifetime = lifetime;
+            let initialized = runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        if let Some(group) = &group {
+                            group.wait_for_force().await;
+                        } else {
+                            core::future::pending::<()>().await;
+                        }
+                    } => None,
+                    result = async { setup().await } => Some(result),
+                }
+            });
+            Some(match initialized {
+                Some(Ok(state)) => run::run(
                     &runtime,
                     state,
                     listener,
@@ -60,10 +91,17 @@ where
                     started,
                     cleanup,
                     retained_setup,
+                    retained_cleanup,
+                    forced,
                 ),
-                Err(error) => {
+                Some(Err(error)) => {
                     drop(listener);
-                    let _result = started.send(Err(error));
+                    let _result = started.send(Err(DedicatedStartError::Init(error)));
+                    Ok(())
+                }
+                None => {
+                    drop(listener);
+                    let _result = started.send(Err(DedicatedStartError::Closed));
                     Ok(())
                 }
             })
@@ -73,12 +111,16 @@ where
     match ready.await {
         Ok(Ok(())) => {
             let finished = handle.inner.finished.clone();
+            let admission = handle.inner.admission.clone();
             Ok((
                 handle,
                 Actor {
+                    admission,
                     commands,
+                    force,
                     running,
                     abandoned_setup,
+                    failed_cleanup,
                 },
                 Dedicated { thread, finished },
             ))
@@ -87,7 +129,7 @@ where
             let joined = task::spawn_blocking(move || thread.join()).await;
 
             match result {
-                Ok(Err(error)) => Err(DedicatedStartError::Init(error)),
+                Ok(Err(error)) => Err(error),
                 _ => Err(DedicatedStartError::Panicked {
                     actor: actor_name,
                     cause: crate::listener::startup_cause(joined),

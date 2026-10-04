@@ -1,39 +1,45 @@
 # Browser SQLite
 
-The [preferences](src/preferences) queries use #[aktor], running in a worker so SQLite can be busy while the page keeps going. Enable the worker feature, then in your page:
+The [preferences](src/preferences) queries use #[aktor], running in a worker so SQLite can be busy while the page keeps going. Enable wasm_browser_workers, then register it with your [AktorGroup](../../README.md#example):
 
 ```rust
 use aktor::*;
-use worker::{Options, Worker};
+use worker::Options;
 use rusqlite::Connection;
 
-let database = Worker::<Connection>::open(
-    "worker.js",
-    Options {
-        build: "preferences-v1".into(),
-        ..Options::default()
-    },
-)
-.await?;
+let mut actors = AktorGroup::new();
+let kill = actors.killswitch();
+let closing = actors.start()?;
+let options = Options {
+    build: "preferences-v1".into(),
+    ..Options::default()
+};
+
+let database = actors.worker::<Connection>("preferences", "worker.js", options).await?;
 
 let volume = read(&database, "volume".into()).await?;
-
-database.shutdown().wait().await?;
 ```
 
-In the worker, list the functions it can receive:
+The group starts its own shutdown task. Put kill.stop() in the UI Close handler and await closing before leaving the page. SQLite runs inside that same worker, open the connection there and start serving:
 
 ```rust
-worker_routes!(
-    routes,
-    Connection,
-    [crate::preferences::read::read, crate::preferences::write::write]
-);
+let cleanup = async |connection: Connection| {
+    connection.close()
+        .map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
+};
+let options = Options {
+    build: "preferences-v1".into(),
+    ..Options::default()
+};
+
+worker::serve_with(connection, cleanup, options)?.wait().await?;
 ```
 
-Those arguments and results need Serde. Calls inside the worker use the connection directly. Use the same build name on both sides.
+Just put #[aktor] above the functions, they're picked up automatically. Worker calls need concrete owned arguments and results with Serde, calls inside the worker use the connection directly. Use the same build name on both sides, change it when your data format changes. Startup checks operation names and type names too, changing fields inside a struct won't show up there.
 
-[Startup](src/browser.rs) opens SQLite in OPFS (browser storage that survives reloading) and passes routes to serve_with. [worker.js](web/worker.js) loads the WASM.
+capacity and max_outstanding_bytes limit ordinary calls waiting for replies. A bigger message takes the whole byte budget and runs on its own, latest sessions keep their pending input outside those limits. The byte budget isn't a ceiling on all the memory the worker uses.
+
+[Startup](src/browser.rs) opens SQLite in OPFS (browser storage that survives reloading) and keeps the server alive with wait() while it handles calls. [worker.js](web/worker.js) loads the WASM.
 
 ## Try it
 

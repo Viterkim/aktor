@@ -21,7 +21,9 @@ impl FailurePolicy {
     }
 
     pub fn report(&self, failure: &Failure) {
-        let _written = writeln!(std::io::stderr().lock(), "{failure}");
+        if !matches!(self, Self::Group(_)) {
+            let _written = writeln!(std::io::stderr().lock(), "{failure}");
+        }
 
         match self {
             Self::Abort => std::process::abort(),
@@ -34,6 +36,11 @@ impl FailurePolicy {
                     std::process::abort();
                 }
             }
+            Self::Group(group) => group.fail(crate::group::ActorFailure {
+                actor: failure.actor.clone(),
+                phase: format!("{:?}", failure.kind),
+                message: failure.to_string(),
+            }),
             Self::Unwind => {}
         }
     }

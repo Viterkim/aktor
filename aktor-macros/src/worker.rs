@@ -38,9 +38,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     let state = input::parse::state(&function.signature.inputs[0])?;
     let state_type = &state.ty;
-    let (implementation, invoke) =
-        signature::implementation(&function.signature, &mut names, &output);
-    let body = &function.body;
+    let (implementation, invoke) = signature::implementation(&function, &mut names, &output);
+    let body_type = &names.body;
 
     let input_type = signature::inputs(&function.signature);
     let input_types: Vec<_> = function
@@ -73,6 +72,11 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let target = &names.target;
     let state_name = &names.state;
     let input_name = &names.input;
+    let operation_name = &names.operation;
+    let inner_name = &names.inner;
+    let results_name = &names.results;
+    let sender_name = &names.sender;
+    let function_name = &names.function;
     let parameter = match &state.pattern {
         syn::Pat::Ident(pattern) if pattern.subpat.is_none() => pattern.ident.clone(),
         _ => state_name.clone(),
@@ -90,6 +94,12 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let input_parameter = names::binding(&mut names.reserved, "__AktorInput");
     let output_parameter = names::binding(&mut names.reserved, "__AktorOutput");
     let role_parameter = names::binding(&mut names.reserved, "__AktorRole");
+    let latest_factory = names::binding(&mut names.reserved, "__AktorLatestFactory");
+    let latest_state = names::binding(&mut names.reserved, "__AktorLatestState");
+    let latest_input = names::binding(&mut names.reserved, "__AktorLatestInput");
+    let latest_output = names::binding(&mut names.reserved, "__AktorLatestOutput");
+    let latest_role = names::binding(&mut names.reserved, "__AktorLatestRole");
+    let latest_inner = names::binding(&mut names.reserved, "__AktorLatestInner");
     let function_parameter = names::binding(&mut names.reserved, "__AktorFunction");
     let state_reference_generic = if state.mutable {
         quote!(&'s mut #state_parameter)
@@ -103,13 +113,23 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     );
     function.signature.generics.params.push(parse_quote!(#mode));
 
+    function.signature.asyncness = None;
+    function.signature.output = parse_quote!(-> #aktor::call::Call<#target, #input_type, <#target as #name::#dispatch_trait<#mode, #state_type, #input_type, #output, #role>>::Request, #name::#latest_factory<#state_type, #input_type, #output, #role>>);
     let signature = &function.signature;
     let visibility = &function.visibility;
     let attributes = &function.attributes;
 
-    let mut scope = signature::scope::Child {
-        shadowed: &["NAME", "request", "export"],
-    };
+    let mut scope = signature::scope::Child::new(
+        &[
+            "NAME",
+            "request",
+            "export",
+            "latest",
+            "LatestSender",
+            "Latest",
+        ],
+        &function.signature.generics,
+    );
     let mut state_type = state_type.clone();
     scope.visit_type_mut(&mut state_type);
     let mut input_type = input_type.clone();
@@ -137,22 +157,89 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         quote!(&#state_type)
     };
 
-    Ok(quote! {
+    let wrapper = quote! {
         #(#attributes)*
+        #[track_caller]
         #visibility #signature {
-            #name::request(#parameter, #(#bindings),*).await
+            #name::request(#parameter, #(#bindings),*)
         }
 
-        #(#attributes)*
-        #[doc(hidden)]
-        #implementation #body
+    };
+    let bindings = &names.arguments;
+    let parameter = state_name;
+
+    Ok(quote! {
+        #wrapper
+        #implementation
 
         #visibility mod #name {
             use super::*;
 
+            #[allow(non_camel_case_types)]
+            #[doc(hidden)]
+            pub struct #body_type;
+
             pub const NAME: &str = ::core::module_path!();
 
+            #[derive(Clone)]
+            pub struct LatestSender<#latest_inner> {
+                pub inner: #latest_inner,
+            }
+            impl<#latest_inner: #aktor::latest::SendLatest<#input_type>> LatestSender<#latest_inner> {
+                pub fn send(&self, #(#bindings: #input_types),*) {
+                    #aktor::latest::SendLatest::send(&self.inner, (#(#bindings,)*));
+                }
+            }
+
             #[doc(hidden)]
+            pub struct #latest_factory<#latest_state, #latest_input, #latest_output, #latest_role> {
+                pub marker: ::core::marker::PhantomData<fn() -> (#latest_state, #latest_input, #latest_output, #latest_role)>,
+            }
+            impl<#target> #aktor::latest::Factory<#target, #input_type> for #latest_factory<#state_type, #input_type, #output, #role>
+            where
+                #target: #aktor::latest::Session<#state_type, #input_type, #output, #role>,
+            {
+                type Sender = LatestSender<<#target as #aktor::latest::Session<#state_type, #input_type, #output, #role>>::Sender>;
+                type Results = <#target as #aktor::latest::Session<#state_type, #input_type, #output, #role>>::Results;
+
+                fn start(self, #parameter: #target, #input_name: #input_type, #operation_name: #aktor::operation::Operation) -> (Self::Sender, Self::Results) {
+                    let (#(#bindings,)*) = #input_name;
+                    let (#inner_name, #results_name) = #aktor::latest::Session::session(
+                        #parameter, #operation_name,
+                        async move |#state_name: &mut #state_type, #input_name| {
+                            let (#(#bindings,)*) = #input_name;
+                            #invoke(#state_name, #(#bindings),*).await
+                        },
+                    );
+                    let #sender_name = LatestSender { inner: #inner_name };
+                    #sender_name.send(#(#bindings),*);
+                    (#sender_name, #results_name)
+                }
+            }
+
+            #[track_caller]
+            pub fn latest<#target>(#parameter: #target) -> (
+                LatestSender<<#target as #aktor::latest::Session<#state_type, #input_type, #output, #role>>::Sender>,
+                <#target as #aktor::latest::Session<#state_type, #input_type, #output, #role>>::Results
+            )
+            where
+                #target: #aktor::latest::Session<#state_type, #input_type, #output, #role>,
+            {
+                let (#inner_name, #results_name) = #aktor::latest::Session::session(
+                    #parameter,
+                    #aktor::operation::Operation { name: NAME, caller: ::core::panic::Location::caller() },
+                    async move |#state_name: &mut #state_type, #input_name| {
+                        let (#(#bindings,)*) = #input_name;
+                        #invoke(#state_name, #(#bindings),*).await
+                    },
+                );
+                (LatestSender { inner: #inner_name }, #results_name)
+            }
+
+            #[doc(hidden)]
+            #[diagnostic::on_unimplemented(
+                note = "Check the actor's state type and actor marker. Browser worker arguments and results must implement Serialize and DeserializeOwned."
+            )]
             pub trait #dispatch_trait<
                 #mode,
                 #state_parameter: 'static,
@@ -164,9 +251,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
                 fn request<#function_parameter>(
                     self,
-                    input: #input_parameter,
-                    operation: #aktor::operation::Operation,
-                    function: #function_parameter
+                    #input_name: #input_parameter,
+                    #operation_name: #aktor::operation::Operation,
+                    #function_name: #function_parameter
                 ) -> Self::Request
                 where
                     #function_parameter: for<'s> ::core::ops::AsyncFnOnce(
@@ -199,9 +286,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
                 fn request<#function_parameter>(
                     self,
-                    input: #input_parameter,
-                    operation: #aktor::operation::Operation,
-                    function: #function_parameter
+                    #input_name: #input_parameter,
+                    #operation_name: #aktor::operation::Operation,
+                    #function_name: #function_parameter
                 ) -> Self::Request
                 where
                     #function_parameter: for<'s> ::core::ops::AsyncFnOnce(
@@ -211,9 +298,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 {
                     <#target as #dispatch<#state_parameter, #input_parameter, #role_parameter>>::dispatch(
                         self,
-                        operation,
-                        function,
-                        input
+                        #operation_name,
+                        #function_name,
+                        #input_name
                     )
                 }
             }
@@ -247,8 +334,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
                 fn request<#function_parameter>(
                     self,
-                    input: #input_parameter,
-                    operation: #aktor::operation::Operation,
+                    #input_name: #input_parameter,
+                    #operation_name: #aktor::operation::Operation,
                     _: #function_parameter
                 ) -> Self::Request
                 where
@@ -257,7 +344,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                         #input_parameter
                     ) -> #output_parameter + ::core::marker::Send + 'static
                 {
-                    #aktor::target::Transport::request(self, operation, input)
+                    #aktor::target::Transport::request(self, #operation_name, #input_name)
                 }
             }
 
@@ -265,21 +352,23 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             pub fn request<
                 #target: #dispatch_trait<#mode, #state_type, #input_type, #output, #role>,
                 #mode
-            >(#parameter: #target, #(#bindings: #input_types),*) -> #target::Request {
-                #parameter.request(
-                    (#(#bindings,)*),
-                    #aktor::operation::Operation {
-                        name: NAME,
-                        caller: ::core::panic::Location::caller(),
-                    },
-                    async move |#state_name: #state_reference, #input_name| {
-                        let (#(#bindings,)*) = #input_name;
-                        super::#invoke(#state_name, #(#bindings),*).await
-                    }
+            >(#parameter: #target, #(#bindings: #input_types),*) -> #aktor::call::Call<#target, #input_type, #target::Request, #latest_factory<#state_type, #input_type, #output, #role>> {
+                #aktor::call::Call::new(
+                    #parameter, (#(#bindings,)*),
+                    #aktor::operation::Operation { name: NAME, caller: ::core::panic::Location::caller() },
+                    |#parameter, #input_name, #operation_name| #parameter.request(
+                        #input_name, #operation_name,
+                        async move |#state_name: #state_reference, #input_name| {
+                            let (#(#bindings,)*) = #input_name;
+                            #invoke(#state_name, #(#bindings),*).await
+                        },
+                    ),
+                    #latest_factory { marker: ::core::marker::PhantomData },
                 )
             }
 
             #[doc(hidden)]
+            #[derive(Default)]
             struct #adapter;
             impl #aktor::target::Export for #adapter {
                 type State = #state_type;
@@ -289,12 +378,12 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
                 fn run(
                     self,
-                    state: &mut #state_type,
-                    input: #input_type
+                    #state_name: &mut #state_type,
+                    #input_name: #input_type
                 ) -> #aktor::message::LocalFuture<'_, #output> {
                     #aktor::message::boxed(async move {
-                        let (#(#bindings,)*) = input;
-                        super::#invoke(state, #(#bindings),*).await
+                        let (#(#bindings,)*) = #input_name;
+                        #invoke(#state_name, #(#bindings),*).await
                     })
                 }
             }
@@ -307,6 +396,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             > {
                 #adapter
             }
+
+            #aktor::__aktor_register!(#adapter, NAME);
         }
     })
 }

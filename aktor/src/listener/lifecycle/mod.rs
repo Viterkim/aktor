@@ -11,9 +11,16 @@ pub mod spawn;
 use answer::{ReplaceReply, ResumeReply, SetupAnswer};
 
 pub struct Actor<S, E, C> {
+    admission: Arc<crate::queue::Admission>,
     commands: mpsc::Sender<Command<S, E, C>>,
+    force: watch::Sender<bool>,
     running: watch::Receiver<bool>,
     abandoned_setup: Arc<Mutex<Vec<AbandonedSetup<E>>>>,
+    failed_cleanup: Arc<Mutex<FailedCleanup<C>>>,
+}
+
+pub struct FailedCleanup<C> {
+    errors: Vec<Arc<C>>,
 }
 
 #[derive(Debug)]

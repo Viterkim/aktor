@@ -27,7 +27,7 @@ cargo +1.89.0 test --manifest-path aktor/Cargo.toml --features tokio --all-targe
 RUSTDOCFLAGS="-D warnings" cargo +1.89.0 doc --manifest-path aktor/Cargo.toml --features tokio --no-deps
 cargo +1.89.0 test --manifest-path aktor/Cargo.toml --no-default-features --features tokio --all-targets
 cargo +1.89.0 check --manifest-path aktor/Cargo.toml --no-default-features \
-    --features macros,worker --target wasm32-unknown-unknown
+    --features macros,wasm_browser_workers --target wasm32-unknown-unknown
 cargo +1.89.0 test --manifest-path integrations/Cargo.toml
 cargo +1.89.0 run --manifest-path integrations/Cargo.toml -p renamed
 cargo +1.89.0 check --manifest-path integrations/Cargo.toml -p aktor-worker-proof \

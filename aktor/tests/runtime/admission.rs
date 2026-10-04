@@ -106,7 +106,7 @@ async fn reply() {
 }
 
 #[tokio::test]
-async fn checked() {
+async fn owner_failure() {
     let executor = tokio::task::LocalSet::new();
 
     executor
@@ -114,18 +114,20 @@ async fn checked() {
             let (handle, listener) = channel::<()>(1).unwrap();
             drop(listener);
 
-            assert_eq!(
-                call(&handle, |_, ()| 1, ()).checked().await,
-                Err(CallError::NotAdmitted)
+            assert!(
+                AssertUnwindSafe(call(&handle, |_, ()| 1, ()))
+                    .catch_unwind()
+                    .await
+                    .is_err()
             );
 
             let (handle, mut listener) = channel::<()>(1).unwrap();
-            let reply = call(&handle, |_, ()| 1, ()).checked_send().await.unwrap();
+            let reply = call(&handle, |_, ()| 1, ()).send().await;
 
             listener.close();
             drop(listener);
 
-            assert_eq!(reply.await, Err(CallError::Discarded));
+            assert!(AssertUnwindSafe(reply).catch_unwind().await.is_err());
 
             let (handle, task) =
                 spawn_local_with_policy(&executor, (), 1, FailurePolicy::Unwind).unwrap();
@@ -138,7 +140,7 @@ async fn checked() {
             .try_send()
             .unwrap();
 
-            assert_eq!(reply.checked().await, Ok(Err("domain")));
+            assert_eq!(reply.await, Err("domain"));
 
             drop(handle);
             task.await.unwrap();
@@ -147,11 +149,10 @@ async fn checked() {
                 spawn_local_with_policy(&executor, (), 1, FailurePolicy::Unwind).unwrap();
 
             let reply = call(&handle, |_, ()| -> () { panic!("operation failed") }, ())
-                .checked_send()
-                .await
-                .unwrap();
+                .send()
+                .await;
 
-            assert_eq!(reply.await, Err(CallError::OutcomeUnknown));
+            assert!(AssertUnwindSafe(reply).catch_unwind().await.is_err());
             assert!(task.await.is_err());
         })
         .await

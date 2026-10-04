@@ -5,14 +5,18 @@ use er::Er;
 mod error;
 #[cfg(feature = "tokio")]
 mod native;
+#[doc(hidden)]
+pub use error::consumed;
 #[cfg(any(feature = "tokio", feature = "embassy"))]
 #[doc(hidden)]
-pub use error::{consumed, stopped};
+pub use error::stopped;
 #[cfg(feature = "tokio")]
 pub use native::*;
 
 #[derive(Clone, Copy, Er, PartialEq, Eq)]
 pub enum ActorError {
+    #[er(format = "start the actor group listener before spawning actors")]
+    NotStarted,
     #[er(format = "actor capacity is outside the supported range")]
     InvalidCapacity,
     #[er(format = "actor closed")]
@@ -21,7 +25,10 @@ pub enum ActorError {
 
 pub type ActorResult<T> = Result<T, ActorError>;
 
-#[cfg_attr(feature = "worker", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "wasm_browser_workers",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Clone, Copy, Er, PartialEq, Eq)]
 pub enum CallError {
     #[er(format = "actor did not admit the request")]
@@ -30,8 +37,6 @@ pub enum CallError {
     Discarded,
     #[er(format = "actor failed after the request started; the outcome is unknown")]
     OutcomeUnknown,
-    #[er(format = "newer queued work superseded the request")]
-    Superseded,
 }
 
 /// Failed immediate submission preserves the request.

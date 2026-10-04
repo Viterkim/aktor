@@ -1,6 +1,6 @@
 # Embassy + alloc
 
-Enable embassy and supply an allocator. One task runs the owner:
+Enable embassy and supply an allocator. The owner stays on your executor:
 
 ```rust
 let (sensor, owner) = embassy::channel::<Sensor, 2, &'static str>()?;
@@ -8,10 +8,32 @@ spawner.spawn(sensor_owner(owner)?);
 sensor.ready().await?;
 
 let count = record_many(&sensor, [4, 5]).await?;
-sensor.shutdown().wait().await?;
+sensor.shutdown().await?;
 ```
 
 The 2 is queue capacity. [sensor_owner](src/lib.rs) runs setup and cleanup, record_many calls record with its local sensor. Handles stay on the owner's executor, state and arguments can contain Rc. Outputs still need Send + 'static.
+
+embassy::AktorGroup keeps the owners together. Start its listener on your executor:
+
+```rust
+#[embassy_executor::task]
+async fn actors_task(closing: aktor::message::LocalFuture<'static, ShutdownReport>) {
+    let report = closing.await;
+    show_report(report);
+}
+
+let mut actors = embassy::AktorGroup::new();
+let kill = actors.killswitch();
+spawner.spawn(actors_task(actors.listen()?)?);
+
+let sensor = actors.spawn_value::<Sensor, 2>("sensor", sensor)?;
+let count = record_many(&sensor, [4, 5]).await?;
+kill.stop();
+```
+
+The listener drives the owners as well as shutdown, dropping it cancels them and gives you a failed report. Use ActorArgs when your sensor needs setup or cleanup, listen_with(after) adds your final application closure. The host supplies embassy-time for timeout() and the shutdown budget.
+
+It also runs on other local executors, [including isolated WASM hosts](../wasm/README.md).
 
 ## Try it
 
@@ -29,4 +51,4 @@ rustup +1.89.0 target add thumbv6m-none-eabi thumbv7em-none-eabihf
 bash scripts/check.sh embassy
 ```
 
-On a board you'll need your panic handler and timer driver too. Latest and pause/resume/replace aren't implemented here yet.
+On a board you'll need your panic handler and timer driver too. pause/resume/replace aren't implemented here yet.

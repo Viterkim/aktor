@@ -19,7 +19,7 @@ embassy-time = { version = "0.5", features = ["std"] }
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
 
 [dev-dependencies]
-futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await", "std"] }
 
 [lints.rust]
 unsafe_code = "deny"

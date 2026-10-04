@@ -31,6 +31,8 @@ pub struct Failure {
 #[derive(Clone, Default)]
 pub enum FailurePolicy {
     Abort,
+    #[doc(hidden)]
+    Group(crate::group::KillSwitch),
     Shutdown(Arc<dyn Fn(&Failure) + Send + Sync>),
     #[default]
     Unwind,
@@ -39,6 +41,7 @@ pub enum FailurePolicy {
 pub struct Failures {
     pub actor: String,
     pub first: Option<Failure>,
+    pub group: Option<crate::group::KillSwitch>,
 }
 
 pub struct FailurePanic {

@@ -75,6 +75,10 @@ pub struct DedicatedJoinError {
 
 #[derive(Er)]
 pub enum DedicatedStartError<E> {
+    #[er(format = "start the actor group before spawning actors")]
+    NotStarted,
+    #[er(format = "actor group is closing")]
+    Closed,
     #[er(format = "an owned actor needs a Tokio runtime")]
     NoRuntime,
     #[er(format = "actor capacity is outside Tokio's supported range")]

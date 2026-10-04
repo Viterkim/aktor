@@ -1,327 +1,313 @@
 use super::*;
-use aktor::listener::Listener;
-use std::{
-    sync::{
-        Arc, Barrier, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use aktor::message::call_async;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
-#[test]
-fn concurrent() {
-    if std::env::var("AKTOR_CHILD").as_deref() != Ok("concurrent latest") {
-        let output = support::child("latest::concurrent", "concurrent latest");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-
-    struct Key {
-        value: u32,
-        barrier: Option<Arc<Barrier>>,
-        first: AtomicBool,
-    }
-    impl PartialEq for Key {
-        fn eq(&self, other: &Self) -> bool {
-            if self.first.swap(false, Ordering::SeqCst)
-                && let Some(barrier) = &self.barrier
-            {
-                barrier.wait();
-            }
-
-            self.value == other.value
-        }
-    }
-    impl Eq for Key {}
-
-    fn append(state: &mut Vec<u32>, value: u32) {
-        state.push(value);
-    }
-
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            for immediate in [false, true] {
-                let capacity = if immediate { 3 } else { 2 };
-                let (handle, listener) = channel::<Vec<u32>>(capacity).unwrap();
-
-                let first = call(&handle, append, 0)
-                    .latest(Key {
-                        value: 0,
-                        barrier: None,
-                        first: AtomicBool::new(false),
-                    })
-                    .try_send()
-                    .unwrap()
-                    .checked();
-
-                let barrier = Arc::new(Barrier::new(2));
-                let replies = std::thread::scope(|scope| {
-                    let threads: Vec<_> = (1..=2)
-                        .map(|value| {
-                            let handle = &handle;
-                            let barrier = barrier.clone();
-                            scope.spawn(move || {
-                                let request = call(handle, append, value).latest(Key {
-                                    value: 1,
-                                    barrier: Some(barrier),
-                                    first: AtomicBool::new(true),
-                                });
-
-                                if immediate {
-                                    request.try_send().unwrap().checked()
-                                } else {
-                                    tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                        .unwrap()
-                                        .block_on(request.checked_send())
-                                        .unwrap()
-                                }
-                            })
-                        })
-                        .collect();
-
-                    threads
-                        .into_iter()
-                        .map(|thread| thread.join().unwrap())
-                        .collect::<Vec<_>>()
-                });
-
-                assert_eq!(handle.capacity(), capacity - 2);
-                drop(handle);
-
-                let state = listener.run(Vec::new()).await;
-                assert_eq!(state.len(), 2);
-                assert_eq!(state[0], 0);
-                first.await.unwrap();
-
-                let mut superseded = 0;
-                for reply in replies {
-                    match reply.await {
-                        Ok(()) => {}
-                        Err(CallError::Superseded) => superseded += 1,
-                        outcome => panic!("unexpected latest outcome: {outcome:?}"),
-                    }
-                }
-
-                assert_eq!(superseded, 1);
-            }
-        });
+struct Rows(u32, std::marker::PhantomPinned);
+struct QueryError(u32);
+struct Database {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    calls: Arc<Mutex<Vec<u32>>>,
 }
 
-#[test]
-fn reentrant() {
-    if std::env::var("AKTOR_CHILD").as_deref() != Ok("latest key") {
-        let output = support::child("latest::reentrant", "latest key");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
+#[aktor]
+async fn search(db: &mut Database, query: u32) -> Result<Rows, QueryError> {
+    db.calls.lock().unwrap().push(query);
+    if query == 1 {
+        db.started.notify_one();
+        db.release.notified().await;
+    }
+    if query == 0 {
+        Err(QueryError(query))
+    } else {
+        Ok(Rows(query, std::marker::PhantomPinned))
+    }
+}
+
+#[tokio::test]
+async fn current_results() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (handle, listener) = channel::<Database>(1).unwrap();
+    let (input, mut output) = search(&handle, 1).latest();
+    let owner = listener.run(Database {
+        started: started.clone(),
+        release: release.clone(),
+        calls: calls.clone(),
+    });
+    let client = async move {
+        started.notified().await;
+        for query in 2..=1000 {
+            input.send(query);
+        }
+        let ordinary = call(&handle, |_, ()| 17, ()).send().await;
+        release.notify_one();
+        assert_eq!(ordinary.await, 17);
+        let Some(Ok(rows)) = output.next().await else {
+            panic!("latest output missing");
+        };
+        assert_eq!(rows.0, 1000);
+        assert_eq!(*calls.lock().unwrap(), [1, 1000]);
+
+        input.send(0);
+        let Some(Err(error)) = output.next().await else {
+            panic!("ordinary error missing");
+        };
+        assert_eq!(error.0, 0);
+        input.send(7);
+        drop(input);
+        let Some(Ok(rows)) = output.next().await else {
+            panic!("final output missing");
+        };
+        assert_eq!(rows.0, 7);
+        assert!(output.next().await.is_none());
+        drop(output);
+        drop(handle);
+    };
+    tokio::join!(owner, client);
+
+    let (handle, listener) = channel::<Database>(1).unwrap();
+    let (input, mut output) = search::latest(&handle);
+    drop(listener);
+    input.send(9);
+    assert!(
+        std::panic::AssertUnwindSafe(output.next())
+            .catch_unwind()
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn idle_latest_observes_listener_drop() {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Wake, Waker},
+    };
+
+    struct IdleWake(AtomicBool);
+    impl Wake for IdleWake {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Release);
+        }
     }
 
-    struct Key {
-        handle: WeakHandle<Vec<u32>>,
-        listener: Option<Arc<Mutex<Listener<Vec<u32>>>>>,
-    }
-    impl PartialEq for Key {
-        fn eq(&self, _: &Self) -> bool {
-            let handle = self.handle.upgrade().unwrap();
-            let listener = self.listener.clone();
-            std::thread::spawn(move || {
-                if let Some(listener) = listener {
-                    drop(listener.lock().unwrap().try_recv().unwrap());
-                }
+    let (handle, listener) = channel::<Database>(1).unwrap();
+    let (input, mut output) = search::latest(&handle);
+    let wake = Arc::new(IdleWake(AtomicBool::new(false)));
+    let waker = Waker::from(wake.clone());
+    let mut next = Box::pin(output.next());
+    assert!(
+        next.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
 
-                call(&handle, |state, value| state.push(value), 2)
-                    .try_cast()
-                    .unwrap();
+    drop(listener);
+    handle.closed().await;
+    assert!(handle.is_closed());
+    assert!(wake.0.load(Ordering::Acquire));
+
+    let failure = tokio::time::timeout(
+        Duration::from_millis(200),
+        AssertUnwindSafe(next).catch_unwind(),
+    )
+    .await
+    .expect("idle latest results did not observe listener destruction");
+    assert!(failure.is_err());
+    drop(input);
+}
+
+#[tokio::test]
+async fn pause_and_shutdown() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let entered = started.clone();
+    let finish = release.clone();
+    let (handle, actor, owner) = spawn(SpawnArgs {
+        name: "latest search".into(),
+        capacity: 1,
+        failure: FailurePolicy::Unwind,
+        setup: move || {
+            Ok::<_, ()>(Database {
+                started: entered,
+                release: finish,
+                calls: observed,
             })
-            .join()
-            .unwrap();
+        },
+        cleanup: |_| Ok::<_, ()>(()),
+    })
+    .await
+    .unwrap();
+    let ordinary = call_async(
+        &handle,
+        async |state, ()| {
+            state.calls.lock().unwrap().push(1);
+            state.started.notify_one();
+            state.release.notified().await;
+        },
+        (),
+    )
+    .send()
+    .await;
+    started.notified().await;
 
-            true
-        }
-    }
-    impl Eq for Key {}
+    let (input, mut output) = search::latest(&handle);
+    input.send(2);
+    let pause = actor.pause();
+    tokio::pin!(pause);
+    let waiting = pause.as_mut().now_or_never().is_none();
+    release.notify_one();
+    assert!(waiting);
+    ordinary.await;
+    pause.await.unwrap();
+    assert_eq!(*calls.lock().unwrap(), [1]);
+    assert!(output.next().now_or_never().is_none());
 
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            for drain in [false, true] {
-                let (handle, listener) = channel::<Vec<u32>>(2).unwrap();
-                let listener = Arc::new(Mutex::new(listener));
-                let key = || Key {
-                    handle: handle.downgrade(),
-                    listener: drain.then(|| listener.clone()),
-                };
-
-                let old = call(&handle, |state, value| state.push(value), 1)
-                    .latest(key())
-                    .try_send()
-                    .unwrap()
-                    .checked();
-
-                let new = call(&handle, |state, value| state.push(value), 3)
-                    .latest(key())
-                    .try_send()
-                    .unwrap();
-
-                assert_eq!(
-                    old.await,
-                    Err(if drain {
-                        CallError::Discarded
-                    } else {
-                        CallError::Superseded
-                    })
-                );
-
-                let mut state = Vec::new();
-                for _ in 0..2 {
-                    let message = listener.lock().unwrap().try_recv().unwrap();
-                    message.run(&mut state).await;
-                }
-                new.await;
-
-                assert_eq!(state, [2, 3]);
-            }
-        });
-}
-
-#[tokio::test]
-async fn reservation() {
-    let (handle, mut listener) = channel::<Vec<u32>>(2).unwrap();
-
-    fn append(state: &mut Vec<u32>, value: u32) {
-        state.push(value);
-    }
-
-    let write = call(&handle, append, 0).try_send().unwrap();
-    let old = call(&handle, append, 1)
-        .latest("search")
-        .try_send()
-        .unwrap()
-        .checked();
-
-    let mut waiting = call(&handle, append, 2).latest("other search");
-    assert!(poll(&mut waiting).is_pending());
-
-    let mut state = Vec::new();
-    listener.recv().await.unwrap().run(&mut state).await;
-    write.await;
-
-    let latest = waiting.latest("search").checked_send().await.unwrap();
-    assert_eq!(old.await, Err(CallError::Superseded));
-    assert_eq!(handle.capacity(), 1);
-
-    listener.recv().await.unwrap().run(&mut state).await;
-    latest.await.unwrap();
-    assert_eq!(handle.capacity(), 2);
-    assert_eq!(state, [0, 2]);
-}
-
-#[tokio::test]
-async fn queue() {
-    let (handle, mut listener) = channel::<Vec<u32>>(3).unwrap();
-
-    let old = call(&handle, |state, value| state.push(value), 1)
-        .latest("search")
-        .checked_send()
+    let observed = calls.clone();
+    actor
+        .resume(move || {
+            Ok(Database {
+                started: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                calls: observed,
+            })
+        })
         .await
         .unwrap();
+    let Some(Ok(rows)) = output.next().await else {
+        panic!("queued latest input missing after resume");
+    };
+    assert_eq!(rows.0, 2);
 
-    let write = call(&handle, |state, value| state.push(value), 2)
-        .send()
-        .await;
-
-    let panel = call(&handle, |state, value| state.push(value), 3)
-        .latest("other panel")
-        .send()
-        .await;
-
-    let mut latest = call(&handle, |state, value| state.push(value), 4)
-        .latest("search")
-        .try_send()
-        .unwrap()
-        .checked();
-
-    assert_eq!(old.await, Err(CallError::Superseded));
-
-    for value in 5..8 {
-        let next = call(&handle, |state, value| state.push(value), value)
-            .latest("search")
-            .try_send()
-            .unwrap()
-            .checked();
-
-        assert_eq!(latest.await, Err(CallError::Superseded));
-        latest = next;
-    }
-
-    let rejected = call(&handle, |state, value| state.push(value), 5)
-        .latest("third panel")
-        .try_send();
-    assert!(matches!(rejected, Err(TrySendError::Full(_))));
-
-    let mut state = Vec::new();
-    for _ in 0..3 {
-        listener.recv().await.unwrap().run(&mut state).await;
-    }
-
-    write.await;
-    panel.await;
-    latest.await.unwrap();
-
-    assert_eq!(state, [2, 3, 7]);
-
-    let running = call(&handle, |state, value| state.push(value), 6)
-        .latest("search")
-        .send()
-        .await;
-    let active = listener.recv().await.unwrap();
-    let queued = call(&handle, |state, value| state.push(value), 7)
-        .latest("search")
-        .send()
-        .await;
-
-    active.run(&mut state).await;
-    running.await;
-    listener.recv().await.unwrap().run(&mut state).await;
-    queued.await;
-
-    assert_eq!(state, [2, 3, 7, 6, 7]);
-
-    let old = call(&handle, |state, value| state.push(value), 8)
-        .latest("search")
-        .send()
-        .await;
-
-    let new = call(&handle, |state, value| state.push(value), 9)
-        .latest("search")
-        .try_send()
+    actor.pause().await.unwrap();
+    input.send(2);
+    input.send(3);
+    assert!(output.next().now_or_never().is_none());
+    let observed = calls.clone();
+    actor
+        .resume(move || {
+            Ok(Database {
+                started: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                calls: observed,
+            })
+        })
+        .await
         .unwrap();
+    let Some(Ok(rows)) = output.next().await else {
+        panic!("resumed output missing");
+    };
+    assert_eq!(rows.0, 3);
 
-    listener.recv().await.unwrap().run(&mut state).await;
-    new.await;
+    input.send(4);
+    actor.shutdown().await.unwrap();
+    let Some(Ok(rows)) = output.next().await else {
+        panic!("shutdown lost its accepted input");
+    };
+    assert_eq!(rows.0, 4);
+    assert!(output.next().await.is_none());
+    assert_eq!(*calls.lock().unwrap(), [1, 2, 3, 4]);
+    owner.join_async().await.unwrap().unwrap();
+}
 
-    let mut waiting = tokio::spawn(old);
-    let result = tokio::time::timeout(Duration::from_secs(1), &mut waiting).await;
+struct LatestWake {
+    sender: aktor::message::LatestSender<usize>,
+    entered: std::sync::atomic::AtomicBool,
+}
+impl std::task::Wake for LatestWake {
+    fn wake(self: Arc<Self>) {
+        if !self.entered.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            aktor::latest::SendLatest::send(&self.sender, 2);
+        }
+    }
+}
 
-    if result.is_err() {
-        waiting.abort();
-        let _result = waiting.await;
+#[test]
+fn callbacks_can_reenter() {
+    if std::env::var_os("AKTOR_CHILD").is_some() {
+        use aktor::latest::{SendLatest, Session};
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (handle, mut listener) = channel::<usize>(1).unwrap();
+                let (sender, mut output) = (&handle).session(
+                    aktor::operation::Operation {
+                        name: "callback",
+                        caller: std::panic::Location::caller(),
+                    },
+                    async |state, input: usize| {
+                        *state = input;
+                        input
+                    },
+                );
+                let wake = Arc::new(LatestWake {
+                    sender: sender.clone(),
+                    entered: std::sync::atomic::AtomicBool::new(false),
+                });
+                let waker = Waker::from(wake.clone());
+                let mut receiver = Box::pin(listener.recv());
+                assert!(
+                    receiver
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+
+                sender.send(1);
+                assert!(wake.entered.load(std::sync::atomic::Ordering::SeqCst));
+                drop(receiver);
+
+                let mut state = 0;
+                listener.try_recv().unwrap().run(&mut state).await;
+                assert_eq!(output.next().await, Some(2));
+                assert!(listener.try_recv().is_err());
+
+                let waker = Waker::from(Arc::new(LatestWake {
+                    sender: sender.clone(),
+                    entered: std::sync::atomic::AtomicBool::new(true),
+                }));
+                let mut next = Box::pin(output.next());
+                assert!(
+                    next.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                drop(waker);
+                assert!(
+                    next.as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                drop(next);
+                drop(listener);
+                sender.send(3);
+                assert!(
+                    AssertUnwindSafe(output.next())
+                        .catch_unwind()
+                        .await
+                        .is_err()
+                );
+            });
+        return;
     }
 
-    assert!(matches!(result, Ok(Err(error)) if error.is_panic()));
-    assert_eq!(state, [2, 3, 7, 6, 7, 9]);
+    let output = support::child("latest::callbacks_can_reenter", "latest");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

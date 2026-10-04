@@ -2,26 +2,8 @@ use super::super::*;
 use futures_util::FutureExt;
 
 impl<S> Message<S> {
-    pub fn latest_key(&self) -> Option<LatestKey> {
-        self.latest.clone()
-    }
-
-    pub fn has_latest_key(&self, key: &LatestKey) -> bool {
-        self.latest
-            .as_ref()
-            .is_some_and(|latest| latest.identical(key))
-    }
-
-    pub fn same_latest(&self, other: &Self) -> bool {
-        match (&self.latest, &other.latest) {
-            (Some(left), Some(right)) => left.same(right),
-            _ => false,
-        }
-    }
-
-    pub fn supersede(mut self) {
-        self.finished = true;
-        self.job.supersede();
+    pub fn counted(&self) -> bool {
+        self.counted
     }
 
     pub async fn run(mut self, state: &mut S) {

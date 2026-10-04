@@ -10,7 +10,7 @@ impl<S> Listener<S> {
     }
 
     pub fn close(&mut self) {
-        self.admission.close();
+        self.admission.shutdown();
         self.receiver.close();
     }
 

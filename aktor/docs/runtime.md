@@ -1,59 +1,41 @@
-# Runtime details
+# While it's running
 
-## Requests / replies
+Tokio and Embassy capacity is the waiting queue, one call can also be running. Browser capacity counts that running call too. Calls wait when full, latest sessions keep one pending input outside those limits. Once a call is queued, dropping its reply or timing out leaves it running. Losing a write's reply doesn't mean it failed, so don't blindly retry it.
 
-send() queues the call and gives you a reply to await later. try_send() returns Full(request) or Closed(request) so you can try again. cast() skips the reply, only for functions returning ().
+Pending calls can outlive their timeout once the group is stopping, drop them with the rest of your application's tasks.
 
-Dropping or timing out a reply leaves queued work running. Drop the last handle and queued calls finish before cleanup. downgrade()/upgrade() gives you a weak handle when you don't want to keep it alive.
-
-## Pause / resume / replace
+## Pause / resume (Tokio)
 
 ```rust
+let reopen = || {
+    Connection::open_in_memory()
+        .map_err(|error| AktorSetupError::new(error.to_string()))
+};
+
 database.actor.pause().await?;
-database.actor.resume(Connection::open_in_memory).await?;
+database.actor.resume(reopen).await?;
 ```
 
-pause finishes queued calls and closes the resource, resume opens a new one. replace(setup) does both. Calls while paused are rejected, failed setup or cleanup leaves it paused.
+pause finishes ordinary queued calls and closes the resource, latest sessions keep their pending input for resume. Calls wait until resume opens it again. If reopening fails, they keep waiting for a later resume.
 
-shutdown().await finishes queued calls and cleanup. Once started it keeps going if you stop awaiting it, and completion.wait().await gets the result later. Keep your tokio runtime running until it's done.
+## Application shutdown
 
-## checked()
-
-For handling a closed actor yourself:
+Put kill.stop() in your Close handler. Actor failure also wakes kill.wait_stopping(), forward that into the same handler:
 
 ```rust
-let result = insert_user::request(&database, "Katten".into()).checked().await?;
-let id = result?;
+let stopping = kill.clone();
+spawn(async move {
+    stopping.wait_stopping().await;
+    events.send(AppEvent::Close).await;
+});
 ```
 
-First ? is for the actor, second is for your function's result. Ordinary calls assume the actor is alive and panic when they can't get a reply. Errors returned by your function come back as usual.
+Your handler stops your application's tasks, then awaits closing before leaving the runtime. A task waiting on a dead actor stays pending until you drop it. Dropping a Tokio JoinHandle leaves its task running.
 
-CallError tells you what happened:
+With Tokio or browser run(), dropping that future starts shutdown too. Actor cleanup keeps going, your final closure is cancelled and the report says so. Keep the runtime alive and await the completion. Embassy needs its driver to keep polling, dropping listen() or run() cancels the actors and publishes a failed report. Dropping a completion observer is fine.
 
-NotAdmitted: wasn't queued.
+Save settings still in your UI before stopping the group. Actor cleanup deals with its own resource, start_with(after) runs your final closure afterward.
 
-Discarded: queued, never started.
+Shutdown gets five seconds by default. At the deadline, pending actor work and your final closure are cancelled, browser workers are terminated. If an actor's native code won't stop, the watchdog kills the process (SIGKILL on Unix, abort elsewhere), printing the report is best effort. Browser code needs to yield so its timer can run. Stopping before start completes an empty group, it can't be started afterward.
 
-OutcomeUnknown: started, lost its reply.
-
-Superseded: replaced by a newer latest() call.
-
-A lost reply can mean a write already happened, don't blindly retry it.
-
-## Panics
-
-FailurePolicy::Unwind attempts cleanup then unwinds the actor's thread/task. Abort attempts cleanup then ends the process. shutdown lets you supply your own hook. Cleanup gets whatever state the panicking code left behind.
-
-Cancelling a runner can't await cleanup. With panic = "abort", the process ends immediately.
-
-## Function arguments
-
-Native queued arguments need Send + 'static, local calls can borrow. Outputs need Send + 'static too. Return owned values.
-
-For nested calls, pass the resource you already have. Calling through that actor's handle queues work behind yourself and can deadlock. It keeps the state across awaits, so the next call waits until yours finishes.
-
-Leave the generated target inferred with generics, like query::<User, _>(&database, id). Put cfg on the function, attributes on arguments aren't supported.
-
-[Browser setup](../../integrations/worker/README.md)
-
-[Embassy setup](../../integrations/embassy/README.md)
+Your own spawn_blocking work can outlive the final closure, runtime.shutdown_background() lets you leave after the report.

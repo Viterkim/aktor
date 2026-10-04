@@ -23,5 +23,10 @@ pub struct OwnerCompletion<C> {
 pub enum OwnerError<C> {
     Cleanup(CleanupErrors<C>),
     Panicked(DedicatedJoinError),
+    PanickedWithCleanup {
+        cause: DedicatedJoinError,
+        cleanup: CleanupErrors<C>,
+    },
     RuntimeStopped,
+    Cancelled,
 }

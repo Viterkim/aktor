@@ -18,6 +18,7 @@ where
     Request {
         sender: &handle.inner.sender,
         admission: &handle.inner.admission,
+        available: None,
         submission: Submission::Unsent(Message {
             operation: crate::listener::Operation {
                 name: std::any::type_name::<F>(),
@@ -25,13 +26,17 @@ where
             },
             job: packet.clone(),
             finished: false,
-            latest: None,
+            counted: true,
         }),
         reply: Reply {
+            admission: handle.inner.admission.clone(),
             answer: packet,
             finished: handle.inner.finished.clone(),
             closing: None,
             error: None,
+            group: handle.inner.admission.group(),
+            parked: false,
+            taken: false,
         },
     }
 }
@@ -52,6 +57,7 @@ where
     Request {
         sender: &handle.inner.sender,
         admission: &handle.inner.admission,
+        available: None,
         submission: Submission::Unsent(Message {
             operation: crate::listener::Operation {
                 name: std::any::type_name::<F>(),
@@ -59,13 +65,17 @@ where
             },
             job: Arc::new(AsyncJob(packet.clone())),
             finished: false,
-            latest: None,
+            counted: true,
         }),
         reply: Reply {
+            admission: handle.inner.admission.clone(),
             answer: packet,
             finished: handle.inner.finished.clone(),
             closing: None,
             error: None,
+            group: handle.inner.admission.group(),
+            parked: false,
+            taken: false,
         },
     }
 }

@@ -15,10 +15,18 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         .map_or_else(|| quote!(()), |role| quote!(#role));
     let mut names = names::Names::new(&function.signature, &function.body, quote!(#aktor #role));
     let output = signature::output(&function.signature);
-    let (implementation, invoke) =
-        signature::implementation(&function.signature, &mut names, &output);
+    let (implementation, invoke) = signature::implementation(&function, &mut names, &output);
     let output = signature::dispatch_output(output);
+    let mut opaque_output = OpaqueOutput(false);
+    syn::visit::Visit::visit_type(&mut opaque_output, &output);
+    let latest_factory = names::binding(&mut names.reserved, "__AktorLatestFactory");
+    let latest_state = names::binding(&mut names.reserved, "__AktorLatestState");
+    let latest_input = names::binding(&mut names.reserved, "__AktorLatestInput");
+    let latest_output = names::binding(&mut names.reserved, "__AktorLatestOutput");
+    let latest_role = names::binding(&mut names.reserved, "__AktorLatestRole");
+    let latest_inner = names::binding(&mut names.reserved, "__AktorLatestInner");
     signature::normalize(&mut function.signature, &mut names);
+    let body_type = &names.body;
 
     let state = input::parse::state(&function.signature.inputs[0])?;
     let state_type = &state.ty;
@@ -32,6 +40,10 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let target = &names.target;
     let state_name = &names.state;
     let input_name = &names.input;
+    let operation_name = &names.operation;
+    let inner_name = &names.inner;
+    let results_name = &names.results;
+    let sender_name = &names.sender;
     let bindings: Vec<_> = function
         .inputs
         .iter()
@@ -45,8 +57,6 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         syn::Pat::Ident(pattern) if pattern.subpat.is_none() => pattern.ident.clone(),
         _ => state_name.clone(),
     };
-    let body = &function.body;
-    let written_output = output.clone();
 
     function.signature.asyncness = None;
     function
@@ -75,14 +85,47 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         }
     }
 
+    let factory_arguments: Vec<_> = function
+        .signature
+        .generics
+        .params
+        .iter()
+        .rev()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|parameter| match parameter {
+            syn::GenericParam::Lifetime(parameter) => {
+                let lifetime = &parameter.lifetime;
+                quote!(#lifetime)
+            }
+            syn::GenericParam::Type(parameter) => {
+                let name = &parameter.ident;
+                quote!(#name)
+            }
+            syn::GenericParam::Const(parameter) => {
+                let name = &parameter.ident;
+                quote!({ #name })
+            }
+        })
+        .collect();
+    let raw_output = function.signature.output.clone();
+    if !opaque_output.0 {
+        let name = &function.signature.ident;
+        let syn::ReturnType::Type(_, raw) = &raw_output else {
+            return Err(syn::Error::new_spanned(
+                &function.signature,
+                "missing actor output",
+            ));
+        };
+        function.signature.output = parse_quote!(-> #aktor::call::Call<#target, #input_type, #raw, #name::#latest_factory<#(#factory_arguments,)* #state_type, #input_type, #output, #role>>);
+    }
+
     let attributes = &function.attributes;
     let visibility = &function.visibility;
     let signature = &function.signature;
     let name = &signature.ident;
-    let mut normal = signature.clone();
-    normal.asyncness = Some(parse_quote!(async));
-    normal.output = parse_quote!(-> #written_output);
-
     let generic_arguments: Vec<_> = signature
         .generics
         .params
@@ -94,16 +137,48 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             }
             syn::GenericParam::Const(parameter) => {
                 let name = &parameter.ident;
-                Some(quote!(#name))
+                Some(quote!({ #name }))
             }
             _ => None,
         })
         .collect();
 
+    let wrapper = quote! {
+        #(#attributes)*
+        #[allow(clippy::extra_unused_lifetimes)]
+        #[track_caller]
+        #visibility #signature {
+            #name::request::<#(#generic_arguments),*>(#parameter, #(#bindings),*)
+        }
+    };
+    let bindings = &names.arguments;
+    let parameter = state_name;
+
     let mut request = signature.clone();
     request.ident = parse_quote!(request);
-    let mut scope = signature::scope::Child { shadowed: &[] };
+    for (argument, binding) in request
+        .inputs
+        .iter_mut()
+        .zip(::core::iter::once(parameter).chain(bindings.iter()))
+    {
+        if let FnArg::Typed(argument) = argument {
+            *argument.pat = parse_quote!(#binding);
+        }
+    }
+    let mut scope =
+        signature::scope::Child::new(&["request", "latest", "LatestSender"], &request.generics);
     scope.visit_signature_mut(&mut request);
+    if !opaque_output.0
+        && let syn::ReturnType::Type(_, ty) = &mut request.output
+        && let syn::Type::Path(path) = &mut **ty
+        && let Some(segment) = path.path.segments.last_mut()
+        && let syn::PathArguments::AngleBracketed(arguments) = &mut segment.arguments
+        && let Some(syn::GenericArgument::Type(syn::Type::Path(factory))) =
+            arguments.args.last_mut()
+        && let Some(name) = factory.path.segments.last().cloned()
+    {
+        factory.path.segments = ::core::iter::once(name).collect();
+    }
 
     let mut state_type = state_type.clone();
     scope.visit_type_mut(&mut state_type);
@@ -125,37 +200,208 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         quote!(&#state_type)
     };
 
-    Ok(quote! {
-        #(#attributes)*
-        #[allow(clippy::extra_unused_lifetimes)]
-        #visibility #normal {
-            #name::request::<#(#generic_arguments),*>(#parameter, #(#bindings),*).await
+    let latest = if opaque_output.0 {
+        TokenStream::new()
+    } else {
+        let mut session_output = output.clone();
+        scope.visit_type_mut(&mut session_output);
+        let input_types: Vec<_> = request
+            .inputs
+            .iter()
+            .skip(1)
+            .filter_map(|argument| match argument {
+                FnArg::Typed(argument) => Some(&argument.ty),
+                _ => None,
+            })
+            .collect();
+        let mut user_generics = request.generics.clone();
+        user_generics.params.pop();
+        let arguments: Vec<_> = user_generics
+            .params
+            .iter()
+            .map(|parameter| match parameter {
+                syn::GenericParam::Lifetime(parameter) => {
+                    let lifetime = &parameter.lifetime;
+                    quote!(#lifetime)
+                }
+                syn::GenericParam::Type(parameter) => {
+                    let name = &parameter.ident;
+                    quote!(#name)
+                }
+                syn::GenericParam::Const(parameter) => {
+                    let name = &parameter.ident;
+                    quote!({ #name })
+                }
+            })
+            .collect();
+        let markers: Vec<_> = user_generics
+            .params
+            .iter()
+            .filter_map(|parameter| match parameter {
+                syn::GenericParam::Lifetime(parameter) => {
+                    let lifetime = &parameter.lifetime;
+                    Some(quote!(&#lifetime ()))
+                }
+                syn::GenericParam::Type(parameter) => {
+                    let name = &parameter.ident;
+                    Some(quote!(*const #name))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut sender_generics = user_generics.clone();
+        sender_generics.params.push(parse_quote!(#latest_inner));
+        let (sender_impl, _, sender_where) = sender_generics.split_for_impl();
+        let sender_type = quote!(<#(#arguments,)* #latest_inner>);
+        let mut send_generics = sender_generics.clone();
+        send_generics
+            .make_where_clause()
+            .predicates
+            .push(parse_quote!(#latest_inner: #aktor::latest::SendLatest<#input_type>));
+        let (send_impl, _, send_where) = send_generics.split_for_impl();
+        let mut clone_generics = sender_generics.clone();
+        clone_generics
+            .make_where_clause()
+            .predicates
+            .push(parse_quote!(#latest_inner: ::core::clone::Clone));
+        let (clone_impl, _, clone_where) = clone_generics.split_for_impl();
+        let mut latest_signature = request.clone();
+        latest_signature.ident = parse_quote!(latest);
+        latest_signature.inputs = latest_signature.inputs.into_iter().take(1).collect();
+        latest_signature.generics = user_generics;
+        latest_signature.generics.params.push(parse_quote!(#target));
+        let mut bounds: Vec<syn::WherePredicate> = Vec::new();
+        for parameter in &mut latest_signature.generics.params {
+            if let syn::GenericParam::Type(parameter) = parameter
+                && !parameter.bounds.is_empty()
+            {
+                let name = &parameter.ident;
+                let bound = core::mem::take(&mut parameter.bounds);
+                bounds.push(parse_quote!(#name: #bound));
+            }
         }
+        let predicates = &mut latest_signature.generics.make_where_clause().predicates;
+        predicates.extend(bounds);
+        predicates.push(parse_quote!(#target: #aktor::latest::Session<#state_type, #input_type, #session_output, #role>));
+        predicates.push(parse_quote!(#input_type: 'static));
+        predicates.push(parse_quote!(#session_output: ::core::marker::Send + 'static));
+        let mut factory_generics = sender_generics.clone();
+        factory_generics.params.pop();
+        for name in [&latest_state, &latest_input, &latest_output, &latest_role] {
+            factory_generics.params.push(parse_quote!(#name));
+        }
+        let (factory_impl, _, factory_where) = factory_generics.split_for_impl();
+        let (latest_impl, _, latest_where) = latest_signature.generics.split_for_impl();
+        latest_signature.output = parse_quote!(-> (
+            self::LatestSender<#(#arguments,)* <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Sender>,
+            <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Results
+        ));
 
-        #(#attributes)*
-        #[doc(hidden)]
-        #[allow(clippy::extra_unused_lifetimes)]
-        #implementation #body
+        quote! {
+            #[doc(hidden)]
+            pub struct #latest_factory #factory_impl #factory_where {
+                pub marker: ::core::marker::PhantomData<fn(#(#markers),*) -> (#latest_state, #latest_input, #latest_output, #latest_role)>,
+            }
+            impl #latest_impl #aktor::latest::Factory<#target, #input_type> for #latest_factory<#(#arguments,)* #state_type, #input_type, #session_output, #role> #latest_where {
+                type Sender = self::LatestSender<#(#arguments,)* <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Sender>;
+                type Results = <#target as #aktor::latest::Session<#state_type, #input_type, #session_output, #role>>::Results;
+
+                fn start(self, #parameter: #target, #input_name: #input_type, #operation_name: #aktor::operation::Operation) -> (Self::Sender, Self::Results) {
+                    let (#(#bindings,)*) = #input_name;
+                    let (#inner_name, #results_name) = #aktor::latest::Session::session(
+                        #parameter, #operation_name,
+                        async move |#state_name: &mut #state_type, #input_name| {
+                            let (#(#bindings,)*) = #input_name;
+                            #invoke(#state_name, #(#bindings),*).await
+                        },
+                    );
+                    let #sender_name = self::LatestSender { inner: #inner_name, marker: ::core::marker::PhantomData };
+                    #sender_name.send(#(#bindings),*);
+                    (#sender_name, #results_name)
+                }
+            }
+
+            pub struct LatestSender #sender_impl #sender_where {
+                pub inner: #latest_inner,
+                marker: ::core::marker::PhantomData<fn(#(#markers),*)>,
+            }
+            impl #send_impl self::LatestSender #sender_type #send_where {
+                pub fn send(&self, #(#bindings: #input_types),*) {
+                    #aktor::latest::SendLatest::send(&self.inner, (#(#bindings,)*));
+                }
+            }
+            impl #clone_impl ::core::clone::Clone for self::LatestSender #sender_type #clone_where {
+                fn clone(&self) -> Self {
+                    Self { inner: self.inner.clone(), marker: ::core::marker::PhantomData }
+                }
+            }
+
+            #[track_caller]
+            pub #latest_signature {
+                let (#inner_name, #results_name) = #aktor::latest::Session::session(
+                    #parameter,
+                    #aktor::operation::Operation { name: ::core::module_path!(), caller: ::core::panic::Location::caller() },
+                    async move |#state_name: &mut #state_type, #input_name| {
+                        let (#(#bindings,)*) = #input_name;
+                        #invoke(#state_name, #(#bindings),*).await
+                    },
+                );
+                (self::LatestSender { inner: #inner_name, marker: ::core::marker::PhantomData }, #results_name)
+            }
+        }
+    };
+
+    let dispatch_body = quote! {
+        <#target as #dispatch<#state_type, #input_type, #role>>::dispatch(
+            #parameter, #operation_name,
+            async move |#state_name: #state_reference, #input_name| {
+                let (#(#bindings,)*) = #input_name;
+                #invoke(#state_name, #(#bindings),*).await
+            },
+            #input_name,
+        )
+    };
+    let operation = quote!(#aktor::operation::Operation {
+        name: ::core::module_path!(), caller: ::core::panic::Location::caller(),
+    });
+    let request_body = if opaque_output.0 {
+        quote! { let #operation_name = #operation; let #input_name = (#(#bindings,)*); #dispatch_body }
+    } else {
+        quote! {
+            #aktor::call::Call::new(
+                #parameter, (#(#bindings,)*), #operation,
+                |#parameter, #input_name, #operation_name| { #dispatch_body },
+                #latest_factory { marker: ::core::marker::PhantomData },
+            )
+        }
+    };
+
+    Ok(quote! {
+        #wrapper
+
+        #implementation
 
         #visibility mod #name {
             use super::*;
 
+            #[allow(non_camel_case_types)]
+            #[doc(hidden)]
+            pub struct #body_type;
+
+            #latest
+
             #[track_caller]
             #[allow(clippy::extra_unused_lifetimes)]
             pub #request {
-                <#target as #dispatch<#state_type, #input_type, #role>>::dispatch(
-                    #parameter,
-                    #aktor::operation::Operation {
-                        name: ::core::module_path!(),
-                        caller: ::core::panic::Location::caller(),
-                    },
-                    async move |#state_name: #state_reference, #input_name| {
-                        let (#(#bindings,)*) = #input_name;
-                        super::#invoke(#state_name, #(#bindings),*).await
-                    },
-                    (#(#bindings,)*),
-                )
+                #request_body
             }
         }
     })
+}
+
+struct OpaqueOutput(bool);
+impl<'ast> syn::visit::Visit<'ast> for OpaqueOutput {
+    fn visit_type_impl_trait(&mut self, _: &'ast syn::TypeImplTrait) {
+        self.0 = true;
+    }
 }

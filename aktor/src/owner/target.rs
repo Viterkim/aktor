@@ -28,3 +28,17 @@ impl<'a, S: 'static, E, C, I: Send + 'static, Role> Write<S, I, Role> for &'a Ak
         Write::dispatch(&self.handle, operation, function, input)
     }
 }
+
+impl<S: 'static, I: Send + 'static, O: Send + 'static, E, C, Role: 'static>
+    crate::latest::Session<S, I, O, Role> for &Aktor<S, E, C, Role>
+{
+    type Sender = crate::message::LatestSender<I>;
+    type Results = crate::message::LatestResults<O>;
+
+    fn session<F>(self, operation: Operation, function: F) -> (Self::Sender, Self::Results)
+    where
+        F: for<'s> core::ops::AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
+    {
+        crate::latest::Session::session(&self.handle, operation, function)
+    }
+}

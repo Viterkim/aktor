@@ -1,4 +1,4 @@
-use crate::{message::Message, queue::key::LatestKey};
+use crate::message::Message;
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::{Notify, Semaphore, SemaphorePermit, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit, mpsc};
 
 mod impls;
 pub use impls::channel;
@@ -16,18 +16,12 @@ struct Queue<S> {
     entries: Mutex<Entries<S>>,
     permits: Semaphore,
     ready: Notify,
-    changed: watch::Sender<()>,
     senders_closed: AtomicBool,
 }
 
 struct Entries<S> {
+    receiving: bool,
     messages: VecDeque<Message<S>>,
-    revision: u64,
-}
-
-pub struct Snapshot {
-    revision: u64,
-    pub key: Option<LatestKey>,
 }
 
 pub struct Sender<S>(Arc<Queue<S>>);

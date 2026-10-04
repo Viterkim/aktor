@@ -150,14 +150,10 @@ pub async fn cat(
 And elsewhere:
 
 ```rust
-let database = Aktor::spawn(SpawnArgs {
-    name: "sqlite".into(),
-    capacity: 128,
-    failure: FailurePolicy::Unwind,
-    setup,
-    cleanup,
-})
-.await?;
+let mut actors = AktorGroup::new();
+actors.start()?;
+
+let database = actors.spawn(ActorArgs::new("sqlite", setup, cleanup)).await?;
 
 let id = post::cat(&database, "Bingo".into()).await?;
 let cat = get::cat(&database, id).await?;
