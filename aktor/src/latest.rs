@@ -1,6 +1,14 @@
 use crate::operation::Operation;
 use core::ops::AsyncFnOnce;
 
+#[doc(hidden)]
+pub trait Factory<T, I> {
+    type Sender;
+    type Results;
+
+    fn start(self, target: T, input: I, operation: Operation) -> (Self::Sender, Self::Results);
+}
+
 /// Update one ongoing operation.
 pub trait SendLatest<I> {
     fn send(&self, input: I);

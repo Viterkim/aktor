@@ -13,7 +13,25 @@ sensor.shutdown().await?;
 
 The 2 is queue capacity. [sensor_owner](src/lib.rs) runs setup and cleanup, record_many calls record with its local sensor. Handles stay on the owner's executor, state and arguments can contain Rc. Outputs still need Send + 'static.
 
-embassy::AktorGroup owns its local owners and application future together, with the same killswitch and cleanup records. The host supplies embassy-time for timeout() and the shutdown budget.
+embassy::AktorGroup keeps the owners together. Start its listener on your executor:
+
+```rust
+#[embassy_executor::task]
+async fn actors_task(closing: aktor::message::LocalFuture<'static, ShutdownReport>) {
+    let report = closing.await;
+    show_report(report);
+}
+
+let mut actors = embassy::AktorGroup::new();
+let kill = actors.killswitch();
+spawner.spawn(actors_task(actors.listen()?)?);
+
+let sensor = actors.spawn_value::<Sensor, 2>("sensor", sensor)?;
+let count = record_many(&sensor, [4, 5]).await?;
+kill.stop();
+```
+
+The listener drives the owners as well as shutdown. Use ActorArgs when your sensor needs setup or cleanup, listen_with(after) adds your final application closure. The host supplies embassy-time for timeout() and the shutdown budget.
 
 It also runs on other local executors, [including isolated WASM hosts](../wasm/README.md).
 

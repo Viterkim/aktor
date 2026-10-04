@@ -22,7 +22,7 @@ mod impls;
 mod latest;
 mod request;
 mod target;
-pub use group::{ActorArgs, AktorGroup, KillSwitch, ShutdownReport};
+pub use group::{ActorArgs, AktorGroup, GroupCompletion, KillSwitch, ShutdownReport};
 pub use latest::{LatestResults, LatestSender};
 
 use event::Event;
@@ -60,6 +60,7 @@ pub struct Request<'a, S, const N: usize, E, O, Role = ()> {
 #[must_use = "await the reply to receive the operation's result"]
 pub struct Reply<O> {
     parked: bool,
+    taken: bool,
     group: Option<KillSwitch>,
     answer: Rc<Answer<O>>,
 }

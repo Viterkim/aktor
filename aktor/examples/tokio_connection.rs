@@ -24,17 +24,12 @@ pub async fn count(connection: &Connection) -> usize {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn core::error::Error>> {
-    let setup = || Ok::<_, aktor::AktorError>(Connection::default());
-    let cleanup = |_| Ok::<_, aktor::AktorError>(());
+    let mut actors = AktorGroup::new();
+    actors.start()?;
 
-    let database = Aktor::spawn(SpawnArgs {
-        name: "database".into(),
-        capacity: 128,
-        failure: FailurePolicy::Unwind,
-        setup,
-        cleanup,
-    })
-    .await?;
+    let database = actors
+        .spawn_value("database", Connection::default())
+        .await?;
 
     let inserted = insert(&database, "BingoManden".to_owned()).send().await;
     let rows: usize = count(&database).await;
@@ -45,7 +40,10 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     assert_eq!(row.as_deref(), Some("BingoManden"));
     assert_eq!(rows, 1);
 
-    database.shutdown().await?;
+    let report = actors.shutdown().await;
+    if report.failed() {
+        return Err(report.into());
+    }
 
     Ok(())
 }

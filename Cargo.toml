@@ -17,6 +17,7 @@ proc-macro-crate = "3.5"
 proc-macro2 = "1.0"
 quote = "1.0"
 parking_lot = "0.12"
+pin-project-lite = "0.2"
 syn = { version = "3.0", features = ["full", "visit", "visit-mut"] }
 tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

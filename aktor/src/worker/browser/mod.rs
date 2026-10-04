@@ -54,6 +54,7 @@ pub struct WorkerReply<O> {
     group: Option<(String, crate::group::KillSwitch)>,
     id: u64,
     parked: bool,
+    taken: bool,
     output: PhantomData<fn() -> O>,
 }
 

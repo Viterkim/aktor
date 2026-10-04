@@ -51,6 +51,19 @@ impl<'de> Deserialize<'de> for RejectedInput {
     }
 }
 
+#[derive(Serialize)]
+struct RejectedOutput;
+impl<'de> Deserialize<'de> for RejectedOutput {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom("output refused"))
+    }
+}
+
+#[aktor::aktor]
+async fn bad_output(_: &u32) -> RejectedOutput {
+    RejectedOutput
+}
+
 struct BrokenData;
 impl Serialize for BrokenData {
     fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
@@ -84,35 +97,51 @@ fn options() -> Options {
 }
 
 #[wasm_bindgen]
-pub fn start_group_worker(fail_cleanup: bool, wrong_data: bool, fail_data: bool) -> Result<(), JsValue> {
+pub fn start_group_worker(
+    fail_cleanup: bool,
+    wrong_data: bool,
+    fail_data: bool,
+) -> Result<(), JsValue> {
     let server = if fail_data {
-        worker::serve_with(0u32, async |_| Err(AktorCleanupError {
-            diagnostics: "backup folder is read only".into(),
-            data: BrokenData,
-        }), options())
+        worker::serve_with(
+            0u32,
+            async |_| {
+                Err(AktorCleanupError {
+                    diagnostics: "backup folder is read only".into(),
+                    data: BrokenData,
+                })
+            },
+            options(),
+        )
     } else if wrong_data {
-        worker::serve_with(0u32, async |_| Err(AktorCleanupError {
-            diagnostics: "backup folder is read only".into(),
-            data: String::from("unexpected data type"),
-        }), options())
+        worker::serve_with(
+            0u32,
+            async |_| {
+                Err(AktorCleanupError {
+                    diagnostics: "backup folder is read only".into(),
+                    data: String::from("unexpected data type"),
+                })
+            },
+            options(),
+        )
     } else {
         worker::serve_with(
-        0u32,
-        async move |_| {
-            if fail_cleanup {
-                Err(AktorCleanupError {
-                    diagnostics: "Flush settings\n  backup folder is read only".into(),
-                    data: CleanupData {
-                        code: 17,
-                        option: Some(None),
-                    },
-                })
-            } else {
-                Ok(())
-            }
-        },
-        options(),
-    )
+            0u32,
+            async move |_| {
+                if fail_cleanup {
+                    Err(AktorCleanupError {
+                        diagnostics: "Flush settings\n  backup folder is read only".into(),
+                        data: CleanupData {
+                            code: 17,
+                            option: Some(None),
+                        },
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            options(),
+        )
     }
     .map_err(|error| JsValue::from_str(&error.to_string()))?;
     SERVER.with(|slot| *slot.borrow_mut() = Some(server));
@@ -223,10 +252,20 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
                         kill.stop();
                         reply.await.unwrap();
                     }
+                    8 => {
+                        let mut reply = bad_output(&storage).send().await;
+                        storage.shutdown().await.unwrap();
+                        assert!(!kill.is_stopping());
+                        assert!(reply.try_take().is_none());
+                        core::future::pending::<()>().await;
+                    }
                     5 => {
                         let value = Portable {
-                            options: Vec::new(), map: Default::default(), choice: Vec::new(),
-                            limits: (0, 0), invalid: Some(RejectedInput),
+                            options: Vec::new(),
+                            map: Default::default(),
+                            choice: Vec::new(),
+                            limits: (0, 0),
+                            invalid: Some(RejectedInput),
                         };
                         drop(roundtrip(&storage, value).send().await);
                         core::future::pending::<()>().await;
@@ -258,14 +297,19 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
         true
     };
     let deferred_reply_safe = if let Some(mut reply) = deferred.borrow_mut().take() {
-        (0..2).all(|_| std::pin::Pin::new(&mut reply)
-            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
-            .is_pending())
+        (0..2).all(|_| {
+            std::pin::Pin::new(&mut reply)
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        })
     } else {
         true
     };
     serde_json::to_string(&Check {
-        failure_message: report.failure.as_ref().map(|failure| failure.message.clone()),
+        failure_message: report
+            .failure
+            .as_ref()
+            .map(|failure| failure.message.clone()),
         failure: report.failure.map(|failure| failure.actor),
         timed_out_actors: report
             .actors
@@ -295,6 +339,112 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
         timed_out: report.timed_out,
     })
     .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+#[wasm_bindgen]
+pub async fn group_listener_check(url: String) -> Result<bool, JsValue> {
+    let mut actors = AktorGroup::with_grace(Duration::from_millis(300));
+    let kill = actors.killswitch();
+    let completed = actors.completion();
+    let hooks = Rc::new(Cell::new(0));
+    let hook_count = hooks.clone();
+    let closing = actors
+        .start_with(async move |_| {
+            hook_count.set(hook_count.get() + 1);
+            Ok::<_, AktorError>(())
+        })
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let _closing = closing;
+
+    let storage = actors
+        .worker::<u32>("storage", &url, options())
+        .await
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let audio = actors
+        .worker_for::<Other, u32>("audio", &format!("{url}?other"), options())
+        .await
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let mut reply = operation(&storage, 0).send().await;
+    let ordinary_error = loop {
+        if let Some(result) = reply.try_take() { break result.is_err(); }
+        gloo_timers::future::TimeoutFuture::new(1).await;
+    };
+    assert!(reply.try_take().is_none());
+    let mut pending = operation(&storage, 0).send().await;
+    assert!(pending.try_take().is_none());
+    assert!(pending.await.is_err());
+    assert!(!kill.is_stopping());
+    assert_eq!(other_operation(&audio).await, 17);
+    drop(operation(&storage, 1).send().await);
+
+    kill.wait_stopping().await;
+    let report = (&completed).await;
+    assert_eq!(completed.await.actors.len(), report.actors.len());
+
+    let mut plain = AktorGroup::new();
+    let closing = plain.start().map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let _audio = plain.worker_for::<Other, u32>("audio", &format!("{url}?other"), options()).await.map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let shutdown = plain.shutdown();
+    assert!(plain.killswitch().is_stopping());
+    assert!(!(&closing).await.failed());
+    assert_eq!(closing.await.actors.len(), shutdown.await.actors.len());
+    Ok(ordinary_error
+        && hooks.get() == 1
+        && report.actors.len() == 2
+        && report
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.actor == "storage")
+        && report
+            .actors
+            .iter()
+            .any(|actor| actor.actor == "audio" && !actor.timed_out))
+}
+
+#[wasm_bindgen]
+pub async fn group_startup_check(url: String, mode: u32) -> Result<bool, JsValue> {
+    let mut actors = AktorGroup::with_grace(Duration::from_millis(500));
+    let hooks = Rc::new(Cell::new(0));
+    let hook_count = hooks.clone();
+    let closing = actors
+        .start_with(async move |_| {
+            hook_count.set(hook_count.get() + 1);
+            Ok::<_, AktorError>(())
+        })
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let audio = actors
+        .worker_for::<Other, u32>("audio", &format!("{url}?other"), options())
+        .await
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let mut storage_options = options();
+    if mode == 0 {
+        storage_options.capacity = 0;
+    } else if mode == 2 {
+        storage_options.build = "wrong build".into();
+    }
+    let storage_url = if mode == 1 {
+        format!("{url}?fail_setup")
+    } else {
+        url
+    };
+    let failed = actors
+        .worker_for_data::<(), u32, CleanupData>("storage", &storage_url, storage_options)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(hooks.get(), 1);
+    let typed_data = mode != 1 || failed.data.is_some_and(|data| data.code == 23);
+    let report = closing.wait().await;
+    Ok(typed_data
+        && report
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.actor == "storage")
+        && audio.completion().wait_report().await.is_ok()
+        && report
+            .actors
+            .iter()
+            .any(|actor| actor.actor == "audio" && !actor.timed_out))
 }
 
 struct Empty;

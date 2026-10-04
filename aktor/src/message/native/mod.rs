@@ -53,6 +53,7 @@ pub struct Reply<O> {
     error: Option<CallError>,
     group: Option<crate::group::KillSwitch>,
     parked: bool,
+    taken: bool,
 }
 
 trait Answer<O>: Send + Sync {

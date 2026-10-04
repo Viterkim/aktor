@@ -4,15 +4,13 @@ use std::{
     io::{self, Write},
 };
 
-type AppError = AktorError;
-
 #[aktor]
 async fn append(file: &mut File, text: String) -> io::Result<()> {
     writeln!(file, "{text}")
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn core::error::Error>> {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "aktor.log".into());
@@ -36,34 +34,33 @@ async fn main() {
         Ok::<_, AktorCleanupError>(())
     };
 
-    let run = async move |app: &mut AktorGroup| -> Result<(), AppError> {
-        let log = app
-            .spawn(ActorArgs {
-                name: "log".into(),
-                capacity: 32,
-                setup,
-                cleanup,
-            })
-            .await
-            .map_err(|error| AktorError::new(error.to_string()))?;
+    let mut actors = AktorGroup::new();
+    let kill = actors.killswitch();
+    let closing = actors.start_with(after)?;
+    let log = actors.spawn(ActorArgs::new("log", setup, cleanup)).await?;
 
-        append(&log, "application started".into())
-            .await
-            .map_err(|error| AktorError::new(error.to_string()))?;
-
+    let work = tokio::spawn(async move {
+        if let Err(error) = append(&log, "application started".into()).await {
+            eprintln!("{error}");
+        }
         core::future::pending::<()>().await;
-        Ok(())
-    };
-
-    let application = AktorGroup::new();
-    let kill = application.killswitch();
-    tokio::spawn(async move {
+    });
+    let ctrl_c = kill.clone();
+    let signal = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            kill.stop();
+            ctrl_c.stop();
         }
     });
 
-    let outcome = application.run(run, after).await;
+    kill.wait_stopping().await;
+    work.abort();
+    signal.abort();
+    let _joined = work.await;
+    let _joined = signal.await;
+    let report = closing.await;
+    if report.failed() {
+        return Err(report.into());
+    }
 
-    std::process::exit(if outcome.is_err() { 1 } else { 0 });
+    Ok(())
 }

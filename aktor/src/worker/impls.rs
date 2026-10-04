@@ -2,19 +2,22 @@ use super::*;
 
 impl Options {
     pub fn validate(&self) -> Result<(), WorkerError> {
-        if self.capacity == 0
-            || self.capacity > tokio::sync::Semaphore::MAX_PERMITS
-            || self.max_outstanding_bytes == 0
+        if self.capacity == 0 || self.capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(WorkerError::new(
+                CallError::NotAdmitted,
+                WorkerCause::Setup("worker queue capacity is outside the supported range".into()),
+            ));
+        }
+        if self.max_outstanding_bytes == 0
             || self.max_outstanding_bytes > u32::MAX as usize
             || self.max_outstanding_bytes > tokio::sync::Semaphore::MAX_PERMITS
         {
-            Err(WorkerError::new(
+            return Err(WorkerError::new(
                 CallError::NotAdmitted,
-                WorkerCause::PayloadTooLarge,
-            ))
-        } else {
-            Ok(())
+                WorkerCause::Setup("worker byte budget is outside the supported range".into()),
+            ));
         }
+        Ok(())
     }
 }
 impl Default for Options {

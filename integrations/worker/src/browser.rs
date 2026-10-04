@@ -91,6 +91,35 @@ pub async fn start_worker() -> Result<(), JsValue> {
 }
 
 #[wasm_bindgen]
+pub async fn sqlite_listener_check(url: String) -> Result<bool, JsValue> {
+    let mut actors = AktorGroup::new();
+    let kill = actors.killswitch();
+    let after = async |_| Ok::<_, AktorCleanupError>(());
+    let closing = actors.start_with(after).map_err(js_error)?;
+    let options = Options {
+        build: "preferences-v1".into(),
+        ..Options::default()
+    };
+    let database = actors
+        .worker::<Connection>("preferences", &url, options)
+        .await
+        .map_err(js_error)?;
+
+    let saved = write(&database, "listener-proof".into(), "0.8".into()).await;
+    let found = read(&database, "listener-proof".into()).await;
+    let missing = read(&database, "listener-missing".into()).await;
+    let stayed_open = !kill.is_stopping();
+    drop(actors);
+    let report = closing.wait().await;
+    Ok(saved.as_deref() == Ok("0.8")
+        && found.as_deref() == Ok("0.8")
+        && missing.is_err()
+        && stayed_open
+        && !report.failed()
+        && report.actors.len() == 1)
+}
+
+#[wasm_bindgen]
 pub struct Client {
     worker: Worker<Connection>,
 }
@@ -166,8 +195,8 @@ impl Client {
         let write = write(&self.worker, "volume".into(), "0.9".into())
             .send()
             .await;
-        let (panel, mut results) = read::latest(&self.worker);
-        let (other, mut other_results) = read::latest(&self.worker);
+        let (panel, mut results) = read(&self.worker, "absent".into()).latest();
+        let (other, mut other_results) = read(&self.worker, "absent".into()).latest();
         panel.send("absent".into());
         for _ in 0..2000 {
             panel.send("volume".into());
@@ -248,7 +277,8 @@ impl Client {
     }
 
     pub async fn submitted(&self) -> Result<String, JsValue> {
-        let (_idle, mut results) = read::latest(&self.worker);
+        let (_idle, mut results) = read(&self.worker, "absent".into()).latest();
+        assert!(results.next().await.unwrap().is_err());
         let mut request = pause::request(&self.worker, 0);
         let pending = Pin::new(&mut request)
             .poll(&mut Context::from_waker(Waker::noop()))

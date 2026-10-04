@@ -23,13 +23,24 @@ let id = insert_user(&database, "Katten".into())
 
 The extra result is the timeout you asked for. If it was admitted, the insert keeps running.
 
-## Latest input
-
-`find_users(&database, query).await` runs one search. For a search box, make one session and keep its sender in your UI:
+If you already have a reply and just want to pick it up when ready:
 
 ```rust
-let (search, mut results) = find_users::latest(&database);
-search.send("kat".into());
+let mut reply = insert_user(&database, "Katten".into()).send().await;
+
+if let Some(result) = reply.try_take() {
+    show_saved(result?);
+}
+```
+
+None leaves it available to await later, Some takes the output once.
+
+## Latest input
+
+For a search box, keep a session in your UI:
+
+```rust
+let (search, mut results) = find_users(&database, "kat".into()).latest();
 search.send("katten".into());
 
 while let Some(rows) = results.next().await {
@@ -37,18 +48,30 @@ while let Some(rows) = results.next().await {
 }
 ```
 
-Send from your input handler, receive from the task updating your results. Each session keeps its newest input. Older work can finish, its result gets thrown away if you already sent something newer. Use it for searches where skipping a few inputs is fine. For latest, give the return type a name instead of `impl Trait`.
+latest() sends "kat", then you keep sending from your input handler. Results from older inputs get thrown away. Use it for searches, writes still need their normal replies.
 
 ## Closing the application
 
 ```rust
-let kill = application.killswitch();
+let after = async |report: ShutdownReport| {
+    if report.failed() {
+        eprintln!("{report}");
+    }
+
+    Ok::<_, AktorCleanupError>(())
+};
+
+let mut actors = AktorGroup::new();
+let closing = actors.start_with(after)?;
+let kill = actors.killswitch();
 
 // in your Close / Ctrl+C handler
 kill.stop();
+
+let report = closing.await;
 ```
 
-Save anything still in your UI before stop(), actor cleanup only has its own resource. The [group example](../examples/group.rs) hooks up Ctrl+C and collects the reports at the end.
+after runs once the actors have cleaned up. Save anything still in your UI before stop(), actor cleanup only has its own resource. The [group example](../examples/group.rs) hooks up Ctrl+C and stops its tasks before exiting.
 
 ## Setup / cleanup errors
 

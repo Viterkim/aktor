@@ -1,6 +1,8 @@
 pub use crate::lifecycle::{ActorArgs, ActorFailure, ActorOutcome, ShutdownReport};
 use crate::{AktorCleanupError, AktorError};
 use core::{future::Future, pin::Pin};
+#[cfg(target_family = "wasm")]
+use std::{cell::RefCell, rc::Rc};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -23,10 +25,14 @@ mod browser;
 #[cfg(not(target_family = "wasm"))]
 mod native;
 
-/// Keep the application and its actors together.
+/// Actors sharing one shutdown. Dropping a started group begins closing it.
 pub struct AktorGroup {
+    stop_on_drop: bool,
     control: Arc<Control>,
-    actors: Vec<Entry>,
+    #[cfg(not(target_family = "wasm"))]
+    actors: Arc<Mutex<Vec<Entry>>>,
+    #[cfg(target_family = "wasm")]
+    actors: Rc<RefCell<Vec<Entry>>>,
 }
 
 /// Put this in your Ctrl+C or Close handler. Clones stop the same group.
@@ -54,6 +60,7 @@ struct Control {
 #[derive(Default)]
 struct State {
     report: ShutdownReport,
+    listening: bool,
     finished: bool,
     force_exit: bool,
     #[cfg(not(target_family = "wasm"))]

@@ -1,15 +1,29 @@
 <!doctype html>
-<meta charset="utf-8">
+<meta charset="utf-8" />
 <title>aktor worker proof</title>
 <p>Worker owns SQLite. Open the console to try window.client.read('volume').</p>
 <script type="module">
-import init, { Client, group_check, registration_check, typed_setup_check } from './pkg/aktor_worker_proof.js';
-await init();
-window.Client = Client;
-window.groupCheck = group_check;
-window.registrationCheck = registration_check;
-window.typedSetupCheck = typed_setup_check;
-window.client = new Client(new URL('./worker.js', location.href).href);
-window.setup = JSON.parse(await window.client.ready());
-window.ready = true;
+    import init, {
+        Client,
+        sqlite_listener_check,
+        group_check,
+        group_listener_check,
+        group_startup_check,
+        registration_check,
+        typed_setup_check
+    } from './pkg/aktor_worker_proof.js';
+
+    await init();
+
+    window.Client = Client;
+    window.sqliteListenerCheck = sqlite_listener_check;
+    window.groupCheck = group_check;
+    window.groupListenerCheck = group_listener_check;
+    window.groupStartupCheck = group_startup_check;
+    window.registrationCheck = registration_check;
+    window.typedSetupCheck = typed_setup_check;
+
+    window.client = new Client(new URL('./worker.js', location.href).href);
+    window.setup = JSON.parse(await window.client.ready());
+    window.ready = true;
 </script>

@@ -34,41 +34,73 @@ impl AktorGroup {
         options: Options,
     ) -> Result<Worker<S, Role, E>, WorkerError<E>> {
         let name = name.into();
-        let worker = Worker::<S, Role, E>::with_options(url, options)
-            .map_err(|error| error.without_data())?;
-        worker.manage(name.clone(), self.killswitch());
-        let shutdown = worker.new_handle();
-        let cancel = worker.new_handle();
-        let completion = worker.completion();
-        let label = name.clone();
-        self.actors.push(Entry {
-            name,
-            start: Box::new(move || {
-                shutdown.shutdown();
-            }),
-            cancel: Box::new(move || cancel.terminate()),
-            outcome: Box::pin(async move {
-                let mut outcome = ActorOutcome {
-                    actor: label,
-                    diagnostics: Vec::new(),
-                    timed_out: false,
-                };
-                if let Err(error) = completion.wait_report().await {
-                    match error.cause {
-                        WorkerCause::Cleanup(message) => {
-                            outcome.diagnostics.push(AktorCleanupError {
-                                diagnostics: message,
-                                data: (),
-                            })
+        if !self.control.lock().listening {
+            return Err(WorkerError {
+                outcome: crate::message::CallError::NotAdmitted,
+                cause: WorkerCause::Setup("start the actor group before opening workers".into()),
+                data: None,
+            });
+        }
+        if self.killswitch().is_stopping() {
+            self.completion().wait().await;
+            return Err(WorkerError {
+                outcome: crate::message::CallError::NotAdmitted,
+                cause: WorkerCause::Closed,
+                data: None,
+            });
+        }
+        let opened = Worker::<S, Role, E>::with_options(url, options);
+        let worker = match opened {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.killswitch().fail(ActorFailure {
+                    actor: name,
+                    phase: "setup".into(),
+                    message: error.to_string(),
+                });
+                self.completion().wait().await;
+                return Err(error.without_data());
+            }
+        };
+        {
+            let mut entries = self.actors.borrow_mut();
+            worker.manage(name.clone(), self.killswitch());
+            let shutdown = worker.new_handle();
+            let cancel = worker.new_handle();
+            let completion = worker.completion();
+            let label = name.clone();
+            entries.push(Entry {
+                name,
+                start: Box::new(move || {
+                    shutdown.shutdown();
+                }),
+                cancel: Box::new(move || cancel.terminate()),
+                outcome: Box::pin(async move {
+                    let mut outcome = ActorOutcome {
+                        actor: label,
+                        diagnostics: Vec::new(),
+                        timed_out: false,
+                    };
+                    if let Err(error) = completion.wait_report().await {
+                        match error.cause {
+                            WorkerCause::Cleanup(message) => {
+                                outcome.diagnostics.push(AktorCleanupError {
+                                    diagnostics: message,
+                                    data: (),
+                                })
+                            }
+                            WorkerCause::Closed => outcome.timed_out = true,
+                            _ => {}
                         }
-                        WorkerCause::Closed | WorkerCause::Timeout => outcome.timed_out = true,
-                        _ => {}
                     }
-                }
-                outcome
-            }),
-        });
-        worker.ready().await?;
+                    outcome
+                }),
+            });
+        }
+        if let Err(error) = worker.ready().await {
+            self.completion().wait().await;
+            return Err(error);
+        }
         Ok(worker)
     }
 }

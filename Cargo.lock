@@ -16,6 +16,7 @@ dependencies = [
  "inventory",
  "js-sys",
  "parking_lot",
+ "pin-project-lite",
  "postcard",
  "rusqlite",
  "serde",

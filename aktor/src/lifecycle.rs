@@ -9,6 +9,17 @@ pub struct ActorArgs<Setup, Cleanup> {
     pub setup: Setup,
     pub cleanup: Cleanup,
 }
+impl<Setup, Cleanup> ActorArgs<Setup, Cleanup> {
+    /// Queue capacity starts at 32, change capacity if you need another size.
+    pub fn new(name: impl Into<String>, setup: Setup, cleanup: Cleanup) -> Self {
+        Self {
+            name: name.into(),
+            capacity: 32,
+            setup,
+            cleanup,
+        }
+    }
+}
 
 /// What failed and how cleanup went.
 #[derive(Clone, Debug, Default)]
@@ -38,20 +49,25 @@ impl fmt::Display for ShutdownReport {
                 failure.actor, failure.phase, failure.message
             )?;
         }
+
         for actor in &self.actors {
             for report in &actor.diagnostics {
                 writeln!(f, "{} cleanup:\n{}", actor.actor, report)?;
             }
+
             if actor.timed_out {
                 writeln!(f, "{} shutdown did not finish", actor.actor)?;
             }
         }
+
         for report in &self.application {
             writeln!(f, "Application:\n{}", report)?;
         }
+
         if self.timed_out {
             writeln!(f, "Shutdown deadline reached")?;
         }
+
         Ok(())
     }
 }

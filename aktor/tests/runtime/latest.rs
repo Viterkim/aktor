@@ -2,7 +2,7 @@ use super::*;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
-struct Rows(u32);
+struct Rows(u32, std::marker::PhantomPinned);
 struct QueryError(u32);
 struct Database {
     started: Arc<Notify>,
@@ -20,7 +20,7 @@ async fn search(db: &mut Database, query: u32) -> Result<Rows, QueryError> {
     if query == 0 {
         Err(QueryError(query))
     } else {
-        Ok(Rows(query))
+        Ok(Rows(query, std::marker::PhantomPinned))
     }
 }
 
@@ -30,14 +30,13 @@ async fn current_results() {
     let release = Arc::new(Notify::new());
     let calls = Arc::new(Mutex::new(Vec::new()));
     let (handle, listener) = channel::<Database>(1).unwrap();
-    let (input, mut output) = search::latest(&handle);
+    let (input, mut output) = search(&handle, 1).latest();
     let owner = listener.run(Database {
         started: started.clone(),
         release: release.clone(),
         calls: calls.clone(),
     });
     let client = async move {
-        input.send(1);
         started.notified().await;
         for query in 2..=1000 {
             input.send(query);

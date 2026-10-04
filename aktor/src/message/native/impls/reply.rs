@@ -2,6 +2,17 @@ use super::super::*;
 use core::task::ready;
 
 impl<O> Reply<O> {
+    /// Take a ready output once. A pending reply can still be awaited.
+    pub fn try_take(&mut self) -> Option<O> {
+        if self.taken {
+            return None;
+        }
+        match Pin::new(self).poll(&mut Context::from_waker(core::task::Waker::noop())) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        }
+    }
+
     pub fn timeout(&mut self, duration: core::time::Duration) -> crate::Timeout<&mut Self> {
         crate::Timeout::native(self, duration, |reply| crate::timeout::WaitStatus {
             admitted: true,
@@ -49,7 +60,10 @@ impl<O> Future for Reply<O> {
             return Poll::Pending;
         }
         match ready!(this.poll_result(cx)) {
-            Ok(output) => Poll::Ready(output),
+            Ok(output) => {
+                this.taken = true;
+                Poll::Ready(output)
+            }
             Err(_) if this.group.is_some() => {
                 this.admission.lost();
                 this.parked = true;

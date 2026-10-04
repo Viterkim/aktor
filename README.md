@@ -13,16 +13,12 @@ You can do whichever structure you want, with functions living in like `things::
 ```toml
 [dependencies]
 aktor = { version = "0.0.2", features = ["tokio"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 ```
 
 Anything up to 0.1 will not have a stable api.
 
 ## Example
-
-```toml
-aktor = { version = "0.0.2", features = ["tokio"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
-```
 
 ```rust
 use aktor::*;
@@ -59,83 +55,51 @@ pub async fn insert_users(db: &mut Connection, names: Vec<String>) -> Result<()>
 }
 ```
 
-The [SQLite example](aktor/examples/sqlite/adopt.rs) also does this and shows it.
-
-## Clone / new_handle
-
-Explicitly make a new handle to the same actor and queue.
-
-```rust
-let another_handle = database.new_handle();
-```
-
-shutdown finishes the queued calls and closes it:
-
-```rust
-database.shutdown().await?;
-```
+That queues the whole transaction once, the calls inside it run right there. Passing the handle again would queue them behind yourself.
 
 ## Opening / starting / spawning
 
-Keep the actors with the application:
+Setup and cleanup are just closures. Give them the text you want printed if something fails:
 
 ```rust
 let setup = || {
     let e = |error: rusqlite::Error| AktorSetupError::new(error.to_string());
     let db = Connection::open("users.sqlite").map_err(e)?;
+
     db.execute("CREATE TABLE IF NOT EXISTS user (name TEXT NOT NULL)", []).map_err(e)?;
 
     Ok(db)
 };
-
 let cleanup = |db: Connection| {
     db.close().map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
 };
-
-let after = async |report: ShutdownReport| {
-    if report.failed() { eprintln!("{report}"); }
-
-    Ok::<_, AktorCleanupError>(())
-};
-
-let run = async move |app: &mut AktorGroup| -> Result<(), AktorError> {
-    let database = app.spawn(ActorArgs {
-        name: "users".into(),
-        capacity: 32,
-        setup,
-        cleanup,
-    }).await.map_err(|error| AktorError::new(error.to_string()))?;
-
-    run_application(database).await.map_err(|error| AktorError::new(error.to_string()))?;
-    Ok(())
-};
-
-let application = AktorGroup::new();
-let kill = application.killswitch();
-
-let outcome = application.run(run, after).await;
 ```
 
-It gets its own thread, and capacity is how many calls can wait in the queue. That means that callers will wait if its full. Errors from your function come back as usual.
+Then start the group and carry on with ordinary startup:
 
-Put `kill.stop()` in your Ctrl+C or Close handler. If an actor dies it starts closing too, each actor cleans up its own resource, then the last closure gets the reports.
+```rust
+let mut actors = AktorGroup::new();
+let kill = actors.killswitch();
+let closing = actors.start()?;
 
-If the database dies, we're closing the app anyway, your queries don't need another Result for that.
+let database = actors.spawn(ActorArgs::new("users", setup, cleanup)).await?;
 
-Setup and cleanup return the text you want printed, [you can keep the error itself too](aktor/docs/examples.md#setup--cleanup-errors). With er, use `error.er_report_string()`.
+// Start your UI / tasks with database.
+// Put kill.stop() in your Close / Ctrl+C handler.
 
-The group gets five seconds to close by default, `AktorGroup::with_grace(duration)` changes that. Your own spawned tasks still need closing too, see the [runtime notes](aktor/docs/runtime.md#application-shutdown).
+kill.wait_stopping().await;
+let report = closing.await;
+```
 
-The [group example](aktor/examples/group.rs) hooks up Ctrl+C and flushes its file before the application cleanup runs. The low level `Aktor::spawn` is still available if you need to own the lifetime yourself.
+If an actor dies, kill.wait_stopping() wakes up too, hook that into the same Close handler. Save settings still in your UI before stopping the group, and stop your own tasks before leaving the runtime.
+
+Use start_with(after) for your code at the end, [like this](aktor/docs/examples.md#closing-the-application). actors.shutdown().await starts closing and waits for the report.
+
+For a struct you already have, actors.spawn_value("counter", counter).await? is enough. database.new_handle() gives you another handle to the same queue.
+
+The group gets five seconds to close, AktorGroup::with_grace(duration) changes that. The [Ctrl+C example](aktor/examples/group.rs) shows an app closing, [runtime notes](aktor/docs/runtime.md) cover stopping your tasks.
 
 ## Setups
-
-### Tokio
-
-```toml
-[dependencies]
-aktor = { version = "0.0.2", features = ["tokio"] }
-```
 
 ### Browser workers
 
@@ -157,22 +121,10 @@ This is the local backend, it also runs in [plain WASM hosts](integrations/wasm/
 
 ## Docs
 
-### Repo links
-
 [Extra examples](aktor/docs/examples.md)
 
-[Runtime details](aktor/docs/runtime.md)
+[Pause and shutdown](aktor/docs/runtime.md)
 
 [Comparisons](aktor/docs/compare-libs.md)
 
-[GitHub Repo](https://github.com/Viterkim/aktor)
-
-### External links
-
-[Docs.rs](https://docs.rs/aktor/latest/aktor/)
-
-[Crates.io for the lib](https://crates.io/crates/aktor)
-
-[Crates.io for the macros](https://crates.io/crates/aktor-macros/)
-
-[Libs.rs](https://lib.rs/crates/aktor)
+[Docs.rs](https://docs.rs/aktor/latest/aktor/) / [Crates.io](https://crates.io/crates/aktor)

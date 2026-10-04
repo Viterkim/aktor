@@ -28,6 +28,7 @@ pub mod group;
 #[cfg(any(feature = "tokio", feature = "wasm_browser_workers"))]
 pub use group::{AktorGroup, GroupCompletion, KillSwitch};
 
+pub mod call;
 #[cfg(feature = "embassy")]
 pub mod embassy;
 pub mod latest;

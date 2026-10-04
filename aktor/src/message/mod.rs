@@ -5,14 +5,18 @@ use er::Er;
 mod error;
 #[cfg(feature = "tokio")]
 mod native;
+#[doc(hidden)]
+pub use error::consumed;
 #[cfg(any(feature = "tokio", feature = "embassy"))]
 #[doc(hidden)]
-pub use error::{consumed, stopped};
+pub use error::stopped;
 #[cfg(feature = "tokio")]
 pub use native::*;
 
 #[derive(Clone, Copy, Er, PartialEq, Eq)]
 pub enum ActorError {
+    #[er(format = "start the actor group listener before spawning actors")]
+    NotStarted,
     #[er(format = "actor capacity is outside the supported range")]
     InvalidCapacity,
     #[er(format = "actor closed")]

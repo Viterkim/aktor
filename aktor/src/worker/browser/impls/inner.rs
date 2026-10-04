@@ -11,8 +11,9 @@ impl Inner {
 
     pub fn lost<O>(&self, error: WireError) -> core::task::Poll<O> {
         if self.group.borrow().is_some() {
+            self.notify(&error);
             if self.finished.borrow().is_none() {
-                self.fail(error.cause);
+                self.fail_error(error);
             }
             return core::task::Poll::Pending;
         }

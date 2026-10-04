@@ -28,6 +28,7 @@ wasm_browser_workers = ["std", "dep:futures-util", "dep:tokio", "dep:serde", "de
 [dependencies]
 aktor-macros = { version = "=0.0.2", path = "../aktor-macros", optional = true }
 er = { version = "0.6", default-features = false, features = ["macros"] }
+pin-project-lite = { workspace = true }
 parking_lot = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }

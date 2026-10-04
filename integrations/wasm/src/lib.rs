@@ -68,6 +68,38 @@ impl embassy_time_driver::Driver for Clock {
 #[cfg(target_family = "wasm")]
 embassy_time_driver::time_driver_impl!(static CLOCK:Clock=Clock);
 
+async fn listening() -> Result<(), &'static str> {
+    let mut actors = embassy::AktorGroup::new();
+    let kill = actors.killswitch();
+    let closing = actors
+        .listen_with(async |_| Ok::<_, AktorError>(()))
+        .map_err(|_| "listener")?;
+    let setup = async || {
+        Ok::<_, AktorError>(State {
+            text: String::new(),
+        })
+    };
+    let cleanup = async |_| Ok::<_, AktorError>(());
+    let mut args = ActorArgs::new("lines", setup, cleanup);
+    args.capacity = 1;
+    let actor = actors.spawn::<State, 1, ()>(args).map_err(|_| "actor")?;
+    let work = async {
+        let value = append(&actor, Line("ordinary startup".into()))
+            .await
+            .unwrap_report();
+        drop(actors);
+        value
+    };
+    let (report, value) = join(closing, work).await;
+    if !kill.is_stopping() {
+        return Err("dropped group did not close");
+    }
+    if report.failed() || value != "ordinary startup" || report.actors.len() != 1 {
+        return Err("listener shutdown");
+    }
+    Ok(())
+}
+
 async fn grouped() -> Result<(), &'static str> {
     let cleaned = Rc::new(Cell::new(false));
     let cleanup = cleaned.clone();
@@ -238,6 +270,7 @@ async fn exercise() -> Result<(), &'static str> {
     if !Rc::ptr_eq(&error, &observed) {
         return Err("retained cleanup failure");
     }
+    listening().await?;
     grouped().await?;
     Ok(())
 }

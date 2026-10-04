@@ -53,9 +53,9 @@ async fn typed() {
     struct Panel {
         search: find::LatestSender<aktor::message::LatestSender<(usize,)>>,
     }
-    let (search, mut results) = find::latest(&db);
+    let (search, mut results) = find(&db, 0).latest();
     let panel = Panel { search };
-    let (other, mut other_results) = fail::latest(&db);
+    let (other, mut other_results) = fail(&db).latest();
     panel.search.send(0);
     panel.search.send(1);
     other.send();
@@ -77,4 +77,20 @@ async fn typed() {
     assert_eq!(results.next().await, None);
     drop(other);
     assert_eq!(other_results.next().await, None);
+}
+
+#[tokio::test]
+async fn retained_reply() {
+    let (handle, mut listener) = channel::<Db>(2).unwrap();
+    let mut state = Db::default();
+    let mut reply = insert(&handle, "first".into()).send().await;
+    assert!(reply.try_take().is_none());
+    listener.recv().await.unwrap().run(&mut state).await;
+    assert_eq!(reply.try_take(), Some(0));
+    assert!(reply.try_take().is_none());
+
+    let mut reply = insert(&handle, "second".into()).send().await;
+    assert!(reply.try_take().is_none());
+    listener.recv().await.unwrap().run(&mut state).await;
+    assert_eq!(reply.await, 1);
 }

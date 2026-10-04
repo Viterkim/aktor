@@ -57,8 +57,6 @@ pub struct WorkerError<T = ()> {
 pub enum WorkerCause {
     Closed,
     Full,
-    Timeout,
-    PayloadTooLarge,
     Codec(String),
     Setup(String),
     Cleanup(String),

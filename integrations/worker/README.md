@@ -1,26 +1,26 @@
 # Browser SQLite
 
-The [preferences](src/preferences) queries use #[aktor], running in a worker so SQLite can be busy while the page keeps going. Enable wasm_browser_workers, then inside your application's [AktorGroup](../../README.md#opening--starting--spawning):
+The [preferences](src/preferences) queries use #[aktor], running in a worker so SQLite can be busy while the page keeps going. Enable wasm_browser_workers, then register it with your [AktorGroup](../../README.md#opening--starting--spawning):
 
 ```rust
 use aktor::*;
 use worker::Options;
 use rusqlite::Connection;
 
-let database = app.worker::<Connection>(
-    "preferences",
-    "worker.js",
-    Options {
-        build: "preferences-v1".into(),
-        ..Options::default()
-    },
-)
-.await?;
+let mut actors = AktorGroup::new();
+let kill = actors.killswitch();
+let closing = actors.start()?;
+let options = Options {
+    build: "preferences-v1".into(),
+    ..Options::default()
+};
+
+let database = actors.worker::<Connection>("preferences", "worker.js", options).await?;
 
 let volume = read(&database, "volume".into()).await?;
 ```
 
-SQLite runs inside that same worker, open the connection there and start serving:
+The group starts its own shutdown task. Put kill.stop() in the UI Close handler and await closing before leaving the page. SQLite runs inside that same worker, open the connection there and start serving:
 
 ```rust
 let cleanup = async |connection: Connection| {

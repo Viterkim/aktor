@@ -9,7 +9,7 @@ pub fn run<S, E, C, CleanupFuture>(
     mut listener: Listener<S>,
     mut commands: mpsc::Receiver<Command<S, E, C>>,
     status: watch::Sender<bool>,
-    started: oneshot::Sender<Result<(), E>>,
+    started: oneshot::Sender<Result<(), DedicatedStartError<E>>>,
     mut cleanup: impl FnMut(S) -> CleanupFuture,
     abandoned_setup: Arc<parking_lot::Mutex<Vec<AbandonedSetup<E>>>>,
     failed_cleanup: Arc<parking_lot::Mutex<FailedCleanup<C>>>,

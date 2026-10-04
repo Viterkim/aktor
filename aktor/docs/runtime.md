@@ -1,43 +1,35 @@
-# Runtime details
+# While it's running
 
-## Requests / replies
-
-send() waits for queue space and gives you a reply to await later. try_send() gives the request back if it can't go straight in. cast() skips the reply, only for functions returning ().
-
-Dropping or timing out a reply leaves queued work running. Drop the last handle and queued calls finish before cleanup. downgrade()/upgrade() gives you a weak handle when you don't want to keep it alive.
+Calls wait when the queue is full. Once a call is queued, dropping its reply or timing out leaves it running. Losing a write's reply doesn't mean it failed, so don't blindly retry it.
 
 ## Pause / resume (Tokio)
 
 ```rust
-database.actor.pause().await?;
-database.actor.resume(|| {
+let reopen = || {
     Connection::open_in_memory()
         .map_err(|error| AktorSetupError::new(error.to_string()))
-}).await?;
+};
+
+database.actor.pause().await?;
+database.actor.resume(reopen).await?;
 ```
 
-pause finishes queued calls and closes the resource, resume opens a new one. replace(setup) does both. Calls made while paused wait for resume, failed setup or cleanup leaves it paused.
-
-shutdown() starts closing immediately, even if you stop awaiting it. Keep your Tokio runtime running until it's done, completion.wait().await gets the result again later.
+pause finishes queued calls and closes the resource. Calls wait until resume opens it again. If reopening fails, they keep waiting for a later resume.
 
 ## Application shutdown
 
-AktorGroup stops its application future and finishes accepted calls, each actor cleans up its own resource, then your last closure gets the reports. If you spawned tasks yourself, they still need stopping in your close flow. `kill.wait_stopping().await` tells your UI or those tasks when we're closing.
+Put kill.stop() in your Close handler. Actor failure also wakes kill.wait_stopping(), forward that into the same handler:
 
-Save settings before stopping the group. If you lost a write's reply, it might already have happened, don't blindly retry it.
+```rust
+let stopping = kill.clone();
+spawn(async move {
+    stopping.wait_stopping().await;
+    events.send(AppEvent::Close).await;
+});
+```
 
-`AktorGroup::with_grace(duration)` gives the whole shutdown that long, including your last closure. At the deadline unfinished work gets cancelled, browser workers get terminated. Native code can block completely, so a watchdog prints the report and exits if it won't finish. Browser hooks need to yield so the timer can run.
+Your handler stops your application's tasks, then awaits closing before leaving the runtime. A task waiting on a dead actor stays pending until you drop it. Dropping a Tokio JoinHandle leaves its task running.
 
-With panic = "abort", a panic in the same process ends it immediately, cleanup can't run then.
+Save settings still in your UI before stopping the group. Actor cleanup deals with its own resource, start_with(after) runs your final closure afterward.
 
-## Function arguments
-
-Native queued arguments need Send + 'static, local calls can borrow. Outputs need Send + 'static too. Return owned values.
-
-For nested calls, pass the resource you already have. Using that actor's handle queues work behind yourself and can deadlock.
-
-Leave the generated target inferred with generics, like query::<User, _>(&database, id). Put cfg on the function, attributes on arguments aren't supported.
-
-[Browser setup](../../integrations/worker/README.md)
-
-[Embassy setup](../../integrations/embassy/README.md)
+Shutdown gets five seconds by default. Unfinished work is cancelled at the deadline, browser workers are terminated. If native code won't stop, the watchdog prints the report and exits the process. Browser code needs to yield so its timer can run.

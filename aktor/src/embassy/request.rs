@@ -33,6 +33,7 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role> Request<'a, S, N, E, O
             }),
             reply: Reply {
                 parked: false,
+                taken: false,
                 answer,
                 group: handle
                     .inner
@@ -211,6 +212,17 @@ impl<F, I, O> Drop for Call<F, I, O> {
 }
 
 impl<O> Reply<O> {
+    /// Take a ready output once. A pending reply can still be awaited.
+    pub fn try_take(&mut self) -> Option<O> {
+        if self.taken {
+            return None;
+        }
+        match Pin::new(self).poll(&mut Context::from_waker(core::task::Waker::noop())) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        }
+    }
+
     pub fn timeout(&mut self, duration: core::time::Duration) -> crate::Timeout<&mut Self> {
         crate::Timeout::local(self, duration, |reply| crate::timeout::WaitStatus {
             admitted: true,
@@ -227,7 +239,10 @@ impl<O> Future for Reply<O> {
             return Poll::Pending;
         }
         match ready!(this.answer.poll(context)) {
-            Ok(output) => Poll::Ready(output),
+            Ok(output) => {
+                this.taken = true;
+                Poll::Ready(output)
+            }
             Err(_) => {
                 if let Some(group) = &this.group {
                     group.fail(crate::ActorFailure {

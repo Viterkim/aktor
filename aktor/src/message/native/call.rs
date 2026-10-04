@@ -36,6 +36,7 @@ where
             error: None,
             group: handle.inner.admission.group(),
             parked: false,
+            taken: false,
         },
     }
 }
@@ -74,6 +75,7 @@ where
             error: None,
             group: handle.inner.admission.group(),
             parked: false,
+            taken: false,
         },
     }
 }

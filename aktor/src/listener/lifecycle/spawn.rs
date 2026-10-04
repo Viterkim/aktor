@@ -45,6 +45,10 @@ where
         .build()
         .map_err(DedicatedStartError::Thread)?;
 
+    let group = match &listener.failure {
+        FailurePolicy::Group(group) => Some(group.clone()),
+        _ => None,
+    };
     let (commands, receiver) = mpsc::channel(1);
     let (force, forced) = watch::channel(false);
     let (status, running) = watch::channel(false);
@@ -64,8 +68,21 @@ where
         .spawn(move || {
             #[cfg(not(target_family = "wasm"))]
             let _lifetime = lifetime;
-            Some(match runtime.block_on(async { setup().await }) {
-                Ok(state) => run::run(
+            let initialized = runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        if let Some(group) = &group {
+                            group.wait_for_force().await;
+                        } else {
+                            core::future::pending::<()>().await;
+                        }
+                    } => None,
+                    result = async { setup().await } => Some(result),
+                }
+            });
+            Some(match initialized {
+                Some(Ok(state)) => run::run(
                     &runtime,
                     state,
                     listener,
@@ -77,9 +94,14 @@ where
                     retained_cleanup,
                     forced,
                 ),
-                Err(error) => {
+                Some(Err(error)) => {
                     drop(listener);
-                    let _result = started.send(Err(error));
+                    let _result = started.send(Err(DedicatedStartError::Init(error)));
+                    Ok(())
+                }
+                None => {
+                    drop(listener);
+                    let _result = started.send(Err(DedicatedStartError::Closed));
                     Ok(())
                 }
             })
@@ -107,7 +129,7 @@ where
             let joined = task::spawn_blocking(move || thread.join()).await;
 
             match result {
-                Ok(Err(error)) => Err(DedicatedStartError::Init(error)),
+                Ok(Err(error)) => Err(error),
                 _ => Err(DedicatedStartError::Panicked {
                     actor: actor_name,
                     cause: crate::listener::startup_cause(joined),

@@ -49,8 +49,7 @@ async fn resume() {
         Err(LifecycleError::AlreadyRunning)
     ));
 
-    let mut before = Box::pin(add(&handle, 4));
-    assert!(poll(before.as_mut()).is_pending());
+    let before = add(&handle, 4).send().await;
 
     let mut pause = Box::pin(actor.pause());
     assert!(poll(pause.as_mut()).is_pending());

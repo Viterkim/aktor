@@ -33,10 +33,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
             .ok_or_else(|| WireError::new(CallError::NotAdmitted, WorkerCause::Closed))?
             .as_ref()
             .map_err(Clone::clone)?;
-        let bytes = input
-            .len()
-            .checked_add(self.operation.len())
-            .ok_or_else(|| WireError::new(CallError::NotAdmitted, WorkerCause::PayloadTooLarge))?;
+        let bytes = input.len().saturating_add(self.operation.len());
 
         Ok(bytes.min(self.inner.options.max_outstanding_bytes))
     }
@@ -86,6 +83,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
             group: inner.group.borrow().clone(),
             id,
             parked: false,
+            taken: false,
             output: PhantomData,
         });
 

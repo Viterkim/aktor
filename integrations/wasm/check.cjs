@@ -10,4 +10,5 @@ for (let i = 0; i < 4; i++) {
         assert.equal(instance.exports.aktor_check(), 0);
     }
 }
+
 console.log('Node: local actor calls and cleanup passed, no host imports.');

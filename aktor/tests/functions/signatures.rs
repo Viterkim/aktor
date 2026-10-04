@@ -192,8 +192,7 @@ async fn inputs() {
     .await
     .unwrap();
 
-    let (sender, mut results) = by_name::latest(&handle);
-    sender.send(String::from("search"));
+    let (sender, mut results) = by_name(&handle, String::from("search")).latest();
     assert_eq!(results.next().await, Some(String::from("search")));
     let cloned = sender.clone();
     cloned.send(String::from("new search"));
@@ -274,18 +273,39 @@ async fn mapped(
     first(std::borrow::Cow::Borrowed(&text)) + second(text)
 }
 
-struct Inner(u32);
+struct Inner(u32, std::marker::PhantomPinned);
 
 #[aktor]
 async fn put(_: &mut usize, value: Inner) -> u32 {
     value.0
 }
 
+#[aktor]
+async fn keep<Latest: Send + 'static>(_: &usize, value: Latest) -> Latest {
+    value
+}
+
 #[tokio::test]
 async fn latest_names() {
     let (handle, owner) = spawn_thread(0usize, 1).unwrap();
-    let (sender, mut results) = put::latest(&handle);
-    sender.send(Inner(17));
+    assert_eq!(
+        put(&handle, Inner(12, std::marker::PhantomPinned)).await,
+        12
+    );
+
+    let (sender, mut results) = put(&handle, Inner(17, std::marker::PhantomPinned)).latest();
+    let (generic, mut found) = keep(&handle, String::from("query")).latest();
+    assert_eq!(found.next().await.as_deref(), Some("query"));
+    drop(generic);
+    drop(found);
+
+    let (pattern, mut matched) = patterns(&handle, (1, 2), "a".into(), "b".into(), ()).latest();
+    assert_eq!(matched.next().await.as_deref(), Some("1:2:ab"));
+    pattern.send((3, 4), "c".into(), "d".into(), ());
+    assert_eq!(matched.next().await.as_deref(), Some("3:4:cd"));
+    drop(pattern);
+    drop(matched);
+
     assert_eq!(results.next().await, Some(17));
     drop(sender);
     drop(results);

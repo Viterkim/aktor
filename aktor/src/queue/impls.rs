@@ -78,15 +78,18 @@ impl Admission {
     }
 
     pub fn register_session(&self, callback: Box<dyn Fn(Phase) -> bool + Send + Sync>) {
-        let lock = self.state.lock();
-        let phase = lock.borrow().phase;
-        let callbacks = lock.borrow().sessions.clone();
+        let (phase, callbacks) = {
+            let lock = self.state.lock();
+            let mut state = lock.borrow_mut();
+            state.sessions.push(Arc::from(callback));
+            (state.phase, state.sessions.clone())
+        };
         let expired: Vec<_> = callbacks.into_iter().filter(|live| !live(phase)).collect();
-        lock.borrow_mut()
+        self.state
+            .lock()
+            .borrow_mut()
             .sessions
             .retain(|live| !expired.iter().any(|dead| Arc::ptr_eq(live, dead)));
-        callback(phase);
-        lock.borrow_mut().sessions.push(Arc::from(callback));
     }
 
     pub fn shutdown(&self) {
@@ -136,5 +139,49 @@ mod tests {
             drop(session);
         }
         assert_eq!(admission.state.lock().borrow().sessions.len(), 1);
+    }
+
+    #[test]
+    fn session_registration() {
+        let admission = Arc::new(Admission::new());
+        let observed = Arc::downgrade(&admission);
+        admission.register_session(Box::new(move |_| {
+            let admission = observed.upgrade().unwrap();
+            let other = admission.clone();
+            assert!(
+                std::thread::spawn(move || other.state.try_lock().is_some())
+                    .join()
+                    .unwrap()
+            );
+            true
+        }));
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let registering = admission.clone();
+        let callback_entered = entered.clone();
+        let callback_resume = resume.clone();
+        let observed = Arc::downgrade(&admission);
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_pause = paused.clone();
+        let registration = std::thread::spawn(move || {
+            registering.register_session(Box::new(move |phase| {
+                if matches!(phase, Phase::Running) {
+                    callback_entered.wait();
+                    callback_resume.wait();
+                }
+                let current = observed.upgrade().unwrap().phase();
+                saw_pause.store(
+                    matches!(current, Phase::Paused),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                true
+            }));
+        });
+        entered.wait();
+        admission.close();
+        resume.wait();
+        registration.join().unwrap();
+        assert!(paused.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

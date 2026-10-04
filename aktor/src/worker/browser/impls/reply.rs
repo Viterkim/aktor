@@ -5,6 +5,17 @@ use core::{
 };
 
 impl<O: DeserializeOwned> WorkerReply<O> {
+    /// Take a ready output once. A pending reply can still be awaited.
+    pub fn try_take(&mut self) -> Option<O> {
+        if self.taken {
+            return None;
+        }
+        match Pin::new(self).poll(&mut Context::from_waker(core::task::Waker::noop())) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        }
+    }
+
     pub(super) fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<O, WireError>> {
         match Pin::new(&mut self.response).poll(context) {
             Poll::Ready(Ok(Ok(output))) => {
@@ -63,7 +74,10 @@ impl<O: DeserializeOwned> Future for WorkerReply<O> {
             return Poll::Pending;
         }
         match this.poll_result(context) {
-            Poll::Ready(Ok(output)) => Poll::Ready(output),
+            Poll::Ready(Ok(output)) => {
+                this.taken = true;
+                Poll::Ready(output)
+            }
             Poll::Ready(Err(error)) => {
                 this.parked = true;
                 if let Some(inner) = this.inner.upgrade() {

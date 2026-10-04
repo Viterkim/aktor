@@ -1,7 +1,10 @@
 extern crate std;
 
 use super::*;
-use aktor::message::TrySendError;
+use aktor::{
+    ShutdownReport,
+    message::{LocalFuture, TrySendError},
+};
 use alloc::{boxed::Box, vec};
 use core::{
     cell::Cell,
@@ -64,7 +67,8 @@ async fn exercise(spawner: Spawner) {
             drop(sensor.shutdown());
         }
 
-        let reply = request.try_send().unwrap();
+        let mut reply = request.try_send().unwrap();
+        assert!(reply.try_take().is_none());
         let completion = sensor.shutdown();
 
         owner
@@ -77,7 +81,8 @@ async fn exercise(spawner: Spawner) {
             .await
             .unwrap();
 
-        assert_eq!(reply.await.unwrap_report(), 1);
+        assert_eq!(reply.try_take().unwrap().unwrap_report(), 1);
+        assert!(reply.try_take().is_none());
         completion.wait().await.unwrap();
     }
 
@@ -238,6 +243,7 @@ async fn exercise(spawner: Spawner) {
     assert_eq!(reply.await.unwrap_report(), 3);
     completion.wait().await.unwrap();
 
+    listening(spawner).await;
     grouped().await;
     DONE.store(true, Ordering::Release);
 }
@@ -270,7 +276,7 @@ async fn grouped() {
                         },
                     })
                     .unwrap();
-                let (search, mut found) = local_search::latest(&sensor);
+                let (search, mut found) = local_search(&sensor, Rc::<str>::from("kat")).latest();
                 search.send(Rc::<str>::from("katten"));
                 assert_eq!(found.next().await.as_deref(), Some("katten"));
                 drop(search);
@@ -324,8 +330,14 @@ async fn grouped() {
         .await
         .unwrap_err();
     let mut reply = deferred.borrow_mut().take().unwrap();
+    assert!(reply.try_take().is_none());
+    assert!(reply.try_take().is_none());
     for _ in 0..2 {
-        assert!(Pin::new(&mut reply).poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            Pin::new(&mut reply)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
     }
     assert!(
         report
@@ -334,4 +346,73 @@ async fn grouped() {
             .message
             .contains("could not open sensor")
     );
+}
+
+#[embassy_executor::task(pool_size = 2)]
+async fn group_owner(
+    closing: LocalFuture<'static, ShutdownReport>,
+    finished: Rc<Signal<NoopRawMutex, ShutdownReport>>,
+) {
+    finished.signal(closing.await);
+}
+
+async fn listening(spawner: Spawner) {
+    for dropped in [false, true] {
+        let mut actors = embassy::AktorGroup::new();
+        assert!(matches!(
+            actors.spawn_value::<u32, 2>("early", 0),
+            Err(aktor::message::ActorError::NotStarted)
+        ));
+        let kill = actors.killswitch();
+        let closing = actors.listen().unwrap();
+        let completed = actors.completion();
+        assert!(actors.listen_with(async |_| Ok::<_, AktorError>(())).is_err());
+        let readings = Rc::new(RefCell::new(Vec::new()));
+        let values = readings.clone();
+        let cleaned = Rc::new(Cell::new(false));
+        let cleanup = cleaned.clone();
+        let setup = async move || Ok::<_, AktorError>(Sensor { readings: values });
+        let cleanup = async move |_| {
+            cleanup.set(true);
+            Ok::<_, AktorError>(())
+        };
+        let mut args = ActorArgs::new("sensor", setup, cleanup);
+        args.capacity = 2;
+        let sensor = actors.spawn::<Sensor, 2, ()>(args).unwrap();
+        let plain_readings = Rc::new(RefCell::new(Vec::new()));
+        let plain = actors
+            .spawn_value::<Sensor, 2>(
+                "plain sensor",
+                Sensor {
+                    readings: plain_readings.clone(),
+                },
+            )
+            .unwrap();
+        let work = async {
+            assert_eq!(record(&plain, 9).await.unwrap_report(), 1);
+            assert_eq!(record(&sensor, 7).await.unwrap_report(), 1);
+            if dropped {
+                drop(actors);
+            } else {
+                drop(actors.shutdown());
+                assert!(matches!(
+                    actors.spawn_value::<u32, 2>("late", 0),
+                    Err(aktor::message::ActorError::Closed)
+                ));
+            }
+        };
+        let finished = Rc::new(Signal::new());
+        spawner.spawn(group_owner(closing, finished.clone()).unwrap());
+        work.await;
+
+        let report = finished.wait().await;
+        assert!(!(&completed).await.failed());
+        assert_eq!(completed.await.actors.len(), report.actors.len());
+        assert!(!report.failed());
+        assert!(cleaned.get());
+        assert_eq!(*readings.borrow(), [7]);
+        assert_eq!(*plain_readings.borrow(), [9]);
+        assert_eq!(Rc::strong_count(&plain_readings), 1);
+        assert!(kill.is_stopping());
+    }
 }

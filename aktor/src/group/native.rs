@@ -60,6 +60,18 @@ impl Drop for ThreadLife {
 
 #[cfg(feature = "tokio")]
 impl AktorGroup {
+    /// Move an existing value into an actor. Cleanup just drops it.
+    pub async fn spawn_value<S: Send + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        value: S,
+    ) -> Result<Aktor<S, AktorSetupError, AktorCleanupError>, DedicatedStartError<AktorSetupError>>
+    {
+        let setup = move || Ok::<_, AktorSetupError>(value);
+        let cleanup = |_| Ok::<_, AktorCleanupError>(());
+        self.spawn(ActorArgs::new(name, setup, cleanup)).await
+    }
+
     /// Start an actor in this group.
     pub async fn spawn<S, E, C, Setup, Cleanup>(
         &mut self,
@@ -114,9 +126,27 @@ impl AktorGroup {
             cleanup,
         } = args;
 
-        let runtime =
-            tokio::runtime::Handle::try_current().map_err(|_| DedicatedStartError::NoRuntime)?;
+        if !self.control.lock().listening {
+            return Err(DedicatedStartError::NotStarted);
+        }
         let kill = self.killswitch();
+        if kill.is_stopping() {
+            self.completion().wait().await;
+            return Err(DedicatedStartError::Closed);
+        }
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                let error = DedicatedStartError::NoRuntime;
+                kill.fail(ActorFailure {
+                    actor: name,
+                    phase: "setup".into(),
+                    message: error.to_string(),
+                });
+                self.completion().wait().await;
+                return Err(error);
+            }
+        };
         let (started, ready) = tokio::sync::oneshot::channel();
         let (completed, outcome) = tokio::sync::oneshot::channel();
         let (closing, mut closed) = watch::channel(false);
@@ -124,22 +154,38 @@ impl AktorGroup {
         let label = name.clone();
 
         // Keep startup owned even if the application stops awaiting it.
-        self.actors.push(Entry {
-            name: name.clone(),
-            start: Box::new(move || {
-                closing.send_replace(true);
-            }),
-            cancel: Box::new(move || {
-                forcing.send_replace(true);
-            }),
-            outcome: Box::pin(async move {
-                outcome.await.unwrap_or_else(|_| ActorOutcome {
-                    actor: label,
-                    diagnostics: vec![AktorCleanupError::new("startup observer stopped")],
-                    timed_out: false,
-                })
-            }),
-        });
+        let registered = {
+            let mut entries = self
+                .actors
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if kill.is_stopping() {
+                false
+            } else {
+                entries.push(Entry {
+                    name: name.clone(),
+                    start: Box::new(move || {
+                        closing.send_replace(true);
+                    }),
+                    cancel: Box::new(move || {
+                        forcing.send_replace(true);
+                    }),
+                    outcome: Box::pin(async move {
+                        outcome.await.unwrap_or_else(|_| ActorOutcome {
+                            actor: label,
+                            diagnostics: vec![AktorCleanupError::new("startup observer stopped")],
+                            timed_out: false,
+                        })
+                    }),
+                });
+                true
+            }
+        };
+        if !registered {
+            self.completion().wait().await;
+            return Err(DedicatedStartError::Closed);
+        }
+        let actor_name = name.clone();
 
         runtime.spawn(async move {
             let owner = match Aktor::spawn_async(SpawnArgs {
@@ -153,6 +199,16 @@ impl AktorGroup {
             {
                 Ok(owner) => owner,
                 Err(error) => {
+                    if matches!(error, DedicatedStartError::Closed) && kill.is_stopping() {
+                        kill.control.lock().report.timed_out = true;
+                        let _sent = started.send(Err(error));
+                        let _sent = completed.send(ActorOutcome {
+                            actor: name,
+                            diagnostics: Vec::new(),
+                            timed_out: true,
+                        });
+                        return;
+                    }
                     let diagnostics = error.to_string();
                     kill.fail(ActorFailure {
                         actor: name.clone(),
@@ -205,6 +261,19 @@ impl AktorGroup {
             };
 
             if let Err(error) = result {
+                let forced = matches!(&*error, OwnerError::Cancelled) && kill.is_stopping();
+                if !forced {
+                    kill.fail(ActorFailure {
+                        actor: outcome.actor.clone(),
+                        phase: if matches!(&*error, OwnerError::Cleanup(_)) {
+                            "cleanup"
+                        } else {
+                            "completion"
+                        }
+                        .into(),
+                        message: error.to_string(),
+                    });
+                }
                 match &*error {
                     OwnerError::Cleanup(errors) => {
                         outcome
@@ -224,13 +293,26 @@ impl AktorGroup {
             let _sent = completed.send(outcome);
         });
 
-        ready.await.unwrap_or_else(|_| {
+        let result = ready.await.unwrap_or_else(|_| {
             Err(DedicatedStartError::Panicked {
-                actor: "startup observer".into(),
+                actor: actor_name.clone(),
                 cause: DedicatedJoinError {
                     payload: parking_lot::Mutex::new(Box::new("startup observer stopped")),
                 },
             })
-        })
+        });
+        if let Err(error) = &result {
+            let cancelled =
+                matches!(error, DedicatedStartError::Closed) && self.killswitch().is_stopping();
+            if !cancelled {
+                self.killswitch().fail(ActorFailure {
+                    actor: actor_name,
+                    phase: "setup".into(),
+                    message: error.to_string(),
+                });
+            }
+            self.completion().wait().await;
+        }
+        result
     }
 }
