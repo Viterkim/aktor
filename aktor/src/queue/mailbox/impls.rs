@@ -3,10 +3,12 @@ use super::*;
 impl<'a, S> Permit<'a, S> {
     pub fn commit(self, message: Message<S>) -> Result<&'a Notify, (Self, Message<S>)> {
         let mut entries = self.queue.entries.lock();
+
         if self.is_closed() {
             drop(entries);
             return Err((self, message));
         }
+
         entries.messages.push_back(message);
         self.permit.forget();
         drop(entries);
@@ -21,16 +23,20 @@ impl<'a, S> Permit<'a, S> {
 impl<S> Sender<S> {
     pub fn commit_service(&self, message: Message<S>) -> Result<&Notify, Message<S>> {
         let mut entries = self.0.entries.lock();
+
         if !entries.receiving {
             return Err(message);
         }
+
         entries.messages.push_back(message);
         drop(entries);
         Ok(&self.0.ready)
     }
 
     pub async fn reserve(&self) -> Result<Permit<'_, S>, tokio::sync::AcquireError> {
+        #[cfg(feature = "tokio")]
         tokio::task::coop::consume_budget().await;
+
         let permit = self.0.permits.acquire().await?;
 
         Ok(Permit {
@@ -68,6 +74,7 @@ impl<S> Drop for Sender<S> {
 
 impl<S> Receiver<S> {
     pub async fn recv(&mut self) -> Option<Message<S>> {
+        #[cfg(feature = "tokio")]
         tokio::task::coop::consume_budget().await;
 
         loop {
@@ -82,23 +89,30 @@ impl<S> Receiver<S> {
     }
 
     pub fn try_recv(&self) -> Result<Message<S>, mpsc::error::TryRecvError> {
-        let entry = {
+        let result = {
             let mut entries = self.0.entries.lock();
-            entries.messages.pop_front()
+
+            if let Some(entry) = entries.messages.pop_front() {
+                Ok(entry)
+            } else if self.0.permits.is_closed() || self.0.senders_closed.load(Ordering::Acquire) {
+                Err(mpsc::error::TryRecvError::Disconnected)
+            } else {
+                Err(mpsc::error::TryRecvError::Empty)
+            }
         };
 
-        if let Some(entry) = entry {
-            if entry.counted() {
-                self.0.permits.add_permits(1);
-            }
-            return Ok(entry);
+        #[cfg(test)]
+        if result.is_err() {
+            tests::after_empty();
         }
 
-        if self.0.permits.is_closed() || self.0.senders_closed.load(Ordering::Acquire) {
-            Err(mpsc::error::TryRecvError::Disconnected)
-        } else {
-            Err(mpsc::error::TryRecvError::Empty)
+        let entry = result?;
+
+        if entry.counted() {
+            self.0.permits.add_permits(1);
         }
+
+        Ok(entry)
     }
 
     pub fn close(&mut self) {
@@ -123,6 +137,7 @@ impl<S> Drop for Receiver<S> {
             entries.receiving = false;
             std::mem::take(&mut entries.messages)
         };
+
         drop(messages);
     }
 }
@@ -139,4 +154,35 @@ pub fn channel<S>(capacity: usize) -> (Sender<S>, Receiver<S>) {
     });
 
     (Sender(queue.clone()), Receiver(queue))
+}
+
+#[cfg(test)]
+mod tests {
+    std::thread_local! {
+        static EMPTY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub fn after_empty() {
+        let action = EMPTY.with(|empty| empty.borrow_mut().take());
+
+        if let Some(action) = action {
+            action();
+        }
+    }
+
+    #[tokio::test]
+    async fn final_input() {
+        let (handle, listener) = crate::listener::channel::<usize>(1).unwrap();
+
+        EMPTY.with(|empty| {
+            *empty.borrow_mut() = Some(Box::new(move || {
+                crate::message::call(&handle, |state, ()| *state += 1, ())
+                    .try_cast()
+                    .unwrap();
+                drop(handle);
+            }));
+        });
+
+        assert_eq!(listener.run(0).await, 1);
+    }
 }

@@ -2,6 +2,7 @@ use crate::message::CallError;
 use er::Er;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+pub mod bytes;
 mod codec;
 mod impls;
 pub use codec::{decode, encode};
@@ -27,12 +28,12 @@ mod browser;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use browser::{
     Completion, LatestResults, LatestSender, Server, Worker, WorkerReply, WorkerRequest, serve,
-    serve_for, serve_with, setup_failed,
+    serve_for, serve_setup, serve_with, setup_failed,
 };
 
-pub use crate::target::{Native, Remote};
+pub use crate::dispatch::{Native, Remote};
 
-pub const VERSION: u32 = 0;
+pub const VERSION: u32 = 2;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 type WireError = WorkerError<Vec<u8>>;
@@ -78,14 +79,24 @@ enum Incoming {
     Call {
         id: u64,
         operation: String,
+        #[serde(with = "bytes")]
         input: Vec<u8>,
     },
     Shutdown,
+    Initialize {
+        #[serde(with = "bytes")]
+        config: Vec<u8>,
+    },
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[derive(Serialize, Deserialize)]
 enum Outgoing {
+    Configure {
+        version: u32,
+        options: Options,
+        operations: Operations,
+    },
     Ready {
         version: u32,
         options: Options,
@@ -97,6 +108,7 @@ enum Outgoing {
     },
     Answer {
         id: u64,
+        #[serde(with = "bytes::result")]
         output: Result<Vec<u8>, WireError>,
     },
     Finished(Result<(), WireError>),
@@ -109,7 +121,7 @@ pub async fn run_export<E>(
     input: &[u8],
 ) -> Result<Vec<u8>, WorkerError>
 where
-    E: crate::target::Export,
+    E: crate::dispatch::Export,
     E::Input: DeserializeOwned,
     E::Output: Serialize,
 {

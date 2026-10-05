@@ -16,6 +16,7 @@ std::thread_local! {
 
 pub fn before_service() {
     let gate = SERVICE_GATE.with(|gate| gate.borrow_mut().take());
+
     if let Some(gate) = gate {
         gate();
     }
@@ -37,6 +38,7 @@ async fn latest_publication() {
             input
         },
     );
+
     let first = sender.clone();
     let (entered, entering) = mpsc::channel();
     let (resume, resuming) = mpsc::channel();
@@ -47,20 +49,27 @@ async fn latest_publication() {
                 resuming.recv_timeout(Duration::from_secs(5)).unwrap();
             }));
         });
+
         first.send(1);
     });
 
     let entered = entering.recv_timeout(Duration::from_secs(5)).is_ok();
+
     if entered {
         sender.send(2);
         listener.close();
     }
+
     let mut state = 0;
+
     if entered {
         listener.serve(&mut state).await;
     }
+
     drop(listener);
+
     let _resumed = resume.send(());
+
     sending.join().unwrap();
 
     assert!(entered, "first sender never reached publication");
@@ -100,6 +109,7 @@ fn wake() {
         packet: Arc::downgrade(&packet),
         callbacks: Arc::clone(&callbacks),
     }));
+
     packet.data.lock().completion = Completion::Waiting(Some(waker));
 
     packet.finish(Ok(()));
@@ -115,6 +125,7 @@ fn replace() {
         packet: Arc::downgrade(&packet),
         callbacks: Arc::clone(&callbacks),
     }));
+
     assert!(
         packet
             .poll(&mut Context::from_waker(&first_waker))

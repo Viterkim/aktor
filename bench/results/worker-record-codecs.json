@@ -1,0 +1,22 @@
+{
+  "source": "typed-record experiment, existing current worker codec and independent Postcard/rkyv probes",
+  "compiler": "rustc 1.99.0 (b940084d7 2026-09-28), prebuilt release WASM probe",
+  "command": "node /tmp/aktor-worker-transfer/run-data-design.cjs",
+  "flags": "release WASM, no affinity pinning for this run",
+  "browser": "Playwright Chromium 153.0.8010.12",
+  "versions": {
+    "serde": "1.0.229",
+    "postcard": "1.1.3",
+    "rkyv": "0.8.18"
+  },
+  "payload": "10485 owned rows, u64 id, key-i String, 72 byte value String",
+  "measurement": "codec only, no worker crossing; owned_decode includes validation and owned reconstruction for rkyv",
+  "repeats": 3,
+  "rounds": 64,
+  "wasm_sha256": "884b2b3860722aad0296d5456eb120a09c71b7c9e66caad461dcfd600b0efd83",
+  "probe_source_sha256": "ce87c22e2eeb0c330820f247032e94dc159163811c975a2832307c84e60cfc3a",
+  "codec_encode_sha256": "d93cb0c6fc63addb57f8ff75de898b9e545b8be6aa8fdcc7d4d06d110a536425",
+  "codec_decode_sha256": "151e7c3ea70f72bf52810dcfcab260f489c7516f7f39fba07625819c763f2d8e",
+  "results": "worker-record-codecs.csv",
+  "limits": "Chromium only. The AktorData scratch derive and registration prototype have not been shipped or tested through the production browser request path."
+}

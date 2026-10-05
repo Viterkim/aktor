@@ -5,9 +5,11 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 if [[ "${1:-}" == browser ]]; then
     exec bash checks/browser.sh
 fi
+
 if [[ "${1:-}" == embassy ]]; then
     exec bash checks/embassy.sh
 fi
+
 if [[ "${1:-}" == wasm ]]; then
     exec bash checks/wasm.sh
 fi

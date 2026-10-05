@@ -12,7 +12,9 @@ impl AktorGroup {
         CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
     {
         let kill = self.killswitch();
+
         kill.stop();
+
         let deadline = kill.deadline();
         let reserve = (self.control.grace / 10).min(Duration::from_millis(100));
         let force_at = kill.force_at();
@@ -27,15 +29,20 @@ impl AktorGroup {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()),
         );
+
         #[cfg(target_family = "wasm")]
         let entries = std::mem::take(&mut *self.actors.borrow_mut());
         let mut done = vec![false; entries.len()];
 
         for (index, entry) in entries.into_iter().enumerate().rev() {
             (entry.start)();
-            names.push((index, entry.name));
+            names.push((index, entry.name, entry.kind));
             cancellations.push((index, entry.cancel));
-            pending.push(async move { (index, entry.outcome.await) });
+            pending.push(async move {
+                let mut outcome = entry.outcome.await;
+                outcome.kind = Some(entry.kind);
+                (index, outcome)
+            });
         }
 
         let drained = async {
@@ -45,8 +52,9 @@ impl AktorGroup {
             }
         };
 
-        if bounded(force_at, drained).await.is_none() {
+        if kill.bounded(force_at, drained).await.is_none() {
             kill.control.lock().report.timed_out = true;
+
             for (index, cancel) in cancellations {
                 if !done[index] {
                     cancel();
@@ -61,13 +69,17 @@ impl AktorGroup {
             };
 
             let settle_at = deadline.checked_sub(reserve / 2).unwrap_or(deadline);
-            if bounded(settle_at, forced).await.is_none() {
+
+            if kill.bounded(settle_at, forced).await.is_none() {
                 let mut state = kill.control.lock();
+
                 state.report.timed_out = true;
                 state.force_exit = true;
-                for (index, name) in names {
+
+                for (index, name, kind) in names {
                     if !done[index] {
                         state.report.actors.push(ActorOutcome {
+                            kind: Some(kind),
                             actor: name,
                             diagnostics: Vec::new(),
                             timed_out: true,
@@ -84,17 +96,27 @@ impl AktorGroup {
                     if kill.control.lock().running.is_empty() {
                         return;
                     }
+
                     kill.control.threads.notified().await;
                 }
             };
-            if bounded(force_at, finished).await.is_none() {
+
+            let settle_at = deadline.checked_sub(reserve / 2).unwrap_or(deadline);
+
+            if kill.bounded(settle_at, finished).await.is_none() {
                 let mut state = kill.control.lock();
+
                 state.report.timed_out = true;
                 state.force_exit = true;
+
                 let running = state.running.clone();
+
                 for name in running {
                     if !state.report.actors.iter().any(|actor| actor.actor == *name) {
+                        let kind = state.kind(&name);
+
                         state.report.actors.push(ActorOutcome {
+                            kind,
                             actor: (*name).clone(),
                             diagnostics: Vec::new(),
                             timed_out: true,
@@ -106,6 +128,7 @@ impl AktorGroup {
 
         let before_hook = kill.control.lock().report.clone();
         let hook_deadline = deadline.checked_sub(reserve / 4).unwrap_or(deadline);
+
         finish_hook(cleanup, before_hook, &kill, hook_deadline).await;
 
         let report = {
@@ -132,9 +155,37 @@ pub fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+#[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+pub async fn bounded_standard<F: Future>(deadline: Instant, future: F) -> Option<F::Output> {
+    let timer = crate::executor::sleep_until(deadline);
+    tokio::pin!(timer, future);
+    tokio::select! { biased; output = &mut future => Some(output), _ = &mut timer => None }
+}
+
 pub async fn bounded<F: Future>(deadline: Instant, future: F) -> Option<F::Output> {
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(
+        not(any(feature = "tokio", feature = "wasm_browser_workers")),
+        not(feature = "std_thread"),
+        not(target_family = "wasm")
+    ))]
+    let _ = deadline;
+    #[cfg(all(
+        any(feature = "tokio", feature = "wasm_browser_workers"),
+        not(target_family = "wasm")
+    ))]
     let timer = tokio::time::sleep(deadline.saturating_duration_since(Instant::now()));
+    #[cfg(all(
+        feature = "std_thread",
+        not(any(feature = "tokio", feature = "wasm_browser_workers")),
+        not(target_family = "wasm")
+    ))]
+    let timer = crate::executor::sleep_until(deadline);
+    #[cfg(all(
+        not(feature = "std_thread"),
+        not(any(feature = "tokio", feature = "wasm_browser_workers")),
+        not(target_family = "wasm")
+    ))]
+    let timer = core::future::pending::<()>();
     #[cfg(target_family = "wasm")]
     let timer = browser_deadline(
         || deadline.saturating_duration_since(Instant::now()),
@@ -152,9 +203,11 @@ async fn browser_deadline<F: Future<Output = ()>>(
 ) {
     loop {
         let duration = remaining();
+
         if duration.is_zero() {
             return;
         }
+
         schedule(crate::timeout::browser_millis(duration)).await;
     }
 }
@@ -169,7 +222,8 @@ pub async fn finish_hook<Cleanup, CleanupFuture, E>(
     CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
 {
     let mut hook = Box::pin(AssertUnwindSafe(async { cleanup(report).await }).catch_unwind());
-    match bounded(deadline, &mut hook).await {
+
+    match kill.bounded(deadline, &mut hook).await {
         Some(Ok(Ok(()))) => {}
         Some(Ok(Err(error))) => {
             kill.control.lock().report.application.push(error.report());
@@ -177,14 +231,17 @@ pub async fn finish_hook<Cleanup, CleanupFuture, E>(
         }
         Some(Err(payload)) => {
             kill.fail(ActorFailure {
+                kind: None,
                 actor: "application".into(),
                 phase: "cleanup".into(),
                 message: panic_message(&payload),
             });
+
             contain_drop(payload, kill, "cleanup panic drop");
         }
         None => kill.control.lock().report.timed_out = true,
     }
+
     contain_drop(hook, kill, "cleanup drop");
 }
 
@@ -198,11 +255,14 @@ pub fn contain_drop(value: impl Sized, kill: &KillSwitch, phase: &str) {
                 "{phase}: {}",
                 panic_message(&payload)
             )));
+
         kill.fail(ActorFailure {
+            kind: None,
             actor: "application".into(),
             phase: phase.into(),
             message: panic_message(&payload),
         });
+
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
             std::mem::forget(payload);
         }
@@ -218,6 +278,7 @@ mod tests {
         use std::cell::Cell;
 
         let max = i32::MAX as u64;
+
         for duration in [
             Duration::ZERO,
             Duration::from_nanos(1),
@@ -227,11 +288,14 @@ mod tests {
         ] {
             let remaining = Cell::new(duration);
             let mut elapsed = Duration::ZERO;
+
             browser_deadline(
                 || remaining.get(),
                 |chunk| {
                     assert!(i32::try_from(chunk).is_ok());
+
                     let wait = Duration::from_millis(u64::from(chunk));
+
                     remaining.set(remaining.get().saturating_sub(wait));
                     elapsed += wait;
                     core::future::ready(())
@@ -253,16 +317,19 @@ mod tests {
         let racers: Vec<_> = (0..8)
             .map(|_| {
                 let kill = kill.clone();
+
                 std::thread::spawn(move || {
                     kill.stop();
                     kill.deadline()
                 })
             })
             .collect();
+
         let deadlines: Vec<_> = racers
             .into_iter()
             .map(|racer| racer.join().unwrap())
             .collect();
+
         assert!(deadlines.iter().all(|value| *value == deadlines[0]));
         assert_eq!(kill.deadline(), deadlines[0]);
         assert!(!complete.wait().await.failed());

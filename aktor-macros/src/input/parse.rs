@@ -22,6 +22,7 @@ impl Function {
         }
 
         let mut output = OutputVisitor { error: None };
+
         output.visit_return_type(&function.sig.output);
 
         if let Some(error) = output.error {
@@ -32,6 +33,7 @@ impl Function {
         let first = arguments
             .next()
             .ok_or_else(|| syn::Error::new(function.sig.span(), "missing actor state"))?;
+
         state(first)?;
 
         let inputs = arguments.map(argument).collect::<syn::Result<_>>()?;

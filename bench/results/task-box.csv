@@ -1,0 +1,17 @@
+round,build,backend,work,clients,calls,median_ns_per_call,min_ns_per_call,max_ns_per_call
+0,before,aktor-task,count,1,500000,407.2,389.6,412.9
+0,after,aktor-task,count,1,500000,397.3,391.5,405.3
+1,after,aktor-task,count,1,500000,413.0,395.7,459.6
+1,before,aktor-task,count,1,500000,660.8,351.4,901.3
+2,before,aktor-task,count,1,500000,348.5,342.3,351.3
+2,after,aktor-task,count,1,500000,327.7,326.3,329.7
+3,after,aktor-task,count,1,500000,325.6,324.5,326.6
+3,before,aktor-task,count,1,500000,340.1,339.5,342.3
+4,before,aktor-task,count,1,500000,336.7,336.0,338.0
+4,after,aktor-task,count,1,500000,325.6,324.8,332.8
+5,after,aktor-task,count,1,500000,324.6,322.4,325.6
+5,before,aktor-task,count,1,500000,335.7,331.6,417.6
+6,before,aktor-task,count,1,500000,346.5,343.5,1954.8
+6,after,aktor-task,count,1,500000,359.3,329.5,666.5
+7,after,aktor-task,count,1,500000,667.5,660.4,729.5
+7,before,aktor-task,count,1,500000,669.4,659.6,676.7

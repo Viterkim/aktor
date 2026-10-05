@@ -39,6 +39,27 @@ impl<S, Role> Handle<S, Role> {
         self.completion().wait().await;
     }
 
+    #[doc(hidden)]
+    pub async fn wait_closing(&self) {
+        let mut changed = self.inner.admission.watch();
+        let mut finished = self.inner.finished.clone();
+
+        loop {
+            if matches!(
+                self.inner.admission.phase(),
+                crate::queue::Phase::Closing { .. }
+            ) || self.inner.sender.is_closed()
+            {
+                return;
+            }
+
+            tokio::select! {
+                _ = changed.changed() => {},
+                _ = finished.changed() => return,
+            }
+        }
+    }
+
     pub fn completion(&self) -> CompletionObserver {
         CompletionObserver {
             finished: self.inner.finished.clone(),

@@ -1,0 +1,5 @@
+backend,owners,cpu_ns,context_switches
+aktor-task,1,225176,3
+aktor-task,64,185854,3
+aktor-thread,64,798993,3
+aktor-std,64,1845684,3

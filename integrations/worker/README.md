@@ -1,6 +1,6 @@
 # Browser SQLite
 
-The [preferences](src/preferences) queries use #[aktor], running in a worker so SQLite can be busy while the page keeps going. Enable wasm_browser_workers, then register it with your [AktorGroup](../../README.md#example):
+The [preferences](src/preferences) queries use #[aktor], running in a worker so SQLite can be busy while the page keeps going. Enable wasm_browser_workers, then register it with your [AktorGroup](../../README.md#sqlite):
 
 ```rust
 use aktor::*;
@@ -36,6 +36,16 @@ worker::serve_with(connection, cleanup, options)?.wait().await?;
 ```
 
 Just put #[aktor] above the functions, they're picked up automatically. Worker calls need concrete owned arguments and results with Serde, calls inside the worker use the connection directly. Use the same build name on both sides, change it when your data format changes. Startup checks operation names and type names too, changing fields inside a struct won't show up there.
+
+For large byte buffers, mark the field so Serde sends it in bulk:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Image {
+    #[serde(with = "aktor::worker::bytes")]
+    data: Vec<u8>,
+}
+```
 
 capacity and max_outstanding_bytes limit ordinary calls waiting for replies. A bigger message takes the whole byte budget and runs on its own, latest sessions keep their pending input outside those limits. The byte budget isn't a ceiling on all the memory the worker uses.
 

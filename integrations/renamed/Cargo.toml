@@ -1,10 +1,12 @@
 [package]
+license.workspace = true
 name = "renamed"
-version = "0.0.0"
-edition = "2024"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
-actor = { package = "aktor", path = "../../aktor", features = ["tokio", "wasm_browser_workers"] }
-er = "0.6"
-tokio = { version = "1.53.1", features = ["macros", "rt"] }
+actor = { package = "aktor", path = "../../aktor", default-features = false, features = ["macros", "tokio", "wasm_browser_workers"] }
+er = { workspace = true, default-features = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

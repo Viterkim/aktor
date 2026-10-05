@@ -14,6 +14,7 @@ pub struct Actor<S, E, C> {
     admission: Arc<crate::queue::Admission>,
     commands: mpsc::Sender<Command<S, E, C>>,
     force: watch::Sender<bool>,
+    shutdown: watch::Sender<bool>,
     running: watch::Receiver<bool>,
     abandoned_setup: Arc<Mutex<Vec<AbandonedSetup<E>>>>,
     failed_cleanup: Arc<Mutex<FailedCleanup<C>>>,
@@ -70,6 +71,7 @@ pub enum Command<S, E, C> {
 }
 
 enum Event<S, E, C> {
+    Shutdown,
     Command(Option<Command<S, E, C>>),
     Message(Option<crate::message::Message<S>>),
     NoHandles,

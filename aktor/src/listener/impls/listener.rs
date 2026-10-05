@@ -25,11 +25,12 @@ impl<S> Listener<S> {
 
     pub async fn serve(&mut self, state: &mut S) {
         while let Some(message) = self.receiver.recv().await {
-            message.run(state).await;
+            message.run_with(state, &mut self.hooks).await;
         }
     }
 
     /// Listen on the current thread until all handles are dropped.
+    #[cfg(feature = "tokio")]
     pub fn run_blocking(mut self, mut state: S) -> S {
         let policy = self.failure.clone();
         let mut failures = Failures::new(self.name.clone());
@@ -37,6 +38,7 @@ impl<S> Listener<S> {
         failures.capture(FailureKind::Runtime, || self.serve_blocking(&mut state));
 
         self.receiver.close();
+
         let state = if failures.first.is_some() {
             failures.capture(FailureKind::Cleanup, || drop(state));
             None
@@ -45,6 +47,7 @@ impl<S> Listener<S> {
         };
 
         let finished = self.discard(&mut failures);
+
         failures.capture(FailureKind::Teardown, || drop(finished));
         failures.finish(&policy);
 
@@ -54,6 +57,7 @@ impl<S> Listener<S> {
         }
     }
 
+    #[cfg(feature = "tokio")]
     pub fn serve_blocking(&mut self, state: &mut S) {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()

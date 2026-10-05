@@ -52,7 +52,7 @@ where
     I: Send + 'static,
     O: Send + 'static,
 {
-    let packet = Arc::new(Packet::new(function, input));
+    let packet = Arc::new(AsyncJob(Packet::new(function, input)));
 
     Request {
         sender: &handle.inner.sender,
@@ -63,7 +63,7 @@ where
                 name: std::any::type_name::<F>(),
                 caller: core::panic::Location::caller(),
             },
-            job: Arc::new(AsyncJob(packet.clone())),
+            job: packet.clone(),
             finished: false,
             counted: true,
         }),

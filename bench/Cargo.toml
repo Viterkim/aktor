@@ -1,0 +1,24 @@
+[package]
+name = "aktor-bench"
+default-run = "aktor-bench"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT-0"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[features]
+allocations = ["dep:allocation-counter"]
+
+[dependencies]
+aktor = { path = "../aktor", features = ["tokio", "std_thread"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
+actify = "0.9"
+allocation-counter = { version = "0.8", optional = true }
+kameo = { version = "0.22", default-features = false, features = ["macros"] }
+
+[lints.rust]
+unsafe_code = "deny"

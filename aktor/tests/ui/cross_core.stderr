@@ -1,0 +1,1 @@
+`std::rc::Rc<u32>` cannot be sent between threads safely

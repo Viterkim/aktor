@@ -150,13 +150,22 @@ pub async fn cat(
 And elsewhere:
 
 ```rust
-let mut actors = AktorGroup::new();
-actors.start()?;
+let actors = start(AktorSetup {
+    name: AktorName::new("sqlite"),
+    role: AktorNoRole,
+    kind: AktorKind::TokioThread,
+    closures: AktorClosures {
+        end: Some(cleanup.into()),
+        ..AktorClosures::new(setup)
+    },
+    options: None,
+}).await?;
+let database = &actors.handles;
 
-let database = actors.spawn(ActorArgs::new("sqlite", setup, cleanup)).await?;
-
-let id = post::cat(&database, "Bingo".into()).await?;
-let cat = get::cat(&database, id).await?;
+let id = post::cat(database, "Bingo".into()).await?;
+let cat = get::cat(database, id).await?;
 ```
 
 Pass the connection you already have for nested calls, including inside a transaction. Functions can live wherever you want.
+
+For the overhead, the [counter benchmark](../../bench/README.md) runs Aktor alongside Actify, Kameo and a handwritten owner loop.

@@ -1,0 +1,28 @@
+[package]
+name = "aktor-native-proof"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["std_thread", "bevy"]
+std_thread = ["aktor/std_thread"]
+bevy = ["aktor/bevy", "dep:bevy_tasks", "dep:tokio"]
+
+[dependencies]
+aktor = { workspace = true, features = ["macros"] }
+bevy_tasks = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"], optional = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "standard"
+required-features = ["std_thread"]
+
+[[bin]]
+name = "bevy"
+required-features = ["bevy"]

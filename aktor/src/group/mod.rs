@@ -1,23 +1,33 @@
-pub use crate::lifecycle::{ActorArgs, ActorFailure, ActorOutcome, ShutdownReport};
-use crate::{AktorCleanupError, AktorError};
+pub use crate::{ActorArgs, ActorFailure, ActorOutcome, ShutdownReport};
+use crate::{AktorCleanupError, AktorError, AktorExecution};
 use core::{future::Future, pin::Pin};
 #[cfg(target_family = "wasm")]
 use std::{cell::RefCell, rc::Rc};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::watch;
 
 mod impls;
+#[doc(hidden)]
+pub use impls::shutdown_deadline;
+#[cfg(any(
+    any(feature = "tokio", feature = "wasm_browser_workers"),
+    target_family = "wasm"
+))]
 mod run;
-mod shutdown;
+pub mod shutdown;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
 #[cfg(target_family = "wasm")]
 mod clock;
 #[cfg(target_family = "wasm")]
-use clock::Instant;
+#[doc(hidden)]
+pub use clock::Instant;
 #[cfg(all(
     feature = "wasm_browser_workers",
     target_family = "wasm",
@@ -44,11 +54,15 @@ pub struct KillSwitch {
 }
 
 /// Get the shutdown report again later.
+#[derive(Clone)]
 pub struct GroupCompletion {
     result: watch::Receiver<Option<ShutdownReport>>,
 }
 
 struct Control {
+    stopping: AtomicBool,
+    #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+    standard: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
     changed: watch::Sender<Option<Instant>>,
     completed: watch::Sender<Option<ShutdownReport>>,
@@ -66,6 +80,7 @@ struct State {
     deadline: Option<Instant>,
     finished: bool,
     force_exit: bool,
+    kinds: Vec<(String, AktorExecution)>,
     #[cfg(not(target_family = "wasm"))]
     running: Vec<Arc<String>>,
 }
@@ -89,6 +104,7 @@ type Action = Box<dyn FnOnce()>;
 
 struct Entry {
     name: String,
+    kind: AktorExecution,
     start: Action,
     cancel: Action,
     outcome: CloseFuture,

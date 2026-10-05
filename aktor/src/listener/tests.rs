@@ -34,6 +34,7 @@ async fn receiver_waker_can_reenter_admission() {
     let waker = Waker::from(wake.clone());
 
     let mut receiver = Box::pin(listener.recv());
+
     assert!(matches!(
         receiver.as_mut().poll(&mut Context::from_waker(&waker)),
         Poll::Pending
@@ -47,6 +48,7 @@ async fn receiver_waker_can_reenter_admission() {
     drop(receiver);
 
     let mut state = 0;
+
     for _ in 0..2 {
         listener.try_recv().unwrap().run(&mut state).await;
     }
@@ -57,6 +59,7 @@ async fn receiver_waker_can_reenter_admission() {
 #[tokio::test]
 async fn outstanding_permit_does_not_keep_failed_runner_alive() {
     let executor = tokio::task::LocalSet::new();
+
     executor
         .run_until(async {
             let (handle, task) =
@@ -93,6 +96,7 @@ async fn outstanding_permit_does_not_keep_failed_runner_alive() {
             .unwrap();
 
             let permit = handle.inner.sender.reserve().await.unwrap();
+
             call(&handle, |_, ()| panic!("operation failed"), ())
                 .cast()
                 .await;
@@ -117,6 +121,7 @@ async fn outstanding_permit_does_not_keep_failed_runner_alive() {
             .unwrap();
 
             let permit = handle.inner.sender.reserve().await.unwrap();
+
             call(&handle, |_, ()| panic!("operation failed"), ())
                 .cast()
                 .await;

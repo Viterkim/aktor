@@ -13,13 +13,16 @@ impl Encoder {
         if self.depth >= MAX_DEPTH {
             return Err(error("worker value is nested too deeply"));
         }
+
         Ok(())
     }
 
     fn nested<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Error> {
         self.check()?;
         self.depth += 1;
+
         let result = value.serialize(&mut *self);
+
         self.depth -= 1;
         result
     }
@@ -28,7 +31,9 @@ impl Encoder {
         if self.depth + levels > MAX_DEPTH {
             return Err(error("worker value is nested too deeply"));
         }
+
         let parent = self.depth;
+
         self.depth += levels;
         Ok(Compound {
             encoder: self,
@@ -227,6 +232,7 @@ impl<'a> ser::Serializer for &'a mut Encoder {
 
     fn serialize_seq(self, len: Option<usize>) -> Result<Compound<'a>, Error> {
         let compound = self.compound(1)?;
+
         compound.encoder.bytes.push(SEQ);
         compound
             .encoder
@@ -251,6 +257,7 @@ impl<'a> ser::Serializer for &'a mut Encoder {
         len: usize,
     ) -> Result<Compound<'a>, Error> {
         let compound = self.compound(2)?;
+
         compound.encoder.variant(v);
         compound.encoder.bytes.push(SEQ);
         compound.encoder.length(len);
@@ -275,6 +282,7 @@ impl<'a> ser::Serializer for &'a mut Encoder {
         _: usize,
     ) -> Result<Compound<'a>, Error> {
         let compound = self.compound(2)?;
+
         compound.encoder.variant(v);
         compound.encoder.bytes.push(MAP);
         Ok(compound)
@@ -401,6 +409,7 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, WorkerError> {
         bytes: Vec::new(),
         depth: 0,
     };
+
     value.serialize(&mut encoder).map_err(report)?;
     Ok(encoder.bytes)
 }

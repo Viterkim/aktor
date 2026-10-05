@@ -29,6 +29,7 @@ async fn counters(executor: &tokio::task::LocalSet) -> Result<()> {
     let (handle, task) = spawn_local(executor, Counter(0), 8)?;
 
     let n = add(&handle, 2).await;
+
     assert_eq!(n, 2);
 
     let reply = add(&handle, 3).send().await;
@@ -36,11 +37,13 @@ async fn counters(executor: &tokio::task::LocalSet) -> Result<()> {
     // do something else
 
     let n: u32 = reply.await;
+
     assert_eq!(n, 5);
 
     clear(&handle).cast().await;
 
     let admitted = clear(&handle).try_cast();
+
     admitted.map_err(|error| error.to_string())?;
 
     let reply = match add(&handle, 3).try_send() {
@@ -50,6 +53,7 @@ async fn counters(executor: &tokio::task::LocalSet) -> Result<()> {
     };
 
     let n: u32 = reply.await;
+
     assert_eq!(n, 3);
 
     use std::time::Duration;
@@ -59,14 +63,18 @@ async fn counters(executor: &tokio::task::LocalSet) -> Result<()> {
         Ok(n) => n,
         Err(_) => reply.await,
     };
+
     assert_eq!(n, 6);
 
     let mut local = Counter(0);
     let n: u32 = add(&mut local, 2).await;
+
     assert_eq!(n, 2);
 
     drop(handle);
+
     let counter = task.await?;
+
     assert_eq!(counter.0, 6);
 
     Ok(())
@@ -104,6 +112,7 @@ async fn roles(executor: &tokio::task::LocalSet) -> Result<()> {
     let database = handle.with_role::<Main>();
 
     let n = main_count(&database).await;
+
     assert_eq!(n, 1);
 
     drop(database);

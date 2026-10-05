@@ -30,6 +30,7 @@ async fn cancel() {
     .unwrap();
 
     let mut replacing = Box::pin(actor.replace(|| Ok(10)));
+
     assert!(poll(replacing.as_mut()).is_pending());
     cleaned.await.unwrap();
     drop(replacing);
@@ -54,6 +55,7 @@ async fn cancel() {
     )
     .send()
     .await;
+
     assert_eq!(reply.await, 11);
 
     assert!(matches!(
@@ -110,7 +112,9 @@ async fn error() {
     assert_eq!(call(&handle, |state, ()| *state, ()).await, 2);
 
     actor.shutdown().await.unwrap();
+
     let errors = thread.join_async().await.unwrap().unwrap_err();
+
     assert_eq!(*errors.errors[0], "cleanup failed");
 }
 
@@ -135,6 +139,7 @@ async fn abandoned_setup() {
         released.recv().unwrap();
         Err("resume setup failed")
     }));
+
     assert!(poll(resume.as_mut()).is_pending());
     entering.await.unwrap();
     drop(resume);
@@ -148,6 +153,7 @@ async fn abandoned_setup() {
         released.recv().unwrap();
         Err("replace setup failed")
     }));
+
     assert!(poll(replace.as_mut()).is_pending());
     entering.await.unwrap();
     drop(replace);
@@ -161,6 +167,7 @@ async fn abandoned_setup() {
         gate.await.unwrap();
         Err("buffered resume error")
     }));
+
     assert!(poll(resume.as_mut()).is_pending());
     release.send(()).unwrap();
     actor.pause().await.unwrap();
@@ -171,6 +178,7 @@ async fn abandoned_setup() {
         gate.await.unwrap();
         Err("buffered replace error")
     }));
+
     assert!(poll(replace.as_mut()).is_pending());
     release.send(()).unwrap();
     actor.pause().await.unwrap();
@@ -179,6 +187,7 @@ async fn abandoned_setup() {
     actor.resume(|| Ok(3)).await.unwrap();
 
     let failures = actor.take_abandoned_setup();
+
     assert!(matches!(
         failures.as_slice(),
         [

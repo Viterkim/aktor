@@ -1,8 +1,11 @@
 use super::*;
 use crate::message::{ActorError, ActorResult};
+#[cfg(feature = "tokio")]
 use core::convert::Infallible;
+use tokio::sync::watch;
+#[cfg(feature = "tokio")]
 use tokio::{
-    sync::{oneshot, watch},
+    sync::oneshot,
     task::{self, JoinHandle},
 };
 
@@ -29,6 +32,7 @@ pub fn channel<S>(capacity: usize) -> ActorResult<(Handle<S>, Listener<S>)> {
         },
         Listener {
             name: std::any::type_name::<S>().into(),
+            hooks: hooks::AktorHooks::default(),
             receiver,
             failure: FailurePolicy::default(),
             admission,
@@ -38,6 +42,7 @@ pub fn channel<S>(capacity: usize) -> ActorResult<(Handle<S>, Listener<S>)> {
     ))
 }
 
+#[cfg(feature = "tokio")]
 pub fn startup_cause<T>(
     joined: Result<std::thread::Result<Option<T>>, tokio::task::JoinError>,
 ) -> DedicatedJoinError {
@@ -53,6 +58,7 @@ pub fn startup_cause<T>(
     }
 }
 
+#[cfg(feature = "tokio")]
 pub fn spawn_local<S: 'static>(
     executor: &task::LocalSet,
     state: S,
@@ -61,6 +67,7 @@ pub fn spawn_local<S: 'static>(
     spawn_local_with_policy(executor, state, capacity, FailurePolicy::default())
 }
 
+#[cfg(feature = "tokio")]
 pub fn spawn_local_with_policy<S: 'static>(
     executor: &task::LocalSet,
     state: S,
@@ -68,6 +75,7 @@ pub fn spawn_local_with_policy<S: 'static>(
     failure: FailurePolicy,
 ) -> ActorResult<(Handle<S>, JoinHandle<S>)> {
     let (handle, mut listener) = channel(capacity)?;
+
     listener.failure = failure;
 
     let task = executor.spawn_local(listener.run(state));
@@ -75,6 +83,7 @@ pub fn spawn_local_with_policy<S: 'static>(
     Ok((handle, task))
 }
 
+#[cfg(feature = "tokio")]
 pub fn spawn_thread<S: Send + 'static>(
     state: S,
     capacity: usize,
@@ -82,6 +91,7 @@ pub fn spawn_thread<S: Send + 'static>(
     spawn_thread_with_policy(state, capacity, FailurePolicy::default())
 }
 
+#[cfg(feature = "tokio")]
 pub fn spawn_thread_with_policy<S: Send + 'static>(
     state: S,
     capacity: usize,
@@ -89,6 +99,7 @@ pub fn spawn_thread_with_policy<S: Send + 'static>(
 ) -> Result<(Handle<S>, Dedicated<S>), DedicatedStartError<Infallible>> {
     let (handle, mut listener) =
         channel(capacity).map_err(|_| DedicatedStartError::InvalidCapacity)?;
+
     listener.failure = failure;
 
     let thread = thread::Builder::new()
@@ -97,6 +108,7 @@ pub fn spawn_thread_with_policy<S: Send + 'static>(
         .map_err(DedicatedStartError::Thread)?;
 
     let finished = handle.inner.finished.clone();
+
     Ok((handle, Dedicated { thread, finished }))
 }
 
@@ -104,6 +116,7 @@ pub fn spawn_thread_with_policy<S: Send + 'static>(
 ///
 /// Cleanup receives the serving outcome, including unwinding panics. After a
 /// panic its return value is discarded and the failure policy runs.
+#[cfg(feature = "tokio")]
 pub async fn spawn_runner<S, E, T, Setup, Serve, Cleanup>(
     args: SpawnArgs<Setup, Cleanup>,
     serve: Serve,
@@ -127,6 +140,7 @@ where
     let actor_name = name.clone();
     let (handle, mut listener) =
         channel(capacity).map_err(|_| DedicatedStartError::InvalidCapacity)?;
+
     listener.failure = failure.clone();
     listener.name = name.clone();
 
@@ -145,6 +159,7 @@ where
                 });
 
                 listener.receiver.close();
+
                 let outcome = match outcome {
                     Some(outcome) => outcome.map_err(RunError::Failed),
                     None => Err(RunError::Panicked),
@@ -152,6 +167,7 @@ where
 
                 let mut result = failures.capture(FailureKind::Cleanup, || cleanup(state, outcome));
                 let finished = listener.discard(&mut failures);
+
                 if failures.first.is_some() {
                     failures.capture(FailureKind::Teardown, || drop(result.take()));
                 }

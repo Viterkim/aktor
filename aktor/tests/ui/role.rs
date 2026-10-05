@@ -1,13 +1,29 @@
-use aktor::{aktor, listener::Handle};
+use aktor::*;
 
 struct Database;
 struct Audio;
 
-#[aktor(crate = aktor, actor = Database)]
+#[aktor(crate = aktor, role = Database)]
 async fn read(state: &usize) -> usize {
     *state
 }
 
-fn queued(handle: &Handle<usize, Audio>) {
-    let _request = read(handle);
+async fn queued() {
+    let actors = aktor::start(AktorSetup {
+        name: AktorName::new("audio"),
+        role: Audio,
+        kind: AktorKind::TokioThread,
+        closures: AktorClosures {
+            start: async || Ok(0_usize),
+            end: None,
+            intervals: vec![],
+            before_each: None,
+            after_each: None,
+        },
+        options: None,
+    })
+    .await
+    .unwrap();
+
+    let _request = read(&actors.handles);
 }

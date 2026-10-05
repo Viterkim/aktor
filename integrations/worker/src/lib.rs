@@ -3,6 +3,10 @@ mod browser;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod group;
 pub mod preferences;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod remote;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod setup;
 
 #[cfg(test)]
 mod tests {
@@ -19,6 +23,7 @@ mod tests {
             failure: FailurePolicy::Unwind,
             setup: async || {
                 let db = Connection::open_in_memory()?;
+
                 db.execute(
                     "CREATE TABLE preferences(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
                     [],

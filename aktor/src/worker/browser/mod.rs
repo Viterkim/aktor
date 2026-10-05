@@ -16,10 +16,12 @@ mod impls;
 mod latest;
 mod open;
 mod server;
+mod setup;
 use completion::observe;
 use impls::fatal;
 pub use latest::{LatestResults, LatestSender};
 pub use server::{Server, serve, serve_for, serve_with, setup_failed};
+pub use setup::serve_setup;
 
 type State<S, Role, E> = PhantomData<fn() -> (S, Role, E)>;
 type EncodeInput<'a> = Box<dyn FnOnce() -> Result<Vec<u8>, WireError> + 'a>;
@@ -81,8 +83,10 @@ struct Inner {
     closed: Cell<bool>,
     failed: Cell<bool>,
     options: Options,
+    initialize: RefCell<Option<Vec<u8>>>,
     group: RefCell<Option<(String, crate::group::KillSwitch)>>,
-    sessions: RefCell<Vec<Rc<dyn Fn() -> bool>>>,
+    sessions: RefCell<Vec<Weak<dyn Fn() -> bool>>>,
+    prune_at: Cell<usize>,
     count: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     ready: watch::Sender<Option<Result<(), WireError>>>,

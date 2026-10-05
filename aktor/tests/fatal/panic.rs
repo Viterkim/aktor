@@ -34,6 +34,7 @@ async fn lifecycle() {
         entering.await.unwrap();
 
         crash(&handle).cast().await;
+
         let later = call(&handle, |state, ()| *state = 999, ()).send().await;
 
         let stopping = async {
@@ -46,16 +47,21 @@ async fn lifecycle() {
                 }
             }
         };
+
         let mut stopping = Box::pin(stopping);
+
         assert!(poll(stopping.as_mut()).is_pending());
 
         release.send(()).unwrap();
+
         let _result = stopping.await;
+
         handle.closed().await;
         assert_eq!(*cleaned.lock().unwrap(), Some(1));
 
         let error = thread.join_async().await.unwrap_err();
         let _: &(dyn std::error::Error + Send + Sync) = &error;
+
         assert_eq!(
             error.payload.lock().downcast_ref::<&str>(),
             Some(&"operation failed")

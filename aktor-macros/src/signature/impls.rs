@@ -34,6 +34,7 @@ impl VisitMut for Inputs<'_> {
 
             let name = names::binding(self.reserved, "__AktorInput");
             let bounds = &opaque.bounds;
+
             self.parameters.push(parse_quote!(#name: #bounds));
             *ty = parse_quote!(#name);
         } else {

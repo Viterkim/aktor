@@ -20,11 +20,13 @@ async fn modules() -> Result<(), Box<dyn Error>> {
     executor
         .run_until(async {
             let mut local = Database::default();
+
             assert_eq!(post::row(&mut local, "local".into()).await, 0);
 
             let (database, actor) = spawn_local(&executor, Database::default(), 8)?;
 
             let id = post::row(&database, "BingoManden".into()).await;
+
             assert_eq!(
                 get::row(&database, id).await.as_deref(),
                 Some("BingoManden")

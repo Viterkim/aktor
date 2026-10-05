@@ -3,14 +3,26 @@ use core::{future::Future, pin::Pin};
 use er::Er;
 
 mod error;
-#[cfg(feature = "tokio")]
+#[cfg(any(
+    feature = "tokio",
+    all(feature = "std_thread", not(target_family = "wasm"))
+))]
 mod native;
 #[doc(hidden)]
 pub use error::consumed;
-#[cfg(any(feature = "tokio", feature = "embassy"))]
+#[cfg(any(
+    any(
+        feature = "tokio",
+        all(feature = "std_thread", not(target_family = "wasm"))
+    ),
+    feature = "local"
+))]
 #[doc(hidden)]
 pub use error::stopped;
-#[cfg(feature = "tokio")]
+#[cfg(any(
+    feature = "tokio",
+    all(feature = "std_thread", not(target_family = "wasm"))
+))]
 pub use native::*;
 
 #[derive(Clone, Copy, Er, PartialEq, Eq)]

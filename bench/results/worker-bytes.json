@@ -1,0 +1,18 @@
+{
+  "source": "9557be1 + worker byte helpers and bulk Postcard envelope",
+  "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "browser": "Playwright Chromium 153.0.8010.12",
+  "flags": "release WASM, taskset -c 4,5",
+  "command": "taskset -c 4,5 node /tmp/aktor-worker-transfer/run-root.cjs",
+  "bytes_checked": [
+    0,
+    256,
+    65536,
+    1048576,
+    8388608
+  ],
+  "payload": "ordinary annotated echo, plain Vec versus serde(with = aktor::worker::bytes)",
+  "measurement": "construction, admission, both codec directions and worker transport",
+  "wasm_sha256": "884b2b3860722aad0296d5456eb120a09c71b7c9e66caad461dcfd600b0efd83",
+  "results": "worker-bytes.csv"
+}

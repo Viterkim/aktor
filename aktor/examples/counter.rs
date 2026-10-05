@@ -1,6 +1,4 @@
-use aktor::{aktor, listener::channel};
-use std::{io, thread};
-use tokio::runtime::Builder;
+use aktor::*;
 
 #[aktor]
 async fn add(count: &mut u32, amount: u32) -> u32 {
@@ -10,35 +8,45 @@ async fn add(count: &mut u32, amount: u32) -> u32 {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn core::error::Error>> {
-    let (handle, mut listener) = channel::<u32>(8)?;
+    let aktor_setup = AktorSetup {
+        name: AktorName::new("counter"),
+        role: AktorNoRole,
+        kind: AktorKind::TokioThread,
+        closures: AktorClosures {
+            end: Some(
+                (async |count: u32| {
+                    println!("final count: {count}");
+                    Ok(())
+                })
+                .into(),
+            ),
+            before_each: Some(
+                (|_: &mut u32, operation: operation::Operation| {
+                    println!("starting {}", operation.name);
+                })
+                .into(),
+            ),
+            after_each: Some(
+                (|count: &mut u32, operation: operation::Operation| {
+                    println!("finished {}, count: {count}", operation.name);
+                })
+                .into(),
+            ),
+            ..AktorClosures::new(async || Ok(0_u32))
+        },
+        options: None,
+    };
 
-    let worker = thread::spawn(move || -> io::Result<u32> {
-        let runtime = Builder::new_current_thread().build()?;
+    let actors = aktor::start(aktor_setup).await?;
 
-        runtime.block_on(async {
-            let mut count = 0;
+    println!("reply: {}", add(&actors.handles, 2).await);
+    println!("reply: {}", add(&actors.handles, 3).await);
 
-            while let Some(message) = listener.recv().await {
-                let name = message.operation.name;
-                println!("starting {name}");
+    let report = actors.shutdown().await;
 
-                message.run(&mut count).await;
+    if report.failed() {
+        return Err(Box::new(report).into());
+    }
 
-                println!("finished {name}");
-            }
-
-            Ok(count)
-        })
-    });
-
-    println!("reply: {}", add(&handle, 2).await);
-    println!("reply: {}", add(&handle, 3).await);
-
-    drop(handle);
-    let count = worker
-        .join()
-        .map_err(|_| io::Error::other("counter thread panicked"))??;
-
-    println!("final count: {count}");
     Ok(())
 }

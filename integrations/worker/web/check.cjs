@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const playwright = require('playwright');
+
 const engine = process.env.AKTOR_BROWSER || 'chromium';
 
 (async () => {
@@ -13,6 +14,45 @@ const engine = process.env.AKTOR_BROWSER || 'chromium';
     try {
         const context = await browser.newContext();
         const page = await context.newPage();
+
+        await page.addInitScript(() => {
+            const NativeWorker = globalThis.Worker;
+
+            globalThis.proofWorkers = [];
+            globalThis.Worker = class extends NativeWorker {
+                constructor(...args) {
+                    super(...args);
+
+                    this.proofEvents = [];
+                    this.proofConfigured = new Promise(resolve => {
+                        this.resolveConfigured = resolve;
+                    });
+
+                    globalThis.proofWorkers.push(this);
+
+                    this.addEventListener('message', event => {
+                        if (event.data?.proof) {
+                            this.proofEvents.push(event.data.proof);
+
+                            if (event.data.proof === 'configured') {
+                                this.resolveConfigured();
+                            }
+
+                            event.stopImmediatePropagation();
+                        }
+                    });
+                }
+
+                terminate() {
+                    this.proofTerminated = true;
+                    super.terminate();
+                }
+            };
+
+            globalThis.aktorGateRelease = () =>
+                globalThis.proofWorkers.at(-1).postMessage('release');
+        });
+
         const frontendErrors = [];
 
         page.on('pageerror', error => {
@@ -22,6 +62,141 @@ const engine = process.env.AKTOR_BROWSER || 'chromium';
 
         await page.goto(process.env.AKTOR_PROOF_URL || 'http://127.0.0.1:8765');
         await page.waitForFunction(() => window.ready);
+
+        if (!process.env.AKTOR_FOCUS || process.env.AKTOR_FOCUS === 'preflight') {
+            const events = await page.evaluate(async () => {
+                const first = window.proofWorkers.length;
+
+                await window.remotePreflightCheck(
+                    new URL('./setup_worker.js?build=config-v1', location.href).href
+                );
+
+                return window.proofWorkers.slice(first).map(worker => worker.proofEvents);
+            });
+
+            assert.deepEqual(events, [[], [], [], [], ['setup', 'end']]);
+
+            if (process.env.AKTOR_FOCUS) {
+                return;
+            }
+        }
+
+        if (!process.env.AKTOR_FOCUS || process.env.AKTOR_FOCUS === 'startup') {
+            for (let attempt = 0; attempt < 8; attempt++) {
+                assert.equal(
+                    await page.evaluate(() => {
+                        const pending = window.cancelStartupCheck(
+                            new URL('./stall.js', location.href).href
+                        );
+
+                        return (
+                            pending &&
+                            window.proofWorkers.at(-1).proofTerminated === true &&
+                            window.proofWorkers.at(-1).onmessage === null
+                        );
+                    }),
+                    true
+                );
+            }
+
+            assert.equal(
+                await page.evaluate(async () => {
+                    await Promise.race([
+                        window.cancelConfiguredCheck(
+                            new URL('./gate-worker.js?startup_gate', location.href).href
+                        ),
+                        new Promise((_, reject) =>
+                            setTimeout(
+                                () => reject(new Error('configured startup timed out')),
+                                5000
+                            )
+                        )
+                    ]);
+
+                    return (
+                        window.proofWorkers.at(-1).proofTerminated === true &&
+                        window.proofWorkers.at(-1).onmessage === null
+                    );
+                }),
+                true
+            );
+
+            if (process.env.AKTOR_FOCUS) {
+                return;
+            }
+        }
+
+        if (!process.env.AKTOR_FOCUS || process.env.AKTOR_FOCUS === 'closure') {
+            for (const bytes of [false, true]) {
+                for (const cleanup of [false, true]) {
+                    const result = await page.evaluate(
+                        async ({ bytes, cleanup }) => {
+                            const url = new URL('./gate-worker.js', location.href);
+
+                            if (cleanup) {
+                                url.searchParams.set('cleanup_gate', 'true');
+                            }
+
+                            await window.closureCheck(url.href, bytes, cleanup, false);
+
+                            return window.proofWorkers.at(-1).proofEvents;
+                        },
+                        { bytes, cleanup }
+                    );
+
+                    assert.deepEqual(result, ['cleanup']);
+                }
+            }
+
+            assert.equal(
+                await page.evaluate(() =>
+                    window.closureCheck(
+                        new URL('./gate-worker.js', location.href).href,
+                        false,
+                        false,
+                        true
+                    )
+                ),
+                true
+            );
+
+            if (process.env.AKTOR_FOCUS) {
+                return;
+            }
+        }
+
+        assert.equal(
+            await page.evaluate(() =>
+                window.liveSessionsCheck(new URL('./group-worker.js', location.href).href)
+            ),
+            true
+        );
+
+        assert.equal(await page.evaluate(() => window.localSetupCheck()), true);
+
+        assert.equal(
+            await page.evaluate(() =>
+                Promise.race([
+                    window.remoteSetupCheck(new URL('./setup_worker.js', location.href).href),
+                    new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('remote setup check timed out')), 5000)
+                    )
+                ])
+            ),
+            true
+        );
+
+        assert.equal(
+            await page.evaluate(() =>
+                Promise.race([
+                    window.bevySetupCheck(),
+                    new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Bevy setup check timed out')), 5000)
+                    )
+                ])
+            ),
+            true
+        );
 
         const registration = await page.evaluate(async () => {
             const missing = JSON.parse(

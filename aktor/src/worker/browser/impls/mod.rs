@@ -1,7 +1,7 @@
 use super::*;
-use crate::target::Transport;
+use crate::dispatch::{OwnedState, ReadState, Transport, WriteState};
 
-mod inner;
+pub mod inner;
 mod reply;
 mod request;
 
@@ -18,6 +18,7 @@ impl<S, Role, E> Worker<S, Role, E> {
         E: DeserializeOwned,
     {
         let worker = Self::with_options(url, options).map_err(|error| error.without_data())?;
+
         worker.ready().await?;
 
         Ok(worker)
@@ -79,6 +80,7 @@ impl<S, Role, E> Worker<S, Role, E> {
 impl<S, Role, E> Drop for Worker<S, Role, E> {
     fn drop(&mut self) {
         let handles = self.inner.handles.get() - 1;
+
         self.inner.handles.set(handles);
 
         if handles == 0 {
@@ -93,6 +95,7 @@ impl<'a, S, I: Serialize + DeserializeOwned + 'a, O: Serialize + DeserializeOwne
 
     fn request(self, operation: Operation, input: I) -> Self::Request {
         let mut request = self.request(operation.name, Ok(Vec::new()));
+
         request.input = None;
         request.encoder = Some(Box::new(move || {
             encode(&input).map_err(|error| error.without_data())
@@ -103,4 +106,11 @@ impl<'a, S, I: Serialize + DeserializeOwned + 'a, O: Serialize + DeserializeOwne
 
 pub fn fatal(error: WireError) -> ! {
     std::panic::resume_unwind(Box::new(error))
+}
+
+impl<S: 'static, Role, E> ReadState<S, Role> for &Worker<S, Role, E> {
+    type Lease = OwnedState<S>;
+}
+impl<S: 'static, Role, E> WriteState<S, Role> for &Worker<S, Role, E> {
+    type Lease = OwnedState<S>;
 }

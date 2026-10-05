@@ -1,4 +1,10 @@
-#[cfg(any(feature = "tokio", feature = "embassy"))]
+#[cfg(any(
+    any(
+        feature = "tokio",
+        all(feature = "std_thread", not(target_family = "wasm"))
+    ),
+    feature = "local"
+))]
 pub fn stopped() -> ! {
     panic!("actor stopped before replying")
 }

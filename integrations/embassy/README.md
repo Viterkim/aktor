@@ -1,6 +1,20 @@
 # Embassy + alloc
 
-Enable embassy and supply an allocator. The owner stays on your executor:
+Enable embassy and supply an allocator. The [sensor setup](src/lib.rs) puts its driver on your executor with AktorKind::EmbassyLocal:
+
+```rust
+let actors = start(sensor_setup(spawner)).await?;
+let count = record_many(&actors.handles, [4, 5]).await?;
+let report = actors.shutdown().await;
+```
+
+State, arguments and outputs can contain Rc. The same setup fields let you add cleanup, before_each / after_each and intervals.
+
+EmbassyCrossCore uses the same fields, [shared_sensor_setup](src/lib.rs) returns a handle you can send to another core. Its arguments and results need Send, the state and operation futures stay on the owner and can still use Rc. Enable embassy_cross_core and supply a critical-section implementation that synchronizes all those cores.
+
+Request timeouts use your Embassy clock. Callers on other executors need Embassy's generic timer queue configured by the application.
+
+For a manually owned task:
 
 ```rust
 let (sensor, owner) = embassy::channel::<Sensor, 2, &'static str>()?;
@@ -11,7 +25,7 @@ let count = record_many(&sensor, [4, 5]).await?;
 sensor.shutdown().await?;
 ```
 
-The 2 is queue capacity. [sensor_owner](src/lib.rs) runs setup and cleanup, record_many calls record with its local sensor. Handles stay on the owner's executor, state and arguments can contain Rc. Outputs still need Send + 'static.
+The 2 is queue capacity. [sensor_owner](src/lib.rs) runs setup and cleanup, record_many calls record with its local sensor. Handles stay on the owner's executor.
 
 embassy::AktorGroup keeps the owners together. Start its listener on your executor:
 

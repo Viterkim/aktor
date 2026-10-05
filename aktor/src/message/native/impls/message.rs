@@ -6,12 +6,24 @@ impl<S> Message<S> {
         self.counted
     }
 
-    pub async fn run(mut self, state: &mut S) {
-        let outcome = std::panic::AssertUnwindSafe(async { self.job.run(state).await })
-            .catch_unwind()
+    pub async fn run(self, state: &mut S) {
+        self.run_with(state, &mut crate::listener::hooks::AktorHooks::default())
             .await;
+    }
+
+    pub async fn run_with(
+        mut self,
+        state: &mut S,
+        hooks: &mut crate::listener::hooks::AktorHooks<S>,
+    ) {
+        let outcome = std::panic::AssertUnwindSafe(async {
+            self.job.run(state, hooks, self.operation).await
+        })
+        .catch_unwind()
+        .await;
 
         self.finished = true;
+
         if let Err(payload) = outcome {
             if let Err(secondary) =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.job.close()))

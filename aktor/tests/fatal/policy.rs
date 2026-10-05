@@ -30,11 +30,13 @@ async fn abort() {
                         .unwrap();
 
                         crash(&handle).cast().await;
+
                         let _result = thread.join_async().await;
                     }
 
                     "hook" | "payload" => {
                         let (handle, mut listener) = channel::<usize>(1).unwrap();
+
                         listener.failure = FailurePolicy::shutdown(move |_| {
                             if case == "payload" {
                                 std::panic::panic_any(Bomb);
@@ -44,8 +46,11 @@ async fn abort() {
                         });
 
                         let task = tokio::task::spawn_local(listener.run(0));
+
                         crash(&handle).cast().await;
+
                         let _result = task.await;
+
                         eprintln!("state cleaned");
                     }
 
@@ -80,6 +85,7 @@ async fn abort() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
 
                 assert!(!stderr.contains("FORBIDDEN_FALLBACK"), "{case}: {stderr}");
+
                 if case != "hook" && case != "payload" {
                     assert!(stderr.contains("state cleaned"), "{case}: {stderr}");
                 }
@@ -91,6 +97,7 @@ async fn abort() {
                 }
 
                 assert!(stderr.contains("actor "), "{case}: {stderr}");
+
                 if case == "cancel" || case == "unpolled" {
                     assert!(stderr.contains("Cancelled"), "{stderr}");
                 }
@@ -140,12 +147,14 @@ async fn discard() {
         )
         .send()
         .await;
+
         running.await.unwrap();
 
         call(&handle, |_, input| drop(input), Bomb).cast().await;
         release.send(()).unwrap();
 
         let _result = thread.join_async().await;
+
         if case != "hook" {
             eprintln!("FORBIDDEN_FALLBACK");
         }

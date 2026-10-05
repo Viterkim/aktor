@@ -27,6 +27,7 @@ async fn wait(
     release: oneshot::Receiver<()>,
 ) -> usize {
     let values = state.values.clone();
+
     started.send(()).unwrap();
     release.await.unwrap();
 
@@ -56,12 +57,14 @@ async fn ownership() {
                     owner: thread::current().id(),
                     timer: Box::pin(tokio::time::sleep(Duration::from_millis(100))),
                 };
+
                 tokio::time::sleep(Duration::from_millis(1)).await;
 
                 Ok::<_, aktor::AktorError>(state)
             },
             cleanup: move |state: State| {
                 let observed = observed.clone();
+
                 async move {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                     assert_eq!(thread::current().id(), state.owner);
@@ -79,9 +82,11 @@ async fn ownership() {
     let (release, blocked) = oneshot::channel();
     let first_handle = database.new_handle().new_handle();
     let first = tokio::spawn(async move { wait(&first_handle, started, blocked).await });
+
     running.await.unwrap();
 
     let mut second = finish::request(&*database).send().await;
+
     assert!(
         tokio::time::timeout(Duration::from_millis(10), &mut second)
             .await
@@ -91,6 +96,7 @@ async fn ownership() {
     let closing = database.clone();
     let completion = database.completion();
     let mut shutdown = tokio::spawn(async move { closing.shutdown().await });
+
     assert!(
         tokio::time::timeout(Duration::from_millis(10), &mut shutdown)
             .await
@@ -133,6 +139,7 @@ async fn panic_after_await() {
         },
         cleanup: move |state: State| {
             let observed = observed.clone();
+
             async move {
                 tokio::task::yield_now().await;
                 *observed.lock() = Some(state.values.borrow().clone());
@@ -157,12 +164,15 @@ async fn panic_after_await() {
     let OwnerError::PanickedWithCleanup { cause, cleanup } = &*error else {
         panic!("expected operation panic and cleanup failure")
     };
+
     assert_eq!(
         cause.payload.lock().downcast_ref::<&str>(),
         Some(&"after await")
     );
     assert_eq!(cleanup.errors[0].diagnostics, "cleanup failed too");
+
     let report = error.to_string();
+
     assert!(report.contains("after await"));
     assert!(report.contains("cleanup failed too"));
     assert_eq!(*cleaned.lock(), Some(vec![9]));
@@ -186,6 +196,7 @@ async fn completion() {
 
     let handle = database.new_handle();
     let completion = database.completion.new_observer();
+
     drop(database);
 
     let reply = call(
@@ -205,11 +216,13 @@ async fn completion() {
 
     let first = completion.wait().await.unwrap_err();
     let second = completion.wait().await.unwrap_err();
+
     assert!(Arc::ptr_eq(&first, &second));
 
     let OwnerError::Cleanup(error) = &*first else {
         panic!("expected cleanup error")
     };
+
     assert_eq!(
         error.errors[0].diagnostics,
         "database connection stayed open"

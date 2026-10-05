@@ -1,0 +1,25 @@
+{
+  "packet-before": {
+    "instructions": [
+      19628651,
+      38807624
+    ],
+    "per_call": 1917.8973
+  },
+  "packet-after": {
+    "instructions": [
+      19308662,
+      38167635
+    ],
+    "per_call": 1885.8973
+  },
+  "source": "9557be1 + task box reuse, before/after skipping abandon for a consumed native reply",
+  "calls": [
+    10000,
+    20000
+  ],
+  "command": "CALLS=N taskset -c 2 valgrind --tool=callgrind packet",
+  "flags": "default release",
+  "scenario": "single runtime task: submit async native request, listener.recv().run, await reply, repeat. No owner thread crossing.",
+  "probe_source": "use aktor::*;\nuse aktor::listener::channel;\nfn main() {\n    let calls: usize = std::env::var(\"CALLS\").unwrap().parse().unwrap();\n    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {\n        let (handle, mut listener) = channel::<u64>(1).unwrap();\n        let mut state = 0;\n        let mut sum = 0;\n        for _ in 0..calls {\n            let reply = message::call_async(&handle, async |state: &mut u64, by| { *state += by; *state }, 1).send().await;\n            listener.recv().await.unwrap().run(&mut state).await;\n            sum += reply.await;\n        }\n        assert_eq!(sum, calls as u64 * (calls as u64 + 1) / 2);\n    });\n}\n"
+}

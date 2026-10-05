@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["aktor", "aktor-macros"]
-exclude = ["integrations"]
+exclude = ["integrations", "bench"]
 
 [workspace.package]
 license = "MIT-0"
@@ -13,14 +13,35 @@ rust-version = "1.89"
 publish = true
 
 [workspace.dependencies]
+aktor-macros = { version = "=0.0.3", path = "aktor-macros" }
+er = { version = "0.6", default-features = false, features = ["macros"] }
 proc-macro-crate = "3.5"
 proc-macro2 = "1.0"
 quote = "1.0"
+syn = { version = "3.0", features = ["full", "visit", "visit-mut"] }
 parking_lot = "0.12"
 pin-project-lite = "0.2"
-syn = { version = "3.0", features = ["full", "visit", "visit-mut"] }
-tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }
+tokio = { version = "1.53.1", features = ["macros", "sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-core = { version = "0.3", default-features = false }
+futures-timer = "3"
+bevy-tasks = { package = "bevy_tasks", version = "0.19" }
+bevy-platform = { package = "bevy_platform", version = "0.19", default-features = false, features = ["web"] }
+embassy-time = "0.5"
+embassy-sync = "0.8"
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
+portable-atomic-util = { version = "0.2", default-features = false, features = ["alloc"] }
+critical-section = "1"
+serde = { version = "1", features = ["derive"] }
+inventory = "0.3"
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = ">=0.3, <0.5", features = ["futures"] }
+web-sys = { version = "0.3", features = ["Worker", "WorkerOptions", "WorkerType", "MessageEvent", "ErrorEvent", "DedicatedWorkerGlobalScope"] }
+js-sys = "0.3"
+rustix = { version = "1.1", default-features = false, features = ["process"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

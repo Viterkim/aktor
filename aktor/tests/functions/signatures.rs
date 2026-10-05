@@ -40,6 +40,7 @@ async fn nested(_: &usize) -> usize {
     let future = async {
         independent().await;
     };
+
     drop(future);
 
     let _callback = async || {
@@ -126,14 +127,18 @@ async fn signatures() {
     assert_eq!(named_parameters::generic(&7, 1usize).await, 8);
 
     let (handle, owner) = spawn_thread(7usize, 1).unwrap();
+
     assert_eq!(named_parameters::echo(&handle, 1).await, 8);
     assert_eq!(named_parameters::value(&handle, 17).await, 17);
     assert_eq!(named_parameters::generic(&handle, 1usize).await, 8);
 
     let (sender, mut results) = named_parameters::value(&handle, 27).latest();
+
     assert_eq!(results.next().await, Some(27));
     drop((sender, results));
+
     let (sender, mut results) = named_parameters::echo(&handle, 2).latest();
+
     assert_eq!(results.next().await, Some(9));
     drop((sender, results, handle));
     owner.join().unwrap();
@@ -144,9 +149,12 @@ async fn signatures() {
     assert_eq!(siblings::generic(&7, 1usize).await, 8);
 
     let mut state = state_borrows::State("kat".into());
+
     assert_eq!(state_borrows::length(&state).await, 3);
     assert_eq!(state_borrows::append(&mut state).await, 4);
+
     let (handle, owner) = spawn_thread(state, 1).unwrap();
+
     assert_eq!(state_borrows::length(&handle).await, 4);
     assert_eq!(state_borrows::append(&handle).await, 5);
     drop(handle);
@@ -249,6 +257,7 @@ async fn generic_locals<T: Into<usize> + Send + 'static>(
 #[tokio::test]
 async fn names() {
     let mut state = 0;
+
     assert_eq!(locals(&mut state, 1, 2, 3, 4, 5, 6).await, 21);
     assert_eq!(generic_locals(&mut state, 1usize, 2, 3, 4, 5, 6).await, 21);
 
@@ -298,9 +307,11 @@ async fn borrowed(_: &usize, name: &str) -> usize {
 #[tokio::test]
 async fn inputs() {
     let text = String::from("name");
+
     assert_eq!(borrowed(&0, &text).await, 4);
 
     let state = std::rc::Rc::new(0);
+
     assert_eq!(by_name(&state, &text).await, text);
     assert_eq!(
         by_name(&state, std::rc::Rc::<str>::from(text.as_str())).await,
@@ -318,8 +329,11 @@ async fn inputs() {
     .unwrap();
 
     let (sender, mut results) = by_name(&handle, String::from("search")).latest();
+
     assert_eq!(results.next().await, Some(String::from("search")));
+
     let cloned = sender.clone();
+
     cloned.send(String::from("new search"));
     assert_eq!(results.next().await, Some(String::from("new search")));
     drop(cloned);
@@ -327,6 +341,7 @@ async fn inputs() {
     drop(results);
 
     let reply = by_name::request(&handle, text).send().await;
+
     drop(handle);
     assert_eq!(tokio::spawn(reply).await.unwrap(), "name");
     thread.join_async().await.unwrap().unwrap();
@@ -345,6 +360,7 @@ async fn state_length(state: &impl AsRef<str>) -> usize {
 #[tokio::test]
 async fn state() {
     let text = String::from("BingoManden");
+
     assert_eq!(state_length(&text).await, 11);
 
     let (handle, _actor, thread) = spawn(SpawnArgs {
@@ -372,6 +388,7 @@ async fn anonymous() {
             use std::borrow::Cow;
 
             let text = String::from("Haandboldfuglen");
+
             assert_eq!(length(&0, Cow::Borrowed(&text)).await, 15);
             assert_eq!(
                 mapped(&0, text.as_str(), |s| s.len(), |s| s.len()).await,
@@ -379,6 +396,7 @@ async fn anonymous() {
             );
 
             let (handle, task) = spawn_local(&executor, 0, 8).unwrap();
+
             assert_eq!(length(&handle, Cow::Owned(text)).await, 15);
 
             drop(handle);
@@ -450,11 +468,13 @@ async fn latest_names() {
     );
 
     let (sender, mut output) = locals(&handle, 1, 2, 3, 4, 5, 6).latest();
+
     assert_eq!(output.next().await, Some(21));
     drop(sender);
     drop(output);
 
     let (sender, mut output) = generic_locals(&handle, 1usize, 2, 3, 4, 5, 6).latest();
+
     assert_eq!(output.next().await, Some(21));
     drop(sender);
     drop(output);
@@ -466,13 +486,16 @@ async fn latest_names() {
 
     let (sender, mut results) = put(&handle, Inner(17, std::marker::PhantomPinned)).latest();
     let (generic, mut found) = keep(&handle, String::from("query")).latest();
+
     assert_eq!(found.next().await.as_deref(), Some("query"));
     drop(generic);
     drop(found);
 
     assert_eq!(echo(&0usize, 7u8).await, 7);
     assert_eq!(echo::request(&handle, 8u8).await, 8);
+
     let (echo_sender, mut found) = echo(&handle, 9u8).latest();
+
     assert_eq!(found.next().await, Some(9));
     drop(echo_sender);
     drop(found);
@@ -481,7 +504,9 @@ async fn latest_names() {
         helpers::concrete(&handle, helpers::LatestSender(7)).await,
         7
     );
+
     let (bound_sender, mut found) = helpers::binders::<_, 17, _>(&handle, [8u8]).latest();
+
     assert_eq!(found.next().await, Some((Some(8), 17)));
     bound_sender.send([9]);
     assert_eq!(found.next().await, Some((Some(9), 17)));
@@ -489,6 +514,7 @@ async fn latest_names() {
     drop(found);
 
     let (pattern, mut matched) = patterns(&handle, (1, 2), "a".into(), "b".into(), ()).latest();
+
     assert_eq!(matched.next().await.as_deref(), Some("1:2:ab"));
     pattern.send((3, 4), "c".into(), "d".into(), ());
     assert_eq!(matched.next().await.as_deref(), Some("3:4:cd"));

@@ -24,8 +24,8 @@ Calls run one after the other, and your function's errors come back as usual. Fu
 
 Keep the actors with your application in an AktorGroup. If one dies, the group starts closing, your queries don't need another Result for that.
 
-Inside another query, pass the connection you already have and it runs right there. Passing the handle again queues it behind yourself. The [examples](examples.md#calling-another-query) shows a transaction doing that.
+Inside another query, pass the connection you already have and it runs right there. Passing the handle again queues it behind yourself. The [examples](examples.md#calling-another-query) show a transaction doing that.
 
-[Opening / spawning](../../README.md#example)
+[Opening / spawning](../../README.md#counter)
 
 [Extra examples](examples.md)

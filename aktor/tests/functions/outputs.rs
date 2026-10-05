@@ -1,4 +1,50 @@
 use super::*;
+use std::rc::Rc;
+
+#[aktor]
+async fn local_value(state: &Rc<u32>, value: Rc<u32>) -> Rc<u32> {
+    Rc::new(**state + *value)
+}
+
+#[aktor]
+async fn generic_local<T: 'static>(_: &(), value: T) -> T {
+    value
+}
+
+#[aktor]
+async fn opaque_local_value(state: &Rc<u32>) -> impl std::ops::Deref<Target = u32> {
+    state.clone()
+}
+
+#[tokio::test]
+async fn local_results() {
+    let value = Rc::new(85);
+
+    assert_eq!(*local_value(&value, Rc::new(5)).await, 90);
+    assert_eq!(*opaque_local_value(&value).await, 85);
+    assert!(Rc::ptr_eq(&generic_local(&(), value.clone()).await, &value));
+
+    #[cfg(feature = "local")]
+    {
+        let (handle, owner) = aktor::local::channel::<Rc<u32>, 2, ()>().unwrap();
+        let client = async {
+            assert_eq!(*local_value(&handle, Rc::new(5)).await, 90);
+            assert_eq!(*opaque_local_value(&handle).await, 85);
+
+            let (sender, mut results) = local_value::latest(&handle);
+
+            sender.send(Rc::new(10));
+            assert_eq!(*results.next().await.unwrap(), 95);
+            drop(sender);
+            drop(results);
+            handle.shutdown();
+        };
+
+        let (result, ()) = tokio::join!(owner.run(value, async |_| Ok(())), client);
+
+        result.unwrap();
+    }
+}
 
 #[aktor]
 async fn indices(state: &usize) -> impl Iterator<Item = usize> + Send {
@@ -35,6 +81,13 @@ async fn named<'a>(state: &'a usize) -> impl Iterator<Item = usize> + Send {
 
 #[tokio::test]
 async fn replies() {
+    let task = tokio::spawn(async {
+        let state = 3;
+        indices(&state).await.collect::<Vec<_>>()
+    });
+
+    assert_eq!(task.await.unwrap(), [0, 1, 2]);
+
     let executor = tokio::task::LocalSet::new();
 
     executor
@@ -43,12 +96,14 @@ async fn replies() {
                 let values = [1, 2];
                 supplied(&0, values.iter().copied()).await
             };
+
             assert_eq!(owned.collect::<Vec<_>>(), [1, 2]);
 
             let nested_owned = {
                 let names = [String::from("Haandboldfuglen")];
                 lengths(&0, &names).await
             };
+
             assert_eq!(nested_owned.collect::<Vec<_>>(), [15]);
 
             let (handle, task) = spawn_local(&executor, 3, 4).unwrap();
@@ -60,6 +115,7 @@ async fn replies() {
             let nested_inputs = lengths::request(&handle, vec![String::from("Haandboldfuglen")])
                 .send()
                 .await;
+
             drop(handle);
 
             assert_eq!(

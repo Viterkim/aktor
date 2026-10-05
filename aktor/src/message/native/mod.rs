@@ -57,6 +57,7 @@ pub struct Reply<O> {
 }
 
 trait Answer<O>: Send + Sync {
+    fn try_take(&self) -> Option<Result<O, CallError>>;
     fn poll(&self, context: &mut Context<'_>) -> Poll<Result<O, CallError>>;
     fn abandon(&self);
 }
@@ -69,11 +70,16 @@ pub struct Message<S> {
 }
 
 trait Job<S>: Send + Sync {
-    fn run<'a>(&'a self, state: &'a mut S) -> LocalFuture<'a, ()>;
+    fn run<'a>(
+        &'a self,
+        state: &'a mut S,
+        hooks: &'a mut crate::listener::hooks::AktorHooks<S>,
+        operation: crate::operation::Operation,
+    ) -> LocalFuture<'a, ()>;
     fn close(&self);
 }
 
-struct AsyncJob<F, I, O>(Arc<Packet<F, I, O>>);
+struct AsyncJob<F, I, O>(Packet<F, I, O>);
 
 struct Packet<F, I, O> {
     data: Mutex<Data<F, I, O>>,

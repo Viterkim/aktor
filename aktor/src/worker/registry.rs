@@ -1,5 +1,5 @@
 use super::*;
-use crate::{message::LocalFuture, target::Export};
+use crate::{dispatch::Export, message::LocalFuture};
 use core::{
     any::{Any, TypeId, type_name},
     marker::PhantomData,
@@ -31,6 +31,7 @@ impl Operations {
                 )
             })
             .collect();
+
         operations.sort_unstable();
         Self(operations)
     }
@@ -40,7 +41,9 @@ pub struct Registry(Vec<Registered>);
 impl Registry {
     pub fn for_actor<S: 'static, Role: 'static>() -> Result<Self, WorkerError> {
         let mut operations: Vec<_> = registered::<S, Role>().collect();
+
         operations.sort_unstable_by_key(|operation| operation.name);
+
         for pair in operations.windows(2) {
             if pair[0].name == pair[1].name {
                 return Err(WorkerError::new(
@@ -49,6 +52,7 @@ impl Registry {
                 ));
             }
         }
+
         Ok(Self(operations))
     }
 
@@ -64,8 +68,17 @@ impl Registry {
                 )
             })
             .collect();
+
         operations.sort_unstable();
         Operations(operations)
+    }
+
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub fn operation_name(&self, name: &str) -> Option<&'static str> {
+        self.0
+            .iter()
+            .find(|operation| operation.name == name)
+            .map(|operation| operation.name)
     }
 
     pub async fn dispatch<S: 'static>(
@@ -81,6 +94,7 @@ impl Registry {
             .ok_or_else(|| {
                 WorkerError::new(CallError::Discarded, WorkerCause::UnknownOperation(name))
             })?;
+
         (operation.run)(state, &input).await
     }
 }
@@ -130,6 +144,7 @@ where
         let state = state
             .downcast_mut::<E::State>()
             .ok_or_else(|| WorkerError::new(CallError::Discarded, WorkerCause::Protocol))?;
+
         run_export(E::default(), state, input).await
     })
 }
@@ -219,10 +234,13 @@ mod tests {
     #[tokio::test]
     async fn names_are_unambiguous() {
         let mut state = State(0);
+
         assert!(Registry::for_actor::<State, Duplicate>().is_err());
+
         let error = dispatch::<State, Duplicate>(&mut state, "same operation".into(), Vec::new())
             .await
             .unwrap_err();
+
         assert!(format!("{error}").contains("same operation"));
         assert_eq!(state.0, 0);
 

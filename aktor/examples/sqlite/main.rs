@@ -30,49 +30,61 @@ pub struct Owner {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::result::Result<(), Box<dyn core::error::Error>> {
-    let setup = || {
+    let setup = async || {
         Connection::open_in_memory().map_err(|error| aktor::AktorSetupError::new(error.to_string()))
     };
-    let cleanup = |db: Connection| {
+    let cleanup = async |db: Connection| {
         db.close()
             .map_err(|(_, error)| aktor::AktorCleanupError::new(error.to_string()))
     };
 
-    let database = Aktor::spawn(SpawnArgs {
-        name: "sqlite".into(),
-        capacity: 128,
-        failure: FailurePolicy::Abort,
-        setup,
-        cleanup,
+    let actors = start(AktorSetup {
+        name: AktorName::new("sqlite"),
+        role: AktorNoRole,
+        kind: AktorKind::TokioThread,
+        closures: AktorClosures {
+            end: Some(cleanup.into()),
+            ..AktorClosures::new(setup)
+        },
+        options: Some(AktorOptions {
+            capacity: 128,
+            ..Default::default()
+        }),
     })
     .await?;
 
-    schema::create(&database).await?;
+    let database = &actors.handles;
 
-    let bingo = post::cats::create(&database, "Bingo").await?;
-    let paws = post::cats::create(&database, String::from("Paws")).await?;
+    schema::create(database).await?;
 
-    update::cats::rename(&database, paws, "Mittens").await?;
+    let bingo = post::cats::create(database, "Bingo").await?;
+    let paws = post::cats::create(database, String::from("Paws")).await?;
 
-    let owner = adopt::household(&database, "BingoManden", vec![bingo, paws]).await?;
+    update::cats::rename(database, paws, "Mittens").await?;
 
-    let cat = get::cats::by_id(&database, bingo).await?;
-    let household = get::owners::by_id(&database, owner).await?;
+    let owner = adopt::household(database, "BingoManden", vec![bingo, paws]).await?;
+
+    let cat = get::cats::by_id(database, bingo).await?;
+    let household = get::owners::by_id(database, owner).await?;
 
     println!("{} lives with {}", cat.name, household.name);
-    assert_eq!(get::cats::by_owner(&database, owner).await?, [bingo, paws]);
-    assert_eq!(get::owners::by_name(&database, "BingoManden").await?, owner);
+    assert_eq!(get::cats::by_owner(database, owner).await?, [bingo, paws]);
+    assert_eq!(get::owners::by_name(database, "BingoManden").await?, owner);
 
     // The missing cat rolls back the new owner and Bingo's move.
     assert!(
-        adopt::household(&database, "Haandboldfuglen", vec![bingo, CatId(-1)])
+        adopt::household(database, "Haandboldfuglen", vec![bingo, CatId(-1)])
             .await
             .is_err()
     );
-    assert_eq!(get::owners::count(&database).await?, 1);
-    assert_eq!(get::cats::by_id(&database, bingo).await?.owner, Some(owner));
+    assert_eq!(get::owners::count(database).await?, 1);
+    assert_eq!(get::cats::by_id(database, bingo).await?.owner, Some(owner));
 
-    database.shutdown().await?;
+    let report = actors.shutdown().await;
+
+    if report.failed() {
+        return Err(Box::new(report).into());
+    }
 
     Ok(())
 }

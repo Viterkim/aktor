@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
             .open(path)
             .map_err(|error| AktorSetupError::new(error.to_string()))
     };
+
     let cleanup = |file: File| {
         file.sync_all()
             .map_err(|error| AktorCleanupError::new(error.to_string()))
@@ -43,8 +44,10 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
         if let Err(error) = append(&log, "application started".into()).await {
             eprintln!("{error}");
         }
+
         core::future::pending::<()>().await;
     });
+
     let ctrl_c = kill.clone();
     let signal = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -55,9 +58,11 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     kill.wait_stopping().await;
     work.abort();
     signal.abort();
+
     let _joined = work.await;
     let _joined = signal.await;
     let report = closing.await;
+
     if report.failed() {
         return Err(report.into());
     }

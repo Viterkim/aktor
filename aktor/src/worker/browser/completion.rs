@@ -61,11 +61,13 @@ pub fn typed<E: DeserializeOwned>(error: WireError) -> WorkerError<E> {
         cause: error.cause,
         data: None,
     };
+
     if let Some(bytes) = error.data {
         match decode(&bytes) {
             Ok(data) => report.data = Some(data),
             Err(codec) => report = report.data_error(codec),
         }
     }
+
     report
 }
