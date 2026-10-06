@@ -7,6 +7,7 @@ impl fmt::Display for Failure {
         if let Some(message) = self.payload.downcast_ref::<&str>() {
             write!(f, ": {message}")?;
         }
+
         if let Some(message) = self.payload.downcast_ref::<String>() {
             write!(f, ": {message}")?;
         }
@@ -33,10 +34,12 @@ impl FailurePolicy {
                         std::io::stderr().lock(),
                         "actor shutdown hook panicked, aborting"
                     );
+
                     std::process::abort();
                 }
             }
             Self::Group(group) => group.fail(crate::group::ActorFailure {
+                kind: None,
                 actor: failure.actor.clone(),
                 phase: format!("{:?}", failure.kind),
                 message: failure.to_string(),

@@ -1,5 +1,6 @@
 use syn::{Block, Ident, Pat, Path, Signature, Type};
 
+pub mod attributes;
 pub mod impls;
 pub mod parse;
 #[cfg(test)]
@@ -7,7 +8,8 @@ mod tests;
 
 pub struct Options {
     pub crate_path: Option<Path>,
-    pub actor: Option<Path>,
+    pub role: Option<Path>,
+    pub data: bool,
 }
 
 pub struct Argument {

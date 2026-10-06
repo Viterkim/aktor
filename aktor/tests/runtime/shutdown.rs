@@ -14,6 +14,7 @@ async fn cutoff() {
         setup: || Ok::<_, std::convert::Infallible>(()),
         cleanup: move |_| {
             let (cleaning, released) = gate.take().unwrap();
+
             cleaning.send(()).unwrap();
             released.recv().unwrap();
             Ok::<_, std::convert::Infallible>(())
@@ -24,6 +25,7 @@ async fn cutoff() {
 
     let observer = actor.new_controller();
     let stopping = tokio::spawn(async move { actor.shutdown().await });
+
     cleaned.await.unwrap();
 
     let running = observer.is_running();
@@ -69,14 +71,17 @@ async fn waiting_admission() {
     )
     .send()
     .await;
+
     running.await.unwrap();
 
     let second = call(&handle, |state, ()| *state += 1, ()).send().await;
 
     let mut waiting = Box::pin(call(&handle, |state, ()| *state += 100, ()));
+
     assert!(poll(waiting.as_mut()).is_pending());
 
     let mut stopping = Box::pin(actor.shutdown());
+
     assert!(poll(stopping.as_mut()).is_pending());
 
     release.send(()).unwrap();

@@ -8,11 +8,18 @@ use pin_project_lite::pin_project;
     target_os = "unknown"
 ))]
 mod browser;
+#[cfg(feature = "embassy_cross_core")]
+mod cross_core;
 mod impls;
-#[cfg(feature = "embassy")]
+#[cfg(feature = "local")]
 mod local;
-#[cfg(feature = "tokio")]
+#[cfg(any(
+    feature = "tokio",
+    all(feature = "std_thread", not(target_family = "wasm"))
+))]
 mod native;
+#[cfg(any(all(feature = "tokio", not(target_family = "wasm")), feature = "bevy"))]
+mod task;
 
 pin_project! {
     /// The call returned by an #[aktor] function.

@@ -52,6 +52,7 @@ async fn resume() {
     let before = add(&handle, 4).send().await;
 
     let mut pause = Box::pin(actor.pause());
+
     assert!(poll(pause.as_mut()).is_pending());
     cleaning.await.unwrap();
     release.send(()).unwrap();
@@ -61,6 +62,7 @@ async fn resume() {
     assert!(!actor.is_running());
 
     let mut parked = Box::pin(add(&handle, 1));
+
     assert!(poll(parked.as_mut()).is_pending());
     assert!(
         add(&other, 3)

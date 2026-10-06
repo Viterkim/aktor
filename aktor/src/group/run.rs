@@ -33,11 +33,13 @@ impl AktorGroup {
             control: self.control.clone(),
             actors: self.actors.clone(),
         };
+
         let closing = async move {
             group.killswitch().wait_stopping().await;
             group
                 .finish(async move |report| {
                     let _sent = hook_start.send(report);
+
                     hook_result.await.map_err(|_| {
                         AktorError::new("group driver cancelled before cleanup finished")
                     })
@@ -51,12 +53,14 @@ impl AktorGroup {
         wasm_bindgen_futures::spawn_local(closing);
 
         self.stop_on_drop = true;
+
         let mut stopping = self.control.changed.subscribe();
         let mut output = None;
 
         {
             let mut application =
                 Box::pin(AssertUnwindSafe(async { application(&mut self).await }).catch_unwind());
+
             tokio::select! {
                 biased;
                 _ = stopped(&mut stopping) => {}
@@ -68,6 +72,7 @@ impl AktorGroup {
                     }
                     Err(payload) => {
                         kill.fail(ActorFailure {
+                            kind: None,
                             actor: "application".into(), phase: "run".into(), message: panic_message(&payload),
                         });
                         contain_drop(payload, &kill, "application panic drop");
@@ -79,16 +84,20 @@ impl AktorGroup {
         }
 
         kill.stop();
+
         if let Ok(report) = hook_report.await {
             let reserve = (self.control.grace / 10).min(Duration::from_millis(100));
             let deadline = kill.deadline();
             let hook_deadline = deadline.checked_sub(reserve / 2).unwrap_or(deadline);
+
             finish_hook(cleanup, report, &kill, hook_deadline).await;
         } else {
             contain_drop(cleanup, &kill, "cleanup drop");
         }
+
         let _sent = hook_done.send(());
         let report = completed.wait().await;
+
         if report.failed() {
             Err(Box::new(report))
         } else {

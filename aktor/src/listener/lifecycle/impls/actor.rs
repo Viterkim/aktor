@@ -5,6 +5,12 @@ impl<S, E, C> Actor<S, E, C> {
         self.admission.shutdown();
     }
 
+    pub fn request_shutdown(&self) {
+        // Subscriber wakes can panic. The owner must already have its stop.
+        self.shutdown.send_replace(true);
+        self.close_admission();
+    }
+
     /// Cancel running async work and cleanup after the shutdown budget is spent.
     pub fn cancel(&self) {
         if self
@@ -14,6 +20,7 @@ impl<S, E, C> Actor<S, E, C> {
         {
             self.admission.lost();
         }
+
         self.force.send_replace(true);
     }
 
@@ -73,6 +80,7 @@ impl<S, E, C> Actor<S, E, C> {
             .map_err(|_| LifecycleError::Closed)?;
 
         let result = answer.await;
+
         self.closed().await;
 
         result.map_err(|_| LifecycleError::Closed)?
@@ -144,6 +152,7 @@ impl<S, E, C> Actor<S, E, C> {
             admission: self.admission.clone(),
             commands: self.commands.clone(),
             force: self.force.clone(),
+            shutdown: self.shutdown.clone(),
             running: self.running.clone(),
             abandoned_setup: self.abandoned_setup.clone(),
             failed_cleanup: self.failed_cleanup.clone(),

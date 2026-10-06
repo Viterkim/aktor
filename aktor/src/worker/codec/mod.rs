@@ -7,6 +7,14 @@ mod encode;
 pub use decode::decode;
 pub use encode::encode;
 
+#[cfg(any(test, all(target_family = "wasm", target_os = "unknown")))]
+pub fn decode_output<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WorkerError> {
+    decode(bytes).map_err(|mut error| {
+        error.outcome = CallError::OutcomeUnknown;
+        error
+    })
+}
+
 const MAX_DEPTH: usize = 128;
 
 const UNIT: u8 = 0;
@@ -60,4 +68,40 @@ fn error(message: &str) -> Error {
 
 fn report(error: Error) -> WorkerError {
     WorkerError::new(CallError::NotAdmitted, WorkerCause::Codec(error.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    struct Rejected;
+    impl<'de> Deserialize<'de> for Rejected {
+        fn deserialize<D: de::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+            Err(de::Error::custom("answer refused"))
+        }
+    }
+
+    impl Serialize for Rejected {
+        fn serialize<S: ser::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(ser::Error::custom("input refused"))
+        }
+    }
+
+    #[test]
+    fn answer_stage() {
+        assert_eq!(
+            encode(&Rejected).unwrap_err().outcome,
+            CallError::NotAdmitted
+        );
+
+        let bytes = encode(&7u32).unwrap();
+        let error = decode_output::<Rejected>(&bytes).err().unwrap();
+
+        assert_eq!(error.outcome, CallError::OutcomeUnknown);
+        assert_eq!(
+            decode::<Rejected>(&bytes).err().unwrap().outcome,
+            CallError::NotAdmitted
+        );
+    }
 }

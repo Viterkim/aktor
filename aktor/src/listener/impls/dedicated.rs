@@ -1,4 +1,5 @@
 use super::super::*;
+#[cfg(feature = "tokio")]
 use tokio::task;
 
 impl<S> Dedicated<S> {
@@ -21,6 +22,7 @@ impl<S> Dedicated<S> {
     }
 
     /// Join without blocking the async runtime.
+    #[cfg(feature = "tokio")]
     pub async fn join_async(self) -> Result<S, DedicatedJoinError>
     where
         S: Send + 'static,

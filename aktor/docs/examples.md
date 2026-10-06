@@ -1,42 +1,52 @@
 # A bit extra
 
-The [counter example](../examples/counter.rs) owns a number on a thread and prints around each queued call. It writes out the receive loop, dropping the handle lets it finish. spawn_value runs Aktor's loop for you, the group handles shutdown.
+## Setups
 
-Using insert_user from the [README](../../README.md).
+TokioThread owns a dedicated thread, TokioTask runs on your runtime. StdThread needs the std_thread feature. No runtime is enabled by default.
 
-## Your own setup / cleanup
-
-These run on the actor's thread, handy if your resource can't be moved there:
+For local state, use TokioLocal(&local_set), BevyLocal(&pool) or BrowserLocal. Keep the local executor running. BevyTask(&pool) uses transferable state.
 
 ```rust
-let setup = || {
-    let e = |error: rusqlite::Error| AktorSetupError::new(error.to_string());
-    let db = Connection::open("users.sqlite").map_err(e)?;
-    db.execute("CREATE TABLE IF NOT EXISTS user (name TEXT NOT NULL)", []).map_err(e)?;
+let actors = start(aktor_setups! {
+    users: users_setup,
+    archive: archive_setup,
+}).await?;
 
-    Ok(db)
+let id = insert_user(&actors.handles.users, "Katten".into()).await?;
+```
+
+Keep actors alive while using its handles. If you already own a started group, `start_in(&group, setup).await?` returns handles. Failed or cancelled startup stops that whole group. Startup errors keep the original .error and an optional rollback .report.
+
+Roles restrict operations: put role: Users in the setup and #[aktor(role = Users)] on its functions. AktorNoRole accepts unmarked functions.
+
+## Setup / cleanup
+
+```rust
+let setup = async || {
+    Connection::open("users.sqlite")
+        .map_err(|error| AktorSetupError::new(error.to_string()))
 };
-let cleanup = |db: Connection| {
+let cleanup = async |db: Connection| {
     db.close().map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
 };
 
-let database = actors.spawn(ActorArgs::new("users", setup, cleanup)).await?;
+let actors = start(AktorSetup {
+    name: AktorName::new("users"),
+    role: AktorNoRole,
+    kind: AktorKind::TokioThread,
+    closures: AktorClosures {
+        end: Some(cleanup.into()),
+        ..AktorClosures::new(setup)
+    },
+    options: None,
+}).await?;
 ```
 
-Give us the text you want in the report, keep whatever else you want in data:
+These run on the owner thread. For typed lifecycle data, use TokioThread.with_data::<SetupData, CleanupData>() with AktorSetupError<SetupData> and AktorCleanupError<CleanupData>. StdThread supports it too.
 
-```rust
-AktorCleanupError {
-    diagnostics: error.er_report_string(),
-    data: error,
-}
-```
-
-That's with er, error.to_string() works too. The group collects the text, the actor's completion keeps your data. AktorSetupError works the same way.
+The [counter](../examples/counter.rs) adds before_each / after_each hooks. Put AktorInterval { every, run } in closures.intervals for periodic work. Its next wait begins after the callback finishes, shutdown stops scheduling. Task callbacks use AktorTaskState<S> through awaits.
 
 ## Calling another query
-
-Pass the connection you already have:
 
 ```rust
 #[aktor]
@@ -51,30 +61,21 @@ pub async fn insert_users(db: &mut Connection, names: Vec<String>) -> Result<()>
 }
 ```
 
-The whole transaction queues once, the calls inside it run right there.
+The transaction queues once. The calls inside it use the connection directly.
 
 ## Get the reply later
-
-```rust
-let reply = insert_user(&database, "Katten".into()).send().await;
-
-// do something else
-let id = reply.await?;
-```
-
-send waits for queue space. Dropping the reply leaves the insert running.
 
 ```rust
 let mut reply = insert_user(&database, "Katten".into()).send().await;
 
 if let Some(result) = reply.try_take() {
     show_saved(result?);
+} else {
+    let id = reply.await?;
 }
 ```
 
-None leaves it available to await later, Some takes the output once.
-
-## Waiting a little less
+send waits for queue space. try_take takes a ready output once. Dropping an admitted reply leaves the operation running.
 
 ```rust
 let id = insert_user(&database, "Katten".into())
@@ -82,19 +83,13 @@ let id = insert_user(&database, "Katten".into())
     .await??;
 ```
 
-The extra result is the timeout you asked for. If it was admitted, the insert keeps running.
+The extra result is the timeout. An admitted insert keeps running, so a timeout doesn't mean the write failed.
 
 ## Latest input
 
-For a search box, keep a session in your UI:
+For a search box:
 
 ```rust
-#[aktor]
-pub async fn find_users(db: &Connection, query: String) -> Result<Vec<String>> {
-    let mut statement = db.prepare("SELECT name FROM user WHERE name LIKE ?")?;
-    statement.query_map([format!("%{query}%")], |row| row.get(0))?.collect()
-}
-
 let (search, mut results) = find_users(&database, "kat".into()).latest();
 search.send("katten".into());
 
@@ -103,27 +98,16 @@ while let Some(rows) = results.next().await {
 }
 ```
 
-latest() sends "kat", then your input handler keeps sending. Older results get thrown away, each session keeps its own pending input outside the queue limit. Writes still need their normal replies.
+Older results get thrown away. Each session keeps one pending input outside the queue limit. Use ordinary replies for writes.
 
-## Closing the application
+[SQLite](../examples/sqlite/main.rs)
 
-```rust
-let after = async |report: ShutdownReport| {
-    if report.failed() {
-        eprintln!("{report}");
-    }
+[Request guide](../examples/guide.rs)
 
-    Ok::<_, AktorCleanupError>(())
-};
+[Shutdown](runtime.md)
 
-let mut actors = AktorGroup::new();
-let closing = actors.start_with(after)?;
-```
+[Browser workers](../../integrations/worker/README.md)
 
-after runs once the actors have cleaned up, closing gives you the report. Save anything still in your UI before stop(), actor cleanup only has its own resource. The [group example](../examples/group.rs) hooks up Ctrl+C and stops its tasks before exiting.
+[Embassy](../../integrations/embassy/README.md)
 
-[SQLite example](../examples/sqlite/main.rs)
-
-[Other request options](../examples/guide.rs)
-
-[Pause/resume and shutdown](runtime.md)
+For your own serving loop, [Custom](../tests/runtime/setup.rs) takes a clock, a spawning callback and a runner. Run each accepted call with call.run().await, Aktor still owns setup and cleanup.

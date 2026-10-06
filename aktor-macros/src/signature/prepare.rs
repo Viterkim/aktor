@@ -7,6 +7,7 @@ pub fn output(signature: &Signature) -> Type {
         ReturnType::Default => parse_quote!(()),
         ReturnType::Type(_, output) => (**output).clone(),
     };
+
     StaticOutput.visit_type_mut(&mut output);
     output
 }

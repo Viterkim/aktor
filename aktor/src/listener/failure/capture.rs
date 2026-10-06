@@ -25,8 +25,10 @@ impl Failures {
                         kind,
                         payload,
                     });
+
                     if let (Some(group), Some(failure)) = (&self.group, &self.first) {
                         group.fail(crate::group::ActorFailure {
+                            kind: None,
                             actor: failure.actor.clone(),
                             phase: format!("{:?}", failure.kind),
                             message: failure.to_string(),

@@ -27,6 +27,7 @@ async fn completion() {
     let mut completion = handle.completion();
     let mut observing = Box::pin(completion.wait());
     let waker = Waker::from(Arc::new(BrokenWake));
+
     assert!(
         observing
             .as_mut()
@@ -38,7 +39,9 @@ async fn completion() {
     let error = thread.join_async().await.unwrap_err();
 
     assert_eq!(error.to_string(), "completion waker failed");
+
     let cleanup = actor.cleanup_errors();
+
     assert_eq!(cleanup.errors.len(), 1);
     assert_eq!(*cleanup.errors[0], "cleanup failed");
 }
@@ -60,7 +63,7 @@ async fn state() {
     tokio::task::LocalSet::new()
         .run_until(async {
             if let Ok(case) = std::env::var("AKTOR_CHILD") {
-                let cancelled = matches!(case.as_str(), "cancel" | "unpolled");
+                let cancelled = matches!(case.as_str(), "cancel" | "unpolled" | "cancel-wake");
                 let (handle, mut listener) = channel::<BrokenState>(1).unwrap();
                 let closed = Arc::new(AtomicBool::new(false));
                 let state = BrokenState {
@@ -86,10 +89,29 @@ async fn state() {
                     tokio::task::spawn_local(listener.run(state))
                 };
 
+                let mut waiting = None;
+
+                if case == "cancel-wake" {
+                    call(&handle, |_, ()| (), ()).try_cast().unwrap();
+
+                    let mut request = Box::pin(call(&handle, |_, ()| (), ()));
+                    let waker = Waker::from(Arc::new(BrokenWake));
+
+                    assert!(
+                        request
+                            .as_mut()
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+
+                    waiting = Some(request);
+                }
+
                 if cancelled {
                     if case == "cancel" {
                         call(&handle, |_, ()| (), ()).await;
                     }
+
                     task.abort();
                 } else {
                     call(&handle, |_, ()| panic!("first failure"), ())
@@ -98,12 +120,14 @@ async fn state() {
                 }
 
                 assert!(task.await.is_err());
+                drop(waiting);
                 return;
             }
 
-            for case in ["task", "blocking", "cancel", "unpolled"] {
+            for case in ["task", "blocking", "cancel", "unpolled", "cancel-wake"] {
                 let output = support::child("drop::state", case);
                 let stderr = String::from_utf8_lossy(&output.stderr);
+
                 assert!(output.status.success(), "{case}: {stderr}");
                 assert!(
                     stderr.contains("HOOK_RAN_AFTER_STATE_DROP"),
@@ -146,9 +170,11 @@ async fn capture() {
             setup: || Ok::<_, std::convert::Infallible>(()),
             cleanup: move |_| {
                 std::hint::black_box(&capture);
+
                 if cleanup_panics {
                     panic!("cleanup failed");
                 }
+
                 Ok::<_, std::convert::Infallible>(())
             },
         })
@@ -156,6 +182,7 @@ async fn capture() {
         .unwrap();
 
         let mut stopping = Box::pin(actor.shutdown());
+
         assert!(poll(stopping.as_mut()).is_pending());
         entering.await.unwrap();
 
@@ -165,6 +192,7 @@ async fn capture() {
         let shutdown_pending = poll(stopping.as_mut()).is_pending();
 
         release.send(()).unwrap();
+
         if shutdown_pending {
             let _result = stopping.await;
         } else {
@@ -182,6 +210,7 @@ async fn capture() {
         );
 
         let phase = notification.try_recv().unwrap();
+
         assert!(matches!(
             (cleanup_panics, phase),
             (true, FailureKind::Cleanup) | (false, FailureKind::Teardown)

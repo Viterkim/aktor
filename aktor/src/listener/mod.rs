@@ -10,8 +10,10 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 pub mod failure;
+pub use crate::operation::hooks;
 mod impls;
-mod lifecycle;
+#[doc(hidden)]
+pub mod lifecycle;
 mod running;
 mod spawn;
 mod teardown;
@@ -20,12 +22,14 @@ mod tests;
 
 use failure::Failures;
 pub use failure::{Failure, FailureKind, FailurePolicy, Operation, RunError};
-pub use lifecycle::spawn::{spawn, spawn_async};
+pub use lifecycle::spawn::{spawn, spawn_async, spawn_async_with_hooks};
 pub use lifecycle::{AbandonedSetup, Actor, CleanupErrors, LifecycleError, ReplaceError};
+pub use spawn::channel;
+#[cfg(feature = "tokio")]
 use spawn::startup_cause;
+#[cfg(feature = "tokio")]
 pub use spawn::{
-    channel, spawn_local, spawn_local_with_policy, spawn_runner, spawn_thread,
-    spawn_thread_with_policy,
+    spawn_local, spawn_local_with_policy, spawn_runner, spawn_thread, spawn_thread_with_policy,
 };
 
 /// Setup and cleanup run on the actor thread.
@@ -50,6 +54,7 @@ pub struct WeakHandle<S, Role = ()> {
 
 pub struct Listener<S> {
     pub name: String,
+    pub hooks: hooks::AktorHooks<S>,
     receiver: mailbox::Receiver<S>,
     pub failure: FailurePolicy,
     admission: Arc<Admission>,

@@ -4,40 +4,68 @@ use core::task::ready;
 impl<O> Reply<O> {
     /// Take a ready output once. A pending reply can still be awaited.
     pub fn try_take(&mut self) -> Option<O> {
-        if self.taken {
+        if self.taken || self.parked {
             return None;
         }
-        match Pin::new(self).poll(&mut Context::from_waker(core::task::Waker::noop())) {
-            Poll::Ready(output) => Some(output),
-            Poll::Pending => None,
+
+        if self.closing.is_none() {
+            match self.answer.try_take()? {
+                Ok(output) => {
+                    self.taken = true;
+                    return Some(output);
+                }
+                Err(error) => self.close(error),
+            }
+        }
+
+        if matches!(self.finished.has_changed(), Ok(false)) {
+            return None;
+        }
+
+        if self.group.is_some() {
+            self.admission.lost();
+            self.parked = true;
+            None
+        } else {
+            stopped()
         }
     }
 
     pub fn timeout(&mut self, duration: core::time::Duration) -> crate::Timeout<&mut Self> {
-        crate::Timeout::native(self, duration, |reply| crate::timeout::WaitStatus {
-            admitted: true,
-            stopping: reply
-                .group
-                .as_ref()
-                .is_some_and(|group| group.is_stopping()),
-        })
+        let standard = self.admission.is_standard();
+
+        crate::Timeout::queued(
+            self,
+            duration,
+            |reply| crate::timeout::WaitStatus {
+                admitted: true,
+                stopping: reply
+                    .group
+                    .as_ref()
+                    .is_some_and(|group| group.is_stopping()),
+            },
+            standard,
+        )
     }
 
     pub async fn wait_closed(&mut self) {
         let _result = self.finished.changed().await;
     }
 
+    fn close(&mut self, error: CallError) {
+        let mut finished = self.finished.clone();
+
+        self.closing = Some(Box::pin(async move {
+            let _result = finished.changed().await;
+        }));
+        self.error = Some(error);
+    }
+
     fn poll_result(&mut self, cx: &mut Context<'_>) -> Poll<Result<O, CallError>> {
         if self.closing.is_none() {
             match ready!(self.answer.poll(cx)) {
                 Ok(output) => return Poll::Ready(Ok(output)),
-                Err(error) => {
-                    let mut finished = self.finished.clone();
-                    self.closing = Some(Box::pin(async move {
-                        let _result = finished.changed().await;
-                    }));
-                    self.error = Some(error);
-                }
+                Err(error) => self.close(error),
             }
         }
 
@@ -56,9 +84,11 @@ impl<O> Future for Reply<O> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
         let this = self.get_mut();
+
         if this.parked {
             return Poll::Pending;
         }
+
         match ready!(this.poll_result(cx)) {
             Ok(output) => {
                 this.taken = true;
@@ -75,6 +105,8 @@ impl<O> Future for Reply<O> {
 }
 impl<O> Drop for Reply<O> {
     fn drop(&mut self) {
-        self.answer.abandon();
+        if !self.taken {
+            self.answer.abandon();
+        }
     }
 }

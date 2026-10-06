@@ -1,9 +1,10 @@
 [package]
+license.workspace = true
 name = "aktor-wasm-proof"
-version = "0.0.0"
-edition = "2024"
-rust-version = "1.89"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -15,13 +16,13 @@ clock-1m = ["embassy-time/tick-hz-1_000_000", "embassy-time-driver/tick-hz-1_000
 clock-32k = ["embassy-time/tick-hz-32_768", "embassy-time-driver/tick-hz-32_768"]
 
 [dependencies]
-aktor = { path = "../../aktor", default-features = false, features = ["macros", "embassy"] }
-er = { version = "0.6", default-features = false, features = ["macros"] }
-embassy-sync = "0.8"
-futures-util = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
+aktor = { workspace = true, features = ["macros", "embassy"] }
+er = { workspace = true, features = ["macros"] }
+embassy-sync.workspace = true
+futures-util = { workspace = true, features = ["alloc", "async-await"] }
 
-embassy-time = "0.5"
-embassy-time-driver = "0.2"
+embassy-time.workspace = true
+embassy-time-driver.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
+embassy-time = { workspace = true, features = ["std", "generic-queue-8"] }

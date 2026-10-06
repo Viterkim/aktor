@@ -15,6 +15,7 @@ impl<F, I, O> Packet<F, I, O> {
 
         if matches!(data.completion, Completion::Waiting(_)) {
             let old = std::mem::replace(&mut data.completion, Completion::Ready(output));
+
             drop(data);
 
             if let Completion::Waiting(Some(waker)) = old {
@@ -32,12 +33,22 @@ where
     I: Send,
     O: Send,
 {
-    fn run<'a>(&'a self, state: &'a mut S) -> LocalFuture<'a, ()> {
+    fn run<'a>(
+        &'a self,
+        state: &'a mut S,
+        hooks: &'a mut crate::listener::hooks::AktorHooks<S>,
+        operation: crate::operation::Operation,
+    ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
             let function = self.data.lock().function.take();
 
             if let Some((function, input)) = function {
-                self.finish(Ok(function(state, input)));
+                hooks.before(state, operation);
+
+                let output = function(state, input);
+
+                hooks.after(state, operation);
+                self.finish(Ok(output));
             }
         })
     }
@@ -55,6 +66,23 @@ where
     }
 }
 impl<F: Send, I: Send, O: Send> Answer<O> for Packet<F, I, O> {
+    fn try_take(&self) -> Option<Result<O, CallError>> {
+        let mut data = self.data.lock();
+
+        if matches!(data.completion, Completion::Waiting(_)) {
+            return None;
+        }
+
+        let old = std::mem::replace(&mut data.completion, Completion::Consumed);
+
+        drop(data);
+
+        match old {
+            Completion::Ready(output) => Some(output),
+            _ => consumed(),
+        }
+    }
+
     fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<O, CallError>> {
         let next = cx.waker().clone();
         let mut data = self.data.lock();
@@ -85,6 +113,7 @@ impl<F: Send, I: Send, O: Send> Answer<O> for Packet<F, I, O> {
             let mut data = self.data.lock();
             std::mem::replace(&mut data.completion, Completion::Abandoned)
         };
+
         drop(old);
     }
 }
@@ -95,12 +124,22 @@ where
     I: Send,
     O: Send,
 {
-    fn run<'a>(&'a self, state: &'a mut S) -> LocalFuture<'a, ()> {
+    fn run<'a>(
+        &'a self,
+        state: &'a mut S,
+        hooks: &'a mut crate::listener::hooks::AktorHooks<S>,
+        operation: crate::operation::Operation,
+    ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
             let function = self.0.data.lock().function.take();
 
             if let Some((function, input)) = function {
-                self.0.finish(Ok(function(state, input).await));
+                hooks.before(state, operation);
+
+                let output = function(state, input).await;
+
+                hooks.after(state, operation);
+                self.0.finish(Ok(output));
             }
         })
     }
@@ -115,5 +154,18 @@ where
 
         self.0.finish(Err(error));
         drop(function);
+    }
+}
+impl<F: Send, I: Send, O: Send> Answer<O> for AsyncJob<F, I, O> {
+    fn try_take(&self) -> Option<Result<O, CallError>> {
+        self.0.try_take()
+    }
+
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<O, CallError>> {
+        self.0.poll(cx)
+    }
+
+    fn abandon(&self) {
+        self.0.abandon();
     }
 }

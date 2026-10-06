@@ -11,15 +11,19 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use wasm_bindgen::closure::Closure;
 use web_sys::{ErrorEvent, MessageEvent};
 
+mod buffer;
 mod completion;
 mod impls;
 mod latest;
 mod open;
 mod server;
+mod setup;
+use buffer::Buffers;
 use completion::observe;
 use impls::fatal;
 pub use latest::{LatestResults, LatestSender};
 pub use server::{Server, serve, serve_for, serve_with, setup_failed};
+pub use setup::serve_setup;
 
 type State<S, Role, E> = PhantomData<fn() -> (S, Role, E)>;
 type EncodeInput<'a> = Box<dyn FnOnce() -> Result<Vec<u8>, WireError> + 'a>;
@@ -41,6 +45,7 @@ pub struct WorkerRequest<'a, S, O, Role = ()> {
     operation: String,
     input: Option<Result<Vec<u8>, WireError>>,
     encoder: Option<EncodeInput<'a>>,
+    decoder: fn(&[u8]) -> Result<O, WorkerError>,
     admission:
         Option<LocalFuture<'a, Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), WireError>>>,
     reply: Option<WorkerReply<O>>,
@@ -56,6 +61,7 @@ pub struct WorkerReply<O> {
     parked: bool,
     taken: bool,
     output: PhantomData<fn() -> O>,
+    decoder: fn(&[u8]) -> Result<O, WorkerError>,
 }
 
 type Callback<Event> = RefCell<Option<Closure<dyn FnMut(Event)>>>;
@@ -81,8 +87,11 @@ struct Inner {
     closed: Cell<bool>,
     failed: Cell<bool>,
     options: Options,
+    buffers: Buffers,
+    initialize: RefCell<Option<Vec<u8>>>,
     group: RefCell<Option<(String, crate::group::KillSwitch)>>,
-    sessions: RefCell<Vec<Rc<dyn Fn() -> bool>>>,
+    sessions: RefCell<Vec<Weak<dyn Fn() -> bool>>>,
+    prune_at: Cell<usize>,
     count: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     ready: watch::Sender<Option<Result<(), WireError>>>,

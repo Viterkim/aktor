@@ -9,7 +9,7 @@ fi
 
 version=$1
 sed -i -E "s/^version = \"[^\"]+\"$/version = \"$version\"/" Cargo.toml
-sed -i -E "s/^(aktor-macros = \{ version = \"=)[^\"]+/\1$version/" aktor/Cargo.toml
+sed -i -E "s/^(aktor-macros = \{ version = \"=)[^\"]+/\1$version/" Cargo.toml
 
 shopt -s globstar nullglob
 for doc in README.md aktor-macros/README.md aktor/docs/**/*.md; do

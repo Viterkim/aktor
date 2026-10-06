@@ -4,7 +4,7 @@ use crate::listener::{FailureKind, Failures};
 
 #[allow(clippy::too_many_arguments)]
 pub fn run<S, E, C, CleanupFuture>(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &crate::executor::Driver,
     state: S,
     mut listener: Listener<S>,
     mut commands: mpsc::Receiver<Command<S, E, C>>,
@@ -14,15 +14,18 @@ pub fn run<S, E, C, CleanupFuture>(
     abandoned_setup: Arc<parking_lot::Mutex<Vec<AbandonedSetup<E>>>>,
     failed_cleanup: Arc<parking_lot::Mutex<FailedCleanup<C>>>,
     force: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CleanupErrors<C>>
 where
     CleanupFuture: core::future::Future<Output = Result<(), C>>,
 {
     let policy = listener.failure.clone();
     let mut failures = Failures::new(listener.name.clone());
+
     if let FailurePolicy::Group(group) = &policy {
         failures.group = Some(group.clone());
     }
+
     let mut errors = Vec::new();
     let mut state = Some(state);
 
@@ -34,11 +37,29 @@ where
         }
 
         let mut controls_open = true;
+
         loop {
+            if *shutdown.borrow() {
+                // Finish committed lifecycle changes before stopping.
+                commands.close();
+            }
+
             let Some(event) = execute(runtime, &force, async {
                 tokio::select! {
                     biased;
                     command = commands.recv(), if controls_open => Event::Command(command),
+                    _ = async {
+                        loop {
+                            if *shutdown.borrow_and_update() { return; }
+                            if shutdown.changed().await.is_err() { core::future::pending::<()>().await; }
+                        }
+                    } => {
+                        commands.close();
+                        match commands.try_recv() {
+                            Ok(command) => Event::Command(Some(command)),
+                            Err(_) => Event::Shutdown,
+                        }
+                    },
                     message = listener.receiver.recv(), if state.is_some() => Event::Message(message),
                     _ = listener.handles.changed(), if state.is_none() => Event::NoHandles,
                 }
@@ -47,11 +68,13 @@ where
             match event {
                 Event::Command(Some(Command::Pause(reply))) => {
                     listener.admission.close();
+
                     if let Some(state) = &mut state {
                         drain(runtime, &force, &mut listener, state);
                     }
 
                     status.send_replace(false);
+
                     let result = clean(runtime, &force, &mut state, &mut cleanup, &mut errors).map_err(LifecycleError::Failed);
                     let _sent = reply.send(result);
                 }
@@ -78,16 +101,19 @@ where
                             _ => None,
                         }
                     });
+
                     let _sent = reply.send(answer);
                 }
 
                 Event::Command(Some(Command::Replace { setup, reply })) => {
                     listener.admission.close();
+
                     if let Some(state) = &mut state {
                         drain(runtime, &force, &mut listener, state);
                     }
 
                     status.send_replace(false);
+
                     let result = match clean(runtime, &force, &mut state, &mut cleanup, &mut errors) {
                         Err(error) => Err(ReplaceError::Cleanup(error)),
                         Ok(()) => match execute(runtime, &force, async { setup().await }) {
@@ -108,18 +134,29 @@ where
                             _ => None,
                         }
                     });
+
                     let _sent = reply.send(answer);
                 }
 
-                Event::Command(Some(Command::Shutdown(reply))) => {
+                Event::Shutdown | Event::Command(Some(Command::Shutdown(_))) => {
+                    let reply = match event {
+                        Event::Command(Some(Command::Shutdown(reply))) => Some(reply),
+                        _ => None,
+                    };
+
                     listener.close();
+
                     if let Some(state) = &mut state {
                         execute(runtime, &force, listener.serve(state));
                     }
 
                     status.send_replace(false);
+
                     let result = clean(runtime, &force, &mut state, &mut cleanup, &mut errors).map_err(LifecycleError::Failed);
-                    let _sent = reply.send(result);
+
+                    if let Some(reply) = reply {
+                        let _sent = reply.send(result);
+                    }
 
                     break;
                 }
@@ -134,7 +171,7 @@ where
 
                 Event::Message(Some(message)) => {
                     if let Some(state) = &mut state
-                        && execute(runtime, &force, message.run(state)).is_none()
+                        && execute(runtime, &force, message.run_with(state, &mut listener.hooks)).is_none()
                     {
                         break;
                     }
@@ -155,12 +192,15 @@ where
 
     // Queued setup closures can panic on drop too.
     commands.close();
+
     while let Ok(command) = commands.try_recv() {
         failures.capture(FailureKind::Teardown, || drop(command));
     }
 
     failures.capture(FailureKind::Teardown, || drop(commands));
+
     let finished = listener.discard(&mut failures);
+
     failures.capture(FailureKind::Teardown, || drop(cleanup));
 
     failures.capture(FailureKind::Teardown, || drop((finished, status)));
@@ -179,7 +219,7 @@ where
 }
 
 pub fn clean<S, C, CleanupFuture>(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &crate::executor::Driver,
     force: &watch::Receiver<bool>,
     state: &mut Option<S>,
     cleanup: &mut impl FnMut(S) -> CleanupFuture,
@@ -201,16 +241,17 @@ where
 }
 
 pub fn drain<S>(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &crate::executor::Driver,
     force: &watch::Receiver<bool>,
     listener: &mut Listener<S>,
     state: &mut S,
 ) {
     let queued = listener.receiver.len();
+
     for _ in 0..queued {
         match listener.receiver.try_recv() {
             Ok(message) => {
-                if execute(runtime, force, message.run(state)).is_none() {
+                if execute(runtime, force, message.run_with(state, &mut listener.hooks)).is_none() {
                     break;
                 }
             }
@@ -220,11 +261,12 @@ pub fn drain<S>(
 }
 
 fn execute<F: core::future::Future>(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &crate::executor::Driver,
     force: &watch::Receiver<bool>,
     future: F,
 ) -> Option<F::Output> {
     let mut force = force.clone();
+
     runtime.block_on(async move {
         tokio::select! {
             biased;

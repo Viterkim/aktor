@@ -2,14 +2,25 @@ use super::*;
 use crate::message::Message;
 
 impl Admission {
+    pub fn set_standard(&self, standard: bool) {
+        self.standard
+            .store(standard, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_standard(&self) -> bool {
+        self.standard.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn new() -> Self {
         Self {
+            standard: std::sync::atomic::AtomicBool::new(false),
             state: ReentrantMutex::new(RefCell::new(AdmissionState {
                 open: true,
                 epoch: 0,
                 group: None,
                 phase: Phase::Running,
                 sessions: Vec::new(),
+                prune_at: 64,
             })),
             changed: watch::channel(0).0,
         }
@@ -53,11 +64,15 @@ impl Admission {
             let state = lock.borrow();
             state.open && state.epoch == epoch
         };
+
         if !valid {
             return Err(message);
         }
+
         let result = permit.commit(message);
+
         drop(lock);
+
         match result {
             Ok(ready) => {
                 ready.notify_one();
@@ -69,12 +84,20 @@ impl Admission {
 
     pub fn lost(&self) {
         let group = self.state.lock().borrow().group.clone();
+
         if let Some((name, group)) = group {
             group.fail(crate::group::ActorFailure {
+                kind: None,
                 actor: name,
                 phase: "call".into(),
                 message: "actor stopped without returning the operation's output".into(),
             });
+        }
+    }
+
+    pub fn rejected(&self) {
+        if !self.group().is_some_and(|group| group.is_stopping()) {
+            self.lost();
         }
     }
 
@@ -86,19 +109,29 @@ impl Admission {
         self.set(|_| Phase::Running);
     }
 
-    pub fn register_session(&self, callback: Box<dyn Fn(Phase) -> bool + Send + Sync>) {
-        let (phase, callbacks) = {
+    pub fn register_session(&self, callback: Arc<dyn Fn(Phase) -> bool + Send + Sync>) {
+        let phase = {
             let lock = self.state.lock();
             let mut state = lock.borrow_mut();
-            state.sessions.push(Arc::from(callback));
-            (state.phase, state.sessions.clone())
+
+            while state
+                .sessions
+                .last()
+                .is_some_and(|session| session.strong_count() == 0)
+            {
+                state.sessions.pop();
+            }
+
+            if state.sessions.len() >= state.prune_at {
+                state.sessions.retain(|session| session.strong_count() != 0);
+                state.prune_at = state.sessions.len().saturating_mul(2).max(64);
+            }
+
+            state.sessions.push(Arc::downgrade(&callback));
+            state.phase
         };
-        let expired: Vec<_> = callbacks.into_iter().filter(|live| !live(phase)).collect();
-        self.state
-            .lock()
-            .borrow_mut()
-            .sessions
-            .retain(|live| !expired.iter().any(|dead| Arc::ptr_eq(live, dead)));
+
+        callback(phase);
     }
 
     pub fn shutdown(&self) {
@@ -110,29 +143,36 @@ impl Admission {
     fn set(&self, transition: impl FnOnce(Phase) -> Phase) {
         let lock = self.state.lock();
         let mut state = lock.borrow_mut();
+
         if matches!(state.phase, Phase::Closing { .. }) {
             return;
         }
+
         let phase = transition(state.phase);
         let open = matches!(phase, Phase::Running);
+
         state.phase = phase;
         state.open = open;
         state.epoch = state.epoch.wrapping_add(1);
+
         let epoch = state.epoch;
+
         drop(state);
         drop(lock);
 
         self.changed.send_replace(epoch);
-        let callbacks = self.state.lock().borrow().sessions.clone();
-        let expired: Vec<_> = callbacks
-            .into_iter()
-            .filter(|callback| !callback(phase))
-            .collect();
-        self.state
-            .lock()
-            .borrow_mut()
-            .sessions
-            .retain(|callback| !expired.iter().any(|dead| Arc::ptr_eq(callback, dead)));
+
+        let callbacks: Vec<_> = {
+            let lock = self.state.lock();
+            let mut state = lock.borrow_mut();
+
+            state.sessions.retain(|session| session.strong_count() != 0);
+            state.sessions.iter().filter_map(Weak::upgrade).collect()
+        };
+
+        for callback in callbacks {
+            callback(phase);
+        }
     }
 }
 
@@ -144,6 +184,7 @@ mod tests {
     impl std::task::Wake for AdmissionWake {
         fn wake(self: Arc<Self>) {
             let admission = self.0.clone();
+
             assert!(
                 std::thread::spawn(move || admission.state.try_lock().is_some())
                     .join()
@@ -163,6 +204,7 @@ mod tests {
         let (handle, mut listener) = crate::listener::channel::<usize>(1).unwrap();
         let waker = Waker::from(Arc::new(AdmissionWake(handle.inner.admission.clone())));
         let mut receiver = Box::pin(listener.recv());
+
         assert!(
             receiver
                 .as_mut()
@@ -178,14 +220,39 @@ mod tests {
     }
 
     #[test]
+    fn live_sessions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let admission = Admission::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut sessions = Vec::new();
+
+        for _ in 0..512 {
+            let calls = calls.clone();
+            let callback: Arc<dyn Fn(Phase) -> bool + Send + Sync> = Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+
+            admission.register_session(callback.clone());
+            sessions.push(callback);
+        }
+
+        assert_eq!(calls.load(Ordering::Relaxed), 512);
+    }
+
+    #[test]
     fn session_churn() {
         let admission = Admission::new();
+
         for _ in 0..1000 {
             let session = Arc::new(());
             let weak = Arc::downgrade(&session);
-            admission.register_session(Box::new(move |_| weak.upgrade().is_some()));
+
+            admission.register_session(Arc::new(move |_| weak.upgrade().is_some()));
             drop(session);
         }
+
         assert_eq!(admission.state.lock().borrow().sessions.len(), 1);
     }
 
@@ -193,9 +260,11 @@ mod tests {
     fn session_registration() {
         let admission = Arc::new(Admission::new());
         let observed = Arc::downgrade(&admission);
-        admission.register_session(Box::new(move |_| {
+
+        admission.register_session(Arc::new(move |_| {
             let admission = observed.upgrade().unwrap();
             let other = admission.clone();
+
             assert!(
                 std::thread::spawn(move || other.state.try_lock().is_some())
                     .join()
@@ -213,12 +282,14 @@ mod tests {
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_pause = paused.clone();
         let registration = std::thread::spawn(move || {
-            registering.register_session(Box::new(move |phase| {
+            registering.register_session(Arc::new(move |phase| {
                 if matches!(phase, Phase::Running) {
                     callback_entered.wait();
                     callback_resume.wait();
                 }
+
                 let current = observed.upgrade().unwrap().phase();
+
                 saw_pause.store(
                     matches!(current, Phase::Paused),
                     std::sync::atomic::Ordering::SeqCst,
@@ -226,6 +297,7 @@ mod tests {
                 true
             }));
         });
+
         entered.wait();
         admission.close();
         resume.wait();

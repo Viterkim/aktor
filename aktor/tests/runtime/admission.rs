@@ -1,19 +1,175 @@
 use super::*;
 
 #[tokio::test]
+async fn stopping() {
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    for mode in 0..4 {
+        for cleanup_fails in [false, true] {
+            let entered = Arc::new(Notify::new());
+            let entering = entered.clone();
+            let release = Arc::new(Notify::new());
+            let released = release.clone();
+            let mut group = AktorGroup::new();
+
+            group.start().unwrap();
+
+            let owner = group
+                .spawn_async(ActorArgs::new(
+                    "closing admission",
+                    async || Ok::<_, AktorSetupError>(()),
+                    move |_| {
+                        let entered = entered.clone();
+                        let release = release.clone();
+
+                        async move {
+                            entered.notify_one();
+                            release.notified().await;
+
+                            if cleanup_fails {
+                                Err(AktorCleanupError::new("real cleanup failure"))
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    },
+                ))
+                .await
+                .unwrap();
+
+            group.killswitch().stop();
+            entering.notified().await;
+
+            let request = call(&owner.handle, |_, ()| panic!("rejected operation ran"), ());
+            let mut waiting: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> = match mode {
+                0 => Box::pin(request),
+                1 => Box::pin(async { drop(request.send().await) }),
+                2 => Box::pin(request.cast()),
+                _ => Box::pin(async {
+                    let _result = request.timeout(Duration::ZERO).await;
+                }),
+            };
+
+            assert!(poll(waiting.as_mut()).is_pending());
+            drop(waiting);
+            released.notify_one();
+
+            let report = group.completion().await;
+
+            assert_eq!(report.failed(), cleanup_fails);
+
+            if cleanup_fails {
+                assert_eq!(report.failure.unwrap().phase, "cleanup");
+            }
+        }
+    }
+
+    #[cfg(feature = "local")]
+    local_stopping().await;
+}
+
+#[cfg(feature = "local")]
+async fn local_stopping() {
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    let executor = tokio::task::LocalSet::new();
+
+    executor
+        .run_until(async {
+            for mode in 0..4 {
+                for cleanup_fails in [false, true] {
+                    let entered = Arc::new(Notify::new());
+                    let entering = entered.clone();
+                    let release = Arc::new(Notify::new());
+                    let released = release.clone();
+                    let actors = start(AktorSetup {
+                        name: AktorName::new("local closure"),
+                        role: AktorNoRole,
+                        kind: AktorKind::TokioLocal(&executor),
+                        closures: AktorClosures {
+                            start: async || Ok(()),
+                            end: Some(
+                                (async move |_| {
+                                    entered.notify_one();
+                                    release.notified().await;
+
+                                    if cleanup_fails {
+                                        Err(AktorCleanupError::new("real cleanup failure"))
+                                    } else {
+                                        Ok(())
+                                    }
+                                })
+                                .into(),
+                            ),
+                            intervals: vec![],
+                            before_each: None,
+                            after_each: None,
+                        },
+                        options: None,
+                    })
+                    .await
+                    .unwrap();
+
+                    actors.killswitch().stop();
+                    entering.notified().await;
+
+                    let request = local::Request::new(
+                        &actors.handles,
+                        aktor::operation::Operation {
+                            name: "rejected",
+                            caller: std::panic::Location::caller(),
+                        },
+                        async |_: &mut (), ()| panic!("rejected call ran"),
+                        (),
+                    );
+
+                    let mut waiting: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> =
+                        match mode {
+                            0 => Box::pin(request),
+                            1 => Box::pin(async { drop(request.send().await) }),
+                            2 => Box::pin(request.cast()),
+                            _ => Box::pin(async {
+                                let _result = request.timeout(Duration::ZERO).await;
+                            }),
+                        };
+
+                    assert!(poll(waiting.as_mut()).is_pending());
+                    drop(waiting);
+                    released.notify_one();
+
+                    let report = actors.completion().await;
+
+                    assert_eq!(report.failed(), cleanup_fails);
+
+                    if cleanup_fails {
+                        assert_eq!(report.failure.unwrap().phase, "cleanup");
+                    }
+                }
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn retry() {
     let (handle, mut listener) = channel::<usize>(1).unwrap();
+
     call(&handle, |s, ()| *s += 1, ()).cast().await;
 
     let mut request = call(&handle, |s, ()| *s += 10, ());
+
     assert!(poll(&mut request).is_pending());
 
     let mut state = 0;
+
     listener.recv().await.unwrap().run(&mut state).await;
     request.try_cast().unwrap();
     listener.recv().await.unwrap().run(&mut state).await;
 
     let mut submitted = call(&handle, |s, ()| *s += 100, ());
+
     assert!(poll(&mut submitted).is_pending());
 
     listener.close();
@@ -47,6 +203,7 @@ async fn consumed() {
         .run_until(async {
             let (handle, task) = spawn_local(&executor, (), 1).unwrap();
             let mut request = call(&handle, |_, ()| (), ());
+
             (&mut request).await;
 
             let rejected =
@@ -65,9 +222,11 @@ async fn consumed() {
 async fn closed() {
     for release_first in [false, true] {
         let (handle, mut listener) = channel::<()>(1).unwrap();
+
         call(&handle, |_, ()| (), ()).cast().await;
 
         let mut request = call(&handle, |_, ()| (), ());
+
         assert!(poll(&mut request).is_pending());
 
         if release_first {
@@ -97,7 +256,9 @@ async fn reply() {
     };
 
     listener.recv().await.unwrap().run(&mut 3).await;
+
     let reply: Reply<usize> = request.try_send().unwrap();
+
     drop(handle);
     listener.run(3).await;
 
@@ -112,6 +273,7 @@ async fn owner_failure() {
     executor
         .run_until(async {
             let (handle, listener) = channel::<()>(1).unwrap();
+
             drop(listener);
 
             assert!(
@@ -183,9 +345,41 @@ async fn cooperative() {
     };
 
     let (_, observed) = tokio::join!(biased; producer, async { sent.get() });
+
     drop(handle);
+
     let completed = listener.run(0).await;
 
     assert_eq!(completed, 1024);
     assert!(observed < completed, "producer monopolised the executor");
+}
+
+#[tokio::test]
+async fn reply_wake() {
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        task::{Context, Waker},
+    };
+
+    let (handle, mut listener) = channel::<usize>(1).unwrap();
+    let mut reply = call(&handle, |s, ()| *s, ()).send().await;
+
+    assert!(reply.try_take().is_none());
+
+    let count = Arc::new(support::CountWake::default());
+    let waker = Waker::from(count.clone());
+
+    assert!(
+        std::pin::Pin::new(&mut reply)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert!(reply.try_take().is_none());
+    listener.recv().await.unwrap().run(&mut 85).await;
+    assert!(
+        count.0.load(Ordering::Relaxed) > 0,
+        "try_take replaced the reply waker"
+    );
+    assert_eq!(reply.try_take(), Some(85));
+    assert_eq!(reply.try_take(), None);
 }

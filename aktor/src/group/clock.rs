@@ -7,7 +7,7 @@ extern "C" {
     fn now() -> f64;
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(Duration);
 impl Instant {
     pub fn now() -> Self {

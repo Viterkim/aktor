@@ -10,8 +10,11 @@ impl<'de> Decoder<'de> {
         if self.depth >= MAX_DEPTH {
             return Err(error("worker value is nested too deeply"));
         }
+
         self.depth += 1;
+
         let result = visit(self);
+
         self.depth -= 1;
         result
     }
@@ -20,7 +23,9 @@ impl<'de> Decoder<'de> {
         if len > self.bytes.len() {
             return Err(error("incomplete worker value"));
         }
+
         let (value, rest) = self.bytes.split_at(len);
+
         self.bytes = rest;
         Ok(value)
     }
@@ -155,15 +160,19 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
                         .try_into()
                         .map_err(|_| error("invalid sequence"))?,
                 );
+
                 let mut seq = Sequence {
                     decoder,
                     ended: false,
                     len: usize::try_from(len).ok(),
                 };
+
                 let value = visitor.visit_seq(&mut seq)?;
+
                 if !seq.ended && seq.decoder.byte()? != END {
                     return Err(error("sequence has extra elements"));
                 }
+
                 Ok(value)
             }
             MAP => {
@@ -172,14 +181,17 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
                     ended: false,
                 };
                 let value = visitor.visit_map(&mut map)?;
+
                 if !map.ended && map.decoder.byte()? != END {
                     return Err(error("map has extra fields"));
                 }
+
                 Ok(value)
             }
             UNIT_VARIANT => visitor.visit_borrowed_str(decoder.string()?),
             ENUM => {
                 let variant = decoder.string()?;
+
                 visitor.visit_map(EnumMap {
                     decoder,
                     variant: Some(variant),
@@ -212,6 +224,7 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
             if decoder.bytes.first() == Some(&NEWTYPE) {
                 decoder.byte()?;
             }
+
             visitor.visit_newtype_struct(decoder)
         })
     }
@@ -225,6 +238,7 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
         self.nested(|decoder| match decoder.byte()? {
             tag @ (ENUM | UNIT_VARIANT | STR) => {
                 let variant = decoder.string()?;
+
                 visitor.visit_enum(Variant {
                     decoder,
                     variant,
@@ -234,7 +248,12 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
             _ => Err(error("invalid enum")),
         })
     }
-    serde::forward_to_deserialize_any! {bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf unit unit_struct seq tuple tuple_struct map struct identifier ignored_any}
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64
+        char str string bytes byte_buf
+        unit unit_struct seq tuple tuple_struct map struct identifier ignored_any
+    }
 }
 
 struct Sequence<'a, 'de> {
@@ -252,11 +271,13 @@ impl<'de> SeqAccess<'de> for &mut Sequence<'_, 'de> {
         if self.ended {
             return Ok(None);
         }
+
         if self.decoder.bytes.first() == Some(&END) {
             self.decoder.byte()?;
             self.ended = true;
             return Ok(None);
         }
+
         self.len = self.len.map(|len| len.saturating_sub(1));
         seed.deserialize(&mut *self.decoder).map(Some)
     }
@@ -279,11 +300,13 @@ impl<'de> MapAccess<'de> for &mut Mapping<'_, 'de> {
         if self.ended {
             return Ok(None);
         }
+
         if self.decoder.bytes.first() == Some(&END) {
             self.decoder.byte()?;
             self.ended = true;
             return Ok(None);
         }
+
         seed.deserialize(&mut *self.decoder).map(Some)
     }
 
@@ -325,6 +348,7 @@ impl<'a, 'de> EnumAccess<'de> for Variant<'a, 'de> {
         let variant = seed.deserialize(de::value::BorrowedStrDeserializer::<Error>::new(
             self.variant,
         ))?;
+
         Ok((variant, self))
     }
 }
@@ -343,6 +367,7 @@ impl<'de> VariantAccess<'de> for Variant<'_, 'de> {
         if !self.payload {
             return Err(error("enum variant has no payload"));
         }
+
         seed.deserialize(&mut *self.decoder)
     }
 
@@ -350,6 +375,7 @@ impl<'de> VariantAccess<'de> for Variant<'_, 'de> {
         if !self.payload {
             return Err(error("enum variant has no payload"));
         }
+
         de::Deserializer::deserialize_any(&mut *self.decoder, visitor)
     }
 
@@ -361,6 +387,7 @@ impl<'de> VariantAccess<'de> for Variant<'_, 'de> {
         if !self.payload {
             return Err(error("enum variant has no payload"));
         }
+
         de::Deserializer::deserialize_any(&mut *self.decoder, visitor)
     }
 }
@@ -369,8 +396,10 @@ impl<'de> VariantAccess<'de> for Variant<'_, 'de> {
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WorkerError> {
     let mut decoder = Decoder { bytes, depth: 0 };
     let value = T::deserialize(&mut decoder).map_err(report)?;
+
     if !decoder.bytes.is_empty() {
         return Err(report(error("worker value has trailing bytes")));
     }
+
     Ok(value)
 }

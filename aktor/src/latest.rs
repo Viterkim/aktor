@@ -15,7 +15,7 @@ pub trait SendLatest<I> {
 }
 
 #[doc(hidden)]
-pub trait Session<S, I, O, Role = ()> {
+pub trait Session<S, I, O, Role = (), Codec = crate::dispatch::SerdeCodec> {
     type Sender: SendLatest<I>;
     type Results;
 
@@ -24,5 +24,24 @@ pub trait Session<S, I, O, Role = ()> {
         F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static;
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(any(
+    feature = "tokio",
+    all(feature = "std_thread", not(target_family = "wasm"))
+))]
 pub use crate::message::{LatestResults as Results, LatestSender as Sender};
+
+#[doc(hidden)]
+pub trait TypedSession<S, I, O, Lease, Role = (), Codec = crate::dispatch::SerdeCodec> {
+    type Sender<Fut>;
+    type Results;
+
+    fn session<F, Fut>(
+        self,
+        operation: Operation,
+        function: F,
+        factory: fn(Lease, I) -> Fut,
+    ) -> (Self::Sender<Fut>, Self::Results)
+    where
+        F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
+        Fut: core::future::Future<Output = (Lease, O)>;
+}

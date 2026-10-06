@@ -70,6 +70,9 @@ struct Shared<I, O> {
     operation: Operation,
     slot: RefCell<Slot<I, O>>,
     this: Weak<Self>,
+    wake_callback: Rc<dyn Fn() -> bool>,
+    encoder: fn(&I) -> Result<Vec<u8>, WorkerError>,
+    decoder: fn(&[u8]) -> Result<O, WorkerError>,
 }
 struct Slot<I, O> {
     revision: u64,
@@ -83,10 +86,11 @@ struct Slot<I, O> {
     wake: Option<Waker>,
 }
 
-impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Shared<I, O> {
+impl<I: 'static, O: 'static> Shared<I, O> {
     fn schedule(&self) {
         {
             let mut slot = self.slot.borrow_mut();
+
             if slot.scheduled
                 || slot.running.is_some()
                 || !slot.receiver
@@ -95,17 +99,22 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Shared<I, O> {
             {
                 return;
             }
+
             slot.scheduled = true;
         }
+
         let id = self.inner.next.get();
         let Some(next) = id.checked_add(1) else {
             self.inner.fail(WorkerCause::Protocol);
             return;
         };
+
         self.inner.next.set(next);
+
         let Some(this) = self.this.upgrade() else {
             return;
         };
+
         self.inner.outstanding.borrow_mut().insert(
             id,
             Work {
@@ -116,19 +125,21 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Shared<I, O> {
                 _bytes: None,
             },
         );
+
         self.inner.queue.borrow_mut().push_back(id);
         self.inner.pump();
     }
 
     fn wake(&self) {
         let wake = self.slot.borrow_mut().wake.take();
+
         if let Some(wake) = wake {
             wake.wake();
         }
     }
 }
 struct ServiceCall<I, O>(Rc<Shared<I, O>>);
-impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Service for ServiceCall<I, O> {
+impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
     fn operation(&self) -> &str {
         self.0.operation.name
     }
@@ -136,26 +147,33 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Service for ServiceC
     fn take(&self) -> Result<Option<Vec<u8>>, WireError> {
         let input = {
             let mut slot = self.0.slot.borrow_mut();
+
             slot.scheduled = false;
+
             if !slot.receiver {
                 return Ok(None);
             }
+
             let Some(input) = slot.pending.take() else {
                 return Ok(None);
             };
+
             slot.running = Some(slot.revision);
             input
         };
-        encode(&input)
+
+        (self.0.encoder)(&input)
             .map(Some)
             .map_err(|error| error.without_data())
     }
 
     fn answer(&self, output: Result<Vec<u8>, WireError>) {
-        let output = output.and_then(|bytes| decode(&bytes).map_err(|error| error.without_data()));
+        let output =
+            output.and_then(|bytes| (self.0.decoder)(&bytes).map_err(|error| error.without_data()));
         let (discarded, pending) = {
             let mut slot = self.0.slot.borrow_mut();
             let revision = slot.running.take();
+
             match output {
                 Ok(output) if slot.receiver && revision == Some(slot.revision) => {
                     (slot.output.replace(output), None)
@@ -168,26 +186,33 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Service for ServiceC
                 }
             }
         };
+
         drop(discarded);
         drop(pending);
+
         let failure = self.0.slot.borrow().failed.clone();
+
         if let Some(error) = failure {
             self.0.inner.fail(error.cause);
         }
+
         self.0.schedule();
         self.0.wake();
     }
 }
-impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Input<I> for Shared<I, O> {
+impl<I: 'static, O: 'static> Input<I> for Shared<I, O> {
     fn send(&self, input: I) {
         let (pending, unread) = {
             let mut slot = self.slot.borrow_mut();
+
             if !slot.receiver || slot.failed.is_some() || self.inner.closed.get() {
                 return;
             }
+
             slot.revision = slot.revision.wrapping_add(1);
             (slot.pending.replace(input), slot.output.take())
         };
+
         drop(pending);
         drop(unread);
         self.schedule();
@@ -199,6 +224,7 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Input<I> for Shared<
 
     fn close_sender(&self) {
         let mut slot = self.slot.borrow_mut();
+
         slot.senders = slot.senders.saturating_sub(1);
         drop(slot);
         self.wake();
@@ -209,10 +235,15 @@ impl<I, O> Output<O> for Shared<I, O> {
         let replacement = cx.waker().clone();
         let mut slot = self.slot.borrow_mut();
 
+        if let Some(output) = slot.output.take() {
+            return Poll::Ready(Some(output));
+        }
+
         if let Some(error) = slot.failed.clone() {
             drop(slot);
             return self.inner.lost(error);
         }
+
         let terminal = self
             .inner
             .finished
@@ -220,13 +251,10 @@ impl<I, O> Output<O> for Shared<I, O> {
             .as_ref()
             .and_then(|result| result.as_ref().err())
             .cloned();
+
         if let Some(error) = terminal {
             drop(slot);
             return self.inner.lost(error);
-        }
-
-        if let Some(output) = slot.output.take() {
-            return Poll::Ready(Some(output));
         }
 
         if (slot.senders == 0 || self.inner.closed.get())
@@ -238,6 +266,7 @@ impl<I, O> Output<O> for Shared<I, O> {
         }
 
         let previous = slot.wake.replace(replacement);
+
         drop(slot);
         drop(previous);
         Poll::Pending
@@ -245,7 +274,9 @@ impl<I, O> Output<O> for Shared<I, O> {
 
     fn close_receiver(&self) {
         let mut slot = self.slot.borrow_mut();
+
         slot.receiver = false;
+
         let pending = slot.pending.take();
         let output = slot.output.take();
         let wake = slot.wake.take();
@@ -256,8 +287,9 @@ impl<I, O> Output<O> for Shared<I, O> {
         drop(wake);
     }
 }
-impl<S, I: Serialize + 'static, O: DeserializeOwned + 'static, Role, E> Session<S, I, O, Role>
-    for &Worker<S, Role, E>
+impl<S, I: 'static, O: 'static, Role, E, C> Session<S, I, O, Role, C> for &Worker<S, Role, E>
+where
+    C: Codec<I> + Codec<O>,
 {
     type Sender = LatestSender<I>;
     type Results = LatestResults<O>;
@@ -267,10 +299,23 @@ impl<S, I: Serialize + 'static, O: DeserializeOwned + 'static, Role, E> Session<
         F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
     {
         self.inner.handles.set(self.inner.handles.get() + 1);
-        let shared = Rc::new_cyclic(|this| Shared {
+
+        let shared = Rc::new_cyclic(|this: &Weak<Shared<I, O>>| Shared {
             inner: self.inner.clone(),
             operation,
+            encoder: <C as Codec<I>>::encode,
+            decoder: <C as Codec<O>>::decode_output,
             this: this.clone(),
+            wake_callback: Rc::new({
+                let weak = this.clone();
+
+                move || {
+                    weak.upgrade().is_some_and(|shared| {
+                        shared.wake();
+                        true
+                    })
+                }
+            }),
             slot: RefCell::new(Slot {
                 revision: 0,
                 pending: None,
@@ -283,21 +328,8 @@ impl<S, I: Serialize + 'static, O: DeserializeOwned + 'static, Role, E> Session<
                 wake: None,
             }),
         });
-        let weak = Rc::downgrade(&shared);
-        let callbacks = self.inner.sessions.borrow().clone();
-        let expired: Vec<_> = callbacks.into_iter().filter(|live| !live()).collect();
-        self.inner
-            .sessions
-            .borrow_mut()
-            .retain(|live| !expired.iter().any(|dead| Rc::ptr_eq(live, dead)));
-        self.inner.sessions.borrow_mut().push(Rc::new(move || {
-            if let Some(shared) = weak.upgrade() {
-                shared.wake();
-                true
-            } else {
-                false
-            }
-        }));
+
+        self.inner.register_session(&shared.wake_callback);
         (
             LatestSender {
                 input: shared.clone(),
@@ -310,9 +342,33 @@ impl<S, I: Serialize + 'static, O: DeserializeOwned + 'static, Role, E> Session<
 impl<I, O> Drop for Shared<I, O> {
     fn drop(&mut self) {
         let handles = self.inner.handles.get() - 1;
+
         self.inner.handles.set(handles);
+
         if handles == 0 {
             self.inner.shutdown();
         }
+    }
+}
+
+impl<S, I, O, Lease, Role, E, C> crate::latest::TypedSession<S, I, O, Lease, Role, C>
+    for &Worker<S, Role, E>
+where
+    Self: crate::latest::Session<S, I, O, Role, C>,
+{
+    type Sender<Fut> = <Self as crate::latest::Session<S, I, O, Role, C>>::Sender;
+    type Results = <Self as crate::latest::Session<S, I, O, Role, C>>::Results;
+
+    fn session<F, Fut>(
+        self,
+        operation: Operation,
+        function: F,
+        _: fn(Lease, I) -> Fut,
+    ) -> (Self::Sender<Fut>, Self::Results)
+    where
+        F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
+        Fut: core::future::Future<Output = (Lease, O)>,
+    {
+        <Self as crate::latest::Session<S, I, O, Role, C>>::session(self, operation, function)
     }
 }

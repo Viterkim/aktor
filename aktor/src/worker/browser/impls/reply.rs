@@ -4,26 +4,64 @@ use core::{
     task::{Context, Poll},
 };
 
-impl<O: DeserializeOwned> WorkerReply<O> {
+impl<O> WorkerReply<O> {
     /// Take a ready output once. A pending reply can still be awaited.
     pub fn try_take(&mut self) -> Option<O> {
-        if self.taken {
+        if self.taken || self.parked {
             return None;
         }
-        match Pin::new(self).poll(&mut Context::from_waker(core::task::Waker::noop())) {
+
+        let result = match self.response.try_recv() {
+            Ok(Ok(output)) => self.decode(&output),
+            Ok(Err(error)) => Err(error),
+            Err(oneshot::error::TryRecvError::Empty) => return None,
+            Err(oneshot::error::TryRecvError::Closed) => Err(WireError::new(
+                CallError::OutcomeUnknown,
+                WorkerCause::Closed,
+            )),
+        };
+
+        match self.ready(result) {
             Poll::Ready(output) => Some(output),
             Poll::Pending => None,
+        }
+    }
+
+    fn decode(&self, output: &[u8]) -> Result<O, WireError> {
+        (self.decoder)(output).map_err(|error| error.without_data())
+    }
+
+    fn ready(&mut self, result: Result<O, WireError>) -> Poll<O> {
+        match result {
+            Ok(output) => {
+                self.taken = true;
+                Poll::Ready(output)
+            }
+            Err(error) => {
+                self.parked = true;
+
+                if let Some(inner) = self.inner.upgrade() {
+                    inner.lost(error)
+                } else if let Some((name, group)) = &self.group {
+                    group.fail(crate::ActorFailure {
+                        kind: None,
+                        actor: name.clone(),
+                        phase: "worker".into(),
+                        message: error.to_string(),
+                    });
+
+                    Poll::Pending
+                } else {
+                    fatal(error)
+                }
+            }
         }
     }
 
     pub fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<O, WireError>> {
         match Pin::new(&mut self.response).poll(context) {
             Poll::Ready(Ok(Ok(output))) => {
-                return Poll::Ready(decode(&output).map_err(|error| {
-                    let mut error: WireError = error.without_data();
-                    error.outcome = CallError::OutcomeUnknown;
-                    error
-                }));
+                return Poll::Ready(self.decode(&output));
             }
             Poll::Ready(Ok(Err(error))) => return Poll::Ready(Err(error)),
             Poll::Ready(Err(_)) => {
@@ -56,6 +94,7 @@ impl<O> WorkerReply<O> {
                 .borrow_mut()
                 .get_mut(&self.id)
                 .and_then(|work| work.answer.take());
+
             drop(answer);
         }
     }
@@ -65,34 +104,18 @@ impl<O> Drop for WorkerReply<O> {
         self.abandon();
     }
 }
-impl<O: DeserializeOwned> Future for WorkerReply<O> {
+impl<O> Future for WorkerReply<O> {
     type Output = O;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<O> {
         let this = self.get_mut();
+
         if this.parked {
             return Poll::Pending;
         }
+
         match this.poll_result(context) {
-            Poll::Ready(Ok(output)) => {
-                this.taken = true;
-                Poll::Ready(output)
-            }
-            Poll::Ready(Err(error)) => {
-                this.parked = true;
-                if let Some(inner) = this.inner.upgrade() {
-                    inner.lost(error)
-                } else if let Some((name, group)) = &this.group {
-                    group.fail(crate::ActorFailure {
-                        actor: name.clone(),
-                        phase: "worker".into(),
-                        message: error.to_string(),
-                    });
-                    Poll::Pending
-                } else {
-                    fatal(error)
-                }
-            }
+            Poll::Ready(result) => this.ready(result),
             Poll::Pending => Poll::Pending,
         }
     }

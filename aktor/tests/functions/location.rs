@@ -28,11 +28,13 @@ async fn caller() {
             let failed = std::panic::AssertUnwindSafe(explode(&db))
                 .catch_unwind()
                 .await;
+
             assert!(failed.is_err());
 
             assert!(matches!(task.await, Err(error) if error.is_panic()));
 
             let (name, line) = report.try_recv().unwrap();
+
             assert!(name.ends_with("::explode"));
             assert_eq!(line, expected);
         })

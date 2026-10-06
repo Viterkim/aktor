@@ -6,11 +6,23 @@ use core::{
 };
 use tokio::sync::TryAcquireError;
 
-impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
+impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
     pub fn new(
         worker: &'a Worker<S, Role, impl Sized>,
         operation: &str,
         input: Result<Vec<u8>, WorkerError>,
+    ) -> Self
+    where
+        O: DeserializeOwned,
+    {
+        Self::with_decoder(worker, operation, input, codec::decode_output)
+    }
+
+    pub fn with_decoder(
+        worker: &'a Worker<S, Role, impl Sized>,
+        operation: &str,
+        input: Result<Vec<u8>, WorkerError>,
+        decoder: fn(&[u8]) -> Result<O, WorkerError>,
     ) -> Self {
         Self {
             inner: &worker.inner,
@@ -18,6 +30,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
             operation: operation.into(),
             input: Some(input.map_err(|error| error.without_data())),
             encoder: None,
+            decoder,
             admission: None,
             reply: None,
             parked: false,
@@ -28,12 +41,14 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
         if let Some(encoder) = self.encoder.take() {
             self.input = Some(encoder());
         }
+
         let input = self
             .input
             .as_ref()
             .ok_or_else(|| WireError::new(CallError::NotAdmitted, WorkerCause::Closed))?
             .as_ref()
             .map_err(Clone::clone)?;
+
         let bytes = input.len().saturating_add(self.operation.len());
 
         Ok(bytes.min(self.inner.options.max_outstanding_bytes))
@@ -45,11 +60,13 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
         bytes: OwnedSemaphorePermit,
     ) -> Result<(), WireError> {
         let inner = self.inner;
+
         if inner.closed.get() {
             return Err(WireError::new(CallError::NotAdmitted, WorkerCause::Closed));
         }
 
         let id = inner.next.get();
+
         inner.next.set(
             id.checked_add(1)
                 .ok_or_else(|| WireError::new(CallError::NotAdmitted, WorkerCause::Closed))?,
@@ -75,6 +92,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
                 _bytes: Some(bytes),
             },
         );
+
         inner.queue.borrow_mut().push_back(id);
         inner.pump();
 
@@ -86,6 +104,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
             parked: false,
             taken: false,
             output: PhantomData,
+            decoder: self.decoder,
         });
 
         Ok(())
@@ -99,6 +118,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
         if self.admission.is_none() {
             let size = self.size()?;
             let inner = self.inner;
+
             self.admission = Some(Box::pin(async move {
                 observe(inner.ready.subscribe()).await?;
 
@@ -142,11 +162,25 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
         if self.parked {
             return Poll::Pending;
         }
+
         match self.poll_submit(cx) {
             Poll::Ready(Err(error)) => {
                 self.parked = true;
                 self.admission = None;
-                self.inner.lost(error)
+
+                if error.outcome == CallError::NotAdmitted
+                    && error.cause == WorkerCause::Closed
+                    && self.inner.closed.get()
+                    && !self.inner.failed.get()
+                {
+                    if self.inner.group.borrow().is_some() {
+                        Poll::Pending
+                    } else {
+                        fatal(error)
+                    }
+                } else {
+                    self.inner.lost(error)
+                }
             }
             Poll::Ready(Ok(())) => Poll::Ready(()),
             Poll::Pending => Poll::Pending,
@@ -167,6 +201,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
 
     pub async fn send(mut self) -> WorkerReply<O> {
         poll_fn(|cx| self.poll_send(cx)).await;
+
         match self.reply.take() {
             Some(reply) => reply,
             None => {
@@ -185,6 +220,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
         }
 
         let inner = self.inner;
+
         if inner.closed.get() || matches!(*inner.ready.borrow(), Some(Err(_))) {
             return Err(TrySendError::Closed(self));
         }
@@ -217,6 +253,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
             },
             Err(error) => {
                 self.input = Some(Err(error.clone()));
+
                 if error.cause == WorkerCause::Closed {
                     Err(TrySendError::Closed(self))
                 } else {
@@ -226,11 +263,12 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
         }
     }
 }
-impl<S, O: DeserializeOwned, Role> Future for WorkerRequest<'_, S, O, Role> {
+impl<S, O, Role> Future for WorkerRequest<'_, S, O, Role> {
     type Output = O;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
         let this = self.get_mut();
+
         if this.parked {
             return Poll::Pending;
         }

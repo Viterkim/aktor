@@ -8,6 +8,7 @@ impl Options {
                 WorkerCause::Setup("worker queue capacity is outside the supported range".into()),
             ));
         }
+
         if self.max_outstanding_bytes == 0
             || self.max_outstanding_bytes > u32::MAX as usize
             || self.max_outstanding_bytes > tokio::sync::Semaphore::MAX_PERMITS
@@ -17,6 +18,7 @@ impl Options {
                 WorkerCause::Setup("worker byte budget is outside the supported range".into()),
             ));
         }
+
         Ok(())
     }
 }
@@ -38,6 +40,7 @@ impl<T> WorkerError<T> {
             WorkerCause::Setup(message) | WorkerCause::Cleanup(message) => message,
             _ => return self,
         };
+
         message.push_str("\nOptional lifecycle data: ");
         message.push_str(&error.to_string());
         self
@@ -50,6 +53,7 @@ impl<T> WorkerError<T> {
             data: None,
         }
     }
+
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     pub fn without_data<U>(self) -> WorkerError<U> {
         WorkerError {

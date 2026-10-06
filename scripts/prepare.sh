@@ -30,6 +30,7 @@ sed -i -E \
 sed -i -E \
     -e "s@\]\((\./)?\.\./\.\./README\.md@](${release_url}/README.md@g" \
     -e "s@\]\((\./)?examples\.md@](${release_url}/aktor/docs/examples.md@g" \
+    -e "s@\]\((\./)?runtime\.md@](${release_url}/aktor/docs/runtime.md@g" \
     "$release_dir/aktor/docs/functions.md"
 sed -i -E \
     -e "s@\]\((\./)?\.\./README\.md@](${release_url}/README.md@g" \
@@ -40,6 +41,9 @@ cd -- "$release_dir"
 bash checks/package.sh
 
 printf '\nDry run bingo! You are in %s\n' "$release_dir"
+printf 'Bash:'
 printf 'cargo publish -p aktor-macros && cargo publish -p aktor\n'
+printf 'Nushell:'
+printf 'cargo publish -p aktor-macros; cargo publish -p aktor\n'
 printf 'exit this shell when you are done.\n\n'
 exec "${SHELL:-bash}" -i

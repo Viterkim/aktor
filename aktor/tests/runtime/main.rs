@@ -20,5 +20,13 @@ mod ownership;
 mod pause;
 mod replace;
 mod runner;
+#[cfg(all(feature = "macros", not(target_family = "wasm")))]
+mod setup;
 mod shutdown;
 mod state;
+
+#[cfg(feature = "macros")]
+mod task;
+
+#[cfg(all(feature = "macros", feature = "local", feature = "embassy_cross_core"))]
+mod teardown;

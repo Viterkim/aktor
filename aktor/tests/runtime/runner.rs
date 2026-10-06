@@ -40,11 +40,13 @@ async fn cleanup() -> TestResult {
             |_: &mut usize, ()| panic!("queued work ran"),
             (),
         ));
+
         let mut waiting = Box::pin(call(
             &handle,
             |_: &mut usize, ()| panic!("waiting work ran"),
             (),
         ));
+
         assert!(poll(queued.as_mut()).is_pending());
         assert!(poll(waiting.as_mut()).is_pending());
 
@@ -55,6 +57,7 @@ async fn cleanup() -> TestResult {
         assert!(poll(waiting.as_mut()).is_pending());
 
         release.send(()).unwrap();
+
         let (finished, queued, waiting) =
             tokio::join!(actor.join_async(), panics(queued), panics(waiting));
 
@@ -80,6 +83,7 @@ async fn error() {
             setup: || Ok::<_, &'static str>(()),
             cleanup: move |_| {
                 let (cleaning, released) = gate.take().unwrap();
+
                 cleaning.send(()).unwrap();
                 released.recv().unwrap();
 
@@ -90,6 +94,7 @@ async fn error() {
         .unwrap();
 
         let mut stopping = Box::pin(actor.shutdown());
+
         assert!(poll(stopping.as_mut()).is_pending());
         cleaned.await.unwrap();
         assert!(poll(stopping.as_mut()).is_pending());

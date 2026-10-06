@@ -32,8 +32,8 @@ impl<T, I, R, L> Call<T, I, R, L> {
     }
 
     #[cfg(any(
-        feature = "tokio",
-        feature = "embassy",
+        any(feature = "tokio", feature = "std_thread"),
+        feature = "local",
         all(
             feature = "wasm_browser_workers",
             target_family = "wasm",
@@ -67,6 +67,7 @@ impl<T, I, R: Future, L> Future for Call<T, I, R, L> {
             };
 
             let request = (this.request)(target, input, *this.operation);
+
             this.running.set(Some(request));
         }
 

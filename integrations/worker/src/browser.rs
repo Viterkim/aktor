@@ -79,6 +79,7 @@ pub async fn start_worker() -> Result<(), JsValue> {
     })?;
 
     let db = Connection::open("preferences.sqlite").map_err(js_error)?;
+
     db.execute(
         "CREATE TABLE IF NOT EXISTS preferences(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         [],
@@ -94,6 +95,7 @@ pub async fn start_worker() -> Result<(), JsValue> {
 
         Ok(())
     };
+
     let options = Options {
         build: "preferences-v1".into(),
         ..Options::default()
@@ -127,8 +129,11 @@ pub async fn sqlite_listener_check(url: String) -> Result<bool, JsValue> {
     let found = read(&database, "listener-proof".into()).await;
     let missing = read(&database, "listener-missing".into()).await;
     let stayed_open = !kill.is_stopping();
+
     drop(actors);
+
     let report = closing.wait().await;
+
     Ok(saved.as_deref() == Ok("0.8")
         && found.as_deref() == Ok("0.8")
         && missing.is_err()
@@ -215,12 +220,17 @@ impl Client {
             .await;
         let (panel, mut results) = read(&self.worker, "absent".into()).latest();
         let (other, mut other_results) = read(&self.worker, "absent".into()).latest();
+
         panel.send("absent".into());
+
         for _ in 0..2000 {
             panel.send("volume".into());
         }
+
         other.send("absent".into());
+
         let bounded = self.worker.outstanding().0;
+
         for _ in 0..20_000 {
             let (sender, results) = read(&self.worker, "absent".into()).latest();
             drop(results);
@@ -231,12 +241,15 @@ impl Client {
         write
             .await
             .map_err(|error| js_error(format!("{error:?}")))?;
+
         let current = results.next().await;
         let independent = other_results.next().await;
 
         LATEST.with(|sender| *sender.borrow_mut() = Some(panel.inner.clone()));
+
         let waker = std::task::Waker::from(std::sync::Arc::new(LatestWake));
         let mut next = Box::pin(results.next());
+
         assert!(
             next.as_mut()
                 .poll(&mut Context::from_waker(&waker))
@@ -252,8 +265,10 @@ impl Client {
 
         panel.send("volume".into());
         drop(panel);
+
         let final_result = results.next().await;
         let ended = results.next().await.is_none();
+
         serde_json::to_string(&(current, independent, final_result, ended, bounded))
             .map_err(js_error)
     }
@@ -273,6 +288,7 @@ impl Client {
         let _ = reply
             .await
             .map_err(|error| js_error(format!("{error:?}")))?;
+
         serde_json::to_string(&(counted, not_admitted)).map_err(js_error)
     }
 
@@ -288,12 +304,14 @@ impl Client {
             _ => return Err(js_error("expected codec rejection")),
         };
         let healthy = read(&self.worker, "volume".into()).await;
+
         serde_json::to_string(&(codec, healthy)).map_err(js_error)
     }
 
     pub async fn large(&self) -> Result<usize, JsValue> {
         let text = "ø".repeat(4 * 1024 * 1024);
         let expected = text.len();
+
         assert_eq!(
             write(&self.worker, "large".into(), text.clone())
                 .await
@@ -314,12 +332,15 @@ impl Client {
             .timeout(core::time::Duration::from_millis(u64::from(timeout)))
             .await
             .map_err(|error| error.admitted);
+
         serde_json::to_string(&result).map_err(js_error)
     }
 
     pub async fn submitted(&self) -> Result<String, JsValue> {
         let (_idle, mut results) = read(&self.worker, "absent".into()).latest();
+
         assert!(results.next().await.unwrap().is_err());
+
         let mut request = pause::request(&self.worker, 0);
         let pending = Pin::new(&mut request)
             .poll(&mut Context::from_waker(Waker::noop()))
@@ -328,12 +349,15 @@ impl Client {
         let (ended, output) =
             futures_util::future::join(async { results.next().await.is_none() }, async {
                 drop(self.worker.shutdown());
+
                 let reply = request.try_send().map_err(js_error)?;
                 let output = reply.await;
+
                 self.worker.completion().wait().await.map_err(js_error)?;
                 Ok::<_, JsValue>(output)
             })
             .await;
+
         serde_json::to_string(&(pending, output?, ended)).map_err(js_error)
     }
 

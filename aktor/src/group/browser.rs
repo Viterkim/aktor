@@ -34,6 +34,7 @@ impl AktorGroup {
         options: Options,
     ) -> Result<Worker<S, Role, E>, WorkerError<E>> {
         let name = name.into();
+
         if !self.control.lock().listening {
             return Err(WorkerError {
                 outcome: crate::message::CallError::NotAdmitted,
@@ -41,6 +42,7 @@ impl AktorGroup {
                 data: None,
             });
         }
+
         if self.killswitch().is_stopping() {
             self.completion().wait().await;
             return Err(WorkerError {
@@ -49,27 +51,40 @@ impl AktorGroup {
                 data: None,
             });
         }
+
+        self.control
+            .lock()
+            .kinds
+            .push((name.clone(), AktorExecution::BrowserWebWorker));
+
         let opened = Worker::<S, Role, E>::with_options(url, options);
         let worker = match opened {
             Ok(worker) => worker,
             Err(error) => {
                 self.killswitch().fail(ActorFailure {
+                    kind: None,
                     actor: name,
                     phase: "setup".into(),
                     message: error.to_string(),
                 });
+
                 self.completion().wait().await;
                 return Err(error.without_data());
             }
         };
+
         {
             let mut entries = self.actors.borrow_mut();
+
             worker.manage(name.clone(), self.killswitch());
+
             let shutdown = worker.new_handle();
             let cancel = worker.new_handle();
             let completion = worker.completion();
             let label = name.clone();
+
             entries.push(Entry {
+                kind: AktorExecution::BrowserWebWorker,
                 name,
                 start: Box::new(move || {
                     shutdown.shutdown();
@@ -77,10 +92,12 @@ impl AktorGroup {
                 cancel: Box::new(move || cancel.terminate()),
                 outcome: Box::pin(async move {
                     let mut outcome = ActorOutcome {
+                        kind: None,
                         actor: label,
                         diagnostics: Vec::new(),
                         timed_out: false,
                     };
+
                     if let Err(error) = completion.wait_report().await {
                         match error.cause {
                             WorkerCause::Cleanup(message) => {
@@ -93,14 +110,17 @@ impl AktorGroup {
                             _ => {}
                         }
                     }
+
                     outcome
                 }),
             });
         }
+
         if let Err(error) = worker.ready().await {
             self.completion().wait().await;
             return Err(error);
         }
+
         Ok(worker)
     }
 }

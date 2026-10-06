@@ -40,6 +40,43 @@ pub struct Timeout<F> {
     status: fn(&F) -> WaitStatus,
 }
 impl<F> Timeout<F> {
+    #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+    #[doc(hidden)]
+    pub fn standard(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Self {
+        Self::new(future, duration, status, |duration| {
+            let deadline = crate::group::shutdown_deadline(std::time::Instant::now(), duration);
+            Box::pin(crate::executor::sleep_until(deadline))
+        })
+    }
+
+    #[cfg(any(
+        feature = "tokio",
+        all(feature = "std_thread", not(target_family = "wasm"))
+    ))]
+    #[doc(hidden)]
+    pub fn queued(
+        future: F,
+        duration: Duration,
+        status: fn(&F) -> WaitStatus,
+        standard: bool,
+    ) -> Self {
+        #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+        if standard {
+            return Self::standard(future, duration, status);
+        }
+
+        let _ = standard;
+
+        #[cfg(feature = "tokio")]
+        {
+            Self::native(future, duration, status)
+        }
+        #[cfg(not(feature = "tokio"))]
+        {
+            Self::standard(future, duration, status)
+        }
+    }
+
     #[cfg(feature = "tokio")]
     #[doc(hidden)]
     pub fn native(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Self {
@@ -56,16 +93,17 @@ impl<F> Timeout<F> {
     }
 
     #[cfg(all(
-        any(feature = "tokio", feature = "wasm_browser_workers"),
+        any(
+            feature = "tokio",
+            feature = "wasm_browser_workers",
+            feature = "browser_local"
+        ),
         target_family = "wasm"
     ))]
     #[doc(hidden)]
     pub fn browser(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Self {
         Self::new(future, duration, status, |duration| {
-            Box::pin(browser_timer(
-                duration,
-                gloo_timers::future::TimeoutFuture::new,
-            ))
+            Box::pin(browser_sleep(duration))
         })
     }
 
@@ -80,7 +118,14 @@ impl<F> Timeout<F> {
         })
     }
 
-    #[cfg(any(feature = "tokio", feature = "embassy", target_family = "wasm"))]
+    #[cfg(any(
+        any(
+            feature = "tokio",
+            all(feature = "std_thread", not(target_family = "wasm"))
+        ),
+        feature = "embassy",
+        target_family = "wasm"
+    ))]
     fn new(
         future: F,
         duration: Duration,
@@ -110,15 +155,18 @@ impl<F: Future> Future for Timeout<F> {
         }
 
         let status = (this.status)(this.future.as_ref().get_ref());
+
         if status.stopping {
             return Poll::Pending;
         }
+
         if timer.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Err(AktorTimeoutError {
                 duration: this.duration,
                 admitted: status.admitted,
             }));
         }
+
         Poll::Pending
     }
 }
@@ -126,7 +174,11 @@ impl<F: Future> Future for Timeout<F> {
 #[cfg(any(
     all(
         target_family = "wasm",
-        any(feature = "tokio", feature = "wasm_browser_workers")
+        any(
+            feature = "tokio",
+            feature = "wasm_browser_workers",
+            feature = "browser_local"
+        )
     ),
     all(test, feature = "tokio")
 ))]
@@ -138,7 +190,11 @@ pub fn browser_millis(duration: Duration) -> u32 {
 #[cfg(any(
     all(
         target_family = "wasm",
-        any(feature = "tokio", feature = "wasm_browser_workers")
+        any(
+            feature = "tokio",
+            feature = "wasm_browser_workers",
+            feature = "browser_local"
+        )
     ),
     all(test, feature = "tokio")
 ))]
@@ -147,10 +203,13 @@ async fn browser_timer<F: Future<Output = ()>>(
     mut schedule: impl FnMut(u32) -> F,
 ) {
     let mut remaining = duration;
+
     loop {
         let chunk = browser_millis(remaining);
+
         schedule(chunk).await;
         remaining = remaining.saturating_sub(Duration::from_millis(u64::from(chunk)));
+
         if remaining.is_zero() {
             return;
         }
@@ -164,6 +223,7 @@ mod tests {
     #[tokio::test]
     async fn browser_delays() {
         let max = i32::MAX as u64;
+
         for (duration, expected) in [
             (Duration::ZERO, vec![0]),
             (Duration::from_nanos(1), vec![1]),
@@ -176,6 +236,7 @@ mod tests {
             ),
         ] {
             let mut scheduled = Vec::new();
+
             browser_timer(duration, |chunk| {
                 assert!(i32::try_from(chunk).is_ok());
                 scheduled.push(chunk);
@@ -194,6 +255,7 @@ pub fn embassy_deadline(now: embassy_time::Instant, grace: Duration) -> embassy_
         .saturating_mul(u128::from(embassy_time::TICK_HZ))
         .div_ceil(1_000_000_000)
         .min(u128::from(u64::MAX)) as u64;
+
     embassy_time::Instant::from_ticks(now.as_ticks().saturating_add(ticks))
 }
 
@@ -205,6 +267,7 @@ mod embassy_tests {
     #[test]
     fn deadlines() {
         let now = Instant::from_ticks(17);
+
         assert_eq!(embassy_deadline(now, Duration::ZERO), now);
         assert_eq!(
             embassy_deadline(now, Duration::from_nanos(1)).as_ticks(),
@@ -220,4 +283,17 @@ mod embassy_tests {
             u64::MAX
         );
     }
+}
+
+#[cfg(all(
+    target_family = "wasm",
+    any(
+        feature = "tokio",
+        feature = "wasm_browser_workers",
+        feature = "browser_local"
+    )
+))]
+#[doc(hidden)]
+pub async fn browser_sleep(duration: Duration) {
+    browser_timer(duration, gloo_timers::future::TimeoutFuture::new).await;
 }

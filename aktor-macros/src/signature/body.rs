@@ -8,9 +8,10 @@ pub fn implementation(
     function: &Function,
     names: &mut Names,
     output: &Type,
-) -> (TokenStream, TokenStream) {
+) -> syn::Result<(TokenStream, TokenStream)> {
     let signature = &function.signature;
     let mut implementation = signature.clone();
+
     implementation.ident = names.body.clone();
     implementation.output = parse_quote!(-> #output);
 
@@ -32,6 +33,7 @@ pub fn implementation(
         .collect();
 
     normalize(&mut implementation, names);
+
     let added: Vec<_> = implementation
         .generics
         .type_params()
@@ -41,6 +43,7 @@ pub fn implementation(
             quote!(#ident)
         })
         .collect();
+
     arguments.extend(added.iter().map(|_| quote!(_)));
 
     let state_borrow = signature.inputs.first().and_then(|input| match input {
@@ -50,6 +53,7 @@ pub fn implementation(
         },
         _ => None,
     });
+
     let captures: Vec<_> = implementation
         .generics
         .params
@@ -69,6 +73,7 @@ pub fn implementation(
             }
         })
         .collect();
+
     Captures { captures, added }.visit_return_type_mut(&mut implementation.output);
 
     let name = &names.body;
@@ -79,7 +84,7 @@ pub fn implementation(
     };
 
     let operation = &signature.ident;
-    let attributes = &function.attributes;
+    let attributes = crate::input::attributes::implementation(&function.attributes)?;
     let body = &function.body;
     let implementation = quote! {
         impl #operation::#name {
@@ -90,5 +95,5 @@ pub fn implementation(
         }
     };
 
-    (implementation, invoke)
+    Ok((implementation, invoke))
 }

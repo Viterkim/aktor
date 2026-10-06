@@ -1,5 +1,8 @@
 use parking_lot::ReentrantMutex;
-use std::{cell::RefCell, sync::Arc};
+use std::{
+    cell::RefCell,
+    sync::{Arc, Weak},
+};
 use tokio::sync::watch;
 
 mod impls;
@@ -13,6 +16,7 @@ pub struct HandleInner<S> {
 }
 
 pub struct Admission {
+    standard: std::sync::atomic::AtomicBool,
     state: ReentrantMutex<RefCell<AdmissionState>>,
     changed: watch::Sender<u64>,
 }
@@ -22,7 +26,8 @@ struct AdmissionState {
     epoch: u64,
     group: Option<(String, crate::group::KillSwitch)>,
     phase: Phase,
-    sessions: Vec<Arc<dyn Fn(Phase) -> bool + Send + Sync>>,
+    sessions: Vec<Weak<dyn Fn(Phase) -> bool + Send + Sync>>,
+    prune_at: usize,
 }
 
 #[derive(Clone, Copy)]

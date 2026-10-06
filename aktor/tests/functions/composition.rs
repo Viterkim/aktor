@@ -21,6 +21,7 @@ mod queries {
 
 fn open() -> rusqlite::Result<Connection> {
     let db = Connection::open_in_memory()?;
+
     db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)", [])?;
 
     Ok(db)

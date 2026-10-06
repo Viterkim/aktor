@@ -25,6 +25,7 @@ pub async fn count(connection: &Connection) -> usize {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn core::error::Error>> {
     let mut actors = AktorGroup::new();
+
     actors.start()?;
 
     let database = actors
@@ -41,6 +42,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     assert_eq!(rows, 1);
 
     let report = actors.shutdown().await;
+
     if report.failed() {
         return Err(report.into());
     }

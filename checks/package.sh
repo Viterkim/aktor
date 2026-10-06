@@ -6,13 +6,17 @@ package_dir=$(mktemp -d "${TMPDIR:-/tmp}/aktor-package.XXXXXX")
 trap 'rm -rf -- "$package_dir"' EXIT
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)
 
-cargo publish --workspace --dry-run --all-features --target-dir "$package_dir/target" "$@"
+cargo package --workspace --no-verify --all-features --target-dir "$package_dir/target" "$@"
 
 mkdir -p "$package_dir/aktor" "$package_dir/aktor-macros" "$package_dir/.cargo"
 for package in aktor aktor-macros; do
-    cp -a "$package_dir/target/package/$package-$version/." "$package_dir/$package/"
+    tar -xzf "$package_dir/target/package/$package-$version.crate" \
+        --strip-components=1 -C "$package_dir/$package"
 done
-tar --exclude=target --exclude=node_modules --exclude=pkg -cf - integrations \
+test -f "$package_dir/aktor/src/dispatch/call.rs"
+test -f "$package_dir/aktor/src/data/decode.rs"
+test -f "$package_dir/aktor-macros/src/data.rs"
+tar --exclude=target --exclude=pkg -cf - integrations \
     | tar -xf - -C "$package_dir"
 cp rust-toolchain.toml "$package_dir/"
 cat > "$package_dir/.cargo/config.toml" <<EOF

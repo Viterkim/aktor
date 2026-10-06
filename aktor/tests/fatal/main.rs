@@ -14,6 +14,8 @@ use tokio::sync::oneshot;
 mod drop;
 mod panic;
 mod policy;
+#[cfg(feature = "macros")]
+mod task;
 
 fn crash(handle: &Handle<usize>) -> Request<'_, usize, ()> {
     call(

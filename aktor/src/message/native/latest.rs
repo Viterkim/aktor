@@ -1,9 +1,9 @@
 use super::*;
-use crate::listener::Handle;
 use crate::{
     latest::{SendLatest, Session},
     queue::Phase,
 };
+use crate::{listener::Handle, operation::Operation};
 use core::{future::poll_fn, ops::AsyncFnOnce};
 use std::sync::Weak;
 
@@ -67,6 +67,7 @@ struct Shared<S, I, O, F, Role> {
     function: Mutex<F>,
     operation: crate::operation::Operation,
     this: Weak<Self>,
+    phase_callback: Arc<dyn Fn(Phase) -> bool + Send + Sync>,
 }
 
 struct Slot<I, O> {
@@ -94,6 +95,7 @@ where
     fn schedule(&self) {
         let (publication, wake) = {
             let mut slot = self.state.lock();
+
             if slot.scheduled
                 || slot.running
                 || !slot.receiver
@@ -103,16 +105,20 @@ where
             {
                 return;
             }
+
             let Some(this) = self.this.upgrade() else {
                 return;
             };
+
             slot.scheduled = true;
+
             let publication = self.handle.inner.sender.commit_service(Message {
                 operation: self.operation,
                 job: Arc::new(LatestJob(this)),
                 finished: false,
                 counted: false,
             });
+
             let wake = if publication.is_err() {
                 slot.scheduled = false;
                 slot.failed = true;
@@ -120,6 +126,7 @@ where
             } else {
                 None
             };
+
             (publication, wake)
         };
 
@@ -133,6 +140,7 @@ where
                 drop(message);
             }
         }
+
         if let Some(wake) = wake {
             wake.wake();
         }
@@ -141,13 +149,16 @@ where
     fn change(&self, _phase: Phase) {
         let mut slot = self.state.lock();
         let phase = self.handle.inner.admission.phase();
+
         slot.phase = phase;
+
         let pending = if let Phase::Closing { paused: true } = phase {
             slot.senders = 0;
             slot.pending.take()
         } else {
             None
         };
+
         let wake = slot.wake.take();
 
         drop(slot);
@@ -172,18 +183,14 @@ where
         }
 
         slot.revision = slot.revision.wrapping_add(1);
+
         let previous = slot.pending.replace(input);
         let unread = slot.output.take();
-        let wake = slot.wake.take();
 
         drop(slot);
+        self.schedule();
         drop(previous);
         drop(unread);
-        self.schedule();
-
-        if let Some(wake) = wake {
-            wake.wake();
-        }
     }
 
     fn clone_sender(&self) {
@@ -192,7 +199,9 @@ where
 
     fn close_sender(&self) {
         let mut slot = self.state.lock();
+
         slot.senders = slot.senders.saturating_sub(1);
+
         let wake = slot.wake.take();
 
         drop(slot);
@@ -210,13 +219,18 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> 
         if !slot.finished {
             let mut closing = slot.closing.take().unwrap_or_else(|| {
                 let mut finished = self.handle.inner.finished.clone();
+
                 Box::pin(async move {
                     let _result = finished.changed().await;
                 })
             });
+
             drop(slot);
+
             let result = closing.as_mut().poll(cx);
+
             slot = self.state.lock();
+
             if result.is_pending() {
                 slot.closing = Some(closing);
             } else {
@@ -235,7 +249,9 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> 
 
         if slot.failed || (slot.finished && !matches!(slot.phase, Phase::Closing { .. })) {
             let finished = slot.finished;
+
             drop(slot);
+
             if !finished {
                 return Poll::Pending;
             }
@@ -244,6 +260,7 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> 
                 self.handle.inner.admission.lost();
                 return Poll::Pending;
             }
+
             stopped();
         }
 
@@ -256,6 +273,7 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> 
         }
 
         let previous = slot.wake.replace(replacement);
+
         drop(slot);
         drop(previous);
         Poll::Pending
@@ -263,7 +281,9 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> 
 
     fn close_receiver(&self) {
         let mut slot = self.state.lock();
+
         slot.receiver = false;
+
         let pending = slot.pending.take();
         let output = slot.output.take();
         let wake = slot.wake.take();
@@ -279,35 +299,54 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static, F> Job<S>
 where
     F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
 {
-    fn run<'a>(&'a self, state: &'a mut S) -> LocalFuture<'a, ()> {
+    fn run<'a>(
+        &'a self,
+        state: &'a mut S,
+        hooks: &'a mut crate::listener::hooks::AktorHooks<S>,
+        operation: crate::operation::Operation,
+    ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
             let request = {
                 let mut slot = self.0.state.lock();
+
                 slot.scheduled = false;
+
                 if !slot.receiver || matches!(slot.phase, Phase::Paused) {
                     return;
                 }
+
                 let Some(input) = slot.pending.take() else {
                     return;
                 };
+
                 slot.running = true;
                 (slot.revision, input)
             };
 
             let function = self.0.function.lock().clone();
+
+            hooks.before(state, operation);
+
             let output = function(state, request.1).await;
 
+            hooks.after(state, operation);
+
             let mut slot = self.0.state.lock();
+
             slot.running = false;
+
             let discarded = if slot.receiver && slot.revision == request.0 {
                 slot.output.replace(output)
             } else {
                 Some(output)
             };
+
             let wake = slot.wake.take();
+
             drop(slot);
             drop(discarded);
             self.0.schedule();
+
             if let Some(wake) = wake {
                 wake.wake();
             }
@@ -316,10 +355,14 @@ where
 
     fn close(&self) {
         let mut slot = self.0.state.lock();
+
         slot.failed = true;
+
         let pending = slot.pending.take();
         let output = slot.output.take();
+
         slot.scheduled = false;
+
         let wake = slot.wake.take();
 
         drop(slot);
@@ -345,7 +388,7 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static> Session<S,
     where
         F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
     {
-        let shared = Arc::new_cyclic(|this| Shared {
+        let shared = Arc::new_cyclic(|this: &Weak<Shared<S, I, O, F, Role>>| Shared {
             handle: self.new_handle(),
             state: Mutex::new(Slot {
                 revision: 0,
@@ -364,23 +407,48 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static> Session<S,
             function: Mutex::new(function),
             operation,
             this: this.clone(),
+            phase_callback: Arc::new({
+                let weak = this.clone();
+
+                move |phase| {
+                    weak.upgrade().is_some_and(|session| {
+                        session.change(phase);
+                        true
+                    })
+                }
+            }),
         });
-        let weak = Arc::downgrade(&shared);
+
         self.inner
             .admission
-            .register_session(Box::new(move |phase| {
-                if let Some(session) = weak.upgrade() {
-                    session.change(phase);
-                    true
-                } else {
-                    false
-                }
-            }));
+            .register_session(shared.phase_callback.clone());
         (
             LatestSender {
                 input: shared.clone(),
             },
             LatestResults { output: shared },
         )
+    }
+}
+
+impl<S, I, O, Lease, Role, Wire> crate::latest::TypedSession<S, I, O, Lease, Role, Wire>
+    for &Handle<S, Role>
+where
+    Self: crate::latest::Session<S, I, O, Role>,
+{
+    type Sender<Fut> = <Self as crate::latest::Session<S, I, O, Role>>::Sender;
+    type Results = <Self as crate::latest::Session<S, I, O, Role>>::Results;
+
+    fn session<F, Fut>(
+        self,
+        operation: Operation,
+        function: F,
+        _: fn(Lease, I) -> Fut,
+    ) -> (Self::Sender<Fut>, Self::Results)
+    where
+        F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
+        Fut: core::future::Future<Output = (Lease, O)>,
+    {
+        crate::latest::Session::session(self, operation, function)
     }
 }

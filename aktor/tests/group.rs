@@ -60,29 +60,37 @@ async fn typed_cleanup_and_timeouts() {
                 )
                 .send()
                 .await;
+
                 started.notified().await;
 
                 let timeout = running.timeout(Duration::from_millis(5)).await.unwrap_err();
+
                 assert!(timeout.admitted);
+
                 let queued = call(&actor.handle, |state, ()| *state, ()).send().await;
                 let timeout = call(&actor.handle, |state, ()| *state += 100, ())
                     .timeout(Duration::from_millis(5))
                     .await
                     .unwrap_err();
+
                 assert!(!timeout.admitted);
 
                 release.notify_one();
                 assert_eq!(running.await, 1);
                 assert_eq!(queued.await, 1);
+
                 let completion = actor.shutdown();
+
                 assert!(matches!(
                     call(&actor.handle, |_, ()| (), ()).try_send(),
                     Err(aktor::message::TrySendError::Closed(_))
                 ));
+
                 let error = (&completion).await.unwrap_err();
                 let aktor::owner::OwnerError::Cleanup(errors) = &*error else {
                     panic!("cleanup error was lost");
                 };
+
                 assert_eq!(errors.errors[0].data.0, 17);
                 assert_eq!(completion.await.unwrap_err().to_string(), error.to_string());
                 Ok::<_, AktorError>(())
@@ -129,12 +137,14 @@ async fn failure_and_cleanup_reports() {
                     })
                     .await
                     .unwrap();
+
                 let value: Result<(), io::Error> = call(
                     &db.handle,
                     |_, ()| Err(io::Error::other("ordinary query error")),
                     (),
                 )
                 .await;
+
                 assert!(value.is_err());
                 call(&db.handle, |_, ()| -> () { panic!("database died") }, ()).await;
                 continued.store(true, Ordering::SeqCst);
@@ -150,7 +160,9 @@ async fn failure_and_cleanup_reports() {
         .unwrap_err();
 
     assert_eq!(result.failure.as_ref().unwrap().actor, "settings");
+
     let report = result.actors[0].diagnostics[0].diagnostics.clone();
+
     assert!(report.contains("Flush the settings"));
     assert!(report.contains("backup folder is read only"));
     assert!(!after.load(Ordering::SeqCst));
@@ -172,6 +184,7 @@ async fn killswitch_then_failure() {
         kill.stop();
         proceed.notify_one();
     });
+
     let result = group
         .run(
             async |app| {
@@ -184,6 +197,7 @@ async fn killswitch_then_failure() {
                     })
                     .await
                     .unwrap();
+
                 let reply = call_async(
                     &db.handle,
                     async move |_, ()| {
@@ -195,6 +209,7 @@ async fn killswitch_then_failure() {
                 )
                 .send()
                 .await;
+
                 reply.await;
                 Ok::<_, AktorError>(())
             },
@@ -202,6 +217,7 @@ async fn killswitch_then_failure() {
         )
         .await
         .unwrap_err();
+
     trigger.await.unwrap();
     assert!(
         result
@@ -230,6 +246,7 @@ async fn stuck_work_and_hooks_are_bounded() {
                             setup: async || Ok::<_, AktorError>(0usize),
                             cleanup: move |_| {
                                 let cleanup_started = cleanup_started.clone();
+
                                 async move {
                                     cleanup_started.store(true, Ordering::SeqCst);
                                     core::future::pending::<()>().await;
@@ -239,6 +256,7 @@ async fn stuck_work_and_hooks_are_bounded() {
                         })
                         .await
                         .unwrap();
+
                     if operation {
                         let entered = Arc::new(Notify::new());
                         let inside = entered.clone();
@@ -252,6 +270,7 @@ async fn stuck_work_and_hooks_are_bounded() {
                         )
                         .send()
                         .await;
+
                         entered.notified().await;
                         kill.stop();
                         reply.await;
@@ -259,6 +278,7 @@ async fn stuck_work_and_hooks_are_bounded() {
                         kill.stop();
                         core::future::pending::<()>().await;
                     }
+
                     Ok::<_, AktorError>(())
                 },
                 async |_| {
@@ -270,6 +290,7 @@ async fn stuck_work_and_hooks_are_bounded() {
         .await
         .unwrap()
         .unwrap_err();
+
         assert!(result.timed_out);
         assert!(result.actors[0].timed_out);
         assert_eq!(cleaned.load(Ordering::SeqCst), !operation);
@@ -295,6 +316,7 @@ async fn failure_starts_before_stuck_cleanup() {
                     })
                     .await
                     .unwrap();
+
                 call(
                     &db.handle,
                     |_, ()| -> () { panic!("failed before cleanup") },
@@ -309,6 +331,7 @@ async fn failure_starts_before_stuck_cleanup() {
     .await
     .unwrap()
     .unwrap_err();
+
     assert_eq!(result.failure.unwrap().actor, "early failure");
 }
 
@@ -326,8 +349,11 @@ async fn paused_calls_resume() {
                     })
                     .await
                     .unwrap();
+
                 database.actor.pause().await.unwrap();
+
                 let request = call(&database.handle, |value, ()| *value, ());
+
                 tokio::pin!(request);
                 assert!(
                     tokio::time::timeout(Duration::from_millis(20), &mut request)
@@ -344,6 +370,7 @@ async fn paused_calls_resume() {
                     })
                     .await
                     .unwrap_err();
+
                 assert!(
                     tokio::time::timeout(Duration::from_millis(20), &mut request)
                         .await
@@ -361,6 +388,7 @@ async fn paused_calls_resume() {
             async |_| Ok::<_, AktorError>(()),
         )
         .await;
+
     assert!(result.is_ok());
 }
 
@@ -387,6 +415,7 @@ fn blocking_shutdown_exits() {
             // The callback has static lifetime and the C calling convention.
             assert_eq!(unsafe { atexit(wait_forever) }, 0);
         }
+
         #[cfg(unix)]
         if mode == "abort handler" {
             unsafe extern "C" {
@@ -404,10 +433,12 @@ fn blocking_shutdown_exits() {
             // The handler only spins, without calling anything unsafe in a signal.
             assert_ne!(unsafe { signal(6, wait_forever) }, usize::MAX);
         }
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+
         if mode == "stderr failure" {
             std::panic::set_hook(Box::new(|_| {}));
             runtime.block_on(async {
@@ -415,23 +446,30 @@ fn blocking_shutdown_exits() {
                 let closing = group.start().unwrap();
                 let actor = group.spawn_value("reporting", 0usize).await.unwrap();
                 let (ready, acquired) = std::sync::mpsc::channel();
+
                 std::thread::spawn(move || {
                     let stderr = std::io::stderr();
                     let _locked = stderr.lock();
+
                     ready.send(()).unwrap();
                     std::thread::sleep(Duration::from_secs(10));
                 });
+
                 acquired.recv().unwrap();
 
                 aktor::message::call(&actor.handle, |_, ()| panic!("report failure"), ())
                     .cast()
                     .await;
+
                 let report = closing.wait().await;
+
                 assert!(report.failure.unwrap().message.contains("report failure"));
                 assert!(!report.timed_out);
             });
+
             return;
         }
+
         if mode == "pending setup" {
             runtime.block_on(async {
                 let mut group = AktorGroup::with_grace(Duration::from_millis(200));
@@ -447,6 +485,7 @@ fn blocking_shutdown_exits() {
                             "pending setup",
                             async move || {
                                 let _drop = StartupDrop(cleanup);
+
                                 inside.notify_one();
                                 core::future::pending::<()>().await;
                                 Ok::<_, AktorError>(())
@@ -455,9 +494,12 @@ fn blocking_shutdown_exits() {
                         ))
                         .await
                 });
+
                 entered.notified().await;
                 kill.stop();
+
                 let report = closing.wait().await;
+
                 assert!(dropped.load(Ordering::SeqCst));
                 assert!(report.timed_out);
                 assert!(report.failure.is_none());
@@ -467,33 +509,120 @@ fn blocking_shutdown_exits() {
                 ));
                 tokio::time::sleep(Duration::from_millis(250)).await;
             });
+
             return;
         }
+
+        if mode == "settling thread" {
+            runtime.block_on(async {
+                let mut group = AktorGroup::with_grace(Duration::from_secs(1));
+                let closing = group.start().unwrap();
+                let lifetime = group.killswitch().track_thread("settling".into());
+                let cancelled = Arc::new(Notify::new());
+                let cancel = cancelled.clone();
+                let (release, released) = tokio::sync::oneshot::channel();
+                let finished = Arc::new(AtomicBool::new(false));
+                let thread_finished = finished.clone();
+
+                std::thread::spawn(move || {
+                    released.blocking_recv().unwrap();
+                    std::thread::sleep(Duration::from_millis(5));
+                    thread_finished.store(true, Ordering::SeqCst);
+                    drop(lifetime);
+                });
+
+                group
+                    .register_owner(
+                        "settling".into(),
+                        aktor::AktorExecution::TokioThread,
+                        Box::new(|| {}),
+                        Box::new(move || cancel.notify_one()),
+                        Box::pin(async move {
+                            cancelled.notified().await;
+                            release.send(()).unwrap();
+                            aktor::ActorOutcome {
+                                actor: "settling".into(),
+                                kind: None,
+                                diagnostics: vec![],
+                                timed_out: true,
+                            }
+                        }),
+                    )
+                    .unwrap();
+
+                group.killswitch().stop();
+                assert!(closing.wait().await.timed_out);
+                assert!(finished.load(Ordering::SeqCst), "thread was still settling");
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            });
+
+            return;
+        }
+
+        if matches!(&*mode, "late completion" | "zero grace" | "tiny grace") {
+            runtime.block_on(async {
+                let grace = match &*mode {
+                    "zero grace" => Duration::ZERO,
+                    "tiny grace" => Duration::from_millis(1),
+                    _ => Duration::from_millis(300),
+                };
+
+                let mut group = AktorGroup::with_grace(grace);
+                let closing = group.start().unwrap();
+                let lifetime = group.killswitch().track_thread("late".into());
+
+                group
+                    .register_owner(
+                        "late".into(),
+                        aktor::AktorExecution::StdThread,
+                        Box::new(|| {}),
+                        Box::new(|| {}),
+                        Box::pin(core::future::pending()),
+                    )
+                    .unwrap();
+
+                group.killswitch().stop();
+                assert!(closing.await.timed_out);
+                drop(lifetime);
+                core::future::pending::<()>().await;
+            });
+
+            return;
+        }
+
         runtime.block_on(async {
             let group = AktorGroup::with_grace(Duration::from_millis(200));
             let kill = group.killswitch();
+
             if mode == "stderr" {
                 let (ready, acquired) = std::sync::mpsc::channel();
+
                 std::thread::spawn(move || {
                     let stderr = std::io::stderr();
                     let _locked = stderr.lock();
+
                     ready.send(()).unwrap();
                     std::thread::sleep(Duration::from_secs(10));
                 });
+
                 acquired.recv().unwrap();
             }
+
             let actor_blocks = matches!(
                 &*mode,
                 "actor" | "stderr" | "exit handler" | "abort handler"
             );
             let setup_blocks = mode == "setup";
+
             if setup_blocks {
                 let kill = kill.clone();
+
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(40));
                     kill.stop();
                 });
             }
+
             let _report = group
                 .run(
                     async |app| {
@@ -507,6 +636,7 @@ fn blocking_shutdown_exits() {
                                             std::thread::sleep(Duration::from_secs(10));
                                         }
                                     }
+
                                     Ok::<_, AktorError>(())
                                 },
                                 cleanup: move |_| {
@@ -515,11 +645,13 @@ fn blocking_shutdown_exits() {
                                             std::thread::sleep(Duration::from_secs(10));
                                         }
                                     }
+
                                     Ok::<_, AktorError>(())
                                 },
                             })
                             .await
                             .unwrap();
+
                         kill.stop();
                         core::future::pending::<()>().await;
                         Ok::<_, AktorError>(())
@@ -530,13 +662,16 @@ fn blocking_shutdown_exits() {
                                 std::thread::sleep(Duration::from_secs(10));
                             }
                         }
+
                         Ok::<_, AktorError>(())
                     },
                 )
                 .await;
+
             // An uninterruptible actor must still cause exit if the report was ignored.
             std::thread::sleep(Duration::from_secs(10));
         });
+
         return;
     }
 
@@ -545,6 +680,10 @@ fn blocking_shutdown_exits() {
         "application",
         "setup",
         "pending setup",
+        "settling thread",
+        "late completion",
+        "zero grace",
+        "tiny grace",
         "stderr",
         "stderr failure",
         "exit handler",
@@ -558,20 +697,26 @@ fn blocking_shutdown_exits() {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
+
         loop {
             if child.try_wait().unwrap().is_some() {
                 break;
             }
+
             if std::time::Instant::now() >= deadline {
                 child.kill().unwrap();
                 child.wait().unwrap();
                 panic!("shutdown watchdog did not stop blocking {mode}");
             }
+
             std::thread::sleep(Duration::from_millis(10));
         }
+
         let output = child.wait_with_output().unwrap();
-        let forced_exit = !matches!(mode, "pending setup" | "stderr failure");
+        let forced_exit = !matches!(mode, "pending setup" | "settling thread" | "stderr failure");
+
         if forced_exit {
             assert!(!output.status.success());
             #[cfg(unix)]
@@ -586,6 +731,7 @@ fn blocking_shutdown_exits() {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+
         if !forced_exit {
             assert!(!String::from_utf8_lossy(&output.stderr).contains("Shutdown deadline reached"));
         }
@@ -614,6 +760,7 @@ async fn startup_error_closes_existing_actors() {
                         diagnostics: error.to_string(),
                         data: (),
                     })?;
+
                 let _second = app
                     .spawn(ActorArgs {
                         name: "failed setup".into(),
@@ -631,22 +778,31 @@ async fn startup_error_closes_existing_actors() {
                         diagnostics: error.to_string(),
                         data: (),
                     })?;
+
                 Ok(())
             },
             async |_| Ok::<_, AktorError>(()),
         )
         .await
         .unwrap_err();
+
     assert!(cleaned.load(Ordering::SeqCst));
     assert_eq!(result.actors.len(), 2);
-    assert_eq!(result.failure.as_ref().unwrap().actor, "failed setup");
-    assert_eq!(result.failure.as_ref().unwrap().phase, "setup");
-    assert!(result.actors.iter().any(|actor| {
-        actor
-            .diagnostics
+    let failure = result.failure.as_ref().unwrap();
+
+    assert_eq!(failure.actor, "failed setup");
+    assert_eq!(failure.phase, "setup");
+    assert!(failure.message.contains("setup went wrong"));
+    assert_eq!(result.to_string().matches("setup went wrong").count(), 1);
+    assert!(
+        result
+            .actors
             .iter()
-            .any(|error| error.diagnostics.contains("setup went wrong"))
-    }));
+            .find(|actor| actor.actor == "failed setup")
+            .unwrap()
+            .diagnostics
+            .is_empty()
+    );
 }
 
 struct ReleaseOnDrop(Arc<Notify>);
@@ -681,6 +837,7 @@ async fn cancelled_startup_keeps_errors() {
                             setup: async move || {
                                 inside.notify_one();
                                 setup_release.notified().await;
+
                                 if setup_fails {
                                     Err(AktorError::new("late setup error"))
                                 } else {
@@ -691,26 +848,41 @@ async fn cancelled_startup_keeps_errors() {
                         })
                         .await
                         .unwrap();
+
                     Ok(())
                 },
                 async |_| Ok::<_, AktorError>(()),
             )
             .await
             .unwrap_err();
+
         trigger.await.unwrap();
 
         assert!(!result.timed_out);
+
         let expected = if setup_fails {
             "late setup error"
         } else {
             "late cleanup error"
         };
-        assert!(
-            result.actors[0]
-                .diagnostics
-                .iter()
-                .any(|error| error.diagnostics.contains(expected))
-        );
+
+        let failure = result.failure.as_ref().unwrap();
+
+        assert_eq!(failure.actor, "cancelled startup");
+        assert_eq!(failure.phase, if setup_fails { "setup" } else { "cleanup" });
+        assert!(failure.message.contains(expected));
+
+        if setup_fails {
+            assert!(result.actors[0].diagnostics.is_empty());
+            assert_eq!(result.to_string().matches(expected).count(), 1);
+        } else {
+            assert!(
+                result.actors[0]
+                    .diagnostics
+                    .iter()
+                    .any(|error| error.diagnostics.contains(expected))
+            );
+        }
     }
 }
 
@@ -743,15 +915,19 @@ async fn cancellation_keeps_shutdown_running() {
                         })
                         .await
                         .unwrap();
+
                     let _drop = (!hook).then(|| BrokenDrop);
+
                     kill.stop();
                     core::future::pending().await
                 },
                 async move |_| {
                     let _drop = hook.then(|| BrokenDrop);
+
                     if hook {
                         core::future::pending::<()>().await;
                     }
+
                     Ok::<_, AktorError>(())
                 },
             )
@@ -777,7 +953,9 @@ struct HoldWake {
 impl std::task::Wake for HoldWake {
     fn wake(self: Arc<Self>) {
         self.entered.notify_one();
+
         let mut released = self.released.lock().unwrap();
+
         while !*released {
             released = self.resume.wait(released).unwrap();
         }
@@ -806,6 +984,7 @@ async fn latest_keeps_the_original_failure() {
         released: std::sync::Mutex::new(false),
         resume: std::sync::Condvar::new(),
     });
+
     let resume = ResumeWake(wake.clone());
     let result = group
         .run(
@@ -819,6 +998,7 @@ async fn latest_keeps_the_original_failure() {
                     })
                     .await
                     .unwrap();
+
                 let release = Arc::new(Notify::new());
                 let inside = release.clone();
                 let (sender, mut results) = (&owner.handle).session(
@@ -831,9 +1011,12 @@ async fn latest_keeps_the_original_failure() {
                         panic!("search handler exploded");
                     },
                 );
+
                 sender.send(());
+
                 let waker = Waker::from(wake.clone());
                 let next = results.next();
+
                 tokio::pin!(next);
                 assert!(
                     next.as_mut()
@@ -858,6 +1041,7 @@ async fn latest_keeps_the_original_failure() {
         )
         .await
         .unwrap_err();
+
     assert!(
         result
             .failure
@@ -876,18 +1060,23 @@ async fn latest_keeps_the_original_failure() {
         },
         async |_: &mut usize, ()| -> usize { panic!("original latest failure") },
     );
+
     sender.send(());
+
     let report = closing.wait().await;
 
     for _ in 0..4 {
         let mut next = Box::pin(results.next());
+
         assert!(
             next.as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
     }
+
     let failure = report.failure.unwrap().message;
+
     assert!(failure.contains("original latest failure"));
     assert_eq!(closing.wait().await.failure.unwrap().message, failure);
 }
@@ -909,6 +1098,7 @@ async fn ordinary_startup_and_shutdown() {
                 Ok::<_, AktorError>(())
             })
             .unwrap();
+
         assert!(
             actors
                 .start_with(async |_| Ok::<_, AktorError>(()))
@@ -946,13 +1136,17 @@ async fn ordinary_startup_and_shutdown() {
                 } => panic!("caller continued after permanent loss"),
             }
         });
+
         started.notified().await;
+
         if !fail {
             kill.stop();
         }
+
         let report = tokio::time::timeout(Duration::from_secs(2), closing.wait())
             .await
             .unwrap();
+
         tokio::time::timeout(Duration::from_secs(2), caller)
             .await
             .unwrap()
@@ -961,6 +1155,7 @@ async fn ordinary_startup_and_shutdown() {
         assert_eq!(hooks.load(Ordering::SeqCst), 1);
         assert_eq!(report.failed(), fail);
         assert_eq!(completed.wait().await.to_string(), report.to_string());
+
         if fail {
             assert!(
                 report
@@ -971,6 +1166,7 @@ async fn ordinary_startup_and_shutdown() {
                     .contains("storage died")
             );
         }
+
         assert!(matches!(
             actors
                 .spawn(ActorArgs::new(
@@ -990,12 +1186,14 @@ async fn default_group() {
     let closing = actors.start().unwrap();
     let actor = actors.spawn_value("counter", 17usize).await.unwrap();
     let shutdown = actors.shutdown();
+
     assert!(actors.killswitch().is_stopping());
     assert!(!(&closing).await.failed());
     assert_eq!(closing.await.to_string(), shutdown.await.to_string());
     assert!(actor.completion().wait().await.is_ok());
 
     let count = std::rc::Rc::new(std::cell::Cell::new(0));
+
     AktorGroup::new()
         .run(
             async |_| Ok::<_, AktorError>(()),
@@ -1006,6 +1204,7 @@ async fn default_group() {
         )
         .await
         .unwrap();
+
     assert_eq!(count.get(), 1);
 }
 
@@ -1028,6 +1227,7 @@ async fn application_creation() {
     }))
     .catch_unwind()
     .await;
+
     let report = completed.wait().await;
 
     assert!(result.is_ok(), "application creation escaped run()");
@@ -1049,6 +1249,7 @@ async fn ordinary_startup_failure_closes_siblings() {
             Ok::<_, AktorError>(())
         })
         .unwrap();
+
     let cleaned = Arc::new(AtomicBool::new(false));
     let cleanup = cleaned.clone();
     let sibling = actors
@@ -1062,6 +1263,7 @@ async fn ordinary_startup_failure_closes_siblings() {
         ))
         .await
         .unwrap();
+
     let startup = tokio::spawn(async move {
         actors
             .spawn(ActorArgs::new(
@@ -1077,18 +1279,23 @@ async fn ordinary_startup_failure_closes_siblings() {
             .await?;
         Ok::<_, aktor::listener::DedicatedStartError<AktorError<u32>>>(())
     });
+
     let failed = tokio::time::timeout(Duration::from_secs(2), startup)
         .await
         .unwrap()
         .unwrap()
         .unwrap_err();
+
     let aktor::listener::DedicatedStartError::Init(error) = failed else {
         panic!("typed setup error was lost");
     };
+
     assert_eq!(error.data, 23);
     assert!(cleaned.load(Ordering::SeqCst));
     assert!(hooks.load(Ordering::SeqCst));
+
     let report = closing.wait().await;
+
     assert_eq!(report.failure.unwrap().actor, "storage");
     assert_eq!(report.actors.len(), 2);
     assert!(sibling.completion().wait().await.is_ok());
@@ -1113,6 +1320,7 @@ async fn listener_retains_cancelled_startup() {
                     move || async move {
                         setup_entered.notify_one();
                         setup_release.notified().await;
+
                         if setup_fails {
                             Err(AktorError::new("late setup failed"))
                         } else {
@@ -1123,11 +1331,13 @@ async fn listener_retains_cancelled_startup() {
                 ))
                 .await
         });
+
         entered.notified().await;
         kill.stop();
         startup.abort();
         assert!(startup.await.err().unwrap().is_cancelled());
         release.notify_one();
+
         let report = tokio::time::timeout(Duration::from_secs(2), closing.wait())
             .await
             .unwrap();
@@ -1136,23 +1346,43 @@ async fn listener_retains_cancelled_startup() {
         } else {
             "late cleanup failed"
         };
+
         assert!(report.failed());
-        assert!(report.actors.iter().any(|actor| {
-            actor
-                .diagnostics
-                .iter()
-                .any(|error| error.diagnostics.contains(expected))
-        }));
+
+        let failure = report.failure.as_ref().unwrap();
+        let actor = report
+            .actors
+            .iter()
+            .find(|actor| actor.actor == "storage")
+            .unwrap();
+
+        assert_eq!(failure.actor, "storage");
+        assert_eq!(failure.phase, if setup_fails { "setup" } else { "cleanup" });
+        assert!(failure.message.contains(expected));
+
+        if setup_fails {
+            assert!(actor.diagnostics.is_empty());
+            assert_eq!(report.to_string().matches(expected).count(), 1);
+        } else {
+            assert!(
+                actor
+                    .diagnostics
+                    .iter()
+                    .any(|error| error.diagnostics.contains(expected))
+            );
+        }
     }
 }
 
 #[tokio::test]
 async fn plain_value_and_cancelled_completion() {
     let mut actors = AktorGroup::new();
+
     assert!(matches!(
         actors.spawn_value("early", 0usize).await,
         Err(aktor::listener::DedicatedStartError::NotStarted)
     ));
+
     let kill = actors.killswitch();
     let completed = actors.completion();
     let closing = actors
@@ -1163,17 +1393,22 @@ async fn plain_value_and_cancelled_completion() {
             })
         })
         .unwrap();
+
     let waiter = tokio::spawn(async move { closing.wait().await });
+
     tokio::task::yield_now().await;
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
 
     let state = actors.spawn_value("counter", 7usize).await.unwrap();
+
     assert_eq!(call(&state.handle, |state, ()| *state, ()).await, 7);
     kill.stop();
+
     let report = tokio::time::timeout(Duration::from_secs(2), completed.wait())
         .await
         .unwrap();
+
     assert_eq!(report.actors.len(), 1);
     assert_eq!(
         report.application[0].diagnostics,
@@ -1209,15 +1444,18 @@ async fn dropping_group_closes_actors() {
                 Err::<(), _>(io::Error::other("application setup failed"))?;
                 Ok::<_, io::Error>(())
             };
+
             assert!(startup.await.is_err());
         } else {
             drop(actors);
         }
 
         assert!(kill.is_stopping());
+
         let report = tokio::time::timeout(Duration::from_secs(1), closing.wait())
             .await
             .unwrap();
+
         assert!(!report.failed());
         assert!(cleaned.load(Ordering::SeqCst));
         assert!(actor.completion().wait().await.is_ok());
@@ -1236,6 +1474,7 @@ async fn terminal_cleanup_closes_group() {
             Ok::<_, AktorCleanupError>(())
         })
         .unwrap();
+
     let actor = actors
         .spawn(ActorArgs::new(
             "storage",
@@ -1249,13 +1488,16 @@ async fn terminal_cleanup_closes_group() {
         ))
         .await
         .unwrap();
+
     let sibling = actors.spawn_value("audio", 17usize).await.unwrap();
 
     drop(actor.shutdown());
     tokio::time::timeout(Duration::from_secs(1), kill.wait_stopping())
         .await
         .unwrap();
+
     let report = closing.wait().await;
+
     assert!(hook.load(Ordering::SeqCst));
     assert_eq!(report.failure.unwrap().actor, "storage");
     assert!(
@@ -1263,10 +1505,12 @@ async fn terminal_cleanup_closes_group() {
             && actor.diagnostics[0].diagnostics == "could not flush")
     );
     assert!(sibling.completion().wait().await.is_ok());
+
     let error = actor.completion().wait().await.unwrap_err();
     let aktor::owner::OwnerError::Cleanup(errors) = &*error else {
         panic!("typed cleanup error was lost");
     };
+
     assert_eq!(errors.errors[0].data.0, 31);
 }
 
@@ -1324,11 +1568,13 @@ fn shutdown_ownership() {
                                     let entered = actor_entered.clone();
                                     let release = actor_release.clone();
                                     let cleanup = cleanup.clone();
+
                                     async move {
                                         if waiting {
                                             entered.notify_one();
                                             release.notified().await;
                                         }
+
                                         cleanup.store(true, Ordering::SeqCst);
                                         Ok::<_, AktorError>(())
                                     }
@@ -1338,40 +1584,49 @@ fn shutdown_ownership() {
                             .unwrap();
 
                         entered.notify_one();
+
                         if app_mode == "application payload" {
                             std::panic::panic_any(BrokenDrop);
                         }
+
                         if app_mode == "application error" {
                             return Err(AktorError {
                                 diagnostics: "original application error".into(),
                                 data: BrokenDrop,
                             });
                         }
+
                         if app_mode == "driver" {
                             core::future::pending::<()>().await;
                         }
+
                         stopping.stop();
                         Ok(())
                     },
                     async move |_| -> Result<(), AktorError<BrokenDrop>> {
                         hook_entered.notify_one();
+
                         if hook_mode == "hook payload" {
                             std::panic::panic_any(BrokenDrop);
                         }
+
                         if hook_mode == "hook error" {
                             return Err(AktorError {
                                 diagnostics: "original hook error".into(),
                                 data: BrokenDrop,
                             });
                         }
+
                         if hook_mode == "hook driver" {
                             core::future::pending::<()>().await;
                         }
+
                         Ok(())
                     },
                 ));
 
                 ready.notified().await;
+
                 if mode == "driver" {
                     task.abort();
                 } else if mode == "actor driver" {
@@ -1386,6 +1641,7 @@ fn shutdown_ownership() {
                         future::Future,
                         task::{Context, Waker},
                     };
+
                     // Use a fresh group so the waiter is registered before stopping.
                     let mut fresh = AktorGroup::with_grace(Duration::from_millis(500));
                     let stopping = fresh.killswitch();
@@ -1397,28 +1653,35 @@ fn shutdown_ownership() {
                         actor: failure.then(|| actor.actor.new_controller()),
                     }));
                     let mut waiting = Box::pin(stopping.wait_stopping());
+
                     assert!(
                         waiting
                             .as_mut()
                             .poll(&mut Context::from_waker(&waker))
                             .is_pending()
                     );
+
                     if failure {
                         actor.actor.cancel();
                     }
+
                     let racers: Vec<_> = (0..2)
                         .map(|_| {
                             let stop = stopping.clone();
                             std::thread::spawn(move || stop.stop())
                         })
                         .collect();
+
                     for racer in racers {
                         racer.join().unwrap();
                     }
+
                     assert_eq!(fresh_done.wait().await.failed(), failure);
                     drop(waiting);
                 }
+
                 let result = task.await;
+
                 if mode.ends_with("driver") {
                     assert!(result.unwrap_err().is_cancelled());
                 } else {
@@ -1426,9 +1689,11 @@ fn shutdown_ownership() {
                 }
 
                 let report = completed.wait().await;
+
                 assert!(cleaned.load(Ordering::SeqCst));
                 assert_eq!(report.actors.len(), 1);
                 assert!(!report.timed_out);
+
                 if mode.ends_with("driver") {
                     assert!(
                         report
@@ -1437,12 +1702,14 @@ fn shutdown_ownership() {
                             .any(|error| error.diagnostics.contains("cancelled"))
                     );
                 }
+
                 if mode.ends_with("payload") {
                     assert_eq!(
                         report.failure.as_ref().unwrap().message,
                         "panic payload had no message"
                     );
                 }
+
                 if mode.ends_with("error") {
                     assert!(
                         report
@@ -1452,6 +1719,7 @@ fn shutdown_ownership() {
                     );
                 }
             });
+
         return;
     }
 
@@ -1467,6 +1735,7 @@ fn shutdown_ownership() {
         "reentrant failure",
     ] {
         let output = support::child("shutdown_ownership", mode);
+
         assert!(
             output.status.success(),
             "{mode}: {}",
@@ -1487,11 +1756,13 @@ fn stop_before_start() {
                     let mut group = AktorGroup::with_grace(Duration::from_millis(20));
                     let completion = group.completion();
                     let kill = group.killswitch();
+
                     if shutdown {
                         drop(group.shutdown());
                     } else {
                         kill.stop();
                     }
+
                     kill.stop();
                     assert!(!completion.wait().await.failed());
                     assert!(!group.shutdown().await.failed());
@@ -1499,10 +1770,12 @@ fn stop_before_start() {
                     tokio::time::sleep(Duration::from_millis(40)).await;
                 }
             });
+
         return;
     }
 
     let output = support::child("stop_before_start", "early stop");
+
     assert!(
         output.status.success(),
         "{}",

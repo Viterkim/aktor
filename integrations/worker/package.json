@@ -1,9 +1,0 @@
-{
-  "private": true,
-  "scripts": {
-    "test": "bash ../../checks/browser.sh"
-  },
-  "devDependencies": {
-    "playwright": "1.63.0"
-  }
-}

@@ -27,6 +27,7 @@ impl Child {
 impl VisitMut for Child {
     fn visit_type_path_mut(&mut self, ty: &mut syn::TypePath) {
         let before = ty.path.segments.len();
+
         visit_mut::visit_type_path_mut(self, ty);
 
         if let Some(qself) = &mut ty.qself {
@@ -36,6 +37,7 @@ impl VisitMut for Child {
 
     fn visit_expr_path_mut(&mut self, expr: &mut syn::ExprPath) {
         let before = expr.path.segments.len();
+
         visit_mut::visit_expr_path_mut(self, expr);
 
         if let Some(qself) = &mut expr.qself {
@@ -56,6 +58,7 @@ impl VisitMut for Child {
 
         let written = first.ident.to_string();
         let name = written.trim_start_matches("r#");
+
         if name == "self" {
             first.ident = syn::Ident::new("super", first.ident.span());
         } else if name == "super"

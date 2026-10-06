@@ -1,7 +1,10 @@
 use std::{
+    boxed::Box,
     process::{Command, Output, Stdio},
+    string::String,
     thread,
     time::{Duration, Instant},
+    vec::Vec,
 };
 
 pub fn child(test: &str, case: &str) -> Output {
@@ -22,6 +25,7 @@ pub fn child(test: &str, case: &str) -> Output {
         stdout.read_to_end(&mut bytes).unwrap();
         bytes
     });
+
     let errors = thread::spawn(move || {
         let mut bytes = Vec::new();
         stderr.read_to_end(&mut bytes).unwrap();
@@ -75,4 +79,12 @@ pub async fn panics<F: std::future::Future>(future: F) -> bool {
 pub fn poll<F: std::future::Future + Unpin>(mut future: F) -> std::task::Poll<F::Output> {
     std::pin::Pin::new(&mut future)
         .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+}
+
+#[derive(Default)]
+pub struct CountWake(pub std::sync::atomic::AtomicUsize);
+impl std::task::Wake for CountWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
