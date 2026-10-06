@@ -150,7 +150,7 @@ where
     spawn(Box::pin(async move {
         let retained = owner.completion();
         let mut driver = Box::pin(
-            AssertUnwindSafe(owner.run_with(
+            AssertUnwindSafe(owner.run_with_custom(
                 async move || start().await,
                 async move |state| {
                     if let Some(mut end) = end {
@@ -158,6 +158,16 @@ where
                     } else {
                         drop(state);
                         Ok(())
+                    }
+                },
+                async |runner| {
+                    #[cfg(target_family = "wasm")]
+                    {
+                        local::serve_browser(runner).await
+                    }
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        local::serve(runner).await
                     }
                 },
             ))

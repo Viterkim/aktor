@@ -85,6 +85,46 @@ pub async fn serve<S, const N: usize, E>(
     Ok(())
 }
 
+pub async fn serve_on<Clock: clock::AktorGroupClock, S, const N: usize, E>(
+    runner: AktorRunner<'_, S, N, E>,
+) -> Result<(), crate::AktorError> {
+    let _ = Clock::EXECUTION;
+
+    #[cfg(all(
+        feature = "browser_local",
+        target_family = "wasm",
+        target_os = "unknown"
+    ))]
+    if Clock::EXECUTION == crate::AktorExecution::BrowserLocal {
+        return serve_browser(runner).await;
+    }
+
+    serve(runner).await
+}
+
+#[cfg(all(
+    feature = "browser_local",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+pub async fn serve_browser<S, const N: usize, E>(
+    mut runner: AktorRunner<'_, S, N, E>,
+) -> Result<(), crate::AktorError> {
+    let mut remaining = 32;
+
+    while let Some(call) = runner.next().await {
+        call.run().await;
+        remaining -= 1;
+
+        if remaining == 0 {
+            crate::timeout::browser_sleep(core::time::Duration::ZERO).await;
+            remaining = 32;
+        }
+    }
+
+    Ok(())
+}
+
 async fn next<S, const N: usize, E>(inner: &Inner<S, N, E>) -> Option<Message<S>> {
     let changed = inner.closed.listen();
 

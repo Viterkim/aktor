@@ -51,6 +51,7 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
             failed: Cell::new(false),
             count: Arc::new(Semaphore::new(options.capacity)),
             bytes: Arc::new(Semaphore::new(options.max_outstanding_bytes)),
+            buffers: Buffers::new(options.max_outstanding_bytes),
             options,
             initialize: RefCell::new(None),
             group: RefCell::new(None),
@@ -74,13 +75,22 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
                 .dyn_into::<js_sys::ArrayBuffer>()
                 .map_err(|_| WireError::new(CallError::OutcomeUnknown, WorkerCause::Protocol))
                 .and_then(|buffer| {
-                    postcard::from_bytes::<Outgoing>(&js_sys::Uint8Array::new(&buffer).to_vec())
-                        .map_err(|error| {
-                            WireError::new(
-                                CallError::OutcomeUnknown,
-                                WorkerCause::Codec(error.to_string()),
-                            )
-                        })
+                    let output = postcard::from_bytes::<Outgoing>(
+                        &js_sys::Uint8Array::new(&buffer).to_vec(),
+                    );
+
+                    if matches!(output, Ok(Outgoing::Answer { .. }))
+                        && inner.finished.borrow().is_none()
+                    {
+                        inner.buffers.retain(buffer);
+                    }
+
+                    output.map_err(|error| {
+                        WireError::new(
+                            CallError::OutcomeUnknown,
+                            WorkerCause::Codec(error.to_string()),
+                        )
+                    })
                 });
 
             match output {
@@ -96,9 +106,11 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
                     } else if inner.ready.borrow().is_some() {
                         inner.fail(WorkerCause::Protocol);
                     } else if let Some(config) = inner.initialize.borrow_mut().take() {
-                        if let Err(error) =
-                            impls::inner::post(&inner.worker, &Incoming::Initialize { config })
-                        {
+                        if let Err(error) = impls::inner::post(
+                            &inner.worker,
+                            &inner.buffers,
+                            &Incoming::Initialize { config },
+                        ) {
                             inner.fail_error(error);
                         }
                     } else {

@@ -1,0 +1,1 @@
+this field is hidden by Serde but would be sent by AktorData; add #[aktor(skip)] to omit it from worker transport

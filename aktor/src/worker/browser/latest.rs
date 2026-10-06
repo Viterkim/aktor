@@ -71,6 +71,8 @@ struct Shared<I, O> {
     slot: RefCell<Slot<I, O>>,
     this: Weak<Self>,
     wake_callback: Rc<dyn Fn() -> bool>,
+    encoder: fn(&I) -> Result<Vec<u8>, WorkerError>,
+    decoder: fn(&[u8]) -> Result<O, WorkerError>,
 }
 struct Slot<I, O> {
     revision: u64,
@@ -84,7 +86,7 @@ struct Slot<I, O> {
     wake: Option<Waker>,
 }
 
-impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Shared<I, O> {
+impl<I: 'static, O: 'static> Shared<I, O> {
     fn schedule(&self) {
         {
             let mut slot = self.slot.borrow_mut();
@@ -137,7 +139,7 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Shared<I, O> {
     }
 }
 struct ServiceCall<I, O>(Rc<Shared<I, O>>);
-impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Service for ServiceCall<I, O> {
+impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
     fn operation(&self) -> &str {
         self.0.operation.name
     }
@@ -160,14 +162,14 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Service for ServiceC
             input
         };
 
-        encode(&input)
+        (self.0.encoder)(&input)
             .map(Some)
             .map_err(|error| error.without_data())
     }
 
     fn answer(&self, output: Result<Vec<u8>, WireError>) {
-        let output = output
-            .and_then(|bytes| codec::decode_output(&bytes).map_err(|error| error.without_data()));
+        let output =
+            output.and_then(|bytes| (self.0.decoder)(&bytes).map_err(|error| error.without_data()));
         let (discarded, pending) = {
             let mut slot = self.0.slot.borrow_mut();
             let revision = slot.running.take();
@@ -198,7 +200,7 @@ impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Service for ServiceC
         self.0.wake();
     }
 }
-impl<I: Serialize + 'static, O: DeserializeOwned + 'static> Input<I> for Shared<I, O> {
+impl<I: 'static, O: 'static> Input<I> for Shared<I, O> {
     fn send(&self, input: I) {
         let (pending, unread) = {
             let mut slot = self.slot.borrow_mut();
@@ -285,8 +287,9 @@ impl<I, O> Output<O> for Shared<I, O> {
         drop(wake);
     }
 }
-impl<S, I: Serialize + 'static, O: DeserializeOwned + 'static, Role, E> Session<S, I, O, Role>
-    for &Worker<S, Role, E>
+impl<S, I: 'static, O: 'static, Role, E, C> Session<S, I, O, Role, C> for &Worker<S, Role, E>
+where
+    C: Codec<I> + Codec<O>,
 {
     type Sender = LatestSender<I>;
     type Results = LatestResults<O>;
@@ -300,6 +303,8 @@ impl<S, I: Serialize + 'static, O: DeserializeOwned + 'static, Role, E> Session<
         let shared = Rc::new_cyclic(|this: &Weak<Shared<I, O>>| Shared {
             inner: self.inner.clone(),
             operation,
+            encoder: <C as Codec<I>>::encode,
+            decoder: <C as Codec<O>>::decode_output,
             this: this.clone(),
             wake_callback: Rc::new({
                 let weak = this.clone();
@@ -346,13 +351,13 @@ impl<I, O> Drop for Shared<I, O> {
     }
 }
 
-impl<S, I, O, Lease, Role, E> crate::latest::TypedSession<S, I, O, Lease, Role>
+impl<S, I, O, Lease, Role, E, C> crate::latest::TypedSession<S, I, O, Lease, Role, C>
     for &Worker<S, Role, E>
 where
-    Self: crate::latest::Session<S, I, O, Role>,
+    Self: crate::latest::Session<S, I, O, Role, C>,
 {
-    type Sender<Fut> = <Self as crate::latest::Session<S, I, O, Role>>::Sender;
-    type Results = <Self as crate::latest::Session<S, I, O, Role>>::Results;
+    type Sender<Fut> = <Self as crate::latest::Session<S, I, O, Role, C>>::Sender;
+    type Results = <Self as crate::latest::Session<S, I, O, Role, C>>::Results;
 
     fn session<F, Fut>(
         self,
@@ -364,6 +369,6 @@ where
         F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
         Fut: core::future::Future<Output = (Lease, O)>,
     {
-        crate::latest::Session::session(self, operation, function)
+        <Self as crate::latest::Session<S, I, O, Role, C>>::session(self, operation, function)
     }
 }

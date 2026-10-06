@@ -4,7 +4,7 @@ use core::{
     task::{Context, Poll},
 };
 
-impl<O: DeserializeOwned> WorkerReply<O> {
+impl<O> WorkerReply<O> {
     /// Take a ready output once. A pending reply can still be awaited.
     pub fn try_take(&mut self) -> Option<O> {
         if self.taken || self.parked {
@@ -12,7 +12,7 @@ impl<O: DeserializeOwned> WorkerReply<O> {
         }
 
         let result = match self.response.try_recv() {
-            Ok(Ok(output)) => Self::decode(&output),
+            Ok(Ok(output)) => self.decode(&output),
             Ok(Err(error)) => Err(error),
             Err(oneshot::error::TryRecvError::Empty) => return None,
             Err(oneshot::error::TryRecvError::Closed) => Err(WireError::new(
@@ -27,8 +27,8 @@ impl<O: DeserializeOwned> WorkerReply<O> {
         }
     }
 
-    fn decode(output: &[u8]) -> Result<O, WireError> {
-        codec::decode_output(output).map_err(|error| error.without_data())
+    fn decode(&self, output: &[u8]) -> Result<O, WireError> {
+        (self.decoder)(output).map_err(|error| error.without_data())
     }
 
     fn ready(&mut self, result: Result<O, WireError>) -> Poll<O> {
@@ -61,7 +61,7 @@ impl<O: DeserializeOwned> WorkerReply<O> {
     pub fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<O, WireError>> {
         match Pin::new(&mut self.response).poll(context) {
             Poll::Ready(Ok(Ok(output))) => {
-                return Poll::Ready(Self::decode(&output));
+                return Poll::Ready(self.decode(&output));
             }
             Poll::Ready(Ok(Err(error))) => return Poll::Ready(Err(error)),
             Poll::Ready(Err(_)) => {
@@ -104,7 +104,7 @@ impl<O> Drop for WorkerReply<O> {
         self.abandon();
     }
 }
-impl<O: DeserializeOwned> Future for WorkerReply<O> {
+impl<O> Future for WorkerReply<O> {
     type Output = O;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<O> {

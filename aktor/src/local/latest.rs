@@ -385,8 +385,8 @@ impl<S: 'static, I: 'static, O: 'static, Role: 'static, const N: usize, E: 'stat
     }
 }
 
-impl<S: 'static, I, O, Lease, Role, E, const N: usize, Clock>
-    crate::latest::TypedSession<S, I, O, Lease, Role> for &Handle<S, N, E, Role, Clock>
+impl<S: 'static, I, O, Lease, Role, E, const N: usize, Clock, Wire>
+    crate::latest::TypedSession<S, I, O, Lease, Role, Wire> for &Handle<S, N, E, Role, Clock>
 where
     Self: crate::latest::Session<S, I, O, Role>,
 {

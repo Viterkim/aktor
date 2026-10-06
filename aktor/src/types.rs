@@ -152,3 +152,6 @@ mod prepared {
     )
 ))]
 pub use prepared::*;
+
+#[cfg(feature = "wasm_browser_workers")]
+pub use crate::data::AktorData;

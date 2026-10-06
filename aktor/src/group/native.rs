@@ -348,14 +348,14 @@ impl AktorGroup {
                         kind: None,
                         actor: name.clone(),
                         phase: "setup".into(),
-                        message: diagnostics.clone(),
+                        message: diagnostics,
                     });
 
                     let _sent = started.send(Err(error));
                     let _sent = completed.send(ActorOutcome {
                         kind: None,
                         actor: name,
-                        diagnostics: vec![AktorError::new(diagnostics)],
+                        diagnostics: Vec::new(),
                         timed_out: false,
                     });
 

@@ -6,11 +6,23 @@ use core::{
 };
 use tokio::sync::TryAcquireError;
 
-impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
+impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
     pub fn new(
         worker: &'a Worker<S, Role, impl Sized>,
         operation: &str,
         input: Result<Vec<u8>, WorkerError>,
+    ) -> Self
+    where
+        O: DeserializeOwned,
+    {
+        Self::with_decoder(worker, operation, input, codec::decode_output)
+    }
+
+    pub fn with_decoder(
+        worker: &'a Worker<S, Role, impl Sized>,
+        operation: &str,
+        input: Result<Vec<u8>, WorkerError>,
+        decoder: fn(&[u8]) -> Result<O, WorkerError>,
     ) -> Self {
         Self {
             inner: &worker.inner,
@@ -18,6 +30,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
             operation: operation.into(),
             input: Some(input.map_err(|error| error.without_data())),
             encoder: None,
+            decoder,
             admission: None,
             reply: None,
             parked: false,
@@ -91,6 +104,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
             parked: false,
             taken: false,
             output: PhantomData,
+            decoder: self.decoder,
         });
 
         Ok(())
@@ -249,7 +263,7 @@ impl<'a, S, O: DeserializeOwned, Role> WorkerRequest<'a, S, O, Role> {
         }
     }
 }
-impl<S, O: DeserializeOwned, Role> Future for WorkerRequest<'_, S, O, Role> {
+impl<S, O, Role> Future for WorkerRequest<'_, S, O, Role> {
     type Output = O;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {

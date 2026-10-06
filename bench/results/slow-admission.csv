@@ -1,9 +1,0 @@
-round,build,backend,work,clients,capacity,calls,median_ns_per_call,min_ns_per_call,max_ns_per_call
-0,before,aktor-task,count,16,1,200000,513.2,508.2,525.4
-0,after,aktor-task,count,16,1,200000,410.2,396.1,472.0
-1,after,aktor-task,count,16,1,200000,409.5,405.3,420.8
-1,before,aktor-task,count,16,1,200000,442.4,430.5,451.9
-2,before,aktor-task,count,16,1,200000,437.0,433.8,481.5
-2,after,aktor-task,count,16,1,200000,418.8,416.9,426.5
-3,after,aktor-task,count,16,1,200000,411.8,399.2,420.5
-3,before,aktor-task,count,16,1,200000,421.7,420.9,424.5

@@ -16,6 +16,7 @@ pub struct Registered {
     role: TypeId,
     input: &'static str,
     output: &'static str,
+    codec: &'static str,
     run: Run,
 }
 
@@ -26,8 +27,8 @@ impl Operations {
         let mut operations: Vec<_> = registered::<S, Role>()
             .map(|operation| {
                 format!(
-                    "{}: {} -> {}",
-                    operation.name, operation.input, operation.output
+                    "{}: {} -> {}{}",
+                    operation.name, operation.input, operation.output, operation.codec
                 )
             })
             .collect();
@@ -63,8 +64,8 @@ impl Registry {
             .iter()
             .map(|operation| {
                 format!(
-                    "{}: {} -> {}",
-                    operation.name, operation.input, operation.output
+                    "{}: {} -> {}{}",
+                    operation.name, operation.input, operation.output, operation.codec
                 )
             })
             .collect();
@@ -99,24 +100,23 @@ impl Registry {
     }
 }
 
-pub struct Exporter<E> {
+pub struct Exporter<E, C = crate::dispatch::SerdeCodec> {
     pub name: &'static str,
-    pub export: PhantomData<E>,
+    pub export: PhantomData<(E, C)>,
 }
 
 pub trait Register {
     fn register(self) -> Option<Registered>;
 }
-impl<E> Register for &Exporter<E> {
+impl<E, C> Register for &Exporter<E, C> {
     fn register(self) -> Option<Registered> {
         None
     }
 }
-impl<E> Register for &&Exporter<E>
+impl<E, C> Register for &&Exporter<E, C>
 where
-    E: Export + Default,
-    E::Input: Serialize + DeserializeOwned,
-    E::Output: Serialize + DeserializeOwned,
+    E: Export<C> + Default,
+    C: Codec<E::Input> + Codec<E::Output>,
     E::Role: 'static,
 {
     fn register(self) -> Option<Registered> {
@@ -126,26 +126,26 @@ where
             role: TypeId::of::<E::Role>(),
             input: type_name::<E::Input>(),
             output: type_name::<E::Output>(),
-            run: run::<E>,
+            codec: <C as Codec<E::Input>>::NAME,
+            run: run::<E, C>,
         })
     }
 }
 
-fn run<'a, E>(
+fn run<'a, E, C>(
     state: &'a mut dyn Any,
     input: &'a [u8],
 ) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>
 where
-    E: Export + Default,
-    E::Input: DeserializeOwned,
-    E::Output: Serialize,
+    E: Export<C> + Default,
+    C: Codec<E::Input> + Codec<E::Output>,
 {
     Box::pin(async move {
         let state = state
             .downcast_mut::<E::State>()
             .ok_or_else(|| WorkerError::new(CallError::Discarded, WorkerCause::Protocol))?;
 
-        run_export(E::default(), state, input).await
+        run_export::<E, C>(E::default(), state, input).await
     })
 }
 
@@ -171,13 +171,13 @@ pub async fn dispatch<S: 'static, Role: 'static>(
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __aktor_register {
-    ($export:ty, $name:expr) => {
+    ($export:ty, $name:expr, $codec:ty) => {
         $crate::worker::inventory::submit! {
             $crate::worker::Registration(|| {
                 use $crate::worker::Register as _;
 
                 // The fallback keeps local Rust calls free of Serde requirements.
-                (&&$crate::worker::Exporter::<$export> {
+                (&&$crate::worker::Exporter::<$export, $codec> {
                     name: $name,
                     export: ::core::marker::PhantomData,
                 }).register()
@@ -222,6 +222,7 @@ mod tests {
             role: TypeId::of::<Role>(),
             input: "()",
             output: "()",
+            codec: "",
             run,
         })
     }

@@ -30,6 +30,7 @@ sed -i -E \
 sed -i -E \
     -e "s@\]\((\./)?\.\./\.\./README\.md@](${release_url}/README.md@g" \
     -e "s@\]\((\./)?examples\.md@](${release_url}/aktor/docs/examples.md@g" \
+    -e "s@\]\((\./)?runtime\.md@](${release_url}/aktor/docs/runtime.md@g" \
     "$release_dir/aktor/docs/functions.md"
 sed -i -E \
     -e "s@\]\((\./)?\.\./README\.md@](${release_url}/README.md@g" \

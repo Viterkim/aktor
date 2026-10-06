@@ -1,5 +1,13 @@
 use aktor::*;
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 use wasm_bindgen::prelude::*;
 
 struct Counter {
@@ -25,6 +33,7 @@ async fn wait(counter: &mut Counter, millis: u32) -> u32 {
 
 #[wasm_bindgen]
 pub async fn local_setup_check() -> Result<bool, JsValue> {
+    browser_budget().await?;
     let value = Rc::new(Cell::new(0));
     let count = value.clone();
     let before = Rc::new(Cell::new(0));
@@ -198,6 +207,127 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
 async fn increment(counter: &mut Cell<u32>, by: u32) -> u32 {
     counter.set(counter.get() + by);
     counter.get()
+}
+
+async fn browser_budget() -> Result<(), JsValue> {
+    let pool = bevy_tasks::TaskPool::new();
+    let mut failures = Vec::new();
+
+    for (mode, name) in ["BrowserLocal", "BevyLocal", "BevyTask", "Local<Browser>"]
+        .into_iter()
+        .enumerate()
+    {
+        for stop in [false, true] {
+            let count = Arc::new(AtomicU32::new(0));
+            let counted = count.clone();
+            let cleaned = Arc::new(AtomicU32::new(0));
+            let cleanup = cleaned.clone();
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let mut started = Some(started);
+            let before = move |_: &mut Cell<u32>, _: operation::Operation| {
+                counted.fetch_add(1, Ordering::Relaxed);
+
+                if let Some(started) = started.take() {
+                    let _sent = started.send(());
+                }
+            };
+            let end = async move |state: Cell<u32>| {
+                cleanup.fetch_add(1, Ordering::Relaxed);
+
+                if state.get() == 4096 {
+                    Ok(())
+                } else {
+                    Err(AktorCleanupError::new("busy owner lost admitted work"))
+                }
+            };
+
+            macro_rules! check {
+                ($kind:expr) => {{
+                    let actors = start(AktorSetup {
+                        name: AktorName::new("browser budget"),
+                        role: AktorNoRole,
+                        kind: $kind,
+                        closures: AktorClosures {
+                            before_each: Some(before.into()),
+                            end: Some(end.into()),
+                            ..AktorClosures::new(async || Ok(Cell::new(0)))
+                        },
+                        options: Some(AktorOptions {
+                            capacity: 4096,
+                            ..Default::default()
+                        }),
+                    })
+                    .await
+                    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+
+                    observe_budget(actors, entered, count, cleaned, stop, |handle| {
+                        increment(handle, 1).try_send().is_ok()
+                    })
+                    .await?
+                }};
+            }
+
+            let observed = match mode {
+                0 => check!(AktorKind::BrowserLocal),
+                1 => check!(AktorKind::BevyLocal(&pool)),
+                2 => check!(AktorKind::BevyTask(&pool)),
+                _ => check!(AktorKind::Local::<local::clock::Browser>(|future| {
+                    wasm_bindgen_futures::spawn_local(future);
+                    Ok(())
+                })),
+            };
+
+            if observed == 4096 {
+                failures.push(format!(
+                    "{name}, stop {stop}: timer waited for all {observed} calls"
+                ));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(JsValue::from_str(&failures.join("\n")))
+    }
+}
+
+async fn observe_budget<H, G: setup::group::AktorSetupGroup>(
+    actors: AktorStarted<H, G>,
+    entered: tokio::sync::oneshot::Receiver<()>,
+    count: Arc<AtomicU32>,
+    cleaned: Arc<AtomicU32>,
+    stop: bool,
+    send: impl Fn(&H) -> bool,
+) -> Result<u32, JsValue> {
+    for _ in 0..4096 {
+        if !send(&actors.handles) {
+            let report = actors.shutdown().await;
+            return Err(JsValue::from_str(&format!("busy admission: {report}")));
+        }
+    }
+
+    entered
+        .await
+        .map_err(|_| JsValue::from_str("busy owner did not start"))?;
+    gloo_timers::future::TimeoutFuture::new(0).await;
+    let observed = count.load(Ordering::Relaxed);
+
+    if stop {
+        G::stop(&actors.killswitch());
+    } else {
+        while count.load(Ordering::Relaxed) < 4096 {
+            gloo_timers::future::TimeoutFuture::new(0).await;
+        }
+    }
+
+    let report = actors.shutdown().await;
+
+    if report.failed() || cleaned.load(Ordering::Relaxed) != 1 {
+        return Err(JsValue::from_str(&format!("busy cleanup: {report}")));
+    }
+
+    Ok(observed)
 }
 
 #[aktor]

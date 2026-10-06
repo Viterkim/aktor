@@ -1,5 +1,0 @@
-repeat,payload,wire_bytes,encode_ms,owned_decode_ms
-0,10485 typed rows,879989,0.102152,0.542338
-1,10485 typed rows,879989,0.132149,0.553136
-2,10485 typed rows,879989,0.132631,0.559219
-0,1MiB byte field,1048579,0.015192,0.014978

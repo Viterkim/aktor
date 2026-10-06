@@ -121,7 +121,12 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
             return Err(ActorError::InvalidCapacity);
         }
 
-        self.spawn_in(args, hooks::AktorHooks::default(), Clock::EXECUTION, serve)
+        self.spawn_in(
+            args,
+            hooks::AktorHooks::default(),
+            Clock::EXECUTION,
+            serve_on::<Clock, _, N, E>,
+        )
     }
 
     #[doc(hidden)]
@@ -134,7 +139,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         hooks: hooks::AktorHooks<S>,
         kind: crate::AktorExecution,
     ) -> Result<Handle<S, 0, E, (), Clock>, ActorError> {
-        self.spawn_in(args, hooks, kind, serve)
+        self.spawn_in(args, hooks, kind, serve_on::<Clock, _, 0, E>)
     }
 
     #[doc(hidden)]

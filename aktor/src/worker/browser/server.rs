@@ -33,6 +33,14 @@ impl Drop for Server {
 }
 
 pub fn respond(scope: &DedicatedWorkerGlobalScope, output: Outgoing) -> Result<(), WireError> {
+    respond_with(scope, output, None)
+}
+
+fn respond_with(
+    scope: &DedicatedWorkerGlobalScope,
+    output: Outgoing,
+    buffers: Option<&Buffers>,
+) -> Result<(), WireError> {
     let output = postcard::to_allocvec(&output).map_err(|error| {
         WireError::new(
             CallError::OutcomeUnknown,
@@ -40,8 +48,16 @@ pub fn respond(scope: &DedicatedWorkerGlobalScope, output: Outgoing) -> Result<(
         )
     })?;
 
-    let array = js_sys::Uint8Array::from(output.as_slice());
-    let buffer = array.buffer();
+    let buffer = if let Some(buffers) = buffers {
+        buffers.write(&output).map_err(|error| {
+            WireError::new(
+                CallError::OutcomeUnknown,
+                WorkerCause::Codec(format!("{error:?}")),
+            )
+        })?
+    } else {
+        js_sys::Uint8Array::from(output.as_slice()).buffer()
+    };
     let transfers = js_sys::Array::new();
 
     transfers.push(&buffer);
@@ -141,6 +157,8 @@ where
     let (stopping, mut stopped) = watch::channel(false);
     let closing = Rc::new(Cell::new(false));
     let replies = scope.clone();
+    let buffers = Rc::new(Buffers::new(options.max_outstanding_bytes));
+    let received = buffers.clone();
 
     let callback = Closure::new(move |event: MessageEvent| {
         let input = event
@@ -148,10 +166,16 @@ where
             .dyn_into::<js_sys::ArrayBuffer>()
             .map_err(|_| WireError::new(CallError::Discarded, WorkerCause::Protocol))
             .and_then(|buffer| {
-                postcard::from_bytes::<Incoming>(&js_sys::Uint8Array::new(&buffer).to_vec())
-                    .map_err(|error| {
-                        WireError::new(CallError::Discarded, WorkerCause::Codec(error.to_string()))
-                    })
+                let input =
+                    postcard::from_bytes::<Incoming>(&js_sys::Uint8Array::new(&buffer).to_vec());
+
+                if matches!(input, Ok(Incoming::Call { .. })) {
+                    received.retain(buffer);
+                }
+
+                input.map_err(|error| {
+                    WireError::new(CallError::Discarded, WorkerCause::Codec(error.to_string()))
+                })
             });
 
         match input {
@@ -188,12 +212,13 @@ where
                 };
 
                 if let Err(error) = result
-                    && let Err(error) = respond(
+                    && let Err(error) = respond_with(
                         &replies,
                         Outgoing::Answer {
                             id,
                             output: Err(error),
                         },
+                        Some(&received),
                     )
                 {
                     fatal(error);
@@ -283,7 +308,9 @@ where
                 hooks.after(&mut state, operation);
             }
 
-            if let Err(error) = respond(&replies, Outgoing::Answer { id, output }) {
+            if let Err(error) =
+                respond_with(&replies, Outgoing::Answer { id, output }, Some(&buffers))
+            {
                 fatal(error);
             }
         }
@@ -298,6 +325,7 @@ where
         };
 
         drop((hooks, intervals));
+        buffers.clear();
 
         if let Err(error) = respond(&replies, Outgoing::Finished(result.clone())) {
             fatal(error);

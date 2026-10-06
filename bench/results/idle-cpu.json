@@ -1,9 +1,0 @@
-{
-  "source": "9557be1 + queued task future reuse",
-  "host": "Linux, Intel Core Ultra 9 285H",
-  "duration_seconds": 5,
-  "counter": "aggregate /proc/self/task/*/schedstat runtime, status context switches",
-  "traffic": "one warmup call, then idle with no intervals",
-  "includes": "reading the counters",
-  "results": "idle-cpu.csv"
-}

@@ -1,6 +1,6 @@
 # Embassy + alloc
 
-Enable embassy and supply an allocator. The [sensor setup](src/lib.rs) puts its driver on your executor with AktorKind::EmbassyLocal:
+Enable embassy and supply an allocator. The [sensor setup](src/lib.rs) puts its driver on your executor:
 
 ```rust
 let actors = start(sensor_setup(spawner)).await?;
@@ -8,61 +8,21 @@ let count = record_many(&actors.handles, [4, 5]).await?;
 let report = actors.shutdown().await;
 ```
 
-State, arguments and outputs can contain Rc. The same setup fields let you add cleanup, before_each / after_each and intervals.
+EmbassyLocal keeps state and handles on that executor, Rc is fine. Keep the driver polling through shutdown.
 
-EmbassyCrossCore uses the same fields, [shared_sensor_setup](src/lib.rs) returns a handle you can send to another core. Its arguments and results need Send, the state and operation futures stay on the owner and can still use Rc. Enable embassy_cross_core and supply a critical-section implementation that synchronizes all those cores.
+EmbassyCrossCore lets handles, arguments and results cross cores with Send, the state stays local. Enable embassy_cross_core and supply a critical-section implementation that synchronizes those cores. [shared_sensor_setup](src/lib.rs) shows it.
 
-Request timeouts use your Embassy clock. Callers on other executors need Embassy's generic timer queue configured by the application.
-
-For a manually owned task:
-
-```rust
-let (sensor, owner) = embassy::channel::<Sensor, 2, &'static str>()?;
-spawner.spawn(sensor_owner(owner)?);
-sensor.ready().await?;
-
-let count = record_many(&sensor, [4, 5]).await?;
-sensor.shutdown().await?;
-```
-
-The 2 is queue capacity. [sensor_owner](src/lib.rs) runs setup and cleanup, record_many calls record with its local sensor. Handles stay on the owner's executor.
-
-embassy::AktorGroup keeps the owners together. Start its listener on your executor:
-
-```rust
-#[embassy_executor::task]
-async fn actors_task(closing: aktor::message::LocalFuture<'static, ShutdownReport>) {
-    let report = closing.await;
-    show_report(report);
-}
-
-let mut actors = embassy::AktorGroup::new();
-let kill = actors.killswitch();
-spawner.spawn(actors_task(actors.listen()?)?);
-
-let sensor = actors.spawn_value::<Sensor, 2>("sensor", sensor)?;
-let count = record_many(&sensor, [4, 5]).await?;
-kill.stop();
-```
-
-The listener drives the owners as well as shutdown, dropping it cancels them and gives you a failed report. Use ActorArgs when your sensor needs setup or cleanup, listen_with(after) adds your final application closure. The host supplies embassy-time for timeout() and the shutdown budget.
-
-It also runs on other local executors, [including isolated WASM hosts](../wasm/README.md).
+The application supplies embassy-time and its timer queue. pause/resume/replace aren't supported here.
 
 ## Try it
 
-The host test uses an Embassy executor:
+Host tests and Cortex M0/M4 compilation:
 
 ```sh
 cargo test --manifest-path integrations/Cargo.toml -p aktor-embassy-proof
-```
-
-For Cortex M0/M4 compilation:
-
-```sh
 rustup target add thumbv6m-none-eabi thumbv7em-none-eabihf
 rustup +1.89.0 target add thumbv6m-none-eabi thumbv7em-none-eabihf
 bash scripts/check.sh embassy
 ```
 
-On a board you'll need your panic handler and timer driver too. pause/resume/replace aren't implemented here yet.
+A board also needs its panic handler and timer driver. [Plain WASM](../wasm/README.md) uses the local backend too.

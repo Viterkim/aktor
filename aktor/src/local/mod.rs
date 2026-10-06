@@ -31,6 +31,13 @@ pub mod panic;
 mod request;
 #[doc(hidden)]
 pub use impls::runner::serve;
+#[cfg(all(
+    feature = "browser_local",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+pub(crate) use impls::runner::serve_browser;
+pub(crate) use impls::runner::serve_on;
 pub use impls::runner::{AktorCustomCall, AktorRunner};
 mod dispatch;
 mod signal;

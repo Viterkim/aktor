@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "aktor"
-version = "0.0.3"
+version = "0.4.0"
 dependencies = [
  "aktor-macros",
  "bevy_platform",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "aktor-macros"
-version = "0.0.3"
+version = "0.4.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",

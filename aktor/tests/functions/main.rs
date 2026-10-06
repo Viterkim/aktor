@@ -6,6 +6,8 @@ use aktor::*;
 
 mod calls;
 mod composition;
+#[cfg(feature = "wasm_browser_workers")]
+mod data;
 mod location;
 mod outputs;
 mod signatures;

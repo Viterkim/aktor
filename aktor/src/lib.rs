@@ -52,6 +52,8 @@ pub use group::{AktorGroup, GroupCompletion, KillSwitch};
 pub mod call;
 #[cfg(feature = "embassy_cross_core")]
 pub mod cross_core;
+#[cfg(feature = "wasm_browser_workers")]
+pub mod data;
 #[cfg(feature = "embassy")]
 pub mod embassy;
 #[cfg(any(
@@ -139,7 +141,7 @@ macro_rules! __aktor_register {
 
 #[cfg(feature = "macros")]
 #[doc(inline)]
-pub use aktor_macros::{aktor, aktor_setups};
+pub use aktor_macros::{AktorData, aktor, aktor_setups};
 #[doc(inline)]
 #[cfg(any(
     feature = "tokio",

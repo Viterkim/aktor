@@ -15,7 +15,7 @@ pub trait SendLatest<I> {
 }
 
 #[doc(hidden)]
-pub trait Session<S, I, O, Role = ()> {
+pub trait Session<S, I, O, Role = (), Codec = crate::dispatch::SerdeCodec> {
     type Sender: SendLatest<I>;
     type Results;
 
@@ -31,7 +31,7 @@ pub trait Session<S, I, O, Role = ()> {
 pub use crate::message::{LatestResults as Results, LatestSender as Sender};
 
 #[doc(hidden)]
-pub trait TypedSession<S, I, O, Lease, Role = ()> {
+pub trait TypedSession<S, I, O, Lease, Role = (), Codec = crate::dispatch::SerdeCodec> {
     type Sender<Fut>;
     type Results;
 

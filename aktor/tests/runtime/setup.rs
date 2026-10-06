@@ -2312,6 +2312,11 @@ async fn lifecycle_data() {
         }) => {
             assert_eq!(error.data, "storage failure");
             assert!(!report.timed_out, "{report}");
+            assert_eq!(
+                report.to_string().matches("setup data").count(),
+                1,
+                "{report}"
+            );
 
             let ready = report
                 .actors

@@ -9,6 +9,7 @@ mod tests;
 pub struct Options {
     pub crate_path: Option<Path>,
     pub role: Option<Path>,
+    pub data: bool,
 }
 
 pub struct Argument {

@@ -2,7 +2,10 @@ use aktor::*;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Poll, Waker},
     time::Duration,
 };
@@ -142,7 +145,93 @@ pub fn check() -> Result<(), String> {
     });
 
     local?;
-    aktor::executor::block_on(task(&pool))
+    aktor::executor::block_on(task(&pool))?;
+    cooperative()
+}
+
+struct Busy {
+    handle: Option<AktorTask<Busy>>,
+    count: Arc<AtomicUsize>,
+    heartbeat: Option<tokio::sync::oneshot::Sender<()>>,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[aktor]
+async fn tick(_: &mut Busy) {}
+
+#[aktor]
+async fn begin(state: &mut Busy, handle: AktorTask<Busy>) {
+    state.handle = Some(handle);
+    drop(tick(state.handle.as_ref().unwrap()).try_send().unwrap());
+}
+
+fn cooperative() -> Result<(), String> {
+    let pool = bevy_tasks::TaskPoolBuilder::new().num_threads(1).build();
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = count.clone();
+    let counted = count.clone();
+    let (heartbeat, waiting) = tokio::sync::oneshot::channel();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let sibling = pool.spawn(async move {
+        waiting.await.unwrap();
+        observed.load(Ordering::Relaxed)
+    });
+
+    aktor::executor::block_on(async {
+        let actors = start(AktorSetup {
+            name: AktorName::new("Bevy busy owner"),
+            role: AktorNoRole,
+            kind: AktorKind::BevyTask(&pool),
+            closures: AktorClosures {
+                before_each: Some(
+                    (|state: &mut Busy, _: operation::Operation| {
+                        let Some(handle) = &state.handle else {
+                            return;
+                        };
+                        let count = state.count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                        if count == 1 {
+                            state.heartbeat.take().unwrap().send(()).unwrap();
+                        }
+
+                        if count < 256 {
+                            drop(tick(handle).try_send().unwrap());
+                        } else {
+                            state.done.take().unwrap().send(()).unwrap();
+                        }
+                    })
+                    .into(),
+                ),
+                ..AktorClosures::new(async move || {
+                    Ok(Busy {
+                        handle: None,
+                        count: counted,
+                        heartbeat: Some(heartbeat),
+                        done: Some(done),
+                    })
+                })
+            },
+            options: Some(AktorOptions {
+                capacity: 1,
+                ..Default::default()
+            }),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+        begin(&actors.handles, actors.handles.clone()).await;
+        finished.await.unwrap();
+        let progress = sibling.await;
+        let report = actors.shutdown().await;
+
+        assert!(!report.failed(), "{report}");
+        assert_eq!(count.load(Ordering::Relaxed), 256);
+        assert!(
+            progress > 0 && progress < 256,
+            "heartbeat saw {progress} jobs"
+        );
+        Ok(())
+    })
 }
 
 struct Movable(Cell<u32>);

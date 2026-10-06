@@ -57,6 +57,7 @@ async fn receiver_waker_can_reenter_admission() {
 }
 
 #[tokio::test]
+#[cfg(feature = "tokio")]
 async fn outstanding_permit_does_not_keep_failed_runner_alive() {
     let executor = tokio::task::LocalSet::new();
 

@@ -88,17 +88,23 @@ impl<S, Role, E> Drop for Worker<S, Role, E> {
         }
     }
 }
-impl<'a, S, I: Serialize + DeserializeOwned + 'a, O: Serialize + DeserializeOwned, Role, E>
-    Transport<S, I, O, Role> for &'a Worker<S, Role, E>
+impl<'a, S, I: 'a, O, Role, E, C> Transport<S, I, O, Role, C> for &'a Worker<S, Role, E>
+where
+    C: Codec<I> + Codec<O>,
 {
     type Request = WorkerRequest<'a, S, O, Role>;
 
     fn request(self, operation: Operation, input: I) -> Self::Request {
-        let mut request = self.request(operation.name, Ok(Vec::new()));
+        let mut request = WorkerRequest::with_decoder(
+            self,
+            operation.name,
+            Ok(Vec::new()),
+            <C as Codec<O>>::decode_output,
+        );
 
         request.input = None;
         request.encoder = Some(Box::new(move || {
-            encode(&input).map_err(|error| error.without_data())
+            <C as Codec<I>>::encode(&input).map_err(|error| error.without_data())
         }));
         request
     }

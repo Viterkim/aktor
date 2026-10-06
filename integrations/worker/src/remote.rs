@@ -58,9 +58,31 @@ async fn echo(_: &Counter, buffer: Buffer) -> Buffer {
     buffer
 }
 
+#[derive(AktorData, Debug, Clone, PartialEq, Eq)]
+struct DataBuffer {
+    data: Vec<u8>,
+    #[aktor(skip)]
+    cache: String,
+}
+
+#[aktor(data)]
+async fn echo_data(_: &Counter, mut buffer: DataBuffer) -> Result<DataBuffer, String> {
+    if !buffer.cache.is_empty() {
+        return Err("local cache crossed the worker boundary".into());
+    }
+
+    buffer.cache = "worker cache".into();
+    Ok(buffer)
+}
+
 #[aktor]
 async fn bytes(counter: &Counter, size: u32) -> Vec<u8> {
     vec![counter.value.get() as u8; size as usize]
+}
+
+#[aktor(data)]
+async fn checksum_data(_: &Counter, buffer: DataBuffer) -> u64 {
+    buffer.data.iter().map(|byte| *byte as u64).sum()
 }
 
 #[aktor]
@@ -291,6 +313,10 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
         vec![6; 256 * 1024]
     );
 
+    for size in [17, 768 * 1024, 0, 5 * 1024 * 1024, 31, 256 * 1024] {
+        assert_eq!(bytes(&actors.handles, size).await, vec![6; size as usize]);
+    }
+
     let (large_input, mut large_output) = bytes::latest(&actors.handles);
 
     large_input.send(256 * 1024);
@@ -302,6 +328,78 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     };
 
     assert_eq!(echo(&actors.handles, buffer.clone()).await, buffer);
+
+    let input = DataBuffer {
+        data: buffer.data.clone(),
+        cache: "parent cache".into(),
+    };
+    let expected = DataBuffer {
+        data: input.data.clone(),
+        cache: String::new(),
+    };
+
+    assert_eq!(
+        echo_data(&actors.handles, input.clone()).await,
+        Ok(expected.clone())
+    );
+
+    let reply = echo_data(&actors.handles, input.clone()).send().await;
+    assert_eq!(reply.await, Ok(expected.clone()));
+
+    let reply = echo_data(&actors.handles, input.clone())
+        .try_send()
+        .map_err(error)?;
+    assert_eq!(reply.await, Ok(expected.clone()));
+
+    let (data_sender, mut data_results) = echo_data(&actors.handles, input).latest();
+    assert_eq!(data_results.next().await, Some(Ok(expected.clone())));
+
+    data_sender.send(DataBuffer {
+        data: vec![37; 32],
+        cache: "another cache".into(),
+    });
+    assert_eq!(
+        data_results.next().await,
+        Some(Ok(DataBuffer {
+            data: vec![37; 32],
+            cache: String::new()
+        }))
+    );
+    for size in [0, 768 * 1024, 13, 256 * 1024] {
+        let data: Vec<_> = (0..size).map(|index| index as u8).collect();
+
+        data_sender.send(DataBuffer {
+            data: data.clone(),
+            cache: String::new(),
+        });
+        assert_eq!(
+            data_results.next().await,
+            Some(Ok(DataBuffer {
+                data,
+                cache: String::new(),
+            }))
+        );
+    }
+
+    drop(data_sender);
+    assert_eq!(data_results.next().await, None);
+
+    for size in [768 * 1024, 0, 1_048_576, 12] {
+        let data: Vec<_> = (0..size).map(|index| index as u8).collect();
+        let expected = data.iter().map(|byte| *byte as u64).sum::<u64>();
+
+        assert_eq!(
+            checksum_data(
+                &actors.handles,
+                DataBuffer {
+                    data,
+                    cache: String::new(),
+                },
+            )
+            .await,
+            expected
+        );
+    }
 
     let (input, mut output) = echo::latest(&actors.handles);
 

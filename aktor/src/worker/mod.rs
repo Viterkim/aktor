@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub mod bytes;
 mod codec;
+mod wire;
+#[doc(hidden)]
+pub use wire::Codec;
 mod impls;
 pub use codec::{decode, encode};
 mod registry;
@@ -115,24 +118,23 @@ enum Outgoing {
 }
 
 #[doc(hidden)]
-pub async fn run_export<E>(
+pub async fn run_export<E, C>(
     export: E,
     state: &mut E::State,
     input: &[u8],
 ) -> Result<Vec<u8>, WorkerError>
 where
-    E: crate::dispatch::Export,
-    E::Input: DeserializeOwned,
-    E::Output: Serialize,
+    E: crate::dispatch::Export<C>,
+    C: Codec<E::Input> + Codec<E::Output>,
 {
-    let input = decode(input).map_err(|mut error| {
+    let input = <C as Codec<E::Input>>::decode(input).map_err(|mut error| {
         error.outcome = CallError::Discarded;
         error
     })?;
 
     let output = export.run(state, input).await;
 
-    encode(&output).map_err(|mut error| {
+    <C as Codec<E::Output>>::encode(&output).map_err(|mut error| {
         error.outcome = CallError::OutcomeUnknown;
         error
     })

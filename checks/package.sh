@@ -14,7 +14,9 @@ for package in aktor aktor-macros; do
         --strip-components=1 -C "$package_dir/$package"
 done
 test -f "$package_dir/aktor/src/dispatch/call.rs"
-tar --exclude=target --exclude=node_modules --exclude=pkg -cf - integrations \
+test -f "$package_dir/aktor/src/data/decode.rs"
+test -f "$package_dir/aktor-macros/src/data.rs"
+tar --exclude=target --exclude=pkg -cf - integrations \
     | tar -xf - -C "$package_dir"
 cp rust-toolchain.toml "$package_dir/"
 cat > "$package_dir/.cargo/config.toml" <<EOF

@@ -360,8 +360,8 @@ where
     }
 }
 
-impl<S: Send + 'static, I: Send + 'static, O: Send + 'static, Role>
-    TypedSession<S, I, O, AktorTaskState<S>, Role> for &AktorTask<S, Role>
+impl<S: Send + 'static, I: Send + 'static, O: Send + 'static, Role, Wire>
+    TypedSession<S, I, O, AktorTaskState<S>, Role, Wire> for &AktorTask<S, Role>
 {
     type Sender<Fut> = AktorTaskLatest<S, I, O, Fut>;
     type Results = AktorTaskResults<O>;

@@ -369,8 +369,8 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static> Session<S,
         )
     }
 }
-impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static>
-    TypedSession<S, I, O, OwnedState<S>, Role> for &Handle<S, Role>
+impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static, Wire>
+    TypedSession<S, I, O, OwnedState<S>, Role, Wire> for &Handle<S, Role>
 {
     type Sender<Fut> = LatestSender<I>;
     type Results = LatestResults<O>;

@@ -98,7 +98,7 @@ where
         >,
     Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
 {
-    start_custom(setup, context, spawn, local::serve).await
+    start_custom(setup, context, spawn, local::serve_on::<Clock, _, 0, ()>).await
 }
 
 pub async fn start_custom<S: 'static, Start, Kind, Clock: AktorGroupClock, Runner>(

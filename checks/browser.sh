@@ -2,7 +2,9 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s checks -p browser_test.py
+extras_dir=${AKTOR_EXTRAS:-"$PWD/../aktor-extras"}
+
+cargo test --locked --manifest-path "$extras_dir/checks/Cargo.toml" --test harness
 
 cargo +1.89.0 check -p aktor --no-default-features --features macros,bevy --target wasm32-unknown-unknown
 cargo clippy -p aktor --no-default-features --features macros,bevy --target wasm32-unknown-unknown -- -D warnings
@@ -15,11 +17,13 @@ cargo clippy -p aktor --no-default-features --features macros,wasm_browser_worke
 cargo +1.89.0 check --manifest-path integrations/Cargo.toml -p aktor-worker-proof --target wasm32-unknown-unknown
 cargo clippy --manifest-path integrations/Cargo.toml -p aktor-worker-proof --target wasm32-unknown-unknown -- -D warnings
 bash integrations/worker/build.sh
-python3 checks/browser.py
+cargo run --quiet --locked --manifest-path "$extras_dir/checks/Cargo.toml" \
+    --bin browser -- "$PWD"
 
 role_output=$(mktemp)
 trap 'rm -f "$role_output"' EXIT
-if cargo check --manifest-path integrations/Cargo.toml -p aktor-worker-proof --target wasm32-unknown-unknown --features wrong-role > "$role_output" 2>&1; then
+if cargo check --manifest-path integrations/Cargo.toml -p aktor-worker-proof \
+    --target wasm32-unknown-unknown --features wrong-role > "$role_output" 2>&1; then
     cat "$role_output"
     exit 1
 fi

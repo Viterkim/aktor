@@ -110,6 +110,7 @@ impl AktorGroupClock for Tokio {
 ))]
 impl AktorGroupClock for Browser {
     type Deadline = crate::group::Instant;
+    const EXECUTION: crate::AktorExecution = crate::AktorExecution::BrowserLocal;
 
     fn deadline(duration: core::time::Duration) -> Self::Deadline {
         crate::group::shutdown_deadline(crate::group::Instant::now(), duration)

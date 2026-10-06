@@ -1,6 +1,27 @@
 use crate::{Timeout, timeout::WaitStatus};
 use core::time::Duration;
 
+pub async fn yield_owner() {
+    #[cfg(target_family = "wasm")]
+    crate::timeout::browser_sleep(Duration::ZERO).await;
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let mut yielded = false;
+
+        core::future::poll_fn(|cx| {
+            if yielded {
+                core::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum TaskClock {
     #[cfg(all(feature = "tokio", not(target_family = "wasm")))]

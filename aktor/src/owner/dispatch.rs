@@ -92,7 +92,7 @@ impl<S: 'static, E, C, Role> WriteState<S, Role> for &Aktor<S, E, C, Role> {
     type Lease = OwnedState<S>;
 }
 
-impl<S, I, O, Lease, Role, E, C> crate::latest::TypedSession<S, I, O, Lease, Role>
+impl<S, I, O, Lease, Role, E, C, Wire> crate::latest::TypedSession<S, I, O, Lease, Role, Wire>
     for &Aktor<S, E, C, Role>
 where
     Self: crate::latest::Session<S, I, O, Role>,

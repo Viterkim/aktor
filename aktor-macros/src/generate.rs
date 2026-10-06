@@ -9,6 +9,13 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         return crate::worker::expand(options, function);
     }
 
+    if options.data {
+        return Err(syn::Error::new_spanned(
+            &function.signature,
+            "#[aktor(data)] needs concrete owned arguments and an owned result",
+        ));
+    }
+
     let aktor = path::aktor(options.crate_path)?;
     let role = options
         .role

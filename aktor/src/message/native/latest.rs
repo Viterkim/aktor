@@ -431,7 +431,8 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static> Session<S,
     }
 }
 
-impl<S, I, O, Lease, Role> crate::latest::TypedSession<S, I, O, Lease, Role> for &Handle<S, Role>
+impl<S, I, O, Lease, Role, Wire> crate::latest::TypedSession<S, I, O, Lease, Role, Wire>
+    for &Handle<S, Role>
 where
     Self: crate::latest::Session<S, I, O, Role>,
 {

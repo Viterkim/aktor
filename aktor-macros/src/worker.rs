@@ -222,6 +222,18 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     scope.visit_path_mut(&mut aktor);
 
+    let (wire, transport_note) = if options.data {
+        (
+            quote!(#aktor::dispatch::DataCodec),
+            "Check the actor's state type and actor marker. #[aktor(data)] worker arguments and results must implement AktorData.",
+        )
+    } else {
+        (
+            quote!(#aktor::dispatch::SerdeCodec),
+            "Check the actor's state type and actor marker. Browser worker arguments and results must implement Serialize and DeserializeOwned.",
+        )
+    };
+
     let dispatch = if state.mutable {
         quote!(#aktor::dispatch::WriteCall)
     } else {
@@ -292,19 +304,19 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #state_type, #input_type, #output, #role, #latest_lease, #latest_future
                 >
             where
-                #target: #aktor::latest::TypedSession<#state_type, #input_type, #output, #latest_lease, #role>,
+                #target: #aktor::latest::TypedSession<#state_type, #input_type, #output, #latest_lease, #role, #wire>,
                 #latest_future: ::core::future::Future<Output = (#latest_lease, #output)>,
                 <#target as #aktor::latest::TypedSession<
-                    #state_type, #input_type, #output, #latest_lease, #role
+                    #state_type, #input_type, #output, #latest_lease, #role, #wire
                 >>::Sender<#latest_future>: #aktor::latest::SendLatest<#input_type>,
             {
                 type Sender = LatestSender<
                     <#target as #aktor::latest::TypedSession<
-                        #state_type, #input_type, #output, #latest_lease, #role
+                        #state_type, #input_type, #output, #latest_lease, #role, #wire
                     >>::Sender<#latest_future>
                 >;
                 type Results = <#target as #aktor::latest::TypedSession<
-                    #state_type, #input_type, #output, #latest_lease, #role
+                    #state_type, #input_type, #output, #latest_lease, #role, #wire
                 >>::Results;
 
                 fn start(
@@ -314,7 +326,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #operation_name: #aktor::operation::Operation
                 ) -> (Self::Sender, Self::Results) {
                     let (#(#bindings,)*) = #input_name;
-                    let (#inner_name, #results_name) = #aktor::latest::TypedSession::session(
+                    let (#inner_name, #results_name) = <#target as #aktor::latest::TypedSession<
+                        #state_type, #input_type, #output, #latest_lease, #role, #wire
+                    >>::session(
                         #parameter, #operation_name,
                         async move |#state_name: &mut #state_type, #input_name| {
                             let (#(#bindings,)*) = #input_name;
@@ -333,7 +347,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 LatestSender<
                     <#target as #aktor::latest::TypedSession<
                         #state_type, #input_type, #output,
-                        <#target as #latest_lease_trait>::Lease, #role
+                        <#target as #latest_lease_trait>::Lease, #role, #wire
                     >>::Sender<
                         impl ::core::future::Future<
                             Output = (<#target as #latest_lease_trait>::Lease, #output)
@@ -341,15 +355,17 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     >
                 >,
                 <#target as #aktor::latest::TypedSession<
-                    #state_type, #input_type, #output, <#target as #latest_lease_trait>::Lease, #role
+                    #state_type, #input_type, #output, <#target as #latest_lease_trait>::Lease, #role, #wire
                 >>::Results
             )
             where
                 #target: #latest_lease_trait,
                 <#target as #latest_lease_trait>::Lease: #future_lifetime,
-                #target: #aktor::latest::TypedSession<#state_type, #input_type, #output, <#target as #latest_lease_trait>::Lease, #role>,
+                #target: #aktor::latest::TypedSession<#state_type, #input_type, #output, <#target as #latest_lease_trait>::Lease, #role, #wire>,
             {
-                let (#inner_name, #results_name) = #aktor::latest::TypedSession::session(
+                let (#inner_name, #results_name) = <#target as #aktor::latest::TypedSession<
+                    #state_type, #input_type, #output, <#target as #latest_lease_trait>::Lease, #role, #wire
+                >>::session(
                     #parameter,
                     #aktor::operation::Operation { name: NAME, caller: ::core::panic::Location::caller() },
                     async move |#state_name: &mut #state_type, #input_name| {
@@ -363,7 +379,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
             #[doc(hidden)]
             #[diagnostic::on_unimplemented(
-                note = "Check the actor's state type and actor marker. Browser worker arguments and results must implement Serialize and DeserializeOwned."
+                note = #transport_note
             )]
             pub trait #dispatch_trait<
                 #mode,
@@ -455,7 +471,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #state_parameter,
                     #input_parameter,
                     #output_parameter,
-                    #role_parameter
+                    #role_parameter,
+                    #wire
                 >
             {
                 type Lease = #aktor::dispatch::OwnedState<#state_parameter>;
@@ -463,7 +480,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #state_parameter,
                     #input_parameter,
                     #output_parameter,
-                    #role_parameter
+                    #role_parameter,
+                    #wire
                 >>::Request;
 
                 fn request<#function_parameter, #future_parameter>(
@@ -480,7 +498,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     ) -> #output_parameter + ::core::marker::Send + 'static,
                     #future_parameter: ::core::future::Future<Output = (Self::Lease, #output_parameter)>
                 {
-                    #aktor::dispatch::Transport::request(self, #operation_name, #input_name)
+                    <#target as #aktor::dispatch::Transport<
+                        #state_parameter, #input_parameter, #output_parameter, #role_parameter, #wire
+                    >>::request(self, #operation_name, #input_name)
                 }
             }
 
@@ -535,7 +555,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             #[doc(hidden)]
             #[derive(Default)]
             struct #adapter;
-            impl #aktor::dispatch::Export for #adapter {
+            impl #aktor::dispatch::Export<#wire> for #adapter {
                 type State = #state_type;
                 type Input = #input_type;
                 type Output = #output;
@@ -553,7 +573,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 }
             }
 
-            pub fn export() -> impl #aktor::dispatch::Export<
+            pub fn export() -> impl #aktor::dispatch::Export<#wire,
                 State = #state_type,
                 Input = #input_type,
                 Output = #output,
@@ -562,7 +582,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 #adapter
             }
 
-            #aktor::__aktor_register!(#adapter, NAME);
+            #aktor::__aktor_register!(#adapter, NAME, #wire);
         }
     })
 }

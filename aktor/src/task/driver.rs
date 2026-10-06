@@ -450,6 +450,15 @@ async fn drive<S, Start, Fut>(
         .iter()
         .map(|interval| clock.deadline(interval.every))
         .collect();
+    let portable_budget = match clock {
+        #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
+        TaskClock::Tokio => false,
+        #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+        TaskClock::Std => true,
+        #[cfg(target_family = "wasm")]
+        TaskClock::Browser => true,
+    };
+    let mut remaining = 32;
 
     loop {
         if ordinary_done && services_done {
@@ -562,6 +571,15 @@ async fn drive<S, Start, Fut>(
                 break;
             }
         }
+
+        if portable_budget {
+            remaining -= 1;
+
+            if remaining == 0 {
+                super::clock::yield_owner().await;
+                remaining = 32;
+            }
+        }
     }
 
     receiver.close();
@@ -635,5 +653,168 @@ async fn wait_interval(due: Option<(usize, TaskDeadline)>) {
         deadline.wait().await;
     } else {
         core::future::pending::<()>().await;
+    }
+}
+
+#[cfg(all(test, feature = "bevy", not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    struct Signal(AtomicUsize);
+    impl Wake for Signal {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct Chain {
+        sender: mpsc::Sender<Message<()>>,
+        services: Option<Arc<service::Services<()>>>,
+        count: Arc<AtomicUsize>,
+        remaining: usize,
+    }
+    impl Chain {
+        fn enqueue(self) {
+            let sender = self.sender.clone();
+            let services = self.services.clone();
+            let message = Message {
+                operation: Operation {
+                    name: "chain",
+                    caller: std::panic::Location::caller(),
+                },
+                job: Box::new(self),
+            };
+
+            if let Some(services) = services {
+                assert!(services.push(message, false).is_ok());
+                services.wake.notify_one();
+            } else {
+                assert!(sender.try_send(message).is_ok());
+            }
+        }
+    }
+    impl Job<()> for Chain {
+        fn poll(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            state: Option<AktorTaskState<()>>,
+            _: &mut AktorHooks<()>,
+            _: Operation,
+        ) -> Poll<()> {
+            let this = self.get_mut();
+            drop(state);
+            this.count.fetch_add(1, Ordering::Relaxed);
+
+            if this.remaining > 1 {
+                Chain {
+                    sender: this.sender.clone(),
+                    services: this.services.clone(),
+                    count: this.count.clone(),
+                    remaining: this.remaining - 1,
+                }
+                .enqueue();
+            }
+
+            Poll::Ready(())
+        }
+    }
+
+    #[test]
+    fn owner_budget() {
+        for latest in [false, true] {
+            let group = AktorGroup::new();
+            let kill = group.killswitch();
+            let (sender, receiver) = mpsc::channel(1);
+            let services = Arc::new(service::Services::new());
+            let count = Arc::new(AtomicUsize::new(0));
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let cleanup = cleaned.clone();
+            let (_closing, closed) = oneshot::channel();
+            let (_forcing, forced) = oneshot::channel();
+            let (ready, _started) = oneshot::channel();
+            let (completed, outcome) = oneshot::channel();
+            let (finished, _observed) = watch::channel(AktorTaskStatus::Running);
+            let completion = Completion {
+                report: ActorOutcome {
+                    actor: "chain".into(),
+                    kind: Some(crate::AktorExecution::BevyTask),
+                    diagnostics: vec![],
+                    timed_out: false,
+                },
+                kill: kill.clone(),
+                completed: Some(completed),
+                finished,
+                failed: false,
+            };
+            let logic = TaskLogic {
+                start: async || Ok(()),
+                end: Some(
+                    (async move |_: ()| {
+                        cleanup.store(true, Ordering::Relaxed);
+                        Ok(())
+                    })
+                    .into(),
+                ),
+                intervals: vec![],
+                hooks: AktorHooks {
+                    before_each: None,
+                    after_each: None,
+                },
+                clock: TaskClock::Std,
+            };
+
+            Chain {
+                sender,
+                services: latest.then(|| services.clone()),
+                count: count.clone(),
+                remaining: 256,
+            }
+            .enqueue();
+
+            let mut owner = Box::pin(drive(
+                logic,
+                receiver,
+                service::ServiceDriver {
+                    services,
+                    kill: kill.clone(),
+                },
+                closed,
+                forced,
+                ready,
+                completion,
+            ));
+            let signal = Arc::new(Signal(AtomicUsize::new(0)));
+            let waker = Waker::from(signal.clone());
+            let first = owner.as_mut().poll(&mut Context::from_waker(&waker));
+            let mut polled = first;
+            let observed = count.load(Ordering::Relaxed);
+            let wakes = signal.0.load(Ordering::Relaxed);
+
+            for _ in 0..256 {
+                if polled.is_ready() || count.load(Ordering::Relaxed) == 256 {
+                    break;
+                }
+
+                polled = owner.as_mut().poll(&mut Context::from_waker(&waker));
+            }
+            kill.stop();
+
+            if polled.is_pending() {
+                crate::executor::block_on(owner);
+            }
+            let report = crate::executor::block_on(outcome).unwrap();
+
+            assert!(!report.timed_out && report.diagnostics.is_empty());
+            assert!(cleaned.load(Ordering::Relaxed));
+            assert_eq!(count.load(Ordering::Relaxed), 256);
+            assert!(
+                observed > 0 && observed < 256,
+                "one poll ran {observed} jobs"
+            );
+            assert!(first.is_pending());
+            assert!(wakes > 0);
+        }
     }
 }

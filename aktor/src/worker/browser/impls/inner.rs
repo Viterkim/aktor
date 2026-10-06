@@ -110,6 +110,7 @@ impl Inner {
         }
 
         self.wake_sessions();
+        self.buffers.clear();
         self.worker.terminate();
         self.retained.borrow_mut().take();
     }
@@ -128,7 +129,7 @@ impl Inner {
             let Some(id) = next else {
                 if self.closed.get()
                     && !self.shutdown_sent.replace(true)
-                    && let Err(error) = post(&self.worker, &Incoming::Shutdown)
+                    && let Err(error) = post(&self.worker, &self.buffers, &Incoming::Shutdown)
                 {
                     self.fail(error.cause);
                 }
@@ -167,7 +168,7 @@ impl Inner {
             if let Some(input) = input {
                 self.outstanding.borrow_mut().insert(id, work);
 
-                if let Err(error) = post(&self.worker, &input) {
+                if let Err(error) = post(&self.worker, &self.buffers, &input) {
                     self.fail(error.cause);
                 }
 
@@ -224,7 +225,12 @@ impl Drop for Inner {
     }
 }
 
-pub fn post(worker: &web_sys::Worker, input: &Incoming) -> Result<(), WireError> {
+pub fn post(
+    worker: &web_sys::Worker,
+    buffers: &Buffers,
+    input: &Incoming,
+) -> Result<(), WireError> {
+    let reusable = matches!(input, Incoming::Call { .. });
     let input = postcard::to_allocvec(input).map_err(|error| {
         WireError::new(
             CallError::NotAdmitted,
@@ -232,8 +238,16 @@ pub fn post(worker: &web_sys::Worker, input: &Incoming) -> Result<(), WireError>
         )
     })?;
 
-    let array = js_sys::Uint8Array::from(input.as_slice());
-    let buffer = array.buffer();
+    let buffer = if reusable {
+        buffers.write(&input).map_err(|error| {
+            WireError::new(
+                CallError::NotAdmitted,
+                WorkerCause::Codec(format!("{error:?}")),
+            )
+        })?
+    } else {
+        js_sys::Uint8Array::from(input.as_slice()).buffer()
+    };
     let transfers = js_sys::Array::new();
 
     transfers.push(&buffer);
