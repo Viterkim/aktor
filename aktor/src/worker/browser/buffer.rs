@@ -9,17 +9,21 @@ export function transfer_buffer(length, capacity) {
     if (capacity > 0 && typeof ArrayBuffer.prototype.resize === 'function') {
         try {
             return new ArrayBuffer(length, { maxByteLength: capacity });
-        } catch (_) {}
+        } catch (_) {
+        }
     }
 
     return new ArrayBuffer(length);
 }
 
 export function resize_transfer_buffer(buffer, length) {
-    if (buffer.byteLength === length) return true;
+    if (buffer.byteLength === length) {
+        return true;
+    }
 
     if (buffer.resizable && length <= buffer.maxByteLength) {
         buffer.resize(length);
+
         return true;
     }
 

@@ -2,9 +2,7 @@
 
 ## Setups
 
-TokioThread owns a dedicated thread, TokioTask runs on your runtime. StdThread needs the std_thread feature. No runtime is enabled by default.
-
-For local state, use TokioLocal(&local_set), BevyLocal(&pool) or BrowserLocal. Keep the local executor running. BevyTask(&pool) uses transferable state.
+The [counter](../../README.md#counter) starts one actor. Give each setup a name to start several together:
 
 ```rust
 let actors = start(aktor_setups! {
@@ -15,9 +13,9 @@ let actors = start(aktor_setups! {
 let id = insert_user(&actors.handles.users, "Katten".into()).await?;
 ```
 
-Keep actors alive while using its handles. If you already own a started group, `start_in(&group, setup).await?` returns handles. Failed or cancelled startup stops that whole group. Startup errors keep the original .error and an optional rollback .report.
+Keep actors alive while using its handles. With an existing started group, `start_in(&group, setup).await?` returns handles instead. Failed or cancelled startup stops that whole group.
 
-Roles restrict operations: put role: Users in the setup and #[aktor(role = Users)] on its functions. AktorNoRole accepts unmarked functions.
+TokioTask uses your runtime, StdThread works without Tokio. For local state, use TokioLocal(&local_set), BevyLocal(&pool) or BrowserLocal and keep that executor running. BevyTask(&pool) requires transferable state.
 
 ## Setup / cleanup
 
@@ -26,6 +24,7 @@ let setup = async || {
     Connection::open("users.sqlite")
         .map_err(|error| AktorSetupError::new(error.to_string()))
 };
+
 let cleanup = async |db: Connection| {
     db.close().map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
 };
@@ -42,9 +41,9 @@ let actors = start(AktorSetup {
 }).await?;
 ```
 
-These run on the owner thread. For typed lifecycle data, use TokioThread.with_data::<SetupData, CleanupData>() with AktorSetupError<SetupData> and AktorCleanupError<CleanupData>. StdThread supports it too.
+Here they run on the owner thread. To keep typed errors, use TokioThread.with_data::<SetupData, CleanupData>() and the matching AktorSetupError<SetupData> / AktorCleanupError<CleanupData>.
 
-The [counter](../examples/counter.rs) adds before_each / after_each hooks. Put AktorInterval { every, run } in closures.intervals for periodic work. Its next wait begins after the callback finishes, shutdown stops scheduling. Task callbacks use AktorTaskState<S> through awaits.
+The [counter example](../examples/counter.rs) adds hooks. Roles restrict which functions a handle accepts, put role: Users in the setup and #[aktor(role = Users)] on its functions.
 
 ## Calling another query
 
@@ -61,7 +60,7 @@ pub async fn insert_users(db: &mut Connection, names: Vec<String>) -> Result<()>
 }
 ```
 
-The transaction queues once. The calls inside it use the connection directly.
+The whole transaction queues once, insert_user gets the connection directly.
 
 ## Get the reply later
 
@@ -75,7 +74,7 @@ if let Some(result) = reply.try_take() {
 }
 ```
 
-send waits for queue space. try_take takes a ready output once. Dropping an admitted reply leaves the operation running.
+send waits for queue space, then you can take the output once with try_take or await it. Dropping that reply leaves the operation running.
 
 ```rust
 let id = insert_user(&database, "Katten".into())
@@ -83,7 +82,7 @@ let id = insert_user(&database, "Katten".into())
     .await??;
 ```
 
-The extra result is the timeout. An admitted insert keeps running, so a timeout doesn't mean the write failed.
+The extra result is the timeout, the insert can still finish after you've stopped waiting. Check stored state before retrying a write.
 
 ## Latest input
 
@@ -98,7 +97,7 @@ while let Some(rows) = results.next().await {
 }
 ```
 
-Older results get thrown away. Each session keeps one pending input outside the queue limit. Use ordinary replies for writes.
+Only the latest input's result comes back. Each session keeps one pending input outside the queue limit, use ordinary replies for writes.
 
 [SQLite](../examples/sqlite/main.rs)
 
@@ -110,4 +109,4 @@ Older results get thrown away. Each session keeps one pending input outside the 
 
 [Embassy](../../integrations/embassy/README.md)
 
-For your own serving loop, [Custom](../tests/runtime/setup.rs) takes a clock, a spawning callback and a runner. Run each accepted call with call.run().await, Aktor still owns setup and cleanup.
+For your own serving loop, [Custom](../tests/runtime/setup.rs) lets you run accepted calls with call.run().await.

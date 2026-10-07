@@ -3,6 +3,7 @@ use aktor::*;
 #[aktor]
 async fn add(count: &mut u32, amount: u32) -> u32 {
     *count += amount;
+
     *count
 }
 

@@ -4,10 +4,10 @@ Write some sql in a normal function, pass your handle and `.await` it. One owner
 
 ```toml
 [dependencies]
-aktor = { path = "aktor", features = ["tokio"] }
+aktor = { version = "0.0.4", features = ["tokio"] }
 ```
 
-This checkout has the next setup API. [0.0.3's docs](https://docs.rs/aktor/0.0.3/aktor/) cover the published version. Anything up to 0.1 will not have a stable api.
+Anything up to 0.1 will not have a stable api.
 
 ## Counter
 
@@ -32,7 +32,7 @@ let count = add(&actors.handles, 5).await;
 let report = actors.shutdown().await;
 ```
 
-TokioThread owns the state on its own thread. The defaults give you a queue of 32 and five seconds to shut down. Keep actors alive, dropping it starts group shutdown.
+Keep actors alive while using its handles, dropping it starts shutdown. TokioThread owns the counter on its own thread, with room for 32 queued calls by default.
 
 ## SQLite
 
@@ -47,7 +47,7 @@ pub async fn insert_user(db: &Connection, name: String) -> rusqlite::Result<i64>
 let id = insert_user(&database, "Katten".into()).await?;
 ```
 
-Create the connection in your start closure, [like this](aktor/examples/sqlite/main.rs). Your function's errors come back as usual. Inside another query, pass the connection you already have. Passing its handle queues behind yourself.
+Create the connection in your start closure, [like this](aktor/examples/sqlite/main.rs), and its errors come back as usual. Inside another query, pass the connection you already have. Passing its handle queues behind yourself.
 
 ## Docs
 

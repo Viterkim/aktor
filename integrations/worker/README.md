@@ -12,7 +12,7 @@ let actors = start(AktorWorkerSetup {
 }).await?;
 ```
 
-The worker builds its closures with worker::serve_setup and awaits server.wait(), [like this](src/remote.rs). Config uses Serde. Set the same build identity on both sides and change it when your wire types change, compatibility is checked before setup runs.
+The worker builds its resource with worker::serve_setup, [like this](src/remote.rs). Give both sides the same build identity and change it when your wire types change, an incompatible worker is rejected before setup runs.
 
 ## Typed data
 
@@ -33,11 +33,11 @@ async fn save(db: &mut Database, record: Record) -> Result<(), String> {
 save(&worker, record).await?;
 ```
 
-AktorData uses compact binary data and sends Vec<u8> in bulk. It leaves ordinary Serde alone. Skipped fields come back through Default, handy for local caches.
+AktorData sends this as compact binary data, including the bytes in bulk, without changing how ordinary Serde sees Record. cache isn't sent, it comes back as Default::default().
 
-Plain #[aktor] uses tagged binary Serde. For bulk bytes there, use #[serde(with = "aktor::worker::bytes")]. Worker arguments and results must be owned. Both codecs are binary.
+Plain #[aktor] uses tagged binary Serde, including for the startup config. With that codec, #[serde(with = "aktor::worker::bytes")] sends byte fields in bulk too. Worker arguments and results must be owned.
 
-capacity counts outstanding ordinary calls, including the running call. An oversized message takes the whole byte budget and runs alone. Latest pending inputs sit outside that budget. A timeout or lost reply can leave a write unconfirmed, reconcile with stored state before retrying.
+Worker capacity includes the running call, latest pending inputs sit outside the ordinary queue budget. If a write times out or loses its reply, check stored state before retrying.
 
 ## Try it
 
@@ -48,7 +48,7 @@ bash integrations/worker/build.sh
 cargo run --manifest-path ../aktor-extras/checks/Cargo.toml --bin browser -- "$PWD" serve
 ```
 
-Open the printed address, Enter stops the server. [The SQLite worker](src/browser.rs) uses OPFS for persistent browser storage.
+Open the printed address to try the [SQLite worker](src/browser.rs), it stores data in OPFS. Enter stops the server.
 
 ```sh
 AKTOR_CHROMIUM=/path/to/chromium bash scripts/check.sh browser

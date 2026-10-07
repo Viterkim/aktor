@@ -26,9 +26,11 @@ pub fn decode<T: AktorData>(bytes: &[u8]) -> Result<T, WorkerError> {
     })
     .map_err(report)?;
     let tail = decoder.finalize().map_err(report)?;
+
     if !tail.is_empty() {
         return Err(report(postcard::Error::DeserializeBadEncoding));
     }
+
     Ok(value.0)
 }
 
@@ -47,9 +49,11 @@ struct Limits<'a> {
 impl Limits<'_> {
     fn value<E: de::Error>(&self) -> Result<(), E> {
         let remaining = self.remaining.get();
+
         if remaining == 0 {
             return Err(E::custom("worker data has too many values"));
         }
+
         self.remaining.set(remaining - 1);
         Ok(())
     }
@@ -58,7 +62,9 @@ impl Limits<'_> {
         if self.depth >= MAX_DEPTH {
             return Err(E::custom("worker data is nested too deeply"));
         }
+
         self.value()?;
+
         Ok(Self {
             depth: self.depth + 1,
             ..self
@@ -70,22 +76,27 @@ struct Bounded<'a, D> {
     inner: D,
     limits: Limits<'a>,
 }
+
 struct Visit<'a, V> {
     inner: V,
     limits: Limits<'a>,
 }
+
 struct Access<'a, A> {
     inner: A,
     limits: Limits<'a>,
 }
+
 struct Seed<'a, S> {
     inner: S,
     limits: Limits<'a>,
 }
 impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for Seed<'_, S> {
     type Value = S::Value;
+
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         self.limits.value()?;
+
         self.inner.deserialize(Bounded {
             inner: deserializer,
             limits: self.limits,
@@ -103,9 +114,11 @@ macro_rules! deserialize {
 }
 impl<'de, D: Deserializer<'de>> Deserializer<'de> for Bounded<'_, D> {
     type Error = D::Error;
+
     fn is_human_readable(&self) -> bool {
         false
     }
+
     deserialize!(
         deserialize_any,
         deserialize_bool,
@@ -150,9 +163,11 @@ macro_rules! visit {
 }
 impl<'de, V: Visitor<'de>> Visitor<'de> for Visit<'_, V> {
     type Value = V::Value;
+
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.expecting(formatter)
     }
+
     visit!(
         visit_bool(bool),
         visit_i8(i8),
@@ -175,6 +190,7 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Visit<'_, V> {
         visit_borrowed_bytes(&'de [u8]),
         visit_byte_buf(Vec<u8>)
     );
+
     fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
         self.inner.visit_none()
     }
@@ -223,6 +239,7 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Visit<'_, V> {
 }
 impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for Access<'_, A> {
     type Error = A::Error;
+
     fn next_element_seed<S: DeserializeSeed<'de>>(
         &mut self,
         seed: S,
@@ -241,6 +258,7 @@ impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for Access<'_, A> {
 }
 impl<'de, A: MapAccess<'de>> MapAccess<'de> for Access<'_, A> {
     type Error = A::Error;
+
     fn next_key_seed<S: DeserializeSeed<'de>>(
         &mut self,
         seed: S,
@@ -270,6 +288,7 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for Access<'_, A> {
 impl<'a, 'de, A: EnumAccess<'de>> EnumAccess<'de> for Access<'a, A> {
     type Error = A::Error;
     type Variant = Access<'a, A::Variant>;
+
     fn variant_seed<S: DeserializeSeed<'de>>(
         self,
         seed: S,
@@ -278,6 +297,7 @@ impl<'a, 'de, A: EnumAccess<'de>> EnumAccess<'de> for Access<'a, A> {
             inner: seed,
             limits: self.limits,
         })?;
+
         Ok((
             value,
             Access {
@@ -289,6 +309,7 @@ impl<'a, 'de, A: EnumAccess<'de>> EnumAccess<'de> for Access<'a, A> {
 }
 impl<'de, A: VariantAccess<'de>> VariantAccess<'de> for Access<'_, A> {
     type Error = A::Error;
+
     fn unit_variant(self) -> Result<(), Self::Error> {
         self.inner.unit_variant()
     }

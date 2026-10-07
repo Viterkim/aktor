@@ -14,6 +14,7 @@ struct Member {
     ty: Type,
     skip: bool,
 }
+
 #[derive(Clone)]
 struct Shape {
     fields: Fields,
@@ -35,8 +36,10 @@ impl Shape {
                 })
             })
             .collect::<syn::Result<Vec<_>>>()?;
+
         Ok(Self { fields, members })
     }
+
     fn helper(&self, aktor: &TokenStream, lifetime: Option<&syn::Lifetime>) -> TokenStream {
         let fields = self
             .members
@@ -49,18 +52,22 @@ impl Shape {
                 } else {
                     quote!(#aktor::data::Owned<#ty>)
                 };
+
                 let name = &field.name;
+
                 match &self.fields {
                     Fields::Named(_) => quote!(#name: #ty),
                     _ => ty,
                 }
             });
+
         match &self.fields {
             Fields::Named(_) => quote!({ #(#fields,)* }),
             Fields::Unnamed(_) => quote!((#(#fields,)*)),
             Fields::Unit => quote!(),
         }
     }
+
     fn construct(
         &self,
         prefix: TokenStream,
@@ -71,12 +78,14 @@ impl Shape {
             .members
             .iter()
             .filter(|field| include_skipped || !field.skip);
+
         match &self.fields {
             Fields::Named(_) => {
                 let fields = members.zip(values).map(|(member, value)| {
                     let name = &member.name;
                     quote!(#name: #value)
                 });
+
                 quote!(#prefix { #(#fields,)* })
             }
             Fields::Unnamed(_) => quote!(#prefix(#(#values,)*)),
@@ -87,6 +96,7 @@ impl Shape {
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let mut overridden = None;
+
     for attribute in &input.attrs {
         if attribute.path().is_ident("aktor") {
             attribute.parse_nested_meta(|meta| {
@@ -99,11 +109,14 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             })?;
         }
     }
+
     let aktor = path::aktor(overridden)?;
     let serde = quote!(#aktor::data::__serde);
     let serde_path = syn::LitStr::new(&serde.to_string(), proc_macro2::Span::call_site());
     let mut reserved = HashSet::new();
+
     names::collect(input.to_token_stream(), &mut reserved);
+
     let reference = names::binding(&mut reserved, "__AktorWireRef");
     let owned = names::binding(&mut reserved, "__AktorWireOwned");
     let marker = names::binding(&mut reserved, "__aktor_marker");
@@ -112,6 +125,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let deserializer = names::binding(&mut reserved, "__AktorDeserializer");
     let lifetime_name = names::binding(&mut reserved, "__aktor_wire_lifetime");
     let lifetime = syn::Lifetime::new(&format!("'{lifetime_name}"), lifetime_name.span());
+
     let name = &input.ident;
     let mut generics = input.generics.clone();
     let mut shapes = Vec::new();
@@ -130,6 +144,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     Ok(variant.ident)
                 })
                 .collect::<syn::Result<Vec<_>>>()?;
+
             Some(variants)
         }
         Data::Union(_) => {
@@ -139,7 +154,9 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             ));
         }
     };
+
     add_bounds(&mut generics, name, &shapes, &aktor);
+
     let (implementation, arguments, bounds) = generics.split_for_impl();
     let decode_lifetime_name = names::binding(&mut reserved, "__aktor_decode_lifetime");
     let decode_lifetime = syn::Lifetime::new(
@@ -154,23 +171,29 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let mut helper_generics = generics.clone();
     let mut helper_shapes = shapes.clone();
     let original: Type = parse_quote!(#name #arguments);
+
     NormalizeSelf(&original).visit_generics_mut(&mut helper_generics);
     RenameLifetime(&renamed_lifetime).visit_generics_mut(&mut helper_generics);
+
     for shape in &mut helper_shapes {
         for field in &mut shape.members {
             NormalizeSelf(&original).visit_type_mut(&mut field.ty);
             RenameLifetime(&renamed_lifetime).visit_type_mut(&mut field.ty);
         }
     }
+
     let (owned_impl, helper_arguments, owned_bounds) = helper_generics.split_for_impl();
     let mut borrowed = helper_generics.clone();
     borrowed.params.insert(0, parse_quote!(#lifetime));
     let (borrowed_impl, _, borrowed_bounds) = borrowed.split_for_impl();
+
     let mut inferred = generics.clone();
     inferred.params.insert(0, parse_quote!(#lifetime));
+
     if let Some(GenericParam::Lifetime(parameter)) = inferred.params.first_mut() {
         parameter.lifetime = syn::Lifetime::new("'_", proc_macro2::Span::call_site());
     }
+
     let (_, borrowed_args, _) = inferred.split_for_impl();
 
     let (helpers, serialize, deserialize) = if let Some(variants) = variants {
@@ -180,12 +203,14 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         let values = helper_shapes.iter().map(|shape| shape.helper(&aktor, None));
         let mut writes = Vec::new();
         let mut reads = Vec::new();
+
         for (variant, shape) in variants.iter().zip(&shapes) {
             let bindings: Vec<_> = shape
                 .members
                 .iter()
                 .map(|_| names::binding(&mut reserved, "__aktor_field"))
                 .collect();
+
             let pattern_values = shape
                 .members
                 .iter()
@@ -208,6 +233,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 .collect();
             let wire = shape.construct(quote!(#reference::#variant), wire_values, false);
             writes.push(quote!(#pattern => #wire));
+
             let read_values = shape
                 .members
                 .iter()
@@ -231,6 +257,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             let restored = shape.construct(quote!(Self::#variant), restored, true);
             reads.push(quote!(#read_pattern => #restored));
         }
+
         let helpers = quote! {
             #[allow(non_camel_case_types)]
             #[derive(#serde::Serialize)]
@@ -240,6 +267,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 #[serde(skip)]
                 #marker(::core::marker::PhantomData<&#lifetime #name #helper_arguments>),
             }
+
             #[allow(non_camel_case_types)]
             #[derive(#serde::Deserialize)]
             #[serde(crate = #serde_path, bound = "")]
@@ -249,10 +277,12 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 #marker(::core::marker::PhantomData<fn() -> #name #helper_arguments>),
             }
         };
+
         let serialize = quote! {
             let #local: #reference #borrowed_args = match self { #(#writes,)* };
             #serde::Serialize::serialize(&#local, serializer)
         };
+
         let deserialize = quote! {
             let #local: #owned #arguments = #serde::Deserialize::deserialize(deserializer)?;
             ::core::result::Result::Ok(match #local {
@@ -260,6 +290,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 #owned::#marker(_) => return ::core::result::Result::Err(#serde::de::Error::custom("invalid AktorData variant")),
             })
         };
+
         (helpers, serialize, deserialize)
     } else {
         let shape = &shapes[0];
@@ -278,6 +309,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             .filter(|field| !field.skip)
             .map(|field| &field.ty)
             .collect();
+
         let helpers = match &shape.fields {
             Fields::Named(_) => quote! {
                 #[derive(#serde::Serialize)]
@@ -287,6 +319,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     #[serde(skip)]
                     #marker: ::core::marker::PhantomData<&#lifetime #name #helper_arguments>,
                 }
+
                 #[derive(#serde::Deserialize)]
                 #[serde(crate = #serde_path, bound = "")]
                 struct #owned #owned_impl #owned_bounds {
@@ -298,12 +331,22 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             _ => quote! {
                 #[derive(#serde::Serialize)]
                 #[serde(crate = #serde_path, bound = "")]
-                struct #reference #borrowed_impl (#(#aktor::data::Ref<#lifetime, #types>,)* #[serde(skip)] ::core::marker::PhantomData<&#lifetime #name #helper_arguments>) #borrowed_bounds;
+                struct #reference #borrowed_impl (
+                    #(#aktor::data::Ref<#lifetime, #types>,)*
+                    #[serde(skip)]
+                    ::core::marker::PhantomData<&#lifetime #name #helper_arguments>
+                ) #borrowed_bounds;
+
                 #[derive(#serde::Deserialize)]
                 #[serde(crate = #serde_path, bound = "")]
-                struct #owned #owned_impl (#(#aktor::data::Owned<#types>,)* #[serde(skip)] ::core::marker::PhantomData<fn() -> #name #helper_arguments>) #owned_bounds;
+                struct #owned #owned_impl (
+                    #(#aktor::data::Owned<#types>,)*
+                    #[serde(skip)]
+                    ::core::marker::PhantomData<fn() -> #name #helper_arguments>
+                ) #owned_bounds;
             },
         };
+
         let serialize = match &shape.fields {
             Fields::Named(_) => {
                 let fields = active.iter().map(|field| {
@@ -321,6 +364,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             }
         };
         let serialize = quote! { #serialize #serde::Serialize::serialize(&#local, serializer) };
+
         let mut active_index = 0;
         let restored = shape
             .members
@@ -340,17 +384,26 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
             let #local: #owned #arguments = #serde::Deserialize::deserialize(deserializer)?;
             ::core::result::Result::Ok(#restored)
         };
+
         (helpers, serialize, deserialize)
     };
+
     Ok(quote! {
         const _: () = {
             #[allow(non_camel_case_types)]
             #helpers
+
             impl #implementation #aktor::AktorData for #name #arguments #bounds {
-                fn serialize_data<#serializer: #serde::Serializer>(&self, serializer: #serializer) -> ::core::result::Result<#serializer::Ok, #serializer::Error> {
+                fn serialize_data<#serializer: #serde::Serializer>(
+                    &self,
+                    serializer: #serializer,
+                ) -> ::core::result::Result<#serializer::Ok, #serializer::Error> {
                     #serialize
                 }
-                fn deserialize_data<#decode_lifetime, #deserializer: #serde::Deserializer<#decode_lifetime>>(deserializer: #deserializer) -> ::core::result::Result<Self, #deserializer::Error> {
+
+                fn deserialize_data<#decode_lifetime, #deserializer: #serde::Deserializer<#decode_lifetime>>(
+                    deserializer: #deserializer,
+                ) -> ::core::result::Result<Self, #deserializer::Error> {
                     #deserialize
                 }
             }
@@ -361,6 +414,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
 fn skipped(field: &Field) -> syn::Result<bool> {
     let mut skip = false;
     let mut hidden = None;
+
     for attribute in &field.attrs {
         if attribute.path().is_ident("aktor") {
             attribute.parse_nested_meta(|meta| {
@@ -368,6 +422,7 @@ fn skipped(field: &Field) -> syn::Result<bool> {
                     if skip {
                         return Err(meta.error("duplicate aktor(skip)"));
                     }
+
                     skip = true;
                     Ok(())
                 } else {
@@ -375,9 +430,11 @@ fn skipped(field: &Field) -> syn::Result<bool> {
                 }
             })?;
         }
+
         if attribute.path().is_ident("serde") {
             let options =
                 attribute.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
+
             for option in options {
                 if option.path().is_ident("skip")
                     || option.path().is_ident("skip_serializing")
@@ -388,12 +445,14 @@ fn skipped(field: &Field) -> syn::Result<bool> {
             }
         }
     }
+
     if !skip && let Some(option) = hidden {
         return Err(syn::Error::new_spanned(
             option,
             "this field is hidden by Serde but would be sent by AktorData; add #[aktor(skip)] to omit it from worker transport",
         ));
     }
+
     Ok(skip)
 }
 
@@ -417,10 +476,13 @@ fn add_bounds(generics: &mut Generics, name: &Ident, shapes: &[Shape], aktor: &T
             _ => None,
         })
         .collect();
+
     let recursive = HashSet::from([name.to_string(), "Self".to_owned()]);
     let mut recursive_parameters = HashSet::new();
+
     for field in shapes.iter().flat_map(|shape| &shape.members) {
         let ty = &field.ty;
+
         if field.skip {
             generics
                 .make_where_clause()
@@ -428,19 +490,23 @@ fn add_bounds(generics: &mut Generics, name: &Ident, shapes: &[Shape], aktor: &T
                 .push(parse_quote!(#ty: ::core::default::Default));
             continue;
         }
+
         let mut uses_parameter = Mentions {
             names: &parameters,
             found: false,
         };
         uses_parameter.visit_type(ty);
+
         if !uses_parameter.found {
             continue;
         }
+
         let mut uses_self = Mentions {
             names: &recursive,
             found: false,
         };
         uses_self.visit_type(ty);
+
         if uses_self.found {
             for parameter in &parameters {
                 let mut mentioned = Mentions {
@@ -448,6 +514,7 @@ fn add_bounds(generics: &mut Generics, name: &Ident, shapes: &[Shape], aktor: &T
                     found: false,
                 };
                 mentioned.visit_type(ty);
+
                 if mentioned.found {
                     recursive_parameters.insert(parameter.clone());
                 }
@@ -459,6 +526,7 @@ fn add_bounds(generics: &mut Generics, name: &Ident, shapes: &[Shape], aktor: &T
                 .push(parse_quote!(#ty: #aktor::AktorData));
         }
     }
+
     for parameter in recursive_parameters {
         let parameter = Ident::new(&parameter, proc_macro2::Span::call_site());
         generics

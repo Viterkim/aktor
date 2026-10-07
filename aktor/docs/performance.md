@@ -1,52 +1,90 @@
 # Performance
 
-Tiny calls make the overhead easy to see. The handwritten loop has no group failure reporting or shutdown watchdog, so the comparisons don't all buy you the same behaviour.
+## Calling a counter
 
-## Task calls
-
-One caller, capacity 100, current-thread Tokio. Time per completed call.
+Add one and wait for the answer. One caller, queue of 100, Tokio on one thread.
 
 ```text
-                   Counter    CPU work    Yielding
-Handwritten        0.19 µs     5.62 µs     0.31 µs
-Actify             0.23 µs     5.90 µs     0.34 µs
-Aktor TokioTask    0.34 µs     5.98 µs     0.46 µs
-Kameo .send()      0.40 µs     5.72 µs     0.55 µs
-Kameo              0.41 µs     5.74 µs     0.57 µs
+Handwritten Tokio loop    0.19 µs
+Actify                    0.23 µs
+Aktor TokioTask           0.34 µs
+Kameo .send()             0.40 µs
+Kameo                     0.41 µs
 ```
 
-Actify uses skip_broadcast. These calls leave queue capacity available.
+Actify has broadcasts turned off.
 
-## Workers
+## With CPU work
 
-Full round trips through BrowserWebWorker, before and after buffer reuse.
+Same call, with a 4,096-step hash loop inside it.
 
 ```text
-AktorData               Fresh buffers    Reused buffers
-64 KiB bytes                0.129 ms          0.054 ms
-1 MiB bytes                  1.39 ms           0.34 ms
-10,485 records               2.63 ms           2.02 ms
+Handwritten Tokio loop    5.62 µs
+Kameo .send()             5.72 µs
+Kameo                     5.74 µs
+Actify                    5.90 µs
+Aktor TokioTask           5.98 µs
 ```
 
-The 1 MiB run used about 78% less browser CPU. Tiny calls stayed around 27 µs.
+## With a yield
 
-Both codecs are binary. With reused buffers, the same records took:
+The counter call also awaits Tokio's yield_now().
 
 ```text
-AktorData           2.02 ms     880 KB encoded
-Tagged Serde        3.41 ms    1.53 MB encoded
+Handwritten Tokio loop    0.31 µs
+Actify                    0.34 µs
+Aktor TokioTask           0.46 µs
+Kameo .send()             0.55 µs
+Kameo                     0.57 µs
 ```
 
-## Batches
+## Web workers
 
-Small items sent together in one worker operation, time per item.
+Send bytes to a worker in Chromium and get them back as Rust bytes. Aktor reuses its buffers automatically.
+
+### 8 bytes
 
 ```text
-  1 item           71.5 µs
- 16 items           3.55 µs
-128 items           1.31 µs
+Yew Agent               22 µs
+Gloo Worker             22 µs
+Leptos Workers          31 µs
+Aktor, Serde            33 µs
+Aktor, AktorData        35 µs
+Leptos, transferable    37 µs
 ```
 
-Another busy Chromium run shared the machine during this batch test. A batch has one operation's hooks and failure boundary.
+### 64 KiB
 
-Linux, October 2026, Rust 1.99.0, Chromium 153. Medians of seven native repeats on CPU 2 and six alternating worker pairs. Batches used four repeats. Runners and raw results live in the adjacent aktor-extras checkout.
+```text
+Aktor, Serde           0.057 ms
+Aktor, AktorData       0.057 ms
+Leptos, transferable   0.095 ms
+Leptos Workers          0.23 ms
+Yew Agent               0.23 ms
+Gloo Worker             0.26 ms
+```
+
+### 1 MiB
+
+```text
+Aktor, AktorData        0.37 ms
+Aktor, Serde            0.41 ms
+Leptos, transferable    1.35 ms
+Leptos Workers          3.15 ms
+Gloo Worker             3.24 ms
+Yew Agent               3.38 ms
+```
+
+The transferable case uses Leptos' buffer adapter, including conversion to and from Rust bytes.
+
+## Sending records
+
+10,485 records with an id and two strings, sent to a worker and back.
+
+```text
+Aktor, AktorData         2.01 ms
+Aktor, Serde             3.43 ms
+Yew Agent                3.68 ms
+Gloo Worker              4.54 ms
+Leptos Workers          22.69 ms
+```

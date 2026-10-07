@@ -4,9 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::{cell::Cell, rc::Rc, time::Duration};
 use wasm_bindgen::prelude::*;
 
-#[wasm_bindgen(
-    inline_js = "export function note_setup() { postMessage({ proof: 'setup' }); } export function note_end() { postMessage({ proof: 'end' }); }"
-)]
+#[wasm_bindgen(inline_js = "
+export function note_setup() {
+    postMessage({ proof: 'setup' });
+}
+
+export function note_end() {
+    postMessage({ proof: 'end' });
+}
+")]
 extern "C" {
     fn note_setup();
     fn note_end();

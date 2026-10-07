@@ -37,11 +37,13 @@ pub struct AktorCustomCall<'a, S, const N: usize = 0, E = ()> {
 impl<S, const N: usize, E> AktorCustomCall<'_, S, N, E> {
     pub async fn run(mut self) {
         let running = self.message.job.run(self.state, self.hooks, self.operation);
+
         #[cfg(any(
             feature = "tokio",
             all(feature = "std_thread", not(target_family = "wasm"))
         ))]
         self.inner.capture(self.operation.name, running).await;
+
         #[cfg(not(any(
             feature = "tokio",
             all(feature = "std_thread", not(target_family = "wasm"))
@@ -50,6 +52,7 @@ impl<S, const N: usize, E> AktorCustomCall<'_, S, N, E> {
             let _inner = &self.inner;
             running.await;
         }
+
         self.completed = true;
     }
 }
@@ -265,11 +268,13 @@ impl<S, const N: usize, E> Owner<S, N, E> {
             })
             .await
         };
+
         #[cfg(any(
             feature = "tokio",
             all(feature = "std_thread", not(target_family = "wasm"))
         ))]
         let mut primary = None;
+
         #[cfg(any(
             feature = "tokio",
             all(feature = "std_thread", not(target_family = "wasm"))
@@ -279,6 +284,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
             .settle("runner", serving, &mut primary)
             .await
             .and_then(|result| result);
+
         #[cfg(not(any(
             feature = "tokio",
             all(feature = "std_thread", not(target_family = "wasm"))
@@ -388,6 +394,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         } else {
             result
         };
+
         #[cfg(any(
             feature = "tokio",
             all(feature = "std_thread", not(target_family = "wasm"))
@@ -405,11 +412,13 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         {
             self.inner.completion.diagnostics.borrow_mut().push(error);
         }
+
         #[cfg(not(any(
             feature = "tokio",
             all(feature = "std_thread", not(target_family = "wasm"))
         )))]
         self.inner.finish(result.clone());
+
         #[cfg(any(
             feature = "tokio",
             all(feature = "std_thread", not(target_family = "wasm"))

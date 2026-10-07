@@ -50,6 +50,7 @@ struct Work {
 impl Work {
     fn value<E: ser::Error>(&self, count: usize) -> Result<(), E> {
         let values = self.values.get().saturating_add(count);
+
         if values > value_budget(self.bytes.get()) {
             return Err(E::custom("worker data has too many values"));
         }
@@ -296,11 +297,18 @@ macro_rules! elements {
                 self.inner.$method(&Value { inner: value, depth: self.depth, work: self.work })
             }
 
-            fn end(self) -> Result<Self::Ok, Self::Error> { self.inner.end() }
+            fn end(self) -> Result<Self::Ok, Self::Error> {
+                self.inner.end()
+            }
         }
     )* };
 }
-elements!(SerializeSeq: serialize_element, SerializeTuple: serialize_element, SerializeTupleStruct: serialize_field, SerializeTupleVariant: serialize_field);
+elements!(
+    SerializeSeq: serialize_element,
+    SerializeTuple: serialize_element,
+    SerializeTupleStruct: serialize_field,
+    SerializeTupleVariant: serialize_field
+);
 
 macro_rules! fields {
     ($($trait:ident),* $(,)?) => { $(
@@ -308,13 +316,25 @@ macro_rules! fields {
             type Ok = C::Ok;
             type Error = C::Error;
 
-            fn serialize_field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> Result<(), Self::Error> {
-                self.inner.serialize_field(key, &Value { inner: value, depth: self.depth, work: self.work })
+            fn serialize_field<T: Serialize + ?Sized>(
+                &mut self,
+                key: &'static str,
+                value: &T,
+            ) -> Result<(), Self::Error> {
+                self.inner.serialize_field(key, &Value {
+                    inner: value,
+                    depth: self.depth,
+                    work: self.work
+                })
             }
 
-            fn skip_field(&mut self, key: &'static str) -> Result<(), Self::Error> { self.inner.skip_field(key) }
+            fn skip_field(&mut self, key: &'static str) -> Result<(), Self::Error> {
+                self.inner.skip_field(key)
+            }
 
-            fn end(self) -> Result<Self::Ok, Self::Error> { self.inner.end() }
+            fn end(self) -> Result<Self::Ok, Self::Error> {
+                self.inner.end()
+            }
         }
     )* };
 }

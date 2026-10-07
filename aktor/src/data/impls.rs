@@ -28,11 +28,14 @@ pub fn serialize_slice<T: AktorData, S: Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+
     for value in values {
         sequence.serialize_element(&Ref(value))?;
     }
+
     sequence.end()
 }
+
 pub fn deserialize_vec<'de, T: AktorData, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<T>, D::Error> {
@@ -90,6 +93,7 @@ impl AktorData for u8 {
         struct Bytes;
         impl<'de> Visitor<'de> for Bytes {
             type Value = Vec<u8>;
+
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("bytes")
             }
@@ -98,6 +102,7 @@ impl AktorData for u8 {
                 Ok(bytes.to_vec())
             }
         }
+
         deserializer.deserialize_bytes(Bytes)
     }
 }
@@ -141,9 +146,11 @@ impl<T: AktorData> AktorData for Box<T> {
 impl<T: AktorData, const N: usize> AktorData for [T; N] {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut tuple = serializer.serialize_tuple(N)?;
+
         for value in self {
             tuple.serialize_element(&Ref(value))?;
         }
+
         tuple.end()
     }
 
@@ -151,6 +158,7 @@ impl<T: AktorData, const N: usize> AktorData for [T; N] {
         struct Array<T, const N: usize>(PhantomData<T>);
         impl<'de, T: AktorData, const N: usize> Visitor<'de> for Array<T, N> {
             type Value = [T; N];
+
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(formatter, "an array of {N} elements")
             }
@@ -160,17 +168,21 @@ impl<T: AktorData, const N: usize> AktorData for [T; N] {
                 mut sequence: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut values = Vec::new();
+
                 for index in 0..N {
                     let value = sequence
                         .next_element::<Owned<T>>()?
                         .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+
                     values.push(value.0);
                 }
+
                 values
                     .try_into()
                     .map_err(|_| serde::de::Error::custom("invalid array length"))
             }
         }
+
         deserializer.deserialize_tuple(N, Array::<T, N>(PhantomData))
     }
 }
@@ -188,14 +200,29 @@ macro_rules! tuple {
         }
     )* };
 }
-tuple!((A:0), (A:0,B:1), (A:0,B:1,C:2), (A:0,B:1,C:2,D:3), (A:0,B:1,C:2,D:3,E:4), (A:0,B:1,C:2,D:3,E:4,F:5), (A:0,B:1,C:2,D:3,E:4,F:5,G:6), (A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7), (A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8), (A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9), (A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9,K:10), (A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9,K:10,L:11));
+tuple!(
+    (A:0),
+    (A:0,B:1),
+    (A:0,B:1,C:2),
+    (A:0,B:1,C:2,D:3),
+    (A:0,B:1,C:2,D:3,E:4),
+    (A:0,B:1,C:2,D:3,E:4,F:5),
+    (A:0,B:1,C:2,D:3,E:4,F:5,G:6),
+    (A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7),
+    (A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8),
+    (A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9),
+    (A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9,K:10),
+    (A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9,K:10,L:11)
+);
 
 impl<T: AktorData> AktorData for VecDeque<T> {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+
         for value in self {
             sequence.serialize_element(&Ref(value))?;
         }
+
         sequence.end()
     }
 
@@ -206,9 +233,11 @@ impl<T: AktorData> AktorData for VecDeque<T> {
 impl<T: AktorData + Ord> AktorData for BTreeSet<T> {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+
         for value in self {
             sequence.serialize_element(&Ref(value))?;
         }
+
         sequence.end()
     }
 
@@ -219,10 +248,13 @@ impl<T: AktorData + Ord> AktorData for BTreeSet<T> {
 impl<K: AktorData + Ord, V: AktorData> AktorData for BTreeMap<K, V> {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
+
         let mut map = serializer.serialize_map(Some(self.len()))?;
+
         for (key, value) in self {
             map.serialize_entry(&Ref(key), &Ref(value))?;
         }
+
         map.end()
     }
 
@@ -230,6 +262,7 @@ impl<K: AktorData + Ord, V: AktorData> AktorData for BTreeMap<K, V> {
         struct Entries<K, V>(PhantomData<(K, V)>);
         impl<'de, K: AktorData + Ord, V: AktorData> Visitor<'de> for Entries<K, V> {
             type Value = BTreeMap<K, V>;
+
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("a map")
             }
@@ -239,12 +272,15 @@ impl<K: AktorData + Ord, V: AktorData> AktorData for BTreeMap<K, V> {
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut values = BTreeMap::new();
+
                 while let Some((key, value)) = map.next_entry::<Owned<K>, Owned<V>>()? {
                     values.insert(key.0, value.0);
                 }
+
                 Ok(values)
             }
         }
+
         deserializer.deserialize_map(Entries(PhantomData))
     }
 }
@@ -267,10 +303,13 @@ where
 {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
+
         let mut map = serializer.serialize_map(Some(self.len()))?;
+
         for (key, value) in self {
             map.serialize_entry(&Ref(key), &Ref(value))?;
         }
+
         map.end()
     }
 
@@ -283,6 +322,7 @@ where
             H: core::hash::BuildHasher + Default,
         {
             type Value = std::collections::HashMap<K, V, H>;
+
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("a map")
             }
@@ -292,12 +332,15 @@ where
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut values = std::collections::HashMap::with_hasher(H::default());
+
                 while let Some((key, value)) = map.next_entry::<Owned<K>, Owned<V>>()? {
                     values.insert(key.0, value.0);
                 }
+
                 Ok(values)
             }
         }
+
         deserializer.deserialize_map(Entries(PhantomData))
     }
 }
@@ -309,9 +352,11 @@ where
 {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+
         for value in self {
             sequence.serialize_element(&Ref(value))?;
         }
+
         sequence.end()
     }
 
@@ -319,7 +364,9 @@ where
         let values = T::deserialize_vec(deserializer)?;
         let mut set =
             std::collections::HashSet::with_capacity_and_hasher(values.len(), H::default());
+
         set.extend(values);
+
         Ok(set)
     }
 }

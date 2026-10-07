@@ -18,6 +18,7 @@ impl TaskJoin {
                 Ok(()) => {}
                 Err(error) => {
                     let message = error.to_string();
+
                     record(kill, report, message);
                     contain_drop(error, kill, "task join error drop");
                 }
@@ -27,6 +28,7 @@ impl TaskJoin {
                 Ok(()) => {}
                 Err(payload) => {
                     let message = panic_message(&payload);
+
                     record(kill, report, message);
                     contain_drop(payload, kill, "task join panic drop");
                 }

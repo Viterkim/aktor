@@ -1,6 +1,6 @@
 # While it's running
 
-Calls wait when the queue is full. Native and local capacity counts waiting calls, browser workers count the running call too. Dropping an admitted reply or timing out leaves the operation running, so don't blindly retry writes.
+Calls wait when the queue is full. capacity counts waiting calls on native and local actors, workers include the running call. A dropped reply or timeout leaves admitted work running.
 
 ## Pause / resume (TokioThread)
 
@@ -14,23 +14,25 @@ database.actor.pause().await?;
 database.actor.resume(reopen).await?;
 ```
 
-pause drains queued calls and closes the resource. Calls wait for resume, latest sessions keep their pending input. A failed reopen leaves it paused.
+pause finishes queued calls and closes the resource. New calls wait for resume, a failed reopen leaves it paused.
 
 ## Shutdown
 
 ```rust
 let kill = actors.killswitch();
 // your Close handler calls kill.stop()
+
 let report = actors.shutdown().await;
+
 if report.failed() {
     eprintln!("{report}");
 }
 ```
 
-Actor failure also wakes kill.wait_stopping(). Stop your application's caller tasks and await shutdown while the runtime is alive. Pending calls can stay parked past their timeout during shutdown. Dropping a Tokio JoinHandle leaves its task running.
+Actor failure also wakes kill.wait_stopping(). Stop your caller tasks before awaiting shutdown, their calls can stay pending even past a timeout once the group is closing. With Tokio, abort those tasks or signal them to exit, dropping a JoinHandle leaves its task running.
 
-Prepared TokioThread groups keep supervision and cleanup on their own runtime, with one sleeping management thread per group. They can finish after the caller's runtime closes. Groups started with group.start() or run() use your executor, keep it alive until shutdown finishes.
+start owns a runtime for TokioThread groups. With group.start() or run(), keep your executor alive until shutdown finishes.
 
-Local and Embassy drivers must keep polling for cleanup. Dropping their driver cancels the actors, dropping a completion observer is fine. With unwinding enabled, an operation panic still attempts cleanup and retains its failures.
+Local and Embassy drivers need to keep polling through cleanup. Dropping the driver cancels its actors. An operation panic still gets a cleanup attempt when Rust can unwind.
 
-The default budget is five seconds. Unfinished cooperative work is cancelled and browser workers are terminated. Native work that misses the settlement cutoff commits the watchdog to killing the process, even if a timeout report returns and work finishes afterward.
+Shutdown gets five seconds by default, then unfinished async work is cancelled and workers are terminated. If native work misses the watchdog's shutdown cutoff, the process will be killed even if a timeout report returns and the work finishes afterward.

@@ -147,8 +147,13 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     let predicates = &mut function.signature.generics.make_where_clause().predicates;
 
-    predicates.push(parse_quote!(<#target as #name::#dispatch_trait<#mode, #state_type, #input_type, #output, #role>>::Lease: #future_lifetime));
+    predicates.push(parse_quote!(
+        <#target as #name::#dispatch_trait<
+            #mode, #state_type, #input_type, #output, #role
+        >>::Lease: #future_lifetime
+    ));
     predicates.push(parse_quote!(#input_type: #future_lifetime));
+
     function.signature.asyncness = None;
     function.signature.output = parse_quote!(-> #aktor::call::Call<
         #target,
@@ -361,7 +366,10 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             where
                 #target: #latest_lease_trait,
                 <#target as #latest_lease_trait>::Lease: #future_lifetime,
-                #target: #aktor::latest::TypedSession<#state_type, #input_type, #output, <#target as #latest_lease_trait>::Lease, #role, #wire>,
+                #target: #aktor::latest::TypedSession<
+                    #state_type, #input_type, #output,
+                    <#target as #latest_lease_trait>::Lease, #role, #wire
+                >,
             {
                 let (#inner_name, #results_name) = <#target as #aktor::latest::TypedSession<
                     #state_type, #input_type, #output, <#target as #latest_lease_trait>::Lease, #role, #wire

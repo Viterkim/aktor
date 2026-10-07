@@ -483,8 +483,14 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
         let predicates = &mut start_generics.make_where_clause().predicates;
 
-        predicates.push(parse_quote!(#target: #aktor::latest::TypedSession<#state_type, #input_type, #session_output, #latest_lease, #role>));
-        predicates.push(parse_quote!(#latest_future: ::core::future::Future<Output = (#latest_lease, #session_output)>));
+        predicates.push(parse_quote!(
+            #target: #aktor::latest::TypedSession<
+                #state_type, #input_type, #session_output, #latest_lease, #role
+            >
+        ));
+        predicates.push(parse_quote!(
+            #latest_future: ::core::future::Future<Output = (#latest_lease, #session_output)>
+        ));
         predicates.push(parse_quote!(
             <#target as #aktor::latest::TypedSession<
                 #state_type, #input_type, #session_output, #latest_lease, #role
@@ -515,7 +521,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             #[doc(hidden)]
             pub struct #latest_factory #factory_impl #factory_where {
                 pub factory: fn(#latest_lease, #latest_input) -> #latest_future,
-                pub marker: ::core::marker::PhantomData<fn(#(#markers),*) -> (#latest_state, #latest_input, #latest_output, #latest_role)>,
+                pub marker: ::core::marker::PhantomData<
+                    fn(#(#markers),*) -> (#latest_state, #latest_input, #latest_output, #latest_role)
+                >,
             }
             impl #latest_impl #aktor::latest::Factory<#target, #input_type>
                 for #latest_factory<
@@ -540,6 +548,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #operation_name: #aktor::operation::Operation
                 ) -> (Self::Sender, Self::Results) {
                     let (#(#bindings,)*) = #input_name;
+
                     let (#inner_name, #results_name) = #aktor::latest::TypedSession::session(
                         #parameter, #operation_name,
                         async move |#state_name: &mut #state_type, #input_name| {
@@ -549,7 +558,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                         self.factory,
                     );
                     let #sender_name = self::LatestSender { inner: #inner_name, marker: ::core::marker::PhantomData };
+
                     #sender_name.send(#(#bindings),*);
+
                     (#sender_name, #results_name)
                 }
             }

@@ -8,11 +8,11 @@ let count = record_many(&actors.handles, [4, 5]).await?;
 let report = actors.shutdown().await;
 ```
 
-EmbassyLocal keeps state and handles on that executor, Rc is fine. Keep the driver polling through shutdown.
+With EmbassyLocal everything stays on that executor, Rc is fine. Keep its driver polling through shutdown.
 
-EmbassyCrossCore lets handles, arguments and results cross cores with Send, the state stays local. Enable embassy_cross_core and supply a critical-section implementation that synchronizes those cores. [shared_sensor_setup](src/lib.rs) shows it.
+To call from another core, enable embassy_cross_core and use [shared_sensor_setup](src/lib.rs). Its handles and messages are Send, the state stays on the owner. Your critical-section implementation must synchronize those cores.
 
-The application supplies embassy-time and its timer queue. pause/resume/replace aren't supported here.
+Supply embassy-time's timer queue too. pause/resume/replace aren't supported here.
 
 ## Try it
 
