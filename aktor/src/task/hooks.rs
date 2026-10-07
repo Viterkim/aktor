@@ -15,6 +15,7 @@ where
         Box::pin(self(state))
     }
 }
+
 impl<S, F, Fut> From<F> for AktorClosure<dyn AktorTaskEnd<S> + Send>
 where
     S: 'static,
@@ -39,6 +40,7 @@ where
         Box::pin(self(state))
     }
 }
+
 impl<S, F, Fut> From<F> for AktorClosure<dyn AktorTaskInterval<S> + Send>
 where
     S: 'static,

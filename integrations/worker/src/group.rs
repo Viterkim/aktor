@@ -1,5 +1,5 @@
 use aktor::{
-    AktorCleanupError, AktorError, AktorGroup,
+    AktorCleanupError, AktorClosures, AktorError, AktorGroup,
     worker::{self, Options, Server},
 };
 use serde::{Deserialize, Serialize};
@@ -15,16 +15,41 @@ thread_local! { static SERVER: RefCell<Option<Server>> = const { RefCell::new(No
 thread_local! { static CLOSING: RefCell<Option<worker::Worker<u32>>> = const { RefCell::new(None) }; }
 
 #[wasm_bindgen(inline_js = r#"
-export function gate() { return globalThis.aktorGate; }
-export function release_gate() { globalThis.aktorGateRelease(); }
+export function gate() {
+    return globalThis.aktorGate;
+}
+
+export function release_gate() {
+    globalThis.aktorGateRelease();
+}
+
 export function cleanup_gate() {
     return globalThis.aktorCleanupGate ? globalThis.aktorGate : Promise.resolve();
 }
+
 export function note_cleanup() {
     if (globalThis.aktorCleanupGate !== undefined) postMessage({ proof: 'cleanup' });
 }
-export function note_configured() { postMessage({ proof: 'configured' }); }
-export function configured() { return globalThis.proofWorkers.at(-1).proofConfigured; }
+
+export function note_configured() {
+    postMessage({ proof: 'configured' });
+}
+
+export function configured() {
+    return globalThis.proofWorkers.at(-1).proofConfigured;
+}
+
+let originalPost;
+export function break_post() {
+    originalPost = Worker.prototype.postMessage;
+    Worker.prototype.postMessage = function() {
+        throw new Error('admission posting probe');
+    };
+}
+
+export function restore_post() {
+    Worker.prototype.postMessage = originalPost;
+}
 "#)]
 extern "C" {
     fn gate() -> js_sys::Promise;
@@ -33,6 +58,8 @@ extern "C" {
     fn note_cleanup();
     fn note_configured();
     fn configured() -> js_sys::Promise;
+    fn break_post();
+    fn restore_post();
 }
 
 #[derive(Deserialize)]
@@ -47,9 +74,13 @@ impl Serialize for ClosingInput {
 
 #[wasm_bindgen]
 pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> {
-    use aktor::{dispatch::Transport, operation::Operation, worker::TrySendError};
+    use aktor::{dispatch::Transport, operation::Operation};
 
-    let worker = worker::Worker::<u32>::open(&url, options())
+    use futures_util::FutureExt;
+    let mut actors = AktorGroup::new();
+    actors.start().unwrap();
+    let worker = actors
+        .worker::<u32>("serialization shutdown", &url, options())
         .await
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
 
@@ -66,14 +97,36 @@ pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> 
             ClosingInput,
         );
 
-    let closed = matches!(request.try_send(), Err(TrySendError::Closed(_)));
+    let closed = request.send().now_or_never().is_none();
 
     assert_eq!(worker.outstanding(), (0, 0));
-    worker
+    let failed = worker
         .completion()
         .wait()
         .await
+        .expect_err("refused managed call");
+    assert_eq!(failed.outcome, aktor::message::CallError::NotAdmitted);
+    assert_eq!(failed.cause, worker::WorkerCause::Closed);
+    let report = actors.completion().wait().await;
+    assert!(report.failed());
+    let mut actors = AktorGroup::new();
+    actors.start().unwrap();
+    let worker = actors
+        .worker::<u32>("posting failure", &url, options())
+        .await
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    break_post();
+    let committed = operation(&worker, 0).send().now_or_never();
+    restore_post();
+    drop(committed.expect("posting failure happens after admission"));
+    let failed = worker
+        .completion()
+        .wait()
+        .await
+        .expect_err("posting failure");
+    assert!(matches!(failed.cause, worker::WorkerCause::Codec(_)));
+    assert!(actors.completion().wait().await.failed());
+
     Ok(closed)
 }
 
@@ -271,16 +324,19 @@ pub fn cancel_startup_check(url: String) -> bool {
 
 #[wasm_bindgen]
 pub async fn start_unready_worker() -> Result<(), JsValue> {
-    let server = worker::serve_setup((), options(), |state: u32| aktor::AktorClosures {
-        start: async move || {
+    let server = worker::serve_setup((), options(), |state: u32| {
+        let start = async move || {
             note_configured();
             wasm_bindgen_futures::JsFuture::from(gate()).await.unwrap();
             Ok(state)
-        },
-        end: None,
-        intervals: Vec::new(),
-        before_each: None,
-        after_each: None,
+        };
+        AktorClosures {
+            start,
+            end: None,
+            intervals: vec![],
+            before_each: None,
+            after_each: None,
+        }
     })
     .await
     .map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -548,10 +604,7 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
 
                 Ok::<_, AktorError>(())
             },
-            async move |_| {
-                hook_count.set(hook_count.get() + 1);
-                Ok::<_, AktorError>(())
-            },
+            move |_| hook_count.set(hook_count.get() + 1),
         )
         .await;
 
@@ -742,7 +795,7 @@ pub async fn group_listener_check(url: String) -> Result<bool, JsValue> {
             started.set(true);
             core::future::pending().await
         },
-        async |_| Ok::<_, AktorError>(()),
+        |_| {},
     );
 
     let mut driver = Box::pin(driver);
@@ -825,6 +878,7 @@ pub async fn group_startup_check(url: String, mode: u32) -> Result<bool, JsValue
     let report = closing.wait().await;
 
     Ok(typed_data
+        && report.startup
         && report
             .failure
             .as_ref()

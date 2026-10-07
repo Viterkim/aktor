@@ -1,7 +1,13 @@
-use super::super::kind::TokioLocal;
-use super::*;
+use super::start_local;
+use crate::{
+    AktorNew, AktorNoRole, AktorSetupError,
+    local::{self, Handle},
+    message::LocalFuture,
+    setup::{AktorStart, AktorStartContext, AktorStartError, kind::TokioLocal},
+};
+use core::ops::AsyncFnOnce;
 
-impl<'a, S, Start, Role> AktorStart for AktorSetup<S, Start, TokioLocal<'a>, Role>
+impl<'a, S, Start, Role> AktorStart for AktorNew<S, Start, TokioLocal<'a>, Role>
 where
     S: 'static,
     Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
@@ -11,10 +17,8 @@ where
     type Handles = Handle<S, 0, (), Role, local::clock::Tokio>;
     type Startup = LocalFuture<'a, Result<Self::Handles, AktorStartError>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {

@@ -27,6 +27,7 @@ struct Shared<S, I, O, Fut> {
     kill: KillSwitch,
     _alive: mpsc::Sender<Message<S>>,
 }
+
 struct SlotOutput<I, O> {
     slot: Arc<SlotMutex<Slot<I, O>>>,
 }
@@ -60,6 +61,7 @@ impl<I, O> SlotOutput<I, O> {
         drop((input, output, wake));
     }
 }
+
 impl<S, I, O, Fut> Shared<S, I, O, Fut>
 where
     S: Send + 'static,

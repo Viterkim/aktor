@@ -1,5 +1,6 @@
 use super::driver::poll_owners;
 use super::*;
+use crate::AktorShutdownOutput;
 
 impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     #[doc(hidden)]
@@ -40,11 +41,15 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     pub fn with_grace(grace: Duration) -> Self {
         Self {
             stop_on_drop: false,
+            startup_failure: None,
             control: Rc::new(Control {
                 stopping: Cell::new(false),
+                starting: Cell::new(false),
                 #[cfg(feature = "embassy_cross_core")]
                 shared_stopping: Shared::new(AtomicBool::new(false)),
                 listening: Cell::new(false),
+                shutdown_hook: RefCell::new(None),
+                callers: RefCell::new(Vec::new()),
                 grace,
                 deadline: Cell::new(None),
                 kinds: RefCell::new(Vec::new()),
@@ -58,10 +63,16 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     }
 
     #[doc(hidden)]
+    pub fn track_startup(&mut self) {
+        self.startup_failure = Some(Rc::new(Cell::new(false)));
+    }
+
+    #[doc(hidden)]
     pub fn new_registration(&self) -> Self {
         Self {
             stop_on_drop: false,
             control: self.control.clone(),
+            startup_failure: self.startup_failure.clone(),
             owners: self.owners.clone(),
         }
     }
@@ -78,6 +89,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     pub fn killswitch(&self) -> KillSwitch<Clock> {
         KillSwitch {
             control: self.control.clone(),
+            startup_failure: self.startup_failure.clone(),
         }
     }
 
@@ -85,6 +97,57 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         GroupCompletion {
             control: self.control.clone(),
         }
+    }
+
+    /// Your hook gets the report after actor cleanup, before completion is published.
+    pub fn on_shutdown<Hook, Output, Mode>(&self, hook: Hook) -> Result<(), AktorError>
+    where
+        Hook: FnOnce(ShutdownReport) -> Output + 'static,
+        Output: AktorShutdownOutput<Mode>,
+        Output::Future: 'static,
+    {
+        let error = if self.killswitch().is_stopping() {
+            Some(AktorError::new("actor group is already stopping"))
+        } else if self.control.shutdown_hook.borrow().is_some() {
+            Some(AktorError::new("actor group already has a shutdown hook"))
+        } else {
+            None
+        };
+
+        if let Some(error) = error {
+            if let Some(dropped) = super::driver::contain(|| drop(hook)) {
+                self.killswitch().record_diagnostic(dropped);
+            }
+
+            return Err(error);
+        }
+
+        *self.control.shutdown_hook.borrow_mut() = Some(Box::new(move |report| {
+            Box::pin(async move { hook(report).into_shutdown().await })
+        }));
+        Ok(())
+    }
+
+    /// Run dependent application work on this group's local driver.
+    pub fn spawn_task<F>(&self, future: F) -> Result<(), ActorError>
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        if self.killswitch().is_stopping() {
+            if let Some(error) = super::driver::contain(|| drop(future)) {
+                self.killswitch().record_diagnostic(error);
+            }
+
+            return Err(ActorError::Closed);
+        }
+
+        if !self.control.listening.get() {
+            return Err(ActorError::NotStarted);
+        }
+
+        self.control.callers.borrow_mut().push(Box::pin(future));
+        self.control.changed.notify();
+        Ok(())
     }
 
     pub fn shutdown(&self) -> GroupCompletion<Clock> {
@@ -208,8 +271,8 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
                     .await
                 {
                     Ok(()) => None,
-                    Err(error) => match &*error {
-                        OwnerError::Setup(_) => None,
+                    Err(error) => match &error {
+                        OwnerError::Setup(_) | OwnerError::SetupPanic(_) => None,
                         OwnerError::Cleanup(error) => Some(error.report()),
                         OwnerError::Runner(error) => Some(error.clone()),
                         OwnerError::Cancelled => Some(AktorError::new("actor owner cancelled")),
@@ -244,6 +307,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         let group = Self {
             stop_on_drop: false,
             control: self.control.clone(),
+            startup_failure: self.startup_failure.clone(),
             owners: self.owners.clone(),
         };
 
@@ -297,6 +361,7 @@ impl<Clock: AktorGroupClock> Default for AktorGroup<Clock> {
         Self::new()
     }
 }
+
 impl<Clock: AktorGroupClock> KillSwitch<Clock> {
     #[doc(hidden)]
     pub fn record_diagnostic(&self, error: AktorError) {
@@ -305,6 +370,7 @@ impl<Clock: AktorGroupClock> KillSwitch<Clock> {
 
     pub fn stop(&self) {
         if !self.control.stopping.replace(true) {
+            self.control.report.borrow_mut().startup |= self.control.starting.get();
             #[cfg(feature = "embassy_cross_core")]
             self.control.shared_stopping.store(true, Ordering::Release);
             self.control
@@ -312,6 +378,12 @@ impl<Clock: AktorGroupClock> KillSwitch<Clock> {
                 .set(Some(Clock::deadline(self.control.grace)));
 
             if !self.control.listening.get() {
+                let hook = self.control.shutdown_hook.borrow_mut().take();
+
+                if let Some(error) = super::driver::contain(|| drop(hook)) {
+                    self.control.report.borrow_mut().application.push(error);
+                }
+
                 let mut report = self.control.report.borrow().clone();
                 report.failure = self.control.failure.borrow().clone();
                 *self.control.completed.borrow_mut() = Some(report);
@@ -346,7 +418,33 @@ impl<Clock: AktorGroupClock> KillSwitch<Clock> {
         .await
     }
 
-    pub fn fail(&self, mut reason: ActorFailure) {
+    #[doc(hidden)]
+    pub fn set_starting(&self, starting: bool) -> bool {
+        if self.is_stopping() || (starting && self.control.failure.borrow().is_some()) {
+            return false;
+        }
+
+        self.control.starting.set(starting);
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn has_startup_failure(&self) -> bool {
+        self.startup_failure
+            .as_ref()
+            .is_some_and(|receipt| receipt.get())
+    }
+
+    #[doc(hidden)]
+    pub fn fail_startup(&self, reason: ActorFailure) -> bool {
+        self.record_failure(reason, true)
+    }
+
+    pub fn fail(&self, reason: ActorFailure) -> bool {
+        self.record_failure(reason, false)
+    }
+
+    fn record_failure(&self, mut reason: ActorFailure, startup: bool) -> bool {
         if reason.kind.is_none() && reason.actor != "application" {
             let kinds = self.control.kinds.borrow();
             let mut matching = kinds
@@ -361,11 +459,19 @@ impl<Clock: AktorGroupClock> KillSwitch<Clock> {
             }
         }
 
-        if self.control.failure.borrow().is_none() {
+        let first = self.control.failure.borrow().is_none();
+
+        if first {
+            if startup && let Some(receipt) = &self.startup_failure {
+                receipt.set(true);
+            }
+
+            self.control.report.borrow_mut().startup |= startup;
             *self.control.failure.borrow_mut() = Some(reason);
         }
 
         self.stop();
+        first
     }
 }
 
@@ -410,9 +516,11 @@ impl<Clock: AktorGroupClock> Clone for KillSwitch<Clock> {
     fn clone(&self) -> Self {
         Self {
             control: self.control.clone(),
+            startup_failure: self.startup_failure.clone(),
         }
     }
 }
+
 impl<Clock: AktorGroupClock> Clone for GroupCompletion<Clock> {
     fn clone(&self) -> Self {
         Self {

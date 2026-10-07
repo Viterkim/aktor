@@ -30,12 +30,13 @@ pub fn check() -> Result<(), String> {
         aktor::executor::block_on(executor.run(async {
             let ended = Rc::new(Cell::new(false));
             let end = ended.clone();
-            let local_setup = AktorSetup {
+            let local_setup = AktorNew {
                 name: AktorName::new("Bevy counter"),
                 role: AktorNoRole,
                 kind: AktorKind::BevyLocal(&pool),
                 closures: AktorClosures {
                     start: async || Ok(Counter(Rc::new(Cell::new(0)))),
+
                     end: Some(
                         (async move |counter: Counter| {
                             assert_eq!(counter.0.get(), 7);
@@ -48,26 +49,33 @@ pub fn check() -> Result<(), String> {
                     before_each: None,
                     after_each: None,
                 },
-                options: None,
+                options: AktorNewOptions { capacity: 32 },
             };
 
-            let task_setup = AktorSetup {
+            let task_setup = AktorNew {
                 name: AktorName::new("Bevy task alongside local"),
                 role: AktorNoRole,
                 kind: AktorKind::BevyTask(&pool),
                 closures: AktorClosures {
                     start: async || Ok(Movable(Cell::new(0))),
+
                     end: None,
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
                 },
-                options: None,
+                options: AktorNewOptions { capacity: 32 },
             };
 
-            let actors = start(aktor_setups! { local: local_setup, task: task_setup })
-                .await
-                .map_err(|error| error.to_string())?;
+            let actors = aktor_start(AktorSetup {
+                actors: aktor_setups! { local: local_setup, task: task_setup },
+                shutdown: |_| {},
+                options: AktorOptions {
+                    shutdown_grace: Duration::from_secs(5),
+                },
+            })
+            .await
+            .map_err(|error| error.to_string())?;
 
             assert_eq!(add(&actors.handles.local, 3).await.get(), 3);
 
@@ -98,31 +106,35 @@ pub fn check() -> Result<(), String> {
 
             let signal = Rc::new(Signal::default());
             let notify = signal.clone();
-            let actors = start(AktorSetup {
-                name: AktorName::new("Bevy interval"),
-                role: AktorNoRole,
-                kind: AktorKind::BevyLocal(&pool),
-                closures: AktorClosures {
-                    start: async || Ok(Counter(Rc::new(Cell::new(0)))),
-                    end: None,
-                    intervals: vec![AktorInterval {
-                        every: Duration::from_millis(1),
-                        run: (async move |_: &mut Counter| {
-                            notify.ready.set(true);
-                            if let Some(wake) = notify.wake.take() {
-                                wake.wake();
-                            }
-                            core::future::pending::<()>().await;
-                        })
-                        .into(),
-                    }],
-                    before_each: None,
-                    after_each: None,
+            let actors = aktor_start(AktorSetup {
+                actors: AktorNew {
+                    name: AktorName::new("Bevy interval"),
+                    role: AktorNoRole,
+                    kind: AktorKind::BevyLocal(&pool),
+                    closures: AktorClosures {
+                        start: async || Ok(Counter(Rc::new(Cell::new(0)))),
+
+                        end: None,
+                        intervals: vec![AktorInterval {
+                            every: Duration::from_millis(1),
+                            run: (async move |_: &mut Counter| {
+                                notify.ready.set(true);
+                                if let Some(wake) = notify.wake.take() {
+                                    wake.wake();
+                                }
+                                core::future::pending::<()>().await;
+                            })
+                            .into(),
+                        }],
+                        before_each: None,
+                        after_each: None,
+                    },
+                    options: AktorNewOptions { capacity: 32 },
                 },
-                options: Some(AktorOptions {
+                shutdown: |_| {},
+                options: AktorOptions {
                     shutdown_grace: Duration::from_millis(200),
-                    ..Default::default()
-                }),
+                },
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -150,7 +162,6 @@ pub fn check() -> Result<(), String> {
 }
 
 struct Busy {
-    handle: Option<AktorTask<Busy>>,
     count: Arc<AtomicUsize>,
     heartbeat: Option<tokio::sync::oneshot::Sender<()>>,
     done: Option<tokio::sync::oneshot::Sender<()>>,
@@ -158,12 +169,6 @@ struct Busy {
 
 #[aktor]
 async fn tick(_: &mut Busy) {}
-
-#[aktor]
-async fn begin(state: &mut Busy, handle: AktorTask<Busy>) {
-    state.handle = Some(handle);
-    drop(tick(state.handle.as_ref().unwrap()).try_send().unwrap());
-}
 
 fn cooperative() -> Result<(), String> {
     let pool = bevy_tasks::TaskPoolBuilder::new().num_threads(1).build();
@@ -178,48 +183,51 @@ fn cooperative() -> Result<(), String> {
     });
 
     aktor::executor::block_on(async {
-        let actors = start(AktorSetup {
-            name: AktorName::new("Bevy busy owner"),
-            role: AktorNoRole,
-            kind: AktorKind::BevyTask(&pool),
-            closures: AktorClosures {
-                before_each: Some(
-                    (|state: &mut Busy, _: operation::Operation| {
-                        let Some(handle) = &state.handle else {
-                            return;
-                        };
-                        let count = state.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let actors = aktor_start(AktorSetup {
+            actors: AktorNew {
+                name: AktorName::new("Bevy busy owner"),
+                role: AktorNoRole,
+                kind: AktorKind::BevyTask(&pool),
+                closures: AktorClosures {
+                    start: async move || {
+                        Ok(Busy {
+                            count: counted,
+                            heartbeat: Some(heartbeat),
+                            done: Some(done),
+                        })
+                    },
+                    before_each: Some(
+                        (|state: &mut Busy, _: operation::Operation| {
+                            let count = state.count.fetch_add(1, Ordering::Relaxed) + 1;
 
-                        if count == 1 {
-                            state.heartbeat.take().unwrap().send(()).unwrap();
-                        }
+                            if count == 1 {
+                                state.heartbeat.take().unwrap().send(()).unwrap();
+                            }
 
-                        if count < 256 {
-                            drop(tick(handle).try_send().unwrap());
-                        } else {
-                            state.done.take().unwrap().send(()).unwrap();
-                        }
-                    })
-                    .into(),
-                ),
-                ..AktorClosures::new(async move || {
-                    Ok(Busy {
-                        handle: None,
-                        count: counted,
-                        heartbeat: Some(heartbeat),
-                        done: Some(done),
-                    })
-                })
+                            if count == 256 {
+                                state.done.take().unwrap().send(()).unwrap();
+                            }
+                        })
+                        .into(),
+                    ),
+
+                    end: None,
+                    intervals: vec![],
+                    after_each: None,
+                },
+                options: AktorNewOptions { capacity: 1 },
             },
-            options: Some(AktorOptions {
-                capacity: 1,
-                ..Default::default()
-            }),
+            shutdown: |_| {},
+            options: AktorOptions {
+                shutdown_grace: Duration::from_secs(5),
+            },
         })
         .await
         .map_err(|error| error.to_string())?;
 
-        begin(&actors.handles, actors.handles.clone()).await;
+        for _ in 0..256 {
+            tick(&actors.handles).cast().await;
+        }
         finished.await.unwrap();
         let progress = sibling.await;
         let report = actors.shutdown().await;
@@ -258,27 +266,31 @@ async fn delayed(
 async fn task(pool: &bevy_tasks::TaskPool) -> Result<(), String> {
     let ended = Arc::new(Mutex::new(None));
     let end = ended.clone();
-    let actors = start(AktorSetup {
-        name: AktorName::new("Bevy movable counter"),
-        role: AktorNoRole,
-        kind: AktorKind::BevyTask(pool),
-        closures: AktorClosures {
-            start: async || Ok(Movable(Cell::new(0))),
-            end: Some(
-                (async move |counter: Movable| {
-                    *end.lock().unwrap() = Some(counter.0.get());
-                    Ok(())
-                })
-                .into(),
-            ),
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
+    let actors = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: AktorName::new("Bevy movable counter"),
+            role: AktorNoRole,
+            kind: AktorKind::BevyTask(pool),
+            closures: AktorClosures {
+                start: async || Ok(Movable(Cell::new(0))),
+
+                end: Some(
+                    (async move |counter: Movable| {
+                        *end.lock().unwrap() = Some(counter.0.get());
+                        Ok(())
+                    })
+                    .into(),
+                ),
+                intervals: vec![],
+                before_each: None,
+                after_each: None,
+            },
+            options: AktorNewOptions { capacity: 32 },
         },
-        options: Some(AktorOptions {
+        shutdown: |_| {},
+        options: AktorOptions {
             shutdown_grace: Duration::from_millis(300),
-            ..Default::default()
-        }),
+        },
     })
     .await
     .map_err(|error| error.to_string())?;
@@ -311,28 +323,32 @@ async fn task(pool: &bevy_tasks::TaskPool) -> Result<(), String> {
     drop(input);
 
     let (notify, started) = std::sync::mpsc::channel();
-    let actors = start(AktorSetup {
-        name: AktorName::new("Bevy movable interval"),
-        role: AktorNoRole,
-        kind: AktorKind::BevyTask(pool),
-        closures: AktorClosures {
-            start: async || Ok(Movable(Cell::new(0))),
-            end: None,
-            intervals: vec![AktorInterval {
-                every: Duration::from_millis(1),
-                run: (move |_counter: AktorTaskState<Movable>| {
-                    let _sent = notify.send(());
-                    async move { core::future::pending::<()>().await }
-                })
-                .into(),
-            }],
-            before_each: None,
-            after_each: None,
+    let actors = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: AktorName::new("Bevy movable interval"),
+            role: AktorNoRole,
+            kind: AktorKind::BevyTask(pool),
+            closures: AktorClosures {
+                start: async || Ok(Movable(Cell::new(0))),
+
+                end: None,
+                intervals: vec![AktorInterval {
+                    every: Duration::from_millis(1),
+                    run: (move |_counter: AktorTaskState<Movable>| {
+                        let _sent = notify.send(());
+                        async move { core::future::pending::<()>().await }
+                    })
+                    .into(),
+                }],
+                before_each: None,
+                after_each: None,
+            },
+            options: AktorNewOptions { capacity: 32 },
         },
-        options: Some(AktorOptions {
+        shutdown: |_| {},
+        options: AktorOptions {
             shutdown_grace: Duration::from_millis(200),
-            ..Default::default()
-        }),
+        },
     })
     .await
     .map_err(|error| error.to_string())?;

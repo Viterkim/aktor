@@ -95,13 +95,14 @@ where
         }
     };
 
+    let closures = logic(config);
     let AktorClosures {
         start,
         end,
         intervals,
         before_each,
         after_each,
-    } = logic(config);
+    } = closures;
 
     if intervals.iter().any(|interval| interval.every.is_zero()) {
         let error = WireError::new(

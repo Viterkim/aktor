@@ -15,10 +15,18 @@ impl<C> Drop for FailedCleanup<C> {
 
 impl<C: fmt::Display> fmt::Display for CleanupErrors<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} actor cleanup failure(s)", self.errors.len())?;
+        write!(
+            f,
+            "{} actor cleanup failure(s)",
+            self.errors.len() + self.diagnostics.len()
+        )?;
 
         for error in &self.errors {
             write!(f, ": {error}")?;
+        }
+
+        for diagnostic in &self.diagnostics {
+            write!(f, ": {diagnostic}")?;
         }
 
         Ok(())

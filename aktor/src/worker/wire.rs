@@ -30,6 +30,7 @@ impl<T: Serialize + DeserializeOwned> Codec<T> for SerdeCodec {
         decode(bytes)
     }
 }
+
 impl<T: AktorData> Codec<T> for DataCodec {
     const NAME: &'static str = " [aktor-data-postcard-v1]";
 

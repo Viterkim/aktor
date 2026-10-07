@@ -66,6 +66,8 @@ impl Admission {
         };
 
         if !valid {
+            drop(lock);
+            drop(permit);
             return Err(message);
         }
 
@@ -78,7 +80,10 @@ impl Admission {
                 ready.notify_one();
                 Ok(())
             }
-            Err((_permit, message)) => Err(message),
+            Err((permit, message)) => {
+                drop(permit);
+                Err(message)
+            }
         }
     }
 
@@ -212,9 +217,7 @@ mod tests {
                 .is_pending()
         );
 
-        crate::message::call(&handle, |_, ()| (), ())
-            .try_cast()
-            .unwrap();
+        crate::message::call(&handle, |_, ()| (), ()).cast().await;
         drop(receiver);
         listener.try_recv().unwrap().run(&mut 0).await;
     }
@@ -281,6 +284,7 @@ mod tests {
         let observed = Arc::downgrade(&admission);
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_pause = paused.clone();
+
         let registration = std::thread::spawn(move || {
             registering.register_session(Arc::new(move |phase| {
                 if matches!(phase, Phase::Running) {

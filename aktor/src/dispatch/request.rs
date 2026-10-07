@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    Timeout,
-    message::{Reply, TrySendError},
-};
+use crate::{Timeout, message::Reply};
 use core::{
     pin::Pin,
     task::{Context, Poll},
@@ -103,11 +100,6 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Queued<'a, S, I
 
     pub async fn send(self) -> Reply<O> {
         self.into_request().send().await
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn try_send(self) -> Result<Reply<O>, TrySendError<Request<'a, S, O>>> {
-        self.into_request().try_send()
     }
 
     pub fn timeout(self, duration: Duration) -> Timeout<Request<'a, S, O>> {

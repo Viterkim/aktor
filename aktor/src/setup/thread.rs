@@ -15,20 +15,19 @@ use std::{
 use super::kind::TokioThread;
 
 #[cfg(feature = "tokio")]
-impl<S, Start, Role> AktorStart for AktorSetup<S, Start, TokioThread, Role>
+impl<S, Start, Role, E> AktorStart for AktorNew<S, Start, TokioThread, Role>
 where
     S: 'static,
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + Send + 'static,
+    E: Send + 'static,
+    Start: AsyncFnOnce() -> Result<S, AktorSetupError<E>> + Send + 'static,
 {
-    type Error = AktorStartError;
+    type Error = AktorStartError<E>;
     type Group = crate::AktorGroup;
-    type Handles = Aktor<S, AktorSetupError, AktorCleanupError, Role>;
-    type Startup = AktorThreadFuture<Result<Self::Handles, AktorStartError>>;
+    type Handles = Aktor<S, AktorSetupError<E>, AktorCleanupError, Role>;
+    type Startup = AktorThreadFuture<Result<Self::Handles, Self::Error>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -42,26 +41,23 @@ where
             start_thread(setup, context, false)
                 .await
                 .map(Aktor::with_role)
-                .map_err(AktorStartError::from)
         })
     }
 }
-
 #[cfg(feature = "std_thread")]
-impl<S, Start, Role> AktorStart for AktorSetup<S, Start, kind::StdThread, Role>
+impl<S, Start, Role, E> AktorStart for AktorNew<S, Start, kind::StdThread, Role>
 where
     S: 'static,
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + Send + 'static,
+    E: Send + 'static,
+    Start: AsyncFnOnce() -> Result<S, AktorSetupError<E>> + Send + 'static,
 {
-    type Error = AktorStartError;
+    type Error = AktorStartError<E>;
     type Group = crate::AktorGroup;
-    type Handles = Aktor<S, AktorSetupError, AktorCleanupError, Role>;
-    type Startup = AktorThreadFuture<Result<Self::Handles, AktorStartError>>;
+    type Handles = Aktor<S, AktorSetupError<E>, AktorCleanupError, Role>;
+    type Startup = AktorThreadFuture<Result<Self::Handles, Self::Error>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -75,29 +71,25 @@ where
             start_thread(setup, context, true)
                 .await
                 .map(Aktor::with_role)
-                .map_err(AktorStartError::from)
         })
     }
 }
-
 #[cfg(feature = "tokio")]
 impl<S, Start, Role, E, C> AktorStart
-    for AktorSetup<S, Start, kind::AktorLifecycle<TokioThread, E, C>, Role>
+    for AktorNew<S, Start, kind::AktorLifecycle<TokioThread, C>, Role>
 where
     S: 'static,
     E: Send + 'static,
     C: Send + Sync + 'static,
     Start: AsyncFnOnce() -> Result<S, AktorSetupError<E>> + Send + 'static,
 {
-    type Error = AktorThreadStartError<E>;
+    type Error = AktorStartError<E>;
     type Group = crate::AktorGroup;
     type Handles = Aktor<S, AktorSetupError<E>, AktorCleanupError<C>, Role>;
     type Startup = AktorThreadFuture<Result<Self::Handles, Self::Error>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -114,25 +106,22 @@ where
         })
     }
 }
-
 #[cfg(feature = "std_thread")]
 impl<S, Start, Role, E, C> AktorStart
-    for AktorSetup<S, Start, kind::AktorLifecycle<kind::StdThread, E, C>, Role>
+    for AktorNew<S, Start, kind::AktorLifecycle<kind::StdThread, C>, Role>
 where
     S: 'static,
     E: Send + 'static,
     C: Send + Sync + 'static,
     Start: AsyncFnOnce() -> Result<S, AktorSetupError<E>> + Send + 'static,
 {
-    type Error = AktorThreadStartError<E>;
+    type Error = AktorStartError<E>;
     type Group = crate::AktorGroup;
     type Handles = Aktor<S, AktorSetupError<E>, AktorCleanupError<C>, Role>;
     type Startup = AktorThreadFuture<Result<Self::Handles, Self::Error>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -156,10 +145,10 @@ struct ThreadInterval<S> {
 }
 
 async fn start_thread<S, Start, Kind, E, C>(
-    setup: AktorSetup<S, Start, Kind>,
+    setup: AktorNew<S, Start, Kind>,
     mut context: AktorStartContext<crate::AktorGroup>,
     standard: bool,
-) -> Result<Aktor<S, AktorSetupError<E>, AktorCleanupError<C>>, AktorThreadStartError<E>>
+) -> Result<Aktor<S, AktorSetupError<E>, AktorCleanupError<C>>, AktorStartError<E>>
 where
     S: 'static,
     Kind: AktorMode<
@@ -171,7 +160,7 @@ where
     C: Send + Sync + 'static,
     Start: AsyncFnOnce() -> Result<S, AktorSetupError<E>> + Send + 'static,
 {
-    let AktorSetup {
+    let AktorNew {
         name,
         closures,
         options,
@@ -187,10 +176,8 @@ where
         after_each,
     } = closures;
 
-    let options = options.unwrap_or_default();
-
     if intervals.iter().any(|interval| interval.every.is_zero()) {
-        return Err(AktorThreadStartError::Setup(AktorError::new(
+        return Err(AktorStartError::Setup(AktorError::new(
             "interval duration must be positive",
         )));
     }
@@ -244,7 +231,7 @@ where
             standard,
         )
         .await
-        .map_err(AktorThreadStartError::Thread)?;
+        .map_err(AktorStartError::from)?;
 
     for interval in intervals {
         schedule(
@@ -252,11 +239,12 @@ where
             actor.new_handle(),
             context.group.killswitch(),
             standard,
-            context.group.spawner(standard).map_err(|error| {
-                AktorThreadStartError::Setup(AktorError::new(error.to_string()))
-            })?,
+            context
+                .group
+                .spawner(standard)
+                .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string())))?,
         )
-        .map_err(|error| AktorThreadStartError::Setup(AktorError::new(error.to_string())))?;
+        .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string())))?;
     }
 
     Ok(actor)
@@ -327,23 +315,20 @@ async fn interval_wait(every: Duration, standard: bool) {
     tokio::time::sleep(every).await;
 }
 
-#[derive(Er)]
-pub enum AktorThreadStartError<Data: 'static> {
-    #[er(format = "{0}")]
-    Setup(#[er(source)] AktorSetupError),
-    #[er(format = "{0}")]
-    Thread(#[er(source)] DedicatedStartError<AktorSetupError<Data>>),
-}
-impl<Data: 'static> From<AktorSetupError> for AktorThreadStartError<Data> {
-    fn from(error: AktorSetupError) -> Self {
-        Self::Setup(error)
-    }
-}
-impl From<AktorThreadStartError<()>> for AktorStartError {
-    fn from(error: AktorThreadStartError<()>) -> Self {
+impl<Data: 'static> From<DedicatedStartError<AktorSetupError<Data>>> for AktorStartError<Data> {
+    fn from(error: DedicatedStartError<AktorSetupError<Data>>) -> Self {
         match error {
-            AktorThreadStartError::Setup(error) => Self::Setup(error),
-            AktorThreadStartError::Thread(error) => Self::Thread(error),
+            DedicatedStartError::Init(error) => Self::Init(error),
+            DedicatedStartError::NotStarted => Self::Thread(DedicatedStartError::NotStarted),
+            DedicatedStartError::Closed => Self::Thread(DedicatedStartError::Closed),
+            DedicatedStartError::NoRuntime => Self::Thread(DedicatedStartError::NoRuntime),
+            DedicatedStartError::InvalidCapacity => {
+                Self::Thread(DedicatedStartError::InvalidCapacity)
+            }
+            DedicatedStartError::Thread(error) => Self::Thread(DedicatedStartError::Thread(error)),
+            DedicatedStartError::Panicked { actor, cause } => {
+                Self::Thread(DedicatedStartError::Panicked { actor, cause })
+            }
         }
     }
 }

@@ -14,6 +14,64 @@ fn add(handle: &Handle<usize>, by: usize) -> Request<'_, usize, usize> {
 }
 
 #[tokio::test]
+async fn running_observation() {
+    use aktor::listener::{Actor, spawn_async};
+    use std::{cell::Cell, error::Error, fmt};
+
+    #[derive(Debug)]
+    struct SetupFailure(Cell<()>);
+    impl fmt::Display for SetupFailure {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "setup refused: {:?}", self.0.get())
+        }
+    }
+    impl Error for SetupFailure {}
+
+    async fn portable(
+        actor: &Actor<(), SetupFailure, std::io::Error>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        actor.wait_running().await?;
+        Ok(())
+    }
+
+    async fn reporting(actor: &Actor<(), SetupFailure, std::io::Error>) -> er::ErTest {
+        actor.wait_running().await?;
+        Ok(())
+    }
+
+    let (handle, actor, thread) = spawn_async(SpawnArgs {
+        name: "running observation".into(),
+        capacity: 1,
+        failure: FailurePolicy::Abort,
+        setup: async || Ok::<_, SetupFailure>(()),
+        cleanup: async |_| Ok::<_, std::io::Error>(()),
+    })
+    .await
+    .unwrap();
+
+    portable(&actor).await.unwrap();
+    reporting(&actor).await.unwrap();
+    actor.shutdown().await.unwrap();
+    drop(handle);
+    thread.join_async().await.unwrap().unwrap();
+
+    assert!(matches!(
+        portable(&actor)
+            .await
+            .unwrap_err()
+            .downcast_ref::<LifecycleError<core::convert::Infallible>>(),
+        Some(LifecycleError::Closed)
+    ));
+    assert!(
+        reporting(&actor)
+            .await
+            .unwrap_err()
+            .er_find::<LifecycleError<core::convert::Infallible>>()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn resume() {
     let cleaned = Arc::new(Mutex::new(Vec::new()));
     let records = cleaned.clone();

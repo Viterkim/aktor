@@ -92,7 +92,7 @@ async fn state() {
                 let mut waiting = None;
 
                 if case == "cancel-wake" {
-                    call(&handle, |_, ()| (), ()).try_cast().unwrap();
+                    call(&handle, |_, ()| (), ()).cast().await;
 
                     let mut request = Box::pin(call(&handle, |_, ()| (), ()));
                     let waker = Waker::from(Arc::new(BrokenWake));

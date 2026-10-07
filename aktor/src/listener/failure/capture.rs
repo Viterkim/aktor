@@ -24,17 +24,24 @@ impl Failures {
                         actor: self.actor.clone(),
                         kind,
                         payload,
+                        diagnostics: Vec::new(),
+                        group_primary: false,
                     });
 
-                    if let (Some(group), Some(failure)) = (&self.group, &self.first) {
-                        group.fail(crate::group::ActorFailure {
+                    if let (Some(group), Some(failure)) = (&self.group, &mut self.first) {
+                        let message = failure.to_string();
+                        failure.group_primary = group.fail(crate::group::ActorFailure {
                             kind: None,
                             actor: failure.actor.clone(),
                             phase: format!("{:?}", failure.kind),
-                            message: failure.to_string(),
+                            message,
                         });
                     }
-                } else {
+                } else if let Some(first) = &mut self.first {
+                    first.diagnostics.push(crate::AktorError::new(format!(
+                        "{kind:?}: {}",
+                        crate::panic::panic_message(&payload)
+                    )));
                     dispose_secondary(payload);
                 }
 
@@ -63,11 +70,7 @@ impl Failures {
     }
 }
 
-pub fn dispose_secondary(payload: Box<dyn std::any::Any + Send>) {
-    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(payload))) {
-        std::mem::forget(payload);
-    }
-}
+pub use crate::panic::dispose_secondary;
 
 impl FailureKind {
     pub fn during<T>(self, action: impl FnOnce() -> T) -> T {
@@ -93,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn secondary_payload_cannot_replace_the_primary_failure() {
+    fn primary_failure() {
         dispose_secondary(Box::new(BrokenDrop));
     }
 }

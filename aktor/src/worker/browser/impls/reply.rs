@@ -58,24 +58,6 @@ impl<O> WorkerReply<O> {
         }
     }
 
-    pub fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<O, WireError>> {
-        match Pin::new(&mut self.response).poll(context) {
-            Poll::Ready(Ok(Ok(output))) => {
-                return Poll::Ready(self.decode(&output));
-            }
-            Poll::Ready(Ok(Err(error))) => return Poll::Ready(Err(error)),
-            Poll::Ready(Err(_)) => {
-                return Poll::Ready(Err(WireError::new(
-                    CallError::OutcomeUnknown,
-                    WorkerCause::Closed,
-                )));
-            }
-            Poll::Pending => {}
-        }
-
-        Poll::Pending
-    }
-
     pub fn timeout(&mut self, duration: core::time::Duration) -> crate::Timeout<&mut Self> {
         crate::Timeout::browser(self, duration, |reply| crate::timeout::WaitStatus {
             admitted: true,

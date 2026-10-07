@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     Timeout,
-    message::{TrySendError, consumed, stopped},
+    message::{consumed, stopped},
 };
 use core::{
     future::{Future, poll_fn},
@@ -148,6 +148,9 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Request<'a, S, 
     }
 
     fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.reply.taken {
+            consumed();
+        }
         if self.parked {
             return Poll::Pending;
         }
@@ -186,32 +189,12 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Request<'a, S, 
     }
 
     pub async fn send(mut self) -> Reply<O> {
+        if self.reply.taken {
+            consumed();
+        }
+
         poll_fn(|cx| self.poll_submit(cx)).await;
         self.reply
-    }
-
-    pub fn try_send(mut self) -> Result<Reply<O>, TrySendError<Self>> {
-        if self.submitted {
-            return Ok(self.reply);
-        }
-
-        let message = self.take_message();
-
-        match self.handle.inner.commit(message, false) {
-            Ok(()) => {
-                self.handle.inner.changed.notify();
-                Ok(self.reply)
-            }
-            Err(message) => {
-                self.pending = Some(Unsent::Job(message.job));
-
-                if self.handle.inner.queue.lock(|queue| queue.borrow().open) {
-                    Err(TrySendError::Full(self))
-                } else {
-                    Err(TrySendError::Closed(self))
-                }
-            }
-        }
     }
 
     pub fn timeout(self, duration: Duration) -> Timeout<Self> {
@@ -233,10 +216,6 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role> Future for Request<
 impl<S: 'static, I: Send + 'static, Role> Request<'_, S, I, (), Role> {
     pub async fn cast(self) {
         drop(self.send().await);
-    }
-
-    pub fn try_cast(self) -> Result<(), TrySendError<Self>> {
-        self.try_send().map(drop)
     }
 }
 

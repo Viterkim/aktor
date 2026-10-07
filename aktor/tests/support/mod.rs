@@ -7,11 +7,37 @@ use std::{
     vec::Vec,
 };
 
+pub fn child_command(test: &str) -> Command {
+    let executable = std::env::current_exe().unwrap();
+    let listed = Command::new(&executable)
+        .args(["--list", "--exact", test])
+        .output()
+        .unwrap();
+    let names = String::from_utf8_lossy(&listed.stdout);
+    let expected = std::format!("{test}: test");
+
+    assert!(
+        listed.status.success() && names.lines().any(|name| name == expected),
+        "unknown child test: {test}\n{names}\n{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+
+    let mut command = Command::new(executable);
+    command.args([
+        "--exact",
+        test,
+        "--nocapture",
+        "--test-threads=1",
+        "--format=pretty",
+        "--color=never",
+    ]);
+    command
+}
+
 pub fn child(test: &str, case: &str) -> Output {
     use std::io::Read;
 
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture"])
+    let mut child = child_command(test)
         .env("AKTOR_CHILD", case)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -59,6 +85,17 @@ pub fn child(test: &str, case: &str) -> Output {
         "child timed out: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    if output.status.success() {
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+            "child test did not finish: {test} ({case})\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     output
 }

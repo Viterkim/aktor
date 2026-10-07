@@ -8,14 +8,14 @@ mod encode;
 mod impls;
 mod types;
 
-const MAX_DEPTH: usize = 128;
-
-fn value_budget(bytes: usize) -> usize {
-    bytes.saturating_mul(128).saturating_add(1024)
-}
-
 pub use decode::decode;
 pub use encode::encode;
 #[doc(hidden)]
 pub use serde as __serde;
 pub use types::{AktorData, Owned, Ref};
+
+const MAX_DEPTH: usize = 128;
+
+fn value_budget(bytes: usize) -> usize {
+    bytes.saturating_mul(128).saturating_add(1024)
+}

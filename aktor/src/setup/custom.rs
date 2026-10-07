@@ -7,7 +7,7 @@ use crate::{
 use core::ops::AsyncFnOnce;
 
 impl<S: 'static, Start, Clock, Runner, Role> AktorStart
-    for AktorSetup<S, Start, kind::Custom<Clock, Runner>, Role>
+    for AktorNew<S, Start, kind::Custom<Clock, Runner>, Role>
 where
     Clock: AktorGroupClock,
     Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
@@ -18,10 +18,8 @@ where
     type Handles = local::Handle<S, 0, (), Role, Clock>;
     type Startup = LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -47,7 +45,7 @@ where
             after_each,
         } = self.closures;
 
-        let setup = AktorSetup {
+        let setup = AktorNew {
             name: self.name,
             role: AktorNoRole,
             kind: kind::Custom {

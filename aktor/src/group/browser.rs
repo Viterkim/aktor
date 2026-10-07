@@ -61,7 +61,7 @@ impl AktorGroup {
         let worker = match opened {
             Ok(worker) => worker,
             Err(error) => {
-                self.killswitch().fail(ActorFailure {
+                self.killswitch().fail_startup(ActorFailure {
                     kind: None,
                     actor: name,
                     phase: "setup".into(),

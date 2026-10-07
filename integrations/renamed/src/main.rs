@@ -1,6 +1,7 @@
 use actor::listener::spawn_local;
 use actor::*;
 use er::*;
+use std::time::Duration;
 
 #[derive(Default)]
 pub struct State {
@@ -75,19 +76,27 @@ async fn main() -> Result<(), ErReport<MainError>> {
             drop(state);
             actor.await.er(())?;
 
-            let actors = actor::start(aktor_setups! {
-                counter: AktorSetup {
-                    name: AktorName::new("named counter"),
-                    role: AktorNoRole,
-                    kind: AktorKind::TokioTask,
-                    closures: AktorClosures {
-                        start: async || Ok(State::default()),
-                        end: None,
-                        intervals: vec![],
-                        before_each: None,
-                        after_each: None,
-                    },
-                    options: None,
+            let actors = actor::aktor_start(AktorSetup {
+                actors: aktor_setups! {
+                                counter: AktorNew {
+
+                                    name: AktorName::new("named counter"),
+                                    role: AktorNoRole,
+                                    kind: AktorKind::TokioTask,
+                                    closures: AktorClosures {
+                start: async || Ok(State::default()),
+
+                                        end: None,
+                                        intervals: vec![],
+                                        before_each: None,
+                                        after_each: None,
+                                    },
+                                    options: AktorNewOptions { capacity: 32 },
+                                },
+                                },
+                shutdown: |_| {},
+                options: AktorOptions {
+                    shutdown_grace: Duration::from_secs(5),
                 },
             })
             .await

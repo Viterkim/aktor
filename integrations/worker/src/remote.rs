@@ -122,21 +122,22 @@ pub async fn start_setup_worker(build: String) -> Result<(), JsValue> {
         },
         |config: Config| {
             note_setup();
+            let start = async move || {
+                gloo_timers::future::TimeoutFuture::new(config.setup_delay).await;
+
+                if config.fail_start {
+                    return Err(AktorSetupError::new("counter setup failed"));
+                }
+
+                Ok(Counter {
+                    value: Rc::new(Cell::new(config.initial)),
+                    before: 0,
+                    after: 0,
+                    interval: false,
+                })
+            };
             AktorClosures {
-                start: async move || {
-                    gloo_timers::future::TimeoutFuture::new(config.setup_delay).await;
-
-                    if config.fail_start {
-                        return Err(AktorSetupError::new("counter setup failed"));
-                    }
-
-                    Ok(Counter {
-                        value: Rc::new(Cell::new(config.initial)),
-                        before: 0,
-                        after: 0,
-                        interval: false,
-                    })
-                },
+                start,
                 end: Some(
                     (async move |counter: Counter| {
                         note_end();
@@ -234,19 +235,16 @@ pub async fn remote_preflight_check(program: String) -> Result<bool, JsValue> {
 }
 
 fn error(error: impl std::fmt::Display) -> JsValue {
-    JsValue::from_str(&error.to_string())
+    JsValue::from_str(&format!("{error:#}"))
 }
 
-fn setup(program: &str, config: Config) -> AktorWorkerSetup<Counter, Config> {
-    AktorWorkerSetup {
+fn setup(program: &str, config: Config) -> AktorWorkerNew<Counter, Config> {
+    AktorWorkerNew {
         name: AktorName::new("remote counter"),
         role: AktorNoRole,
         kind: AktorKind::BrowserWebWorker(program),
         config,
-        options: Some(AktorWorkerOptions {
-            shutdown_grace: Duration::from_millis(300),
-            ..Default::default()
-        }),
+        options: Default::default(),
     }
 }
 
@@ -254,7 +252,7 @@ fn setup(program: &str, config: Config) -> AktorWorkerSetup<Counter, Config> {
 pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     let mut group = AktorGroup::new();
     let completed = group.start().map_err(error)?;
-    let handles = start_in(
+    let handles = aktor_start_in(
         &group,
         aktor_setups! {
             first: setup(&program, Config {
@@ -284,15 +282,50 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     assert_eq!(report.actors.len(), 2);
     assert_eq!(completed.await.actors.len(), 2);
 
-    let actors = start(setup(
-        &program,
-        Config {
-            initial: 2,
-            fail_start: false,
-            fail_end: false,
-            setup_delay: 0,
+    let terminated = aktor_start(AktorSetup {
+        actors: setup(
+            &program,
+            Config {
+                initial: 0,
+                fail_start: false,
+                fail_end: false,
+                setup_delay: 0,
+            },
+        ),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_secs(5),
         },
-    ))
+    })
+    .await
+    .map_err(error)?;
+    terminated.handles.terminate();
+    let report = terminated.completion().wait().await;
+
+    assert!(!report.startup);
+
+    if !report.failed() || report.timed_out || report.actors[0].timed_out {
+        return Err(error(format!(
+            "explicit termination was marked as a timeout: {report}"
+        )));
+    }
+    assert!(!report.actors[0].diagnostics.is_empty());
+
+    let actors = aktor_start(AktorSetup {
+        actors: setup(
+            &program,
+            Config {
+                initial: 2,
+                fail_start: false,
+                fail_end: false,
+                setup_delay: 0,
+            },
+        ),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_millis(300),
+        },
+    })
     .await
     .map_err(error)?;
 
@@ -352,9 +385,7 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     let reply = echo_data(&actors.handles, input.clone()).send().await;
     assert_eq!(reply.await, Ok(expected.clone()));
 
-    let reply = echo_data(&actors.handles, input.clone())
-        .try_send()
-        .map_err(error)?;
+    let reply = echo_data(&actors.handles, input.clone()).send().await;
     assert_eq!(reply.await, Ok(expected.clone()));
 
     let (data_sender, mut data_results) = echo_data(&actors.handles, input).latest();
@@ -429,15 +460,21 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
 
     drop(input);
 
-    let actors = start(setup(
-        &program,
-        Config {
-            initial: 0,
-            fail_start: false,
-            fail_end: true,
-            setup_delay: 0,
+    let actors = aktor_start(AktorSetup {
+        actors: setup(
+            &program,
+            Config {
+                initial: 0,
+                fail_start: false,
+                fail_end: true,
+                setup_delay: 0,
+            },
+        ),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_millis(300),
         },
-    ))
+    })
     .await
     .map_err(error)?;
 
@@ -463,26 +500,32 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
         return Err(error("remote cleanup report was lost"));
     }
 
-    let failed = start((
-        setup(
-            &program,
-            Config {
-                initial: 0,
-                fail_start: false,
-                fail_end: true,
-                setup_delay: 0,
-            },
+    let failed = aktor_start(AktorSetup {
+        actors: (
+            setup(
+                &program,
+                Config {
+                    initial: 0,
+                    fail_start: false,
+                    fail_end: true,
+                    setup_delay: 0,
+                },
+            ),
+            setup(
+                &program,
+                Config {
+                    initial: 0,
+                    fail_start: true,
+                    fail_end: false,
+                    setup_delay: 0,
+                },
+            ),
         ),
-        setup(
-            &program,
-            Config {
-                initial: 0,
-                fail_start: true,
-                fail_end: false,
-                setup_delay: 0,
-            },
-        ),
-    ))
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_millis(300),
+        },
+    })
     .await
     .err()
     .ok_or_else(|| error("remote setup failure was lost"))?;
@@ -500,15 +543,21 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
 
     let legacy = program.replace("setup_worker.js", "setup_legacy_worker.js");
 
-    if start(setup(
-        &legacy,
-        Config {
-            initial: 2,
-            fail_start: false,
-            fail_end: false,
-            setup_delay: 0,
+    if aktor_start(AktorSetup {
+        actors: setup(
+            &legacy,
+            Config {
+                initial: 2,
+                fail_start: false,
+                fail_end: false,
+                setup_delay: 0,
+            },
+        ),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_millis(300),
         },
-    ))
+    })
     .await
     .is_ok()
     {
@@ -517,15 +566,21 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
         ));
     }
 
-    let mut startup = Box::pin(start(setup(
-        &program,
-        Config {
-            initial: 0,
-            fail_start: false,
-            fail_end: false,
-            setup_delay: 10_000,
+    let mut startup = Box::pin(aktor_start(AktorSetup {
+        actors: setup(
+            &program,
+            Config {
+                initial: 0,
+                fail_start: false,
+                fail_end: false,
+                setup_delay: 10_000,
+            },
+        ),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_millis(300),
         },
-    )));
+    }));
 
     let completion = startup.completion();
 
@@ -543,19 +598,28 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
 
     let report = completion.wait().await;
 
-    if !report.timed_out || report.actors[0].kind != Some(AktorExecution::BrowserWebWorker) {
+    if !report.timed_out
+        || !report.actors[0].timed_out
+        || report.actors[0].kind != Some(AktorExecution::BrowserWebWorker)
+    {
         return Err(error("stopping remote startup lost its cleanup report"));
     }
 
-    let mut startup = Box::pin(start(setup(
-        &program,
-        Config {
-            initial: 0,
-            fail_start: false,
-            fail_end: false,
-            setup_delay: 10_000,
+    let mut startup = Box::pin(aktor_start(AktorSetup {
+        actors: setup(
+            &program,
+            Config {
+                initial: 0,
+                fail_start: false,
+                fail_end: false,
+                setup_delay: 10_000,
+            },
+        ),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_millis(300),
         },
-    )));
+    }));
 
     let completion = startup.completion();
 
@@ -564,5 +628,7 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
 
     let report = completion.wait().await;
 
-    Ok(report.timed_out && report.actors[0].kind == Some(AktorExecution::BrowserWebWorker))
+    Ok(report.timed_out
+        && report.actors[0].timed_out
+        && report.actors[0].kind == Some(AktorExecution::BrowserWebWorker))
 }

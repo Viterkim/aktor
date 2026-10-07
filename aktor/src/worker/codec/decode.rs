@@ -335,6 +335,7 @@ impl<'de> MapAccess<'de> for EnumMap<'_, 'de> {
         seed.deserialize(&mut *self.decoder)
     }
 }
+
 struct Variant<'a, 'de> {
     decoder: &'a mut Decoder<'de>,
     variant: &'de str,

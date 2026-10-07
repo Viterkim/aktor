@@ -4,7 +4,6 @@ use core::{
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use tokio::sync::TryAcquireError;
 
 impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
     pub fn new(
@@ -111,7 +110,10 @@ impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
     }
 
     fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WireError>> {
-        if self.reply.is_some() {
+        if let Some(reply) = &self.reply {
+            if reply.taken {
+                crate::message::consumed();
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -173,10 +175,16 @@ impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
                     && self.inner.closed.get()
                     && !self.inner.failed.get()
                 {
-                    if self.inner.group.borrow().is_some() {
+                    let stopping = self
+                        .inner
+                        .group
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|(_, group)| group.is_stopping());
+                    if stopping {
                         Poll::Pending
                     } else {
-                        fatal(error)
+                        self.inner.lost(error)
                     }
                 } else {
                     self.inner.lost(error)
@@ -210,58 +218,6 @@ impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
             }
         }
     }
-
-    #[allow(clippy::result_large_err)]
-    pub fn try_send(mut self) -> Result<WorkerReply<O>, TrySendError<Self>> {
-        self.admission = None;
-
-        if let Some(reply) = self.reply.take() {
-            return Ok(reply);
-        }
-
-        let inner = self.inner;
-
-        if inner.closed.get() || matches!(*inner.ready.borrow(), Some(Err(_))) {
-            return Err(TrySendError::Closed(self));
-        }
-
-        if inner.ready.borrow().is_none() {
-            return Err(TrySendError::Full(self));
-        }
-
-        let size = match self.size() {
-            Ok(size) => size,
-            Err(error) => return Err(TrySendError::Rejected(self, error.without_data())),
-        };
-
-        let count = match inner.count.clone().try_acquire_owned() {
-            Ok(count) => count,
-            Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(self)),
-            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(self)),
-        };
-
-        let bytes = match inner.bytes.clone().try_acquire_many_owned(size as u32) {
-            Ok(bytes) => bytes,
-            Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(self)),
-            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(self)),
-        };
-
-        match self.submit(count, bytes) {
-            Ok(()) => match self.reply.take() {
-                Some(reply) => Ok(reply),
-                None => Err(TrySendError::Closed(self)),
-            },
-            Err(error) => {
-                self.input = Some(Err(error.clone()));
-
-                if error.cause == WorkerCause::Closed {
-                    Err(TrySendError::Closed(self))
-                } else {
-                    Err(TrySendError::Rejected(self, error.without_data()))
-                }
-            }
-        }
-    }
 }
 impl<S, O, Role> Future for WorkerRequest<'_, S, O, Role> {
     type Output = O;
@@ -285,14 +241,8 @@ impl<S, O, Role> Future for WorkerRequest<'_, S, O, Role> {
         }
     }
 }
-
 impl<S, Role> WorkerRequest<'_, S, (), Role> {
     pub async fn cast(self) {
         drop(self.send().await);
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn try_cast(self) -> Result<(), TrySendError<Self>> {
-        self.try_send().map(drop)
     }
 }

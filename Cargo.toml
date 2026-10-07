@@ -7,13 +7,13 @@ exclude = ["integrations"]
 license = "MIT-0"
 readme = "README.md"
 repository = "https://github.com/Viterkim/aktor"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 rust-version = "1.89"
 publish = true
 
 [workspace.dependencies]
-aktor-macros = { version = "=0.0.4", path = "aktor-macros" }
+aktor-macros = { version = "=0.0.5", path = "aktor-macros" }
 er = { version = "0.7", default-features = false, features = ["macros"] }
 proc-macro-crate = "3.5"
 proc-macro2 = "1.0"

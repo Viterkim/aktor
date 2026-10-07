@@ -172,6 +172,7 @@ where
         self.changed.notify();
     }
 }
+
 impl<S: 'static, I: Send + 'static, O: Send + 'static, F, Role: 'static> Input<I>
     for Arc<Shared<S, I, O, F, Role>>
 where
@@ -258,6 +259,7 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Arc<Shared<S, I, O, F, Ro
         drop(discarded);
     }
 }
+
 impl<S: 'static, I: Send + 'static, O: Send + 'static, F, Role: 'static> Job<S>
     for LatestJob<S, I, O, F, Role>
 where

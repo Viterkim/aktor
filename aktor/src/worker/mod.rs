@@ -2,37 +2,27 @@ use crate::message::CallError;
 use er::Er;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub mod bytes;
-mod codec;
-mod wire;
-#[doc(hidden)]
-pub use wire::Codec;
-mod impls;
-pub use codec::{decode, encode};
-mod registry;
-#[doc(hidden)]
-pub use inventory;
-pub use registry::Operations;
-#[doc(hidden)]
-pub use registry::{Exporter, Register, Registered, Registration, dispatch};
-
-#[derive(Er)]
-pub enum TrySendError<R> {
-    #[er(format = "actor mailbox is full")]
-    Full(R),
-    #[er(format = "actor closed")]
-    Closed(R),
-    #[er(format = "{1}")]
-    Rejected(R, #[er(source)] WorkerError),
-}
-
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod browser;
+pub mod bytes;
+mod codec;
+mod impls;
+mod registry;
+mod wire;
+
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use browser::{
     Completion, LatestResults, LatestSender, Server, Worker, WorkerReply, WorkerRequest, serve,
     serve_for, serve_setup, serve_with, setup_failed,
 };
+pub use codec::{decode, encode};
+#[doc(hidden)]
+pub use inventory;
+pub use registry::Operations;
+#[doc(hidden)]
+pub use registry::{Exporter, Register, Registered, Registration, dispatch};
+#[doc(hidden)]
+pub use wire::Codec;
 
 pub use crate::dispatch::{Native, Remote};
 

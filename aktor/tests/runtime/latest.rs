@@ -161,7 +161,7 @@ async fn current_results() {
 }
 
 #[tokio::test]
-async fn idle_latest_observes_listener_drop() {
+async fn idle_close() {
     use std::{
         future::Future,
         sync::atomic::{AtomicBool, Ordering},

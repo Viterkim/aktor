@@ -4,6 +4,7 @@ use serde::{de, ser};
 
 mod decode;
 mod encode;
+mod impls;
 pub use decode::decode;
 pub use encode::encode;
 
@@ -45,22 +46,6 @@ const UNIT_VARIANT: u8 = 24;
 
 #[derive(Debug)]
 struct Error(String);
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl core::error::Error for Error {}
-impl ser::Error for Error {
-    fn custom<T: fmt::Display>(message: T) -> Self {
-        Self(message.to_string())
-    }
-}
-impl de::Error for Error {
-    fn custom<T: fmt::Display>(message: T) -> Self {
-        Self(message.to_string())
-    }
-}
 
 fn error(message: &str) -> Error {
     Error(message.into())
@@ -81,7 +66,6 @@ mod tests {
             Err(de::Error::custom("answer refused"))
         }
     }
-
     impl Serialize for Rejected {
         fn serialize<S: ser::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
             Err(ser::Error::custom("input refused"))

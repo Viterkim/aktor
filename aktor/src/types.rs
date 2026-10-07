@@ -36,6 +36,18 @@ pub struct AktorError<T = ()> {
 pub type AktorSetupError<T = ()> = AktorError<T>;
 pub type AktorCleanupError<T = ()> = AktorError<T>;
 
+#[doc(hidden)]
+pub struct AktorShutdownSync;
+#[doc(hidden)]
+pub struct AktorShutdownAsync;
+
+#[doc(hidden)]
+pub trait AktorShutdownOutput<Mode, Data = ()> {
+    type Future: core::future::Future<Output = Result<(), AktorCleanupError<Data>>>;
+
+    fn into_shutdown(self) -> Self::Future;
+}
+
 /// Setup and cleanup for an actor owned by the application.
 pub struct ActorArgs<Setup, Cleanup> {
     pub name: String,
@@ -47,6 +59,8 @@ pub struct ActorArgs<Setup, Cleanup> {
 /// What failed and how cleanup went.
 #[derive(Clone, Debug, Default)]
 pub struct ShutdownReport {
+    /// Stopped during root startup, or because a new actor could not initialize.
+    pub startup: bool,
     pub failure: Option<ActorFailure>,
     pub actors: Vec<ActorOutcome>,
     pub application: Vec<AktorError>,
@@ -85,7 +99,7 @@ pub struct ActorOutcome {
     )
 ))]
 mod prepared {
-    use super::AktorNoRole;
+    use super::{AktorNoRole, ShutdownReport};
     use crate::setup::{AktorMode, group::AktorSetupGroup};
     use alloc::{string::String, vec::Vec};
     use core::time::Duration;
@@ -110,23 +124,36 @@ mod prepared {
     pub struct AktorName {
         pub name: String,
     }
-    pub struct AktorSetup<S: 'static, Start, Kind: AktorMode, Role = AktorNoRole> {
+
+    pub struct AktorNew<S: 'static, Start, Kind: AktorMode, Role = AktorNoRole> {
         pub name: AktorName,
         pub role: Role,
         pub kind: Kind,
         pub closures: AktorClosures<S, Start, Kind>,
-        pub options: Option<AktorOptions>,
+        pub options: AktorNewOptions,
+    }
+
+    pub struct AktorNewOptions {
+        pub capacity: usize,
+    }
+
+    pub struct AktorSetup<Actors, Shutdown, ShutdownOutput>
+    where
+        Shutdown: FnOnce(ShutdownReport) -> ShutdownOutput,
+    {
+        pub actors: Actors,
+        pub shutdown: Shutdown,
+        pub options: AktorOptions,
     }
 
     pub struct AktorOptions {
-        pub capacity: usize,
         pub shutdown_grace: Duration,
     }
 
     /// Keep this owner alive while using its handles. Dropping its group starts shutdown.
     ///
     /// ```rust,ignore
-    /// let actors = start(setup).await?;
+    /// let actors = aktor_start(setup).await?;
     /// let count = count_users(&actors.handles).await;
     /// let report = actors.shutdown().await;
     /// ```

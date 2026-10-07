@@ -31,30 +31,33 @@ pub struct Owner {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::result::Result<(), Box<dyn core::error::Error>> {
     let setup = async || {
-        Connection::open_in_memory().map_err(|error| aktor::AktorSetupError::new(error.to_string()))
+        Connection::open_in_memory().map_err(|error| aktor_err_setup(error.to_string(), error))
     };
     let cleanup = async |db: Connection| {
         db.close()
-            .map_err(|(_, error)| aktor::AktorCleanupError::new(error.to_string()))
+            .map_err(|(_, error)| aktor_err_cleanup(error.to_string(), error))
     };
 
-    let actors = start(AktorSetup {
-        name: AktorName::new("sqlite"),
-        role: AktorNoRole,
-        kind: AktorKind::TokioThread,
-        closures: AktorClosures {
-            end: Some(cleanup.into()),
-            ..AktorClosures::new(setup)
+    let actors = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: AktorName::new("sqlite"),
+            role: AktorNoRole,
+            kind: AktorKind::TokioThread.with_cleanup(),
+            closures: AktorClosures {
+                start: setup,
+                end: Some(cleanup.into()),
+                intervals: vec![],
+                before_each: None,
+                after_each: None,
+            },
+            options: AktorNewOptions { capacity: 128 },
         },
-        options: Some(AktorOptions {
-            capacity: 128,
-            ..Default::default()
-        }),
+        shutdown: |_| (),
+        options: Default::default(),
     })
     .await?;
 
     let database = &actors.handles;
-
     schema::create(database).await?;
 
     let bingo = post::cats::create(database, "Bingo").await?;
@@ -83,7 +86,7 @@ async fn main() -> std::result::Result<(), Box<dyn core::error::Error>> {
     let report = actors.shutdown().await;
 
     if report.failed() {
-        return Err(Box::new(report).into());
+        return Err(report.into());
     }
 
     Ok(())

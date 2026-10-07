@@ -131,7 +131,7 @@ impl<S: 'static, E: Send + 'static, C: Send + Sync + 'static>
                 Ok(Err(error)) => Err(Arc::new(OwnerError::Cleanup(error))),
                 Err(cause) => {
                     let cleanup = observer.cleanup_errors();
-                    let error = if cleanup.errors.is_empty() {
+                    let error = if cleanup.errors.is_empty() && cleanup.diagnostics.is_empty() {
                         OwnerError::Panicked(cause)
                     } else {
                         OwnerError::PanickedWithCleanup { cause, cleanup }
@@ -154,7 +154,6 @@ impl<S: 'static, E: Send + 'static, C: Send + Sync + 'static>
         ))
     }
 }
-
 impl<S, E, C, Role> Aktor<S, E, C, Role> {
     pub fn completion(&self) -> OwnerCompletion<C> {
         self.completion.new_observer()
@@ -215,21 +214,33 @@ impl<C: fmt::Debug> fmt::Display for OwnerError<C> {
                 write!(
                     formatter,
                     "actor cleanup failed {} time(s)",
-                    error.errors.len()
+                    error.errors.len() + error.diagnostics.len()
                 )?;
 
                 for failure in &error.errors {
                     write!(formatter, ": {failure:?}")?;
                 }
 
+                for diagnostic in &error.diagnostics {
+                    write!(formatter, ": {diagnostic}")?;
+                }
+
                 Ok(())
             }
             Self::Panicked(error) => write!(formatter, "actor thread failed: {error}"),
             Self::PanickedWithCleanup { cause, cleanup } => {
-                write!(formatter, "actor thread failed: {cause}; cleanup failed")?;
+                write!(formatter, "actor thread failed: {cause}")?;
+
+                if !cleanup.errors.is_empty() {
+                    write!(formatter, "; cleanup failed")?;
+                }
 
                 for error in &cleanup.errors {
                     write!(formatter, ": {error:?}")?;
+                }
+
+                for diagnostic in &cleanup.diagnostics {
+                    write!(formatter, "; {diagnostic}")?;
                 }
 
                 Ok(())

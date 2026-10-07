@@ -88,11 +88,11 @@ pub enum DedicatedStartError<E> {
     NoRuntime,
     #[er(format = "actor capacity is outside Tokio's supported range")]
     InvalidCapacity,
-    #[er(format = "could not spawn actor thread: {0}")]
+    #[er(format = "could not spawn actor thread")]
     Thread(#[er(source)] io::Error),
-    #[er(format = "could not initialize actor: {0:?}")]
+    #[er(format = "could not initialize actor")]
     Init(#[er(source)] E),
-    #[er(format = "actor {actor:?} panicked while initializing: {cause}")]
+    #[er(format = "actor {actor:?} panicked while initializing")]
     Panicked {
         actor: String,
         #[er(source)]

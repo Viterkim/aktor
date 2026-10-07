@@ -26,6 +26,9 @@ pub struct Failure {
     pub actor: String,
     pub kind: FailureKind,
     pub payload: Box<dyn Any + Send>,
+    pub diagnostics: Vec<crate::AktorError>,
+    /// This panic became the group's first failure.
+    pub group_primary: bool,
 }
 
 #[derive(Clone, Default)]

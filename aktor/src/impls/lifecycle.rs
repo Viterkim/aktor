@@ -1,6 +1,26 @@
-use crate::{ActorArgs, AktorExecution, ShutdownReport};
+use crate::{
+    ActorArgs, AktorExecution, AktorShutdownAsync, AktorShutdownOutput, AktorShutdownSync,
+    ShutdownReport,
+};
 use alloc::string::String;
 use core::fmt;
+
+impl AktorShutdownOutput<AktorShutdownSync> for () {
+    type Future = core::future::Ready<Result<(), crate::AktorCleanupError>>;
+
+    fn into_shutdown(self) -> Self::Future {
+        core::future::ready(Ok(()))
+    }
+}
+impl<F: core::future::Future<Output = Result<(), crate::AktorCleanupError<Data>>>, Data>
+    AktorShutdownOutput<AktorShutdownAsync, Data> for F
+{
+    type Future = Self;
+
+    fn into_shutdown(self) -> Self::Future {
+        self
+    }
+}
 
 impl<Setup, Cleanup> ActorArgs<Setup, Cleanup> {
     /// Queue capacity starts at 32, change capacity if you need another size.

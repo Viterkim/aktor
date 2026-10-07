@@ -1,38 +1,27 @@
-# While it's running
+# Closing the app
 
-Calls wait when the queue is full. capacity counts waiting calls on native and local actors, workers include the running call. A dropped reply or timeout leaves admitted work running.
+Close and Ctrl C call actors.killswitch().stop(). An actor failure starts shutdown too, while an ordinary error returned by your function goes back to its caller.
 
-## Pause / resume (TokioThread)
-
-```rust
-let reopen = || {
-    Connection::open_in_memory()
-        .map_err(|error| AktorSetupError::new(error.to_string()))
-};
-
-database.actor.pause().await?;
-database.actor.resume(reopen).await?;
-```
-
-pause finishes queued calls and closes the resource. New calls wait for resume, a failed reopen leaves it paused.
-
-## Shutdown
+The shutdown closure runs after actor cleanup, so the app can finish closing when it receives the report:
 
 ```rust
-let kill = actors.killswitch();
-// your Close handler calls kill.stop()
+let actors = aktor_start(AktorSetup {
+    actors: (database_actor, cache_actor),
+    shutdown: |report| {
+        if report.failed() {
+            eprintln!("{report}");
+        }
 
-let report = actors.shutdown().await;
-
-if report.failed() {
-    eprintln!("{report}");
-}
+        request_app_close();
+    },
+    options: Default::default(),
+}).await?;
 ```
 
-Actor failure also wakes kill.wait_stopping(). Stop your caller tasks before awaiting shutdown, their calls can stay pending even past a timeout once the group is closing. With Tokio, abort those tasks or signal them to exit, dropping a JoinHandle leaves its task running.
+If the user can fix a failed startup and try again, report.startup lets this callback leave recovery to the code starting the actors.
 
-start owns a runtime for TokioThread groups. With group.start() or run(), keep your executor alive until shutdown finishes.
+Jobs started with actors.group.spawn_task are cancelled when stopping begins. Other application work holding resources that cleanup needs should release them when actors.killswitch().wait_stopping() completes.
 
-Local and Embassy drivers need to keep polling through cleanup. Dropping the driver cancels its actors. An operation panic still gets a cleanup attempt when Rust can unwind.
+To request shutdown and wait for it yourself, use actors.shutdown().await. Don't wait for this group inside its own shutdown callback, completion waits for that callback to return.
 
-Shutdown gets five seconds by default, then unfinished async work is cancelled and workers are terminated. If native work misses the watchdog's shutdown cutoff, the process will be killed even if a timeout report returns and the work finishes afterward.
+Shutdown gets five seconds by default, change options.shutdown_grace if it needs longer. A native actor that still won't stop can cause Aktor to terminate the process.

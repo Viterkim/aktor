@@ -261,3 +261,123 @@ async fn output() {
             .await
     }
 }
+
+#[cfg(all(feature = "local", feature = "macros"))]
+#[tokio::test]
+async fn local_waiting() {
+    use local_values::{Input, add};
+    use std::{cell::Cell, rc::Rc};
+
+    let (handle, owner) = local::channel::<Rc<Cell<u32>>, 1, ()>().unwrap();
+    let state = Rc::new(Cell::new(0));
+    let drops = Rc::new(Cell::new(0));
+    let input = |value| Input {
+        drops: drops.clone(),
+        value,
+    };
+    let first = add(&handle, input(1)).send().await;
+    let mut abandoned = add(&handle, input(100));
+    assert!(poll(&mut abandoned).is_pending());
+    drop(abandoned);
+    assert_eq!(drops.get(), 1);
+    assert_eq!(state.get(), 0);
+
+    let mut waiting = add(&handle, input(10)).into_request();
+    assert!(poll(&mut waiting).is_pending());
+    let mut running = Box::pin(owner.run(state.clone(), async |_| Ok(())));
+    assert!(poll(&mut running).is_pending());
+    assert_eq!(first.await.0.get(), 1);
+    let reply = waiting.send().await;
+    assert!(poll(&mut running).is_pending());
+    assert_eq!(reply.await.0.get(), 11);
+    assert_eq!(drops.get(), 3);
+
+    let mut admitted = add(&handle, input(1000)).into_request();
+    assert!(poll(&mut admitted).is_pending());
+    handle.shutdown();
+    let reply = admitted.send().await;
+    running.await.unwrap();
+    assert_eq!(reply.await.0.get(), 1011);
+    assert_eq!(drops.get(), 4);
+}
+
+#[cfg(all(feature = "local", feature = "macros"))]
+#[tokio::test]
+async fn local_consumed() {
+    use local_values::count;
+    use std::{cell::Cell, rc::Rc};
+
+    for extract in 0..2 {
+        let (handle, owner) = local::channel::<Rc<Cell<u32>>, 1, ()>().unwrap();
+        let state = Rc::new(Cell::new(0));
+        let mut running = Box::pin(owner.run(state.clone(), async |_| Ok(())));
+        let mut request = count(&handle).into_request();
+        assert!(poll(&mut request).is_pending());
+        assert!(poll(&mut running).is_pending());
+        (&mut request).await;
+
+        let panic = match extract {
+            0 => panics(async { drop(request.send().await) }).await,
+            _ => panics(request.cast()).await,
+        };
+        assert!(panic);
+        assert_eq!(state.get(), 1);
+        handle.shutdown();
+        running.await.unwrap();
+    }
+}
+
+#[cfg(all(feature = "local", feature = "macros"))]
+mod local_values {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    pub struct Input {
+        pub drops: Rc<Cell<usize>>,
+        pub value: u32,
+    }
+    impl Drop for Input {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    pub struct Output(pub Rc<Cell<u32>>);
+
+    #[aktor]
+    pub async fn add(state: &mut Rc<Cell<u32>>, input: Input) -> Output {
+        state.set(state.get() + input.value);
+        Output(state.clone())
+    }
+
+    #[aktor]
+    pub async fn count(state: &mut Rc<Cell<u32>>) {
+        state.set(state.get() + 1);
+    }
+}
+
+#[cfg(all(feature = "embassy_cross_core", feature = "macros"))]
+#[tokio::test]
+async fn cross_core_consumed() {
+    use local_values::count;
+    use std::{cell::Cell, rc::Rc};
+
+    for extract in 0..2 {
+        let (handle, owner) = cross_core::channel::<Rc<Cell<u32>>>(1).unwrap();
+        let state = Rc::new(Cell::new(0));
+        let mut running = Box::pin(owner.run_with(async || Ok(state.clone()), async |_| Ok(())));
+        let mut request = count(&handle).into_request();
+        assert!(poll(&mut request).is_pending());
+        assert!(poll(&mut running).is_pending());
+        (&mut request).await;
+
+        let panic = match extract {
+            0 => panics(async { drop(request.send().await) }).await,
+            _ => panics(request.cast()).await,
+        };
+        assert!(panic);
+        assert_eq!(state.get(), 1);
+        handle.shutdown();
+        running.await.unwrap();
+    }
+}

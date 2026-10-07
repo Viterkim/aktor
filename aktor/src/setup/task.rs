@@ -2,7 +2,7 @@ use super::*;
 use crate::{AktorTask, task};
 use kind::TokioTask;
 
-impl<S, Start, Fut, Role> AktorStart for AktorSetup<S, Start, TokioTask, Role>
+impl<S, Start, Fut, Role> AktorStart for AktorNew<S, Start, TokioTask, Role>
 where
     S: Send + 'static,
     Start: FnOnce() -> Fut + Send + 'static,
@@ -13,10 +13,8 @@ where
     type Handles = AktorTask<S, Role>;
     type Startup = AktorThreadFuture<Result<Self::Handles, AktorStartError>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {

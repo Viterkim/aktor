@@ -3,7 +3,7 @@ use super::*;
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 use crate::setup::kind::TokioTask;
 use crate::{
-    ActorFailure, ActorOutcome, AktorClosures, AktorError, AktorGroup, AktorSetup, AktorSetupError,
+    ActorFailure, ActorOutcome, AktorClosures, AktorError, AktorGroup, AktorNew, AktorSetupError,
     AktorStartError,
     group::shutdown::{contain_drop, panic_message},
     operation::hooks::AktorHooks,
@@ -50,12 +50,22 @@ struct Completion {
     failed: bool,
 }
 impl Completion {
-    fn fail(&mut self, phase: &str, message: String) {
+    fn fail(&mut self, phase: &str, message: String) -> bool {
         self.failed = true;
         self.kill.fail(ActorFailure {
             actor: self.report.actor.clone(),
             kind: self.report.kind,
             phase: phase.into(),
+            message,
+        })
+    }
+
+    fn fail_startup(&mut self, message: String) {
+        self.failed = true;
+        self.kill.fail_startup(ActorFailure {
+            actor: self.report.actor.clone(),
+            kind: self.report.kind,
+            phase: "setup".into(),
             message,
         });
     }
@@ -121,7 +131,7 @@ impl Drop for Completion {
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 #[doc(hidden)]
 pub async fn start<S, Start, Fut>(
-    setup: AktorSetup<S, Start, TokioTask>,
+    setup: AktorNew<S, Start, TokioTask>,
     group: &mut AktorGroup,
 ) -> Result<AktorTask<S>, AktorStartError>
 where
@@ -137,7 +147,7 @@ where
 
 #[doc(hidden)]
 pub async fn start_on<S, Start, Fut, Kind>(
-    setup: AktorSetup<S, Start, Kind>,
+    setup: AktorNew<S, Start, Kind>,
     group: &mut AktorGroup,
     clock: TaskClock,
     spawn: impl FnOnce(TaskOwnerFuture) -> TaskJoin,
@@ -153,7 +163,7 @@ where
         >,
 {
     let kind = Kind::EXECUTION;
-    let options = setup.options.unwrap_or_default();
+    let options = setup.options;
 
     if options.capacity == 0 || options.capacity > tokio::sync::Semaphore::MAX_PERMITS {
         return Err(AktorStartError::Setup(AktorError::new(
@@ -181,6 +191,7 @@ where
     let (joining, joined) = oneshot::channel::<TaskJoin>();
     let (finished, observed) = watch::channel(AktorTaskStatus::Running);
     let services = Arc::new(service::Services::new());
+
     let service_driver = service::ServiceDriver {
         services: services.clone(),
         kill: kill.clone(),
@@ -282,7 +293,7 @@ where
     started
         .await
         .unwrap_or_else(|_| Err(AktorError::new("actor task cancelled during setup")))
-        .map_err(AktorStartError::Setup)?;
+        .map_err(AktorStartError::Init)?;
 
     if kill.is_stopping() {
         return Err(AktorStartError::Setup(AktorError::new(
@@ -398,8 +409,8 @@ async fn drive<S, Start, Fut>(
     };
 
     match &result {
-        Some(Ok(Err(error))) => completion.fail("setup", error.to_string()),
-        Some(Err(payload)) => completion.fail("setup", panic_message(payload)),
+        Some(Ok(Err(error))) => completion.fail_startup(error.to_string()),
+        Some(Err(payload)) => completion.fail_startup(panic_message(payload)),
         _ => {}
     }
 
@@ -408,7 +419,7 @@ async fn drive<S, Start, Fut>(
     let state = match result {
         Some(Ok(Ok(state))) => state,
         Some(Ok(Err(error))) => {
-            completion.fail("setup", error.to_string());
+            completion.fail_startup(error.to_string());
 
             let _sent = ready.send(Err(error));
 
@@ -422,7 +433,7 @@ async fn drive<S, Start, Fut>(
         Some(Err(payload)) => {
             let message = panic_message(&payload);
 
-            completion.fail("setup", message.clone());
+            completion.fail_startup(message.clone());
             completion.dispose(payload, "task setup panic drop");
 
             let _sent = ready.send(Err(AktorError::new(message)));
@@ -582,7 +593,14 @@ async fn drive<S, Start, Fut>(
         };
 
         if let Some(Err(payload)) = &outcome {
-            completion.fail(operation.name, panic_message(payload));
+            let message = panic_message(payload);
+
+            if !completion.fail(operation.name, message.clone()) {
+                completion
+                    .report
+                    .diagnostics
+                    .push(AktorError::new(format!("{}: {message}", operation.name)));
+            }
         }
 
         completion.dispose(run, "task operation drop");
@@ -590,7 +608,6 @@ async fn drive<S, Start, Fut>(
         match outcome {
             Some(Ok(())) => {}
             Some(Err(payload)) => {
-                completion.fail(operation.name, panic_message(&payload));
                 completion.dispose(payload, "task operation panic drop");
                 break;
             }
@@ -642,8 +659,12 @@ async fn drive<S, Start, Fut>(
         };
 
         match &result {
-            Some(Ok(Err(error))) => completion.fail("cleanup", error.to_string()),
-            Some(Err(payload)) => completion.fail("cleanup", panic_message(payload)),
+            Some(Ok(Err(error))) => {
+                completion.fail("cleanup", error.to_string());
+            }
+            Some(Err(payload)) => {
+                completion.fail("cleanup", panic_message(payload));
+            }
             _ => {}
         }
 
@@ -765,6 +786,7 @@ mod tests {
             let (ready, _started) = oneshot::channel();
             let (completed, outcome) = oneshot::channel();
             let (finished, _observed) = watch::channel(AktorTaskStatus::Running);
+
             let completion = Completion {
                 report: ActorOutcome {
                     actor: "chain".into(),
@@ -777,6 +799,7 @@ mod tests {
                 finished,
                 failed: false,
             };
+
             let logic = TaskLogic {
                 start: Some(async || Ok(())),
                 end: Some(

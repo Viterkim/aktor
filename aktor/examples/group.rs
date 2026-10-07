@@ -40,27 +40,22 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     let closing = actors.start_with(after)?;
     let log = actors.spawn(ActorArgs::new("log", setup, cleanup)).await?;
 
-    let work = tokio::spawn(async move {
+    actors.spawn_task(async move {
         if let Err(error) = append(&log, "application started".into()).await {
             eprintln!("{error}");
         }
 
         core::future::pending::<()>().await;
-    });
+    })?;
 
     let ctrl_c = kill.clone();
-    let signal = tokio::spawn(async move {
+    actors.spawn_task(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             ctrl_c.stop();
         }
-    });
+    })?;
 
     kill.wait_stopping().await;
-    work.abort();
-    signal.abort();
-
-    let _joined = work.await;
-    let _joined = signal.await;
     let report = closing.await;
 
     if report.failed() {

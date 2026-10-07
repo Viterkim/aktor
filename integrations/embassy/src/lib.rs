@@ -101,7 +101,7 @@ pub fn sensor_setup(
     spawner: embassy_executor::Spawner,
 ) -> impl aktor::setup::AktorStart<Group = embassy::AktorGroup, Handles = embassy::Handle<Sensor, 0, ()>>
 {
-    AktorSetup {
+    AktorNew {
         name: AktorName::new("sensor"),
         role: AktorNoRole,
         kind: AktorKind::EmbassyLocal(move |future| {
@@ -117,12 +117,13 @@ pub fn sensor_setup(
                     readings: Rc::new(RefCell::new(Vec::new())),
                 })
             },
+
             end: None,
             intervals: Vec::new(),
             before_each: None,
             after_each: None,
         },
-        options: None,
+        options: AktorNewOptions { capacity: 32 },
     }
 }
 
@@ -130,7 +131,7 @@ pub fn shared_sensor_setup(
     spawner: embassy_executor::Spawner,
 ) -> impl aktor::setup::AktorStart<Group = embassy::AktorGroup, Handles = cross_core::Handle<Sensor>>
 {
-    AktorSetup {
+    AktorNew {
         name: AktorName::new("shared sensor"),
         role: AktorNoRole,
         kind: AktorKind::EmbassyCrossCore(move |future| {
@@ -146,14 +147,12 @@ pub fn shared_sensor_setup(
                     readings: Rc::new(RefCell::new(Vec::new())),
                 })
             },
+
             end: None,
             intervals: Vec::new(),
             before_each: None,
             after_each: None,
         },
-        options: Some(AktorOptions {
-            capacity: 1,
-            ..Default::default()
-        }),
+        options: AktorNewOptions { capacity: 1 },
     }
 }

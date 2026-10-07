@@ -1,7 +1,71 @@
 use super::shutdown::bounded;
 use super::*;
+use crate::AktorShutdownOutput;
 
 impl AktorGroup {
+    #[cfg(not(target_family = "wasm"))]
+    /// Run once after actor cleanup, before publishing the group's final report.
+    pub fn on_shutdown<Cleanup, Output, Mode>(&self, cleanup: Cleanup) -> Result<(), AktorError>
+    where
+        Cleanup: FnOnce(ShutdownReport) -> Output + Send + 'static,
+        Output: AktorShutdownOutput<Mode>,
+        Output::Future: Send + 'static,
+    {
+        self.register_shutdown(Box::new(move |report| {
+            Box::pin(async move { cleanup(report).into_shutdown().await })
+        }))
+    }
+
+    #[cfg(target_family = "wasm")]
+    /// Run once after actor cleanup, before publishing the group's final report.
+    pub fn on_shutdown<Cleanup, Output, Mode>(&self, cleanup: Cleanup) -> Result<(), AktorError>
+    where
+        Cleanup: FnOnce(ShutdownReport) -> Output + 'static,
+        Output: AktorShutdownOutput<Mode>,
+        Output::Future: 'static,
+    {
+        self.register_shutdown(Box::new(move |report| {
+            Box::pin(async move { cleanup(report).into_shutdown().await })
+        }))
+    }
+
+    fn register_shutdown(&self, hook: ShutdownHook) -> Result<(), AktorError> {
+        let state = self.control.lock();
+        #[cfg(not(target_family = "wasm"))]
+        let mut state = state;
+        #[cfg(not(target_family = "wasm"))]
+        let registered = state.shutdown_hook.is_some();
+        #[cfg(target_family = "wasm")]
+        let registered = self.shutdown_hook.borrow().is_some();
+        let error = if registered {
+            Some("this group already has a shutdown closure")
+        } else if state.deadline.is_some() || state.finished {
+            Some("actor group is closing")
+        } else {
+            None
+        };
+
+        if let Some(error) = error {
+            drop(state);
+            super::shutdown::contain_drop(
+                hook,
+                &self.killswitch(),
+                "rejected shutdown closure drop",
+            );
+            return Err(AktorError::new(error));
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            state.shutdown_hook = Some(hook);
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            *self.shutdown_hook.borrow_mut() = Some(hook);
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn register_owner(
         &mut self,
@@ -59,6 +123,7 @@ impl AktorGroup {
             changed: watch::channel(None).0,
             completed: watch::channel(None).0,
             grace,
+            application_changed: watch::channel(()).0,
             #[cfg(not(target_family = "wasm"))]
             wake: std::sync::Condvar::new(),
             #[cfg(not(target_family = "wasm"))]
@@ -68,10 +133,13 @@ impl AktorGroup {
         Self {
             stop_on_drop: false,
             control,
+            startup_failure: None,
             #[cfg(not(target_family = "wasm"))]
             actors: Arc::new(Mutex::new(Vec::new())),
             #[cfg(target_family = "wasm")]
             actors: Rc::new(RefCell::new(Vec::new())),
+            #[cfg(target_family = "wasm")]
+            shutdown_hook: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -128,7 +196,7 @@ impl AktorGroup {
                 Ok(completed)
             }
             Err(error) => {
-                let report = {
+                {
                     let mut state = self.control.lock();
                     state.listening = false;
                     state.finished = true;
@@ -136,9 +204,10 @@ impl AktorGroup {
                         .report
                         .application
                         .push(AktorError::new(error.to_string()));
-                    state.report.clone()
                 };
 
+                self.killswitch().dispose_shutdown_hook();
+                let report = self.control.lock().report.clone();
                 self.control.completed.send_replace(Some(report));
                 self.control.wake.notify_all();
                 Err(AktorError::new(error.to_string()))
@@ -179,7 +248,7 @@ impl AktorGroup {
         if let Err(error) = crate::executor::Spawner::Std.spawn_named("aktor group", async move {
             closing.await;
         }) {
-            let report = {
+            {
                 let mut state = self.control.lock();
 
                 state.listening = false;
@@ -188,9 +257,10 @@ impl AktorGroup {
                     .report
                     .application
                     .push(AktorError::new(error.to_string()));
-                state.report.clone()
             };
 
+            self.killswitch().dispose_shutdown_hook();
+            let report = self.control.lock().report.clone();
             self.control.completed.send_replace(Some(report));
             self.control.wake.notify_all();
             return Err(AktorError::new(error.to_string()));
@@ -212,6 +282,7 @@ impl AktorGroup {
     pub fn killswitch(&self) -> KillSwitch {
         KillSwitch {
             control: self.control.clone(),
+            startup_failure: self.startup_failure.clone(),
         }
     }
 
@@ -222,11 +293,19 @@ impl AktorGroup {
     }
 
     #[doc(hidden)]
+    pub fn track_startup(&mut self) {
+        self.startup_failure = Some(Arc::new(AtomicBool::new(false)));
+    }
+
+    #[doc(hidden)]
     pub fn new_registration(&self) -> Self {
         Self {
             stop_on_drop: false,
             control: self.control.clone(),
+            startup_failure: self.startup_failure.clone(),
             actors: self.actors.clone(),
+            #[cfg(target_family = "wasm")]
+            shutdown_hook: self.shutdown_hook.clone(),
         }
     }
 
@@ -335,7 +414,10 @@ impl AktorGroup {
         let group = Self {
             stop_on_drop: false,
             control: self.control.clone(),
+            startup_failure: self.startup_failure.clone(),
             actors: self.actors.clone(),
+            #[cfg(target_family = "wasm")]
+            shutdown_hook: self.shutdown_hook.clone(),
         };
 
         let kill = self.killswitch();
@@ -375,6 +457,7 @@ impl Default for AktorGroup {
         Self::new()
     }
 }
+
 impl KillSwitch {
     pub fn stop(&self) {
         let (deadline, report) = {
@@ -386,6 +469,7 @@ impl KillSwitch {
 
             let deadline = shutdown_deadline(Instant::now(), self.control.grace);
 
+            state.report.startup |= state.starting;
             state.deadline = Some(deadline);
             self.control.stopping.store(true, Ordering::Release);
 
@@ -406,9 +490,18 @@ impl KillSwitch {
 
         self.control.changed.send_replace(Some(deadline));
 
-        if let Some(report) = report {
+        if report.is_some() {
+            #[cfg(not(target_family = "wasm"))]
+            self.dispose_shutdown_hook();
+            let report = self.control.lock().report.clone();
             self.control.completed.send_replace(Some(report));
         }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn dispose_shutdown_hook(&self) {
+        let hook = self.control.lock().shutdown_hook.take();
+        super::shutdown::contain_drop(hook, self, "cancelled shutdown closure drop");
     }
 
     /// Let your UI or other tasks know we're closing.
@@ -421,8 +514,39 @@ impl KillSwitch {
     }
 
     #[doc(hidden)]
-    pub fn fail(&self, mut failure: ActorFailure) {
+    pub fn set_starting(&self, starting: bool) -> bool {
+        let mut state = self.control.lock();
+
+        if state.deadline.is_some()
+            || state.finished
+            || (starting && state.report.failure.is_some())
         {
+            return false;
+        }
+
+        state.starting = starting;
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn has_startup_failure(&self) -> bool {
+        self.startup_failure
+            .as_ref()
+            .is_some_and(|receipt| receipt.load(Ordering::Acquire))
+    }
+
+    #[doc(hidden)]
+    pub fn fail_startup(&self, failure: ActorFailure) -> bool {
+        self.record_failure(failure, true)
+    }
+
+    #[doc(hidden)]
+    pub fn fail(&self, failure: ActorFailure) -> bool {
+        self.record_failure(failure, false)
+    }
+
+    fn record_failure(&self, mut failure: ActorFailure, startup: bool) -> bool {
+        let first = {
             let mut state = self.control.lock();
 
             if failure.kind.is_none() {
@@ -430,11 +554,20 @@ impl KillSwitch {
             }
 
             if state.report.failure.is_none() {
+                if startup && let Some(receipt) = &self.startup_failure {
+                    receipt.store(true, Ordering::Release);
+                }
+
+                state.report.startup |= startup;
                 state.report.failure = Some(failure);
+                true
+            } else {
+                false
             }
-        }
+        };
 
         self.stop();
+        first
     }
 
     pub fn deadline(&self) -> Instant {
@@ -469,11 +602,8 @@ impl KillSwitch {
         self.wait_for_force().await;
     }
 
-    pub(super) async fn bounded<F: Future>(
-        &self,
-        deadline: Instant,
-        future: F,
-    ) -> Option<F::Output> {
+    #[doc(hidden)]
+    pub async fn bounded<F: Future>(&self, deadline: Instant, future: F) -> Option<F::Output> {
         #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
         if self
             .control
@@ -486,6 +616,7 @@ impl KillSwitch {
         bounded(deadline, future).await
     }
 }
+
 impl State {
     pub fn kind(&self, name: &str) -> Option<AktorExecution> {
         let mut kinds = self
@@ -505,6 +636,7 @@ impl Control {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 }
+
 impl GroupCompletion {
     /// Read the retained report if shutdown has finished.
     pub fn try_report(&self) -> Option<ShutdownReport> {

@@ -47,12 +47,18 @@ impl Inner {
 
     fn notify(&self, error: &WireError) {
         if let Some((name, group)) = &*self.group.borrow() {
-            group.fail(crate::group::ActorFailure {
+            let failure = crate::group::ActorFailure {
                 kind: None,
                 actor: name.clone(),
                 phase: "worker".into(),
                 message: error.to_string(),
-            });
+            };
+
+            if matches!(&*self.ready.borrow(), Some(Ok(()))) {
+                group.fail(failure);
+            } else {
+                group.fail_startup(failure);
+            }
         }
     }
 

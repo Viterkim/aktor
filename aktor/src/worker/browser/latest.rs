@@ -74,6 +74,7 @@ struct Shared<I, O> {
     encoder: fn(&I) -> Result<Vec<u8>, WorkerError>,
     decoder: fn(&[u8]) -> Result<O, WorkerError>,
 }
+
 struct Slot<I, O> {
     revision: u64,
     pending: Option<I>,
@@ -138,6 +139,7 @@ impl<I: 'static, O: 'static> Shared<I, O> {
         }
     }
 }
+
 struct ServiceCall<I, O>(Rc<Shared<I, O>>);
 impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
     fn operation(&self) -> &str {
@@ -200,6 +202,7 @@ impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
         self.0.wake();
     }
 }
+
 impl<I: 'static, O: 'static> Input<I> for Shared<I, O> {
     fn send(&self, input: I) {
         let (pending, unread) = {

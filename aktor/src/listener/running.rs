@@ -59,6 +59,8 @@ impl<S> Drop for Running<S> {
             actor: listener.name.clone(),
             kind: FailureKind::Cancelled,
             payload: Box::new("actor task cancelled before completion"),
+            diagnostics: Vec::new(),
+            group_primary: false,
         });
 
         failures.capture(FailureKind::Teardown, || listener.receiver.close());

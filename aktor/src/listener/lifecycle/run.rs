@@ -205,8 +205,12 @@ where
 
     failures.capture(FailureKind::Teardown, || drop((finished, status)));
 
-    if failures.first.is_some() {
-        failed_cleanup.lock().errors = std::mem::take(&mut errors);
+    if let Some(failure) = &mut failures.first {
+        let mut saved = failed_cleanup.lock();
+
+        saved.errors = std::mem::take(&mut errors);
+        saved.diagnostics = failure.diagnostics.clone();
+        saved.group_primary = failure.group_primary;
     }
 
     failures.finish(&policy);
@@ -214,7 +218,10 @@ where
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(CleanupErrors { errors })
+        Err(CleanupErrors {
+            errors,
+            diagnostics: Vec::new(),
+        })
     }
 }
 

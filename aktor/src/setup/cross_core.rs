@@ -3,7 +3,7 @@ use crate::{cross_core, local::hooks::AktorHooks};
 use core::ops::AsyncFnOnce;
 use kind::EmbassyCrossCore;
 
-impl<S: 'static, Start, Role> AktorStart for AktorSetup<S, Start, EmbassyCrossCore, Role>
+impl<S: 'static, Start, Role> AktorStart for AktorNew<S, Start, EmbassyCrossCore, Role>
 where
     Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
 {
@@ -12,10 +12,8 @@ where
     type Handles = cross_core::Handle<S, Role>;
     type Startup = crate::message::LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -30,7 +28,7 @@ where
         let setup = self.with_role(AktorNoRole);
 
         Box::pin(async move {
-            let options = setup.options.unwrap_or_default();
+            let options = setup.options;
             let AktorClosures {
                 start,
                 mut end,
@@ -94,7 +92,7 @@ where
                 .map_err(|error| {
                     AktorStartError::Setup(AktorSetupError::new(alloc::format!("{error}")))
                 })?;
-            handle.ready().await.map_err(AktorStartError::Setup)?;
+            handle.ready().await.map_err(AktorStartError::Init)?;
             Ok(handle.with_role::<Role>())
         })
     }

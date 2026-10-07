@@ -15,26 +15,43 @@ async fn add(counter: &mut Counter, by: u32) -> Result<u32, &'static str> {
 
 pub fn check() -> Result<(), String> {
     executor::block_on(async {
-        let failed = start(AktorSetup {
-            name: AktorName::new("typed startup"),
-            role: AktorNoRole,
-            kind: AktorKind::StdThread.with_data::<Cell<u32>, ()>(),
-            closures: AktorClosures::new(async || {
-                Err::<Counter, _>(AktorSetupError {
-                    diagnostics: "storage refused".into(),
-                    data: Cell::new(23),
-                })
-            }),
-            options: None,
+        let failed = aktor_start(AktorSetup {
+            actors: AktorNew {
+                name: AktorName::new("typed startup"),
+                role: AktorNoRole,
+                kind: AktorKind::StdThread,
+                closures: AktorClosures {
+                    start: async || {
+                        Err::<Counter, _>(AktorSetupError {
+                            diagnostics: "storage refused".into(),
+                            data: Cell::new(23),
+                        })
+                    },
+
+                    end: None,
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
+                options: AktorNewOptions { capacity: 32 },
+            },
+            shutdown: |_| {},
+            options: AktorOptions {
+                shutdown_grace: Duration::from_secs(5),
+            },
         })
         .await;
 
         match failed {
             Err(AktorStartupError {
-                error: AktorThreadStartError::Thread(listener::DedicatedStartError::Init(error)),
-                report: Some(_),
+                error: AktorStartError::Init(error),
+                report: Some(report),
+                ..
             }) => {
                 assert_eq!(error.data.get(), 23);
+                if !report.failed() {
+                    return Err("typed startup lost its rollback report".into());
+                }
             }
             _ => return Err("typed startup lost its data".into()),
         }
@@ -42,44 +59,58 @@ pub fn check() -> Result<(), String> {
         let caller = thread::current().id();
         let (end, ended) = mpsc::channel();
         let (tick, ticked) = mpsc::channel();
-        let actors = start((
-            AktorSetup {
-                name: AktorName::new("counter"),
-                role: AktorNoRole,
-                kind: AktorKind::StdThread,
-                closures: AktorClosures {
-                    start: async move || {
-                        assert_ne!(thread::current().id(), caller);
-                        Ok(Counter(Rc::new(Cell::new(0))))
+        let actors = aktor_start(AktorSetup {
+            actors: (
+                AktorNew {
+                    name: AktorName::new("counter"),
+                    role: AktorNoRole,
+                    kind: AktorKind::StdThread,
+                    closures: AktorClosures {
+                        start: async move || {
+                            assert_ne!(thread::current().id(), caller);
+                            Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0))))
+                        },
+
+                        end: Some(
+                            (async move |counter: Counter| {
+                                end.send(counter.0.get())
+                                    .map_err(|error| AktorCleanupError::new(error.to_string()))?;
+                                Ok(())
+                            })
+                            .into(),
+                        ),
+                        intervals: vec![AktorInterval {
+                            every: Duration::from_millis(1),
+                            run: (async move |_: &mut Counter| {
+                                let _sent = tick.send(());
+                            })
+                            .into(),
+                        }],
+                        before_each: None,
+                        after_each: None,
                     },
-                    end: Some(
-                        (async move |counter: Counter| {
-                            end.send(counter.0.get())
-                                .map_err(|error| AktorCleanupError::new(error.to_string()))?;
-                            Ok(())
-                        })
-                        .into(),
-                    ),
-                    intervals: vec![AktorInterval {
-                        every: Duration::from_millis(1),
-                        run: (async move |_: &mut Counter| {
-                            let _sent = tick.send(());
-                        })
-                        .into(),
-                    }],
-                    before_each: None,
-                    after_each: None,
+                    options: AktorNewOptions { capacity: 32 },
                 },
-                options: None,
+                AktorNew {
+                    name: AktorName::new("sibling"),
+                    role: AktorNoRole,
+                    kind: AktorKind::StdThread,
+                    closures: AktorClosures {
+                        start: async || Ok::<_, AktorSetupError>(0_u32),
+
+                        end: None,
+                        intervals: vec![],
+                        before_each: None,
+                        after_each: None,
+                    },
+                    options: AktorNewOptions { capacity: 32 },
+                },
+            ),
+            shutdown: |_| {},
+            options: AktorOptions {
+                shutdown_grace: Duration::from_secs(5),
             },
-            AktorSetup {
-                name: AktorName::new("sibling"),
-                role: AktorNoRole,
-                kind: AktorKind::StdThread,
-                closures: AktorClosures::new(async || Ok(0_u32)),
-                options: None,
-            },
-        ))
+        })
         .await
         .map_err(|error| error.to_string())?;
 

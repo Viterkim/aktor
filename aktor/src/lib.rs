@@ -6,24 +6,31 @@ extern crate alloc;
 extern crate self as aktor;
 
 mod impls;
+#[cfg(all(
+    feature = "std",
+    any(
+        feature = "local",
+        feature = "tokio",
+        all(feature = "std_thread", not(target_family = "wasm")),
+        feature = "wasm_browser_workers"
+    )
+))]
+mod panic;
+pub use impls::{aktor_err_cleanup, aktor_err_setup};
 pub mod types;
 pub use types::*;
 
 #[cfg(any(
-    any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm"))
-    ),
+    feature = "tokio",
+    all(feature = "std_thread", not(target_family = "wasm")),
     feature = "embassy",
     feature = "wasm_browser_workers",
     feature = "browser_local"
 ))]
 pub mod timeout;
 #[cfg(any(
-    any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm"))
-    ),
+    feature = "tokio",
+    all(feature = "std_thread", not(target_family = "wasm")),
     feature = "embassy",
     feature = "wasm_browser_workers",
     feature = "browser_local"
@@ -31,19 +38,15 @@ pub mod timeout;
 pub use timeout::{AktorTimeoutError, Timeout};
 
 #[cfg(any(
-    any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm"))
-    ),
+    feature = "tokio",
+    all(feature = "std_thread", not(target_family = "wasm")),
     feature = "wasm_browser_workers",
     all(feature = "browser_local", target_family = "wasm")
 ))]
 pub mod group;
 #[cfg(any(
-    any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm"))
-    ),
+    feature = "tokio",
+    all(feature = "std_thread", not(target_family = "wasm")),
     feature = "wasm_browser_workers",
     all(feature = "browser_local", target_family = "wasm")
 ))]
@@ -76,10 +79,7 @@ pub mod dispatch;
 pub mod message;
 pub mod operation;
 #[cfg(all(
-    any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm"))
-    ),
+    any(feature = "tokio", feature = "std_thread"),
     not(target_family = "wasm")
 ))]
 pub mod owner;
@@ -91,10 +91,7 @@ mod queue;
 #[cfg(any(
     feature = "local",
     all(
-        any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ),
+        any(feature = "tokio", feature = "std_thread"),
         not(target_family = "wasm")
     ),
     all(
@@ -106,18 +103,10 @@ mod queue;
 pub mod setup;
 #[cfg(any(all(feature = "tokio", not(target_family = "wasm")), feature = "bevy"))]
 pub mod task;
-#[cfg(all(
-    any(feature = "tokio", feature = "std_thread"),
-    not(target_family = "wasm")
-))]
-pub use setup::AktorThreadStartError;
 #[cfg(any(
     feature = "local",
     all(
-        any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ),
+        any(feature = "tokio", feature = "std_thread"),
         not(target_family = "wasm")
     ),
     all(
@@ -126,7 +115,7 @@ pub use setup::AktorThreadStartError;
         target_os = "unknown"
     )
 ))]
-pub use setup::{start, start_in};
+pub use setup::{aktor_start, aktor_start_in};
 #[cfg(any(all(feature = "tokio", not(target_family = "wasm")), feature = "bevy"))]
 pub use task::{AktorTask, AktorTaskState};
 #[cfg(feature = "wasm_browser_workers")]
@@ -149,10 +138,7 @@ pub use aktor_macros::{AktorData, aktor, aktor_setups};
 ))]
 pub use listener::{FailurePolicy, SpawnArgs};
 #[cfg(all(
-    any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm"))
-    ),
+    any(feature = "tokio", feature = "std_thread"),
     not(target_family = "wasm")
 ))]
 #[doc(inline)]
@@ -163,4 +149,4 @@ pub use owner::Aktor;
     target_family = "wasm",
     target_os = "unknown"
 ))]
-pub use setup::{AktorWorkerOptions, AktorWorkerSetup};
+pub use setup::{AktorWorkerNew, AktorWorkerOptions};

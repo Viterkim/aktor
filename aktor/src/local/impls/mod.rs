@@ -37,6 +37,7 @@ pub fn channel_with_clock<S, const N: usize, E, Clock>(
             ready: RefCell::new(None),
             result: RefCell::new(None),
             diagnostics: Rc::new(RefCell::new(alloc::vec::Vec::new())),
+            panic_reported: Cell::new(false),
             changed: Event::default(),
         }),
     });
@@ -145,18 +146,24 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         if let Some((name, group)) = supervisor
             && !(matches!(error, OwnerError::Cancelled) && group.is_stopping())
         {
-            group.fail(crate::ActorFailure {
+            let failure = crate::ActorFailure {
                 kind: None,
                 actor: name,
                 phase: match error {
-                    OwnerError::Setup(_) => "setup",
+                    OwnerError::Setup(_) | OwnerError::SetupPanic(_) => "setup",
                     OwnerError::Cleanup(_) => "cleanup",
                     OwnerError::Runner(_) => "runner",
                     OwnerError::Cancelled => "owner",
                 }
                 .into(),
-                message: alloc::format!("{error}"),
-            });
+                message: alloc::format!("{error:#}"),
+            };
+
+            if matches!(error, OwnerError::Setup(_) | OwnerError::SetupPanic(_)) {
+                group.fail_startup(failure);
+            } else {
+                group.fail(failure);
+            }
         }
     }
 
@@ -183,29 +190,18 @@ impl<S, const N: usize, E> Inner<S, N, E> {
 
         let queued = core::mem::take(&mut *self.queue.borrow_mut());
         let services = core::mem::take(&mut *self.services.borrow_mut());
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let primary = crate::local::panic::discard(queued.into_iter().chain(services), |payload| {
             self.completion
                 .diagnostics
                 .borrow_mut()
-                .push(crate::AktorError::new(
-                    crate::group::shutdown::panic_message(payload),
-                ));
+                .push(crate::AktorError::new(crate::panic::panic_message(payload)));
         });
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         for message in queued.into_iter().chain(services) {
             drop(message);
         }
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let result = if result.is_ok() && primary.is_some() {
             Err(completion.failure.clone())
         } else {
@@ -214,10 +210,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
 
         self.complete(result);
         completion.armed = false;
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         if let Some(payload) = primary {
             std::panic::resume_unwind(payload);
         }
@@ -281,15 +274,22 @@ impl<S, const N: usize, E, Role, Clock> Handle<S, N, E, Role, Clock> {
         }
     }
 
-    /// Wait for setup, or get its error.
-    pub async fn ready(&self) -> Result<(), Rc<OwnerError<E>>> {
+    /// Wait for setup, or get an owned diagnostic without retaining setup data.
+    pub async fn ready(&self) -> Result<(), OwnerError> {
+        self.ready_with_data()
+            .await
+            .map_err(|error| error.error.report())
+    }
+
+    /// Observe the original setup error and its data on this executor.
+    pub async fn ready_with_data(&self) -> Result<(), SharedOwnerError<E>> {
         let changed = self.inner.completion.changed.listen();
 
         poll_fn(|context| {
             changed.register(context);
 
             match self.inner.completion.ready.borrow().clone() {
-                Some(result) => Poll::Ready(result),
+                Some(result) => Poll::Ready(result.map_err(|error| SharedOwnerError { error })),
                 None => Poll::Pending,
             }
         })
@@ -374,7 +374,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         self,
         setup: Setup,
         cleanup: Cleanup,
-    ) -> Result<(), Rc<OwnerError<E>>>
+    ) -> Result<(), OwnerError>
     where
         Setup: FnOnce() -> SetupFuture,
         SetupFuture: Future<Output = Result<S, crate::AktorSetupError<E>>>,
@@ -389,7 +389,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         self,
         state: S,
         cleanup: Cleanup,
-    ) -> Result<(), Rc<OwnerError<E>>>
+    ) -> Result<(), OwnerError>
     where
         Cleanup: FnOnce(S) -> CleanupFuture,
         CleanupFuture: Future<Output = Result<(), crate::AktorCleanupError<E>>>,
@@ -399,19 +399,14 @@ impl<S, const N: usize, E> Owner<S, N, E> {
 
     async fn dispose_hooks(&mut self) {
         let hooks = core::mem::take(&mut self.hooks);
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         {
             let report = |payload: &Box<dyn std::any::Any + Send>| {
                 self.inner
                     .completion
                     .diagnostics
                     .borrow_mut()
-                    .push(crate::AktorError::new(
-                        crate::group::shutdown::panic_message(payload),
-                    ));
+                    .push(crate::AktorError::new(crate::panic::panic_message(payload)));
             };
 
             let primary = crate::local::panic::discard_hooks(hooks, report);
@@ -420,22 +415,16 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 std::panic::resume_unwind(payload);
             }
         }
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         drop(hooks);
     }
 }
 impl<S, const N: usize, E> Drop for Owner<S, N, E> {
     fn drop(&mut self) {
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         {
             let report = |payload: &Box<dyn std::any::Any + Send>| {
-                let error = crate::AktorError::new(crate::group::shutdown::panic_message(payload));
+                let error = crate::AktorError::new(crate::panic::panic_message(payload));
                 self.inner.fail(&OwnerError::Runner(error.clone()));
                 self.inner.completion.diagnostics.borrow_mut().push(error);
             };
@@ -459,22 +448,19 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
                 if primary.is_none() {
                     primary = Some(payload);
                 } else {
-                    crate::listener::failure::dispose_secondary(payload);
+                    crate::panic::dispose_secondary(payload);
                 }
             }
 
             if let Some(payload) = primary {
                 if std::thread::panicking() {
-                    crate::listener::failure::dispose_secondary(payload);
+                    crate::panic::dispose_secondary(payload);
                 } else {
                     std::panic::resume_unwind(payload);
                 }
             }
         }
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         if self.inner.completion.result.borrow().is_none() {
             self.inner.finish(Err(Rc::new(OwnerError::Cancelled)));
         }
@@ -482,6 +468,11 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
 }
 
 impl<E> Completion<E> {
+    #[doc(hidden)]
+    pub fn panic_reported(&self) -> bool {
+        self.inner.panic_reported.get()
+    }
+
     #[doc(hidden)]
     pub fn diagnostics(&self) -> alloc::vec::Vec<crate::AktorError> {
         self.inner.diagnostics.borrow().clone()
@@ -493,14 +484,22 @@ impl<E> Completion<E> {
         }
     }
 
-    pub async fn wait(&self) -> Result<(), Rc<OwnerError<E>>> {
+    /// Observe completion without retaining the owner's typed failure data.
+    pub async fn wait(&self) -> Result<(), OwnerError> {
+        self.wait_with_data()
+            .await
+            .map_err(|error| error.error.report())
+    }
+
+    /// Observe the exact lifecycle error and its data on this executor.
+    pub async fn wait_with_data(&self) -> Result<(), SharedOwnerError<E>> {
         let changed = self.inner.changed.listen();
 
         poll_fn(|context| {
             changed.register(context);
 
             match self.inner.result.borrow().clone() {
-                Some(result) => Poll::Ready(result),
+                Some(result) => Poll::Ready(result.map_err(|error| SharedOwnerError { error })),
                 None => Poll::Pending,
             }
         })
@@ -508,7 +507,7 @@ impl<E> Completion<E> {
     }
 }
 impl<E: 'static> IntoFuture for Completion<E> {
-    type Output = Result<(), Rc<OwnerError<E>>>;
+    type Output = Result<(), OwnerError>;
     type IntoFuture = LocalFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -516,7 +515,7 @@ impl<E: 'static> IntoFuture for Completion<E> {
     }
 }
 impl<'a, E: 'a> IntoFuture for &'a Completion<E> {
-    type Output = Result<(), Rc<OwnerError<E>>>;
+    type Output = Result<(), OwnerError>;
     type IntoFuture = LocalFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -526,25 +525,71 @@ impl<'a, E: 'a> IntoFuture for &'a Completion<E> {
 
 impl<E> core::fmt::Display for OwnerError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Setup(error) => write!(f, "actor setup failed: {error}"),
-            Self::Cleanup(error) => write!(f, "actor cleanup failed: {error}"),
-            Self::Runner(error) => write!(f, "actor runner failed: {error}"),
-            Self::Cancelled => f.write_str("actor owner stopped before cleanup completed"),
+        let (context, source): (&str, Option<&dyn core::fmt::Display>) = match self {
+            Self::Setup(error) => ("actor setup failed", Some(error)),
+            Self::SetupPanic(error) => ("actor setup panicked", Some(error)),
+            Self::Cleanup(error) => ("actor cleanup failed", Some(error)),
+            Self::Runner(error) => ("actor runner failed", Some(error)),
+            Self::Cancelled => ("actor owner stopped before cleanup completed", None),
+        };
+
+        f.write_str(context)?;
+
+        if f.alternate()
+            && let Some(error) = source
+        {
+            write!(f, ": {error}")?;
         }
+
+        Ok(())
     }
 }
 impl<E> core::fmt::Debug for OwnerError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Display::fmt(self, f)
+        write!(f, "{self:#}")
     }
 }
 impl<E: 'static> core::error::Error for OwnerError<E> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Setup(error) | Self::Cleanup(error) => Some(error),
-            Self::Runner(error) => Some(error),
+            Self::SetupPanic(error) | Self::Runner(error) => Some(error),
             Self::Cancelled => None,
         }
+    }
+}
+impl<E> OwnerError<E> {
+    /// Copy the diagnostic, leaving the original typed data available to observers.
+    pub fn report(&self) -> OwnerError {
+        match self {
+            Self::Setup(error) => OwnerError::Setup(error.report()),
+            Self::SetupPanic(error) => OwnerError::SetupPanic(error.clone()),
+            Self::Cleanup(error) => OwnerError::Cleanup(error.report()),
+            Self::Runner(error) => OwnerError::Runner(error.clone()),
+            Self::Cancelled => OwnerError::Cancelled,
+        }
+    }
+}
+
+impl<E> Clone for SharedOwnerError<E> {
+    fn clone(&self) -> Self {
+        Self {
+            error: self.error.clone(),
+        }
+    }
+}
+impl<E> core::fmt::Display for SharedOwnerError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&*self.error, f)
+    }
+}
+impl<E> core::fmt::Debug for SharedOwnerError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:#}")
+    }
+}
+impl<E: 'static> core::error::Error for SharedOwnerError<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&*self.error)
     }
 }

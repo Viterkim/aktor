@@ -1,61 +1,35 @@
 use super::*;
 use crate::{
     ActorOutcome, AktorGroup,
-    worker::{Options, Worker, WorkerCause},
+    worker::{Options, Worker},
 };
+use alloc::rc::Rc;
+use core::cell::Cell;
 use serde::Serialize;
 
-pub struct AktorWorkerSetup<S, Config, Role = AktorNoRole> {
+pub struct AktorWorkerNew<S, Config, Role = AktorNoRole> {
     pub name: AktorName,
     pub role: Role,
     pub kind: kind::BrowserWebWorker<S>,
     pub config: Config,
-    pub options: Option<AktorWorkerOptions>,
-}
-impl<S, Config, Role> AktorWorkerSetup<S, Config, Role> {
-    pub async fn start_in(
-        self,
-        group: &<Self as AktorStart>::Group,
-    ) -> Result<<Self as AktorStart>::Handles, AktorStartupError<<Self as AktorStart>::Error>>
-    where
-        Self: AktorStart,
-    {
-        start_in(group, self).await
-    }
-
-    pub fn start(self) -> AktorStartup<Self>
-    where
-        Self: AktorStart,
-    {
-        start(self)
-    }
+    pub options: AktorWorkerOptions,
 }
 
+#[derive(Default)]
 pub struct AktorWorkerOptions {
-    pub shutdown_grace: Duration,
     pub transport: Options,
-}
-impl Default for AktorWorkerOptions {
-    fn default() -> Self {
-        Self {
-            shutdown_grace: Duration::from_secs(5),
-            transport: Options::default(),
-        }
-    }
 }
 
 impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
-    for AktorWorkerSetup<S, Config, Role>
+    for AktorWorkerNew<S, Config, Role>
 {
     type Error = AktorStartError;
     type Group = AktorGroup;
     type Handles = Worker<S, Role>;
     type Startup = crate::message::LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -66,7 +40,7 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
         Box::pin(async move {
             let worker = Worker::<S, Role>::with_config(
                 &self.kind.program,
-                self.options.unwrap_or_default().transport,
+                self.options.transport,
                 &self.config,
             )
             .map_err(|error| AktorStartError::Setup(AktorSetupError::new(error.to_string())))?;
@@ -79,6 +53,8 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
             let cancel = worker.new_handle();
             let completion = worker.completion();
             let label = self.name.name.clone();
+            let timed_out = Rc::new(Cell::new(false));
+            let forced = timed_out.clone();
 
             if let Err(error) = context.group.register_owner(
                 self.name.name,
@@ -86,7 +62,10 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
                 Box::new(move || {
                     shutdown.shutdown();
                 }),
-                Box::new(move || cancel.terminate()),
+                Box::new(move || {
+                    forced.set(true);
+                    cancel.terminate();
+                }),
                 Box::pin(async move {
                     let mut report = ActorOutcome {
                         actor: label,
@@ -96,7 +75,7 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
                     };
 
                     if let Err(error) = completion.wait_report().await {
-                        report.timed_out = error.cause == WorkerCause::Closed;
+                        report.timed_out = timed_out.get();
                         report
                             .diagnostics
                             .push(AktorSetupError::new(error.to_string()));
@@ -112,7 +91,7 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
             worker
                 .ready()
                 .await
-                .map_err(|error| AktorStartError::Setup(AktorSetupError::new(error.to_string())))?;
+                .map_err(|error| AktorStartError::Init(AktorSetupError::new(error.to_string())))?;
             Ok(worker)
         })
     }

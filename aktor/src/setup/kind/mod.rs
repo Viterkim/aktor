@@ -44,7 +44,7 @@ pub struct EmbassyLocal {
 #[cfg(feature = "local")]
 pub struct Local<Clock: AktorGroupClock> {
     pub spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>>,
-    clock: PhantomData<fn() -> Clock>,
+    pub clock: PhantomData<fn() -> Clock>,
 }
 
 #[cfg(feature = "local")]
@@ -80,7 +80,7 @@ pub use bevy::*;
 ))]
 pub struct BrowserWebWorker<S> {
     pub program: alloc::string::String,
-    state: PhantomData<fn() -> S>,
+    pub state: PhantomData<fn() -> S>,
 }
 
 #[cfg(feature = "embassy_cross_core")]
@@ -88,10 +88,10 @@ pub struct EmbassyCrossCore {
     pub spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>>,
 }
 
-/// Keep typed setup and cleanup data on this execution kind.
-pub struct AktorLifecycle<Kind, SetupData, CleanupData> {
+/// Keep typed cleanup data on this execution kind.
+pub struct AktorLifecycle<Kind, CleanupData> {
     pub kind: Kind,
-    data: PhantomData<fn() -> (SetupData, CleanupData)>,
+    pub data: PhantomData<fn() -> CleanupData>,
 }
 
 #[doc(hidden)]

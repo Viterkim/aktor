@@ -16,19 +16,19 @@ use core::{
 };
 
 pub mod clock;
+mod dispatch;
 mod event;
 mod group;
 pub mod hooks;
 mod impls;
 mod latest;
 mod opaque_dispatch;
-#[cfg(any(
-    feature = "tokio",
-    all(feature = "std_thread", not(target_family = "wasm"))
-))]
+#[cfg(feature = "std")]
 #[doc(hidden)]
 pub mod panic;
 mod request;
+mod signal;
+pub use group::{ActorArgs, AktorGroup, GroupCompletion, KillSwitch, ShutdownReport};
 #[doc(hidden)]
 pub use impls::runner::serve;
 #[cfg(all(
@@ -36,12 +36,11 @@ pub use impls::runner::serve;
     target_family = "wasm",
     target_os = "unknown"
 ))]
-pub(crate) use impls::runner::serve_browser;
-pub(crate) use impls::runner::serve_on;
+#[doc(hidden)]
+pub use impls::runner::serve_browser;
+#[doc(hidden)]
+pub use impls::runner::serve_on;
 pub use impls::runner::{AktorCustomCall, AktorRunner};
-mod dispatch;
-mod signal;
-pub use group::{ActorArgs, AktorGroup, GroupCompletion, KillSwitch, ShutdownReport};
 pub use latest::{LatestResults, LatestSender};
 use signal::StopSignal;
 
@@ -60,6 +59,7 @@ pub struct WeakHandle<S, const N: usize, E = core::convert::Infallible, Role = (
 }
 
 /// Move this into one application task and await run or run_with there.
+/// Keep a completion first if you want the original typed failure data.
 pub struct Owner<S, const N: usize, E = core::convert::Infallible> {
     pub hooks: hooks::AktorHooks<S>,
     inner: Rc<Inner<S, N, E>>,
@@ -90,11 +90,17 @@ pub struct Reply<O, Clock = ()> {
 pub type Channel<S, const N: usize, E = core::convert::Infallible, Clock = ()> =
     (Handle<S, N, E, (), Clock>, Owner<S, N, E>);
 
-pub enum OwnerError<E> {
+pub enum OwnerError<E = ()> {
     Setup(AktorSetupError<E>),
+    SetupPanic(crate::AktorError),
     Cleanup(AktorCleanupError<E>),
     Runner(crate::AktorError),
     Cancelled,
+}
+
+/// The original local lifecycle error, shared between typed observers.
+pub struct SharedOwnerError<E> {
+    pub error: Rc<OwnerError<E>>,
 }
 
 struct Inner<S, const N: usize, E> {
@@ -115,6 +121,7 @@ struct Completed<E> {
     ready: RefCell<Option<Result<(), Rc<OwnerError<E>>>>>,
     result: RefCell<Option<Result<(), Rc<OwnerError<E>>>>>,
     diagnostics: Rc<RefCell<alloc::vec::Vec<crate::AktorError>>>,
+    panic_reported: Cell<bool>,
     changed: Event,
 }
 

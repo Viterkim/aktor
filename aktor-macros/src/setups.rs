@@ -97,12 +97,14 @@ pub fn expand(input: Setups) -> syn::Result<TokenStream> {
     let handles = names::binding(&mut reserved, "__AktorHandles");
     let context = names::binding(&mut reserved, "__aktor_context");
     let result = names::binding(&mut reserved, "__aktor_result");
+
     let types: Vec<_> = (0..fields.len())
         .map(|index| names::binding(&mut reserved, &format!("__AktorSetup{index}")))
         .collect();
     let bindings: Vec<_> = (0..fields.len())
         .map(|index| names::binding(&mut reserved, &format!("__aktor_handle{index}")))
         .collect();
+
     let first_type = types
         .first()
         .ok_or_else(|| syn::Error::new(proc_macro2::Span::call_site(), "missing actor setup"))?;
@@ -110,6 +112,7 @@ pub fn expand(input: Setups) -> syn::Result<TokenStream> {
         .first()
         .ok_or_else(|| syn::Error::new(proc_macro2::Span::call_site(), "missing actor setup"))?;
     let other_types = &types[1..];
+
     let nested_type = pairs(types.iter().map(|ty| quote!(#ty)).collect())?;
     let nested_setup = pairs(fields.iter().map(|field| quote!(self.#field)).collect())?;
     let nested_handles = pairs(bindings.iter().map(|binding| quote!(#binding)).collect())?;
@@ -135,8 +138,8 @@ pub fn expand(input: Setups) -> syn::Result<TokenStream> {
                 Self::Error,
             >;
 
-            fn grace(&self) -> ::core::time::Duration {
-                ::core::time::Duration::ZERO #(.max(#aktor::setup::AktorStart::grace(&self.#fields)))*
+            fn source_is_setup(#result: &Self::Error) -> bool {
+                <#nested_type as #aktor::setup::AktorStart>::source_is_setup(#result)
             }
 
             fn begin(&self, #context: &mut Self::Group) -> ::core::result::Result<(), #aktor::AktorSetupError> {

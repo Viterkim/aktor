@@ -36,6 +36,7 @@ pub fn aktor_setups(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(AktorData, attributes(aktor))]
 pub fn data(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
+
     match data::expand(input) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),

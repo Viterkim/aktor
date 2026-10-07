@@ -67,8 +67,8 @@ fn teardown() {
                     async |_: &mut (), ()| panic!("primary operation"),
                     (),
                 )
-                .try_cast()
-                .unwrap();
+                .cast()
+                .await;
 
                 for _ in 0..2 {
                     local::Request::new(
@@ -77,8 +77,8 @@ fn teardown() {
                         async |_: &mut (), _: Broken| {},
                         Broken(count.clone()),
                     )
-                    .try_cast()
-                    .unwrap();
+                    .cast()
+                    .await;
                 }
             } else if mode.ends_with("intervals") {
                 for _ in 0..2 {
@@ -128,16 +128,10 @@ fn teardown() {
                     )
                     .await;
 
-                assert!(result.unwrap_err().to_string().contains("primary setup"));
+                assert!(format!("{:#}", result.unwrap_err()).contains("primary setup"));
                 assert_eq!(completion.diagnostics().len(), 2);
-                assert!(
-                    completion
-                        .wait()
-                        .await
-                        .unwrap_err()
-                        .to_string()
-                        .contains("primary setup")
-                );
+                let error = completion.wait().await.unwrap_err();
+                assert!(format!("{error:#}").contains("primary setup"));
                 assert_eq!(count.load(Ordering::SeqCst), 2);
                 return;
             }
@@ -161,12 +155,10 @@ fn teardown() {
             let (handle, mut owner) = cross_core::channel::<()>(3).unwrap();
 
             if mode.ends_with("queue") {
-                crash(&handle).try_cast().unwrap();
+                crash(&handle).cast().await;
 
                 for _ in 0..2 {
-                    task_discard(&handle, Broken(count.clone()))
-                        .try_cast()
-                        .unwrap();
+                    task_discard(&handle, Broken(count.clone())).cast().await;
                 }
             } else if mode.ends_with("intervals") {
                 let mut intervals = Vec::new();
@@ -214,17 +206,10 @@ fn teardown() {
                     )
                     .await;
 
-                assert!(result.unwrap_err().to_string().contains("primary setup"));
+                assert!(format!("{:#}", result.unwrap_err()).contains("primary setup"));
                 assert_eq!(handle.completion().diagnostics().len(), 2);
-                assert!(
-                    handle
-                        .completion()
-                        .wait()
-                        .await
-                        .unwrap_err()
-                        .to_string()
-                        .contains("primary setup")
-                );
+                let error = handle.completion().wait().await.unwrap_err();
+                assert!(format!("{error:#}").contains("primary setup"));
                 assert_eq!(count.load(Ordering::SeqCst), 2);
                 return;
             }
@@ -245,15 +230,18 @@ fn teardown() {
             assert_eq!(handle.completion().diagnostics().len(), 2);
             assert!(handle.completion().wait().await.is_err());
         } else {
-            let mut setup = AktorSetup {
+            let mut setup = AktorNew {
                 name: AktorName::new("teardown task"),
                 role: AktorNoRole,
                 kind: AktorKind::TokioTask,
-                closures: AktorClosures::new(async || Ok(())),
-                options: Some(AktorOptions {
-                    capacity: 3,
-                    ..Default::default()
-                }),
+                closures: AktorClosures {
+                    start: async || Ok(()),
+                    end: None,
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
+                options: AktorNewOptions { capacity: 3 },
             };
 
             if mode.ends_with("hooks") {
@@ -301,7 +289,15 @@ fn teardown() {
                 }
             }
 
-            let actors = start(setup).await.unwrap();
+            let actors = aktor_start(AktorSetup {
+                actors: setup,
+                shutdown: |_| {},
+                options: AktorOptions {
+                    shutdown_grace: Duration::from_secs(5),
+                },
+            })
+            .await
+            .unwrap();
             let latest = if mode == "task latest before" {
                 Some(task_discard(&actors.handles, Broken(count.clone())).latest())
             } else {
@@ -310,21 +306,19 @@ fn teardown() {
 
             if mode == "task before" {
                 task_discard(&actors.handles, Broken(count.clone()))
-                    .try_cast()
-                    .unwrap();
+                    .cast()
+                    .await;
             } else if mode.ends_with("queue") {
                 let (entered, entering) = tokio::sync::oneshot::channel();
                 let (release, released) = tokio::sync::oneshot::channel();
 
-                task_crash(&actors.handles, entered, released)
-                    .try_cast()
-                    .unwrap();
+                task_crash(&actors.handles, entered, released).cast().await;
                 entering.await.unwrap();
 
                 for _ in 0..2 {
                     task_discard(&actors.handles, Broken(count.clone()))
-                        .try_cast()
-                        .unwrap();
+                        .cast()
+                        .await;
                 }
 
                 release.send(()).unwrap();

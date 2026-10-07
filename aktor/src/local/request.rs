@@ -1,5 +1,5 @@
 use super::*;
-use crate::message::{TrySendError, consumed, stopped};
+use crate::message::{consumed, stopped};
 use core::{
     future::poll_fn,
     ops::AsyncFnOnce,
@@ -78,32 +78,6 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock>
         self.reply
     }
 
-    pub fn try_send(mut self) -> Result<Reply<O, Clock>, TrySendError<Self>> {
-        if self.submitted {
-            return Ok(self.reply);
-        }
-
-        if self.message.is_none() {
-            consumed();
-        }
-
-        if !self.handle.inner.open.get() {
-            return Err(TrySendError::Closed(self));
-        }
-
-        let Some(message) = self.message.take() else {
-            consumed()
-        };
-
-        match self.handle.inner.enqueue(message) {
-            Ok(()) => Ok(self.reply),
-            Err(message) => {
-                self.message = Some(message);
-                Err(TrySendError::Full(self))
-            }
-        }
-    }
-
     fn poll_submit(&mut self, context: &mut Context<'_>) -> Poll<bool> {
         let result = self.poll_admit(context);
 
@@ -115,6 +89,10 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock>
     }
 
     fn poll_admit(&mut self, context: &mut Context<'_>) -> Poll<bool> {
+        if self.reply.taken {
+            consumed();
+        }
+
         if self.submitted {
             return Poll::Ready(true);
         }
@@ -162,7 +140,6 @@ impl<S: 'static, const N: usize, E, O: 'static, Role, Clock> Future
         output
     }
 }
-
 impl<S: 'static, const N: usize, E, Role, Clock> Request<'_, S, N, E, (), Role, Clock> {
     #[doc(hidden)]
     pub async fn run_interval(mut self) -> bool {
@@ -177,10 +154,6 @@ impl<S: 'static, const N: usize, E, Role, Clock> Request<'_, S, N, E, (), Role, 
 
     pub async fn cast(self) {
         drop(self.send().await);
-    }
-
-    pub fn try_cast(self) -> Result<(), TrySendError<Self>> {
-        self.try_send().map(drop)
     }
 }
 
@@ -341,7 +314,6 @@ impl<O, Clock> Future for Reply<O, Clock> {
         }
     }
 }
-
 impl<O, Clock> Drop for Reply<O, Clock> {
     fn drop(&mut self) {
         let previous = self.answer.result.replace(AnswerState::Abandoned);

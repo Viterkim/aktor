@@ -1,7 +1,6 @@
 use super::*;
-use crate::group::shutdown::panic_message;
-use crate::listener::failure::dispose_secondary;
-use futures_util::FutureExt;
+use crate::panic::{dispose_secondary, panic_message};
+use core::{future::poll_fn, task::Poll};
 use std::{
     any::Any,
     panic::{self, AssertUnwindSafe},
@@ -49,12 +48,30 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         let supervisor = self.group.borrow().clone();
 
         if let Some((name, group)) = supervisor {
-            group.fail(crate::ActorFailure {
+            if self.completion.panic_reported.replace(true) {
+                return;
+            }
+
+            let message = panic_message(payload);
+            let failure = crate::ActorFailure {
                 kind: None,
                 actor: name,
                 phase: phase.into(),
-                message: panic_message(payload),
-            });
+                message: message.clone(),
+            };
+
+            let first = if self.completion.ready.borrow().is_none() {
+                group.fail_startup(failure)
+            } else {
+                group.fail(failure)
+            };
+
+            if !first {
+                self.completion
+                    .diagnostics
+                    .borrow_mut()
+                    .push(crate::AktorError::new(alloc::format!("{phase}: {message}")));
+            }
         }
     }
 }
@@ -63,8 +80,15 @@ pub async fn catch<F: Future>(
     future: F,
     report: impl Fn(bool, &Box<dyn Any + Send>),
 ) -> Result<F::Output, Box<dyn Any + Send>> {
-    let mut future = Box::pin(AssertUnwindSafe(future).catch_unwind());
-    let result = (&mut future).await;
+    let mut future = Box::pin(future);
+    let result =
+        poll_fn(
+            |cx| match panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+                Ok(result) => result.map(Ok),
+                Err(payload) => Poll::Ready(Err(payload)),
+            },
+        )
+        .await;
 
     if let Err(payload) = &result {
         report(false, payload);

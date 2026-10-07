@@ -97,15 +97,21 @@ where
         FailurePolicy::Group(group) => Some(group.clone()),
         _ => None,
     };
+
     let (commands, receiver) = mpsc::channel(1);
     let (force, forced) = watch::channel(false);
     let (shutdown, closing) = watch::channel(false);
     let (status, running) = watch::channel(false);
     let abandoned_setup = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let retained_setup = abandoned_setup.clone();
-    let failed_cleanup = Arc::new(Mutex::new(FailedCleanup { errors: Vec::new() }));
+    let failed_cleanup = Arc::new(Mutex::new(FailedCleanup {
+        errors: Vec::new(),
+        diagnostics: Vec::new(),
+        group_primary: false,
+    }));
     let retained_cleanup = failed_cleanup.clone();
     let (mut started, ready) = oneshot::channel();
+
     #[cfg(not(target_family = "wasm"))]
     let lifetime = match &listener.failure {
         FailurePolicy::Group(group) => Some(group.track_thread(actor_name.clone())),
@@ -227,8 +233,8 @@ fn spawn_owner<T: Send + 'static>(
 mod tests {
     use super::*;
     use crate::{
-        AktorClosures, AktorGroup, AktorKind, AktorName, AktorNoRole, AktorSetup, AktorSetupError,
-        AktorStartError, executor::FAIL_SPAWN, start_in,
+        AktorClosures, AktorGroup, AktorKind, AktorName, AktorNew, AktorNewOptions, AktorNoRole,
+        AktorSetupError, AktorStartError, aktor_start_in, executor::FAIL_SPAWN,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -247,13 +253,14 @@ mod tests {
 
         let cleaned = Arc::new(AtomicUsize::new(0));
         let count = cleaned.clone();
-        let _actor = start_in(
+        let _actor = aktor_start_in(
             &group,
-            AktorSetup {
+            AktorNew {
                 name: AktorName::new("already started"),
                 role: AktorNoRole,
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
+                    start: async || Ok::<_, AktorSetupError>(()),
                     end: Some(
                         (async move |_: ()| {
                             count.fetch_add(1, Ordering::SeqCst);
@@ -261,9 +268,12 @@ mod tests {
                         })
                         .into(),
                     ),
-                    ..AktorClosures::new(async || Ok(()))
+
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
                 },
-                options: None,
+                options: AktorNewOptions { capacity: 32 },
             },
         )
         .await
@@ -273,16 +283,22 @@ mod tests {
 
         FAIL_SPAWN.with(|setting| setting.set(Some("aktor owner")));
 
-        let error = start_in(
+        let error = aktor_start_in(
             &group,
-            AktorSetup {
+            AktorNew {
                 name: AktorName::new("cannot create thread"),
                 role: AktorNoRole,
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures::new(async || -> Result<(), AktorSetupError> {
-                    panic!("setup ran after thread creation failed")
-                }),
-                options: None,
+                closures: AktorClosures {
+                    start: async || -> Result<(), AktorSetupError> {
+                        panic!("setup ran after thread creation failed")
+                    },
+                    end: None,
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
+                options: AktorNewOptions { capacity: 32 },
             },
         )
         .await

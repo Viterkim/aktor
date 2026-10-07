@@ -6,6 +6,59 @@ use futures_util::{
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 impl AktorGroup {
+    fn settle_application(&self) -> impl Future<Output = ()> + use<> {
+        let kill = self.killswitch();
+        #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
+        let callers = std::mem::take(&mut kill.control.lock().callers);
+        #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
+        for caller in &callers {
+            caller.abort();
+        }
+
+        async move {
+            #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
+            let mut callers = callers;
+            let mut changed = kill.control.application_changed.subscribe();
+            loop {
+                #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
+                for caller in callers {
+                    if let Err(error) = caller.await
+                        && error.is_panic()
+                    {
+                        let payload = error.into_panic();
+                        fail_application(&kill, "task", panic_message(&payload));
+                        contain_drop(payload, &kill, "task panic drop");
+                    }
+                }
+
+                #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
+                {
+                    let mut state = kill.control.lock();
+                    callers = std::mem::take(&mut state.callers);
+                    if state.applications == 0 && callers.is_empty() {
+                        break;
+                    }
+                }
+                #[cfg(not(all(feature = "tokio", not(target_family = "wasm"))))]
+                if kill.control.lock().applications == 0 {
+                    break;
+                }
+                #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
+                {
+                    for caller in &callers {
+                        caller.abort();
+                    }
+                    if !callers.is_empty() {
+                        continue;
+                    }
+                }
+                if changed.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
     pub(super) async fn finish<Cleanup, CleanupFuture, E>(self, cleanup: Cleanup) -> ShutdownReport
     where
         Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
@@ -18,6 +71,8 @@ impl AktorGroup {
         let deadline = kill.deadline();
         let reserve = (self.control.grace / 10).min(Duration::from_millis(100));
         let force_at = kill.force_at();
+        let application = self.settle_application();
+        let mut application_done = false;
         let mut pending = FuturesUnordered::new();
         let mut cancellations = Vec::new();
         let mut names = Vec::new();
@@ -52,8 +107,24 @@ impl AktorGroup {
             }
         };
 
+        let drained = async {
+            tokio::join!(
+                async {
+                    application.await;
+                    application_done = true;
+                },
+                drained
+            );
+        };
+
         if kill.bounded(force_at, drained).await.is_none() {
-            kill.control.lock().report.timed_out = true;
+            {
+                let mut state = kill.control.lock();
+                state.report.timed_out = true;
+                if !application_done {
+                    state.force_exit = true;
+                }
+            }
 
             for (index, cancel) in cancellations {
                 if !done[index] {
@@ -131,6 +202,15 @@ impl AktorGroup {
 
         finish_hook(cleanup, before_hook, &kill, hook_deadline).await;
 
+        #[cfg(not(target_family = "wasm"))]
+        let registered = kill.control.lock().shutdown_hook.take();
+        #[cfg(target_family = "wasm")]
+        let registered = self.shutdown_hook.borrow_mut().take();
+        if let Some(hook) = registered {
+            let before_hook = kill.control.lock().report.clone();
+            finish_hook(hook, before_hook, &kill, hook_deadline).await;
+        }
+
         let report = {
             let mut state = kill.control.lock();
             state.finished = true;
@@ -145,15 +225,7 @@ impl AktorGroup {
     }
 }
 
-pub fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).into()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "panic payload had no message".into()
-    }
-}
+pub use crate::panic::panic_message;
 
 #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
 pub async fn bounded_standard<F: Future>(deadline: Instant, future: F) -> Option<F::Output> {
@@ -230,12 +302,7 @@ pub async fn finish_hook<Cleanup, CleanupFuture, E>(
             contain_drop(error, kill, "cleanup error drop");
         }
         Some(Err(payload)) => {
-            kill.fail(ActorFailure {
-                kind: None,
-                actor: "application".into(),
-                phase: "cleanup".into(),
-                message: panic_message(&payload),
-            });
+            fail_application(kill, "cleanup", panic_message(&payload));
 
             contain_drop(payload, kill, "cleanup panic drop");
         }
@@ -245,27 +312,28 @@ pub async fn finish_hook<Cleanup, CleanupFuture, E>(
     contain_drop(hook, kill, "cleanup drop");
 }
 
+pub fn fail_application(kill: &KillSwitch, phase: &str, message: String) {
+    kill.control
+        .lock()
+        .report
+        .application
+        .push(AktorError::new(format!("{phase}: {message}")));
+
+    kill.fail(ActorFailure {
+        kind: None,
+        actor: "application".into(),
+        phase: phase.into(),
+        message,
+    });
+}
+
 pub fn contain_drop(value: impl Sized, kill: &KillSwitch, phase: &str) {
     contain(|| drop(value), kill, phase);
 }
 
 pub fn contain(action: impl FnOnce(), kill: &KillSwitch, phase: &str) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(action)) {
-        kill.control
-            .lock()
-            .report
-            .application
-            .push(AktorError::new(format!(
-                "{phase}: {}",
-                panic_message(&payload)
-            )));
-
-        kill.fail(ActorFailure {
-            kind: None,
-            actor: "application".into(),
-            phase: phase.into(),
-            message: panic_message(&payload),
-        });
+        fail_application(kill, phase, panic_message(&payload));
 
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
             std::mem::forget(payload);

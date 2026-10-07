@@ -1,5 +1,8 @@
 use super::*;
-use core::task::{Context, Poll};
+use core::{
+    fmt,
+    task::{Context, Poll},
+};
 
 #[doc(hidden)]
 pub struct AktorPairStartup<A: AktorStart, B: AktorStart<Group = A::Group>> {
@@ -60,8 +63,12 @@ impl<A: AktorStart, B: AktorStart<Group = A::Group>> AktorStart for (A, B) {
     type Handles = (A::Handles, B::Handles);
     type Startup = AktorPairStartup<A, B>;
 
-    fn grace(&self) -> Duration {
-        self.0.grace().max(self.1.grace())
+    fn source_is_setup(error: &Self::Error) -> bool {
+        match error {
+            AktorPairStartError::First(error) => A::source_is_setup(error),
+            AktorPairStartError::Second(error) => B::source_is_setup(error),
+            AktorPairStartError::Setup(_) => false,
+        }
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -128,8 +135,8 @@ macro_rules! tuple {
                 Self::Error,
             >;
 
-            fn grace(&self) -> Duration {
-                self.$first_index.grace()$(.max(self.$index.grace()))+
+            fn source_is_setup(error: &Self::Error) -> bool {
+                <nested_type!($first, $($type),+) as AktorStart>::source_is_setup(error)
             }
 
             fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -154,14 +161,39 @@ tuple!(A: a: 0, B: b: 1, C: c: 2, D: d: 3, E: e: 4, F: f: 5);
 tuple!(A: a: 0, B: b: 1, C: c: 2, D: d: 3, E: e: 4, F: f: 5, G: g: 6);
 tuple!(A: a: 0, B: b: 1, C: c: 2, D: d: 3, E: e: 4, F: f: 5, G: g: 6, H: h: 7);
 
-#[derive(Er)]
 pub enum AktorPairStartError<A: core::error::Error + 'static, B: core::error::Error + 'static> {
-    #[er(format = "{0}")]
-    Setup(#[er(source)] AktorSetupError),
-    #[er(format = "{0}")]
-    First(#[er(source)] A),
-    #[er(format = "{0}")]
-    Second(#[er(source)] B),
+    Setup(AktorSetupError),
+    First(A),
+    Second(B),
+}
+impl<A: core::error::Error + 'static, B: core::error::Error + 'static> fmt::Display
+    for AktorPairStartError<A, B>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Setup(_) => f.write_str("actor setup failed"),
+            Self::First(error) => fmt::Display::fmt(error, f),
+            Self::Second(error) => fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl<A: core::error::Error + 'static, B: core::error::Error + 'static> fmt::Debug
+    for AktorPairStartError<A, B>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+impl<A: core::error::Error + 'static, B: core::error::Error + 'static> core::error::Error
+    for AktorPairStartError<A, B>
+{
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Setup(error) => Some(error),
+            Self::First(error) => error.source(),
+            Self::Second(error) => error.source(),
+        }
+    }
 }
 impl<A: core::error::Error + 'static, B: core::error::Error + 'static> From<AktorSetupError>
     for AktorPairStartError<A, B>

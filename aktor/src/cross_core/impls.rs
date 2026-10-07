@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "std")]
+use crate::panic::{dispose_secondary, panic_message};
 use crate::{
     ActorFailure, AktorCleanupError, AktorExecution, AktorSetupError, message::ActorError,
 };
@@ -88,29 +90,21 @@ impl<S> Inner<S> {
         });
 
         let (ordinary, services) = discarded;
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let primary =
             crate::local::panic::discard(ordinary.into_iter().chain(services), |payload| {
                 self.status.state.lock(|state| {
-                    state.borrow_mut().diagnostics.push(AktorError::new(
-                        crate::group::shutdown::panic_message(payload),
-                    ))
+                    state
+                        .borrow_mut()
+                        .diagnostics
+                        .push(AktorError::new(panic_message(payload)))
                 });
             });
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         for message in ordinary.into_iter().chain(services) {
             drop(message);
         }
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let result = if result.is_ok() && primary.is_some() {
             Err(completion.fallback.clone())
         } else {
@@ -119,10 +113,7 @@ impl<S> Inner<S> {
 
         self.status.finish(result);
         completion.armed = false;
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         if let Some(payload) = primary {
             std::panic::resume_unwind(payload);
         }
@@ -272,6 +263,7 @@ impl<S, Role> Drop for Handle<S, Role> {
         }
     }
 }
+
 impl<S, Role> WeakHandle<S, Role> {
     pub fn upgrade(&self) -> Option<Handle<S, Role>> {
         let inner = self.inner.upgrade()?;
@@ -427,6 +419,15 @@ impl<S> Owner<S> {
                     .map(Work::Message)
             };
 
+            #[cfg(all(test, feature = "std"))]
+            if class == 0 && work.is_none() {
+                let action = tests::EMPTY_QUEUE.with(|action| action.borrow_mut().take());
+
+                if let Some(action) = action {
+                    action();
+                }
+            }
+
             if let Some(work) = work {
                 self.work_cursor = (class + 1) % 3;
 
@@ -438,18 +439,31 @@ impl<S> Owner<S> {
             }
         }
 
-        if self.inner.queue.lock(|queue| !queue.borrow().open) {
+        let (open, empty) = self.inner.queue.lock(|queue| {
+            let queue = queue.borrow();
+
+            (
+                queue.open,
+                queue.ordinary.is_empty() && queue.services.is_empty(),
+            )
+        });
+
+        if !open && empty {
             Poll::Ready(None)
         } else {
+            if !empty {
+                cx.waker().wake_by_ref();
+            }
+
             Poll::Pending
         }
     }
 
     pub fn manage(&mut self, name: alloc::string::String, kill: crate::embassy::KillSwitch) {
-        self.inner
-            .status
-            .state
-            .lock(|state| state.borrow_mut().group_stopping = Some(kill.shared_stopping()));
+        self.inner.status.state.lock(|state| {
+            let mut state = state.borrow_mut();
+            state.group_stopping = Some(kill.shared_stopping());
+        });
         self.supervisor = Some((name, kill));
     }
 
@@ -459,6 +473,17 @@ impl<S> Owner<S> {
                 actor: name.clone(),
                 kind: Some(AktorExecution::EmbassyCrossCore),
                 phase: phase.into(),
+                message: error.to_string(),
+            });
+        }
+    }
+
+    fn fail_startup(&self, error: &AktorError) {
+        if let Some((name, kill)) = &self.supervisor {
+            kill.fail_startup(ActorFailure {
+                actor: name.clone(),
+                kind: Some(AktorExecution::EmbassyCrossCore),
+                phase: "setup".into(),
                 message: error.to_string(),
             });
         }
@@ -476,18 +501,12 @@ impl<S> Owner<S> {
         }
     }
 
-    #[cfg(any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm"))
-    ))]
+    #[cfg(feature = "std")]
     fn dispose_hooks(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
         let hooks = core::mem::take(&mut self.hooks);
         let intervals = core::mem::take(&mut self.intervals);
         let report = |payload: &Box<dyn std::any::Any + Send>| {
-            self.diagnostic(
-                "hook drop",
-                AktorError::new(crate::group::shutdown::panic_message(payload)),
-            );
+            self.diagnostic("hook drop", AktorError::new(panic_message(payload)));
         };
 
         let mut primary = crate::local::panic::discard_hooks(hooks, report);
@@ -502,17 +521,14 @@ impl<S> Owner<S> {
             if primary.is_none() {
                 primary = Some(payload);
             } else {
-                crate::listener::failure::dispose_secondary(payload);
+                dispose_secondary(payload);
             }
         }
 
         primary
     }
 
-    #[cfg(not(any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm"))
-    )))]
+    #[cfg(not(feature = "std"))]
     fn dispose_hooks(&mut self) {
         drop(core::mem::take(&mut self.hooks));
         drop(core::mem::take(&mut self.intervals));
@@ -529,21 +545,45 @@ impl<S> Owner<S> {
         End: FnOnce(S) -> EndFuture,
         EndFuture: Future<Output = Result<(), AktorCleanupError>>,
     {
-        let mut state = match start().await {
+        #[cfg(feature = "std")]
+        let started = crate::local::panic::catch(async { start().await }, |_, payload| {
+            self.fail_startup(&AktorError::new(panic_message(payload)));
+        })
+        .await;
+        #[cfg(feature = "std")]
+        let started = match started {
+            Ok(result) => result,
+            Err(payload) => {
+                let error = AktorError::new(panic_message(&payload));
+
+                if let Err(secondary) = crate::local::panic::catch(
+                    async {
+                        self.inner.finish(Err(error));
+                    },
+                    |_, secondary| {
+                        self.diagnostic("queue drop", AktorError::new(panic_message(secondary)));
+                    },
+                )
+                .await
+                {
+                    dispose_secondary(secondary);
+                }
+
+                std::panic::resume_unwind(payload);
+            }
+        };
+        #[cfg(not(feature = "std"))]
+        let started = start().await;
+
+        let mut state = match started {
             Ok(state) => state,
             Err(error) => {
-                self.fail("setup", &error);
-                #[cfg(any(
-                    feature = "tokio",
-                    all(feature = "std_thread", not(target_family = "wasm"))
-                ))]
+                self.fail_startup(&error);
+                #[cfg(feature = "std")]
                 if let Some(payload) = self.dispose_hooks() {
-                    crate::listener::failure::dispose_secondary(payload);
+                    dispose_secondary(payload);
                 }
-                #[cfg(not(any(
-                    feature = "tokio",
-                    all(feature = "std_thread", not(target_family = "wasm"))
-                )))]
+                #[cfg(not(feature = "std"))]
                 self.dispose_hooks();
                 self.inner.finish(Err(error.clone()));
                 return Err(error);
@@ -610,97 +650,59 @@ impl<S> Owner<S> {
                 .await;
             }
         };
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let mut primary = crate::local::panic::catch(serving, |_, _| {}).await.err();
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         if let Some(payload) = &primary {
-            self.fail(
-                "operation",
-                &AktorError::new(crate::group::shutdown::panic_message(payload)),
-            );
+            self.fail("operation", &AktorError::new(panic_message(payload)));
         }
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         serving.await;
 
         self.inner.close();
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let cleaned = crate::local::panic::catch(async { end(state).await }, |_, payload| {
-            self.fail(
-                "cleanup",
-                &AktorError::new(crate::group::shutdown::panic_message(payload)),
-            );
+            self.fail("cleanup", &AktorError::new(panic_message(payload)));
         })
         .await;
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let result = match cleaned {
             Ok(result) => result,
             Err(payload) => {
-                let error = AktorError::new(crate::group::shutdown::panic_message(&payload));
+                let error = AktorError::new(panic_message(&payload));
 
                 if primary.is_none() {
                     primary = Some(payload);
                 } else {
-                    crate::listener::failure::dispose_secondary(payload);
+                    dispose_secondary(payload);
                 }
 
                 Err(error)
             }
         };
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         let result = end(state).await;
 
         if let Err(error) = &result {
             self.diagnostic("cleanup", error.clone());
         }
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         if let Some(payload) = self.dispose_hooks() {
             if primary.is_none() {
                 primary = Some(payload);
             } else {
-                crate::listener::failure::dispose_secondary(payload);
+                dispose_secondary(payload);
             }
         }
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         self.dispose_hooks();
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let result = if let Some(payload) = &primary {
-            Err(AktorError::new(crate::group::shutdown::panic_message(
-                payload,
-            )))
+            Err(AktorError::new(panic_message(payload)))
         } else {
             result
         };
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         if let Err(payload) = crate::local::panic::catch(
             async {
                 self.inner.finish(result.clone());
@@ -709,26 +711,17 @@ impl<S> Owner<S> {
         )
         .await
         {
-            self.diagnostic(
-                "queue drop",
-                AktorError::new(crate::group::shutdown::panic_message(&payload)),
-            );
+            self.diagnostic("queue drop", AktorError::new(panic_message(&payload)));
 
             if primary.is_none() {
                 primary = Some(payload);
             } else {
-                crate::listener::failure::dispose_secondary(payload);
+                dispose_secondary(payload);
             }
         }
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         self.inner.finish(result.clone());
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         if let Some(payload) = primary {
             std::panic::resume_unwind(payload);
         }
@@ -738,15 +731,9 @@ impl<S> Owner<S> {
 }
 impl<S> Drop for Owner<S> {
     fn drop(&mut self) {
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let mut primary = self.dispose_hooks();
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         self.dispose_hooks();
 
         if self
@@ -764,37 +751,25 @@ impl<S> Drop for Owner<S> {
             {
                 self.fail("owner", &error);
             }
-            #[cfg(any(
-                feature = "tokio",
-                all(feature = "std_thread", not(target_family = "wasm"))
-            ))]
+            #[cfg(feature = "std")]
             if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.inner.finish(Err(error));
             })) {
-                self.diagnostic(
-                    "queue drop",
-                    AktorError::new(crate::group::shutdown::panic_message(&payload)),
-                );
+                self.diagnostic("queue drop", AktorError::new(panic_message(&payload)));
 
                 if primary.is_none() {
                     primary = Some(payload);
                 } else {
-                    crate::listener::failure::dispose_secondary(payload);
+                    dispose_secondary(payload);
                 }
             }
-            #[cfg(not(any(
-                feature = "tokio",
-                all(feature = "std_thread", not(target_family = "wasm"))
-            )))]
+            #[cfg(not(feature = "std"))]
             self.inner.finish(Err(error));
         }
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         if let Some(payload) = primary {
             if std::thread::panicking() {
-                crate::listener::failure::dispose_secondary(payload);
+                dispose_secondary(payload);
             } else {
                 std::panic::resume_unwind(payload);
             }
@@ -826,9 +801,163 @@ impl Drop for CompletionGuard {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+    use core::task::{Context, Waker};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     std::thread_local! {
         pub static LAST_HANDLE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        pub static EMPTY_QUEUE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    fn ready<F: Future>(future: F) -> F::Output {
+        let mut future = core::pin::pin!(future);
+
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("available work did not finish"),
+        }
+    }
+
+    #[test]
+    fn panic_cleanup() {
+        for setup in [false, true] {
+            let mut group =
+                crate::embassy::AktorGroup::with_grace(core::time::Duration::from_secs(1));
+            let mut driver = group.listen().unwrap();
+            let (handle, mut owner) = channel::<u32>(1).unwrap();
+            let completion = handle.completion();
+
+            owner.manage("panicking actor".into(), group.killswitch());
+
+            let request = Request::new(
+                &handle,
+                Operation {
+                    name: "panic",
+                    caller: core::panic::Location::caller(),
+                },
+                Box::new(request::WriteBody(async |state: &mut u32, ()| {
+                    *state = 7;
+                    panic!("operation failed");
+                })),
+                (),
+            );
+
+            ready(request.cast());
+
+            let cleaned = Rc::new(RefCell::new(Vec::new()));
+            let observed = cleaned.clone();
+            let mut running = core::pin::pin!(owner.run_with(
+                async move || {
+                    if setup {
+                        panic!("initialization failed");
+                    }
+
+                    Ok(0)
+                },
+                async move |state| {
+                    let mut yielded = false;
+
+                    poll_fn(|cx| {
+                        if yielded {
+                            Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    observed.borrow_mut().push(state);
+                    Ok(())
+                }
+            ));
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut failure = None;
+
+            for _ in 0..4 {
+                if let Err(payload) =
+                    catch_unwind(AssertUnwindSafe(|| running.as_mut().poll(&mut cx)))
+                {
+                    failure = Some(payload);
+                    break;
+                }
+            }
+
+            let reason = if setup {
+                "initialization failed"
+            } else {
+                "operation failed"
+            };
+
+            assert_eq!(&**cleaned.borrow(), if setup { &[][..] } else { &[7][..] });
+            assert_eq!(failure.unwrap().downcast_ref::<&str>(), Some(&reason));
+            assert_eq!(ready(completion.wait()).unwrap_err().diagnostics, reason);
+
+            let report = ready(&mut driver);
+
+            assert_eq!(report.startup, setup);
+            assert_eq!(report.failure.unwrap().message, reason);
+        }
+    }
+
+    #[test]
+    fn close_drain() {
+        for explicit in [true, false] {
+            let (handle, owner) = channel::<u32>(1).unwrap();
+            let completion = handle.completion();
+            let (send, empty) = std::sync::mpsc::channel();
+            let producer = std::thread::spawn(move || {
+                empty.recv().unwrap();
+                let request = Request::new(
+                    &handle,
+                    Operation {
+                        name: "increment",
+                        caller: core::panic::Location::caller(),
+                    },
+                    Box::new(request::WriteBody(async |state: &mut u32, ()| {
+                        *state += 1;
+                    })),
+                    (),
+                );
+
+                ready(request.cast());
+
+                if explicit {
+                    drop(handle.shutdown());
+                }
+            });
+
+            EMPTY_QUEUE.with(|action| {
+                *action.borrow_mut() = Some(Box::new(move || {
+                    send.send(()).unwrap();
+                    producer.join().unwrap();
+                }));
+            });
+
+            let cleaned = Rc::new(RefCell::new(None));
+            let observed = cleaned.clone();
+            let mut running = core::pin::pin!(owner.run_with(
+                async || Ok(0),
+                async move |state| {
+                    *observed.borrow_mut() = Some(state);
+                    Ok(())
+                }
+            ));
+            let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+
+            for _ in 0..4 {
+                if let Poll::Ready(result) = running.as_mut().poll(&mut cx) {
+                    result.unwrap();
+                    break;
+                }
+            }
+
+            ready(completion.wait()).unwrap();
+            assert_eq!(*cleaned.borrow(), Some(1), "accepted work was discarded");
+        }
     }
 
     #[test]
@@ -839,20 +968,21 @@ mod tests {
 
         drop(handle);
 
-        let mut reply = Request::new(
-            &survivor,
-            Operation {
-                name: "increment",
-                caller: core::panic::Location::caller(),
-            },
-            Box::new(request::WriteBody(async |state: &mut u32, ()| {
-                *state += 1;
-                *state
-            })),
-            (),
-        )
-        .try_send()
-        .unwrap();
+        let mut reply = ready(
+            Request::new(
+                &survivor,
+                Operation {
+                    name: "increment",
+                    caller: core::panic::Location::caller(),
+                },
+                Box::new(request::WriteBody(async |state: &mut u32, ()| {
+                    *state += 1;
+                    *state
+                })),
+                (),
+            )
+            .send(),
+        );
 
         drop(survivor);
 
@@ -911,6 +1041,7 @@ mod arbitration_tests {
             Box::pin(async {})
         }
     }
+
     fn message() -> Message<()> {
         Message {
             operation: Operation {

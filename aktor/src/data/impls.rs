@@ -17,6 +17,7 @@ impl<T: AktorData> Serialize for Ref<'_, T> {
         self.0.serialize_data(serializer)
     }
 }
+
 impl<'de, T: AktorData> Deserialize<'de> for Owned<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         T::deserialize_data(deserializer).map(Self)
@@ -106,6 +107,7 @@ impl AktorData for u8 {
         deserializer.deserialize_bytes(Bytes)
     }
 }
+
 impl<T: AktorData> AktorData for Vec<T> {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         T::serialize_slice(self, serializer)
@@ -115,6 +117,7 @@ impl<T: AktorData> AktorData for Vec<T> {
         T::deserialize_vec(deserializer)
     }
 }
+
 impl<T: AktorData> AktorData for Option<T> {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.as_ref().map(Ref).serialize(serializer)
@@ -124,6 +127,7 @@ impl<T: AktorData> AktorData for Option<T> {
         Option::<Owned<T>>::deserialize(deserializer).map(|value| value.map(|value| value.0))
     }
 }
+
 impl<T: AktorData, E: AktorData> AktorData for Result<T, E> {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.as_ref().map(Ref).map_err(Ref).serialize(serializer)
@@ -134,6 +138,7 @@ impl<T: AktorData, E: AktorData> AktorData for Result<T, E> {
             .map(|value| value.map(|value| value.0).map_err(|value| value.0))
     }
 }
+
 impl<T: AktorData> AktorData for Box<T> {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.as_ref().serialize_data(serializer)
@@ -230,6 +235,7 @@ impl<T: AktorData> AktorData for VecDeque<T> {
         Vec::<T>::deserialize_data(deserializer).map(VecDeque::from)
     }
 }
+
 impl<T: AktorData + Ord> AktorData for BTreeSet<T> {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
@@ -245,6 +251,7 @@ impl<T: AktorData + Ord> AktorData for BTreeSet<T> {
         Vec::<T>::deserialize_data(deserializer).map(|values| values.into_iter().collect())
     }
 }
+
 impl<K: AktorData + Ord, V: AktorData> AktorData for BTreeMap<K, V> {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;

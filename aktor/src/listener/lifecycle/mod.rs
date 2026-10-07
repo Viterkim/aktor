@@ -22,6 +22,8 @@ pub struct Actor<S, E, C> {
 
 pub struct FailedCleanup<C> {
     errors: Vec<Arc<C>>,
+    diagnostics: Vec<crate::AktorError>,
+    group_primary: bool,
 }
 
 #[derive(Debug)]
@@ -53,6 +55,7 @@ pub enum ReplaceError<E, C> {
 #[derive(Debug)]
 pub struct CleanupErrors<C> {
     pub errors: Vec<Arc<C>>,
+    pub diagnostics: Vec<crate::AktorError>,
 }
 
 pub type Reply<E> = oneshot::Sender<Result<(), LifecycleError<E>>>;

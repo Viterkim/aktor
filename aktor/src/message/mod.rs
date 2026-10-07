@@ -51,15 +51,6 @@ pub enum CallError {
     OutcomeUnknown,
 }
 
-/// Failed immediate submission preserves the request.
-#[derive(Er)]
-pub enum TrySendError<R> {
-    #[er(format = "actor mailbox is full")]
-    Full(R),
-    #[er(format = "actor closed")]
-    Closed(R),
-}
-
 pub type LocalFuture<'a, O> = Pin<Box<dyn Future<Output = O> + 'a>>;
 
 #[doc(hidden)]

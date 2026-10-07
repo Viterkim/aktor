@@ -29,10 +29,9 @@ async fn cutoff() {
     cleaned.await.unwrap();
 
     let running = observer.is_running();
-    let closed = matches!(
-        call(&handle, |_, ()| (), ()).try_cast(),
-        Err(TrySendError::Closed(_))
-    );
+    let mut waiting = call(&handle, |_, ()| (), ());
+    let closed = poll(&mut waiting).is_pending();
+    drop(waiting);
 
     release.send(()).unwrap();
     stopping.await.unwrap().unwrap();
@@ -146,7 +145,9 @@ async fn failed_cleanup() {
     cleaning.await.unwrap();
 
     assert!(!actor.is_running());
-    assert!(call(&handle, |_, ()| (), ()).try_send().is_err());
+    let mut waiting = call(&handle, |_, ()| (), ());
+    assert!(poll(&mut waiting).is_pending());
+    drop(waiting);
 
     release.send(()).unwrap();
     assert!(thread.join_async().await.is_err());

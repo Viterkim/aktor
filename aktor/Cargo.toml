@@ -75,7 +75,7 @@ rustix = { workspace = true, optional = true }
 
 [dev-dependencies]
 postcard.workspace = true
-er = { workspace = true, features = ["serde"] }
+er = { workspace = true, features = ["serde", "test"] }
 tokio = { workspace = true, features = ["time", "rt-multi-thread", "signal", "test-util"] }
 rusqlite.workspace = true
 
@@ -118,6 +118,16 @@ required-features = ["macros", "tokio"]
 [[test]]
 name = "fatal"
 path = "tests/fatal/main.rs"
+required-features = ["tokio"]
+
+[[test]]
+name = "application"
+path = "tests/application/main.rs"
+required-features = ["tokio"]
+
+[[test]]
+name = "group"
+path = "tests/group/main.rs"
 required-features = ["tokio"]
 
 [[test]]

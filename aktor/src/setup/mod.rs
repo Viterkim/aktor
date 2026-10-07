@@ -13,19 +13,18 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use core::{future::Future, pin::Pin, time::Duration};
 use er::Er;
 
-pub mod closures;
-#[doc(hidden)]
-pub mod group;
-mod impls;
-use group::AktorSetupGroup;
 #[cfg(feature = "bevy")]
 mod bevy;
+pub mod closures;
 #[cfg(feature = "embassy_cross_core")]
 mod cross_core;
 #[cfg(feature = "local")]
 mod custom;
 #[cfg(feature = "local")]
 mod driven;
+#[doc(hidden)]
+pub mod group;
+mod impls;
 #[cfg(feature = "local")]
 mod intervals;
 pub mod kind;
@@ -41,6 +40,7 @@ pub mod kind;
     )
 ))]
 mod local;
+pub mod shutdown;
 mod startup;
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 mod task;
@@ -49,11 +49,6 @@ mod task;
     not(target_family = "wasm")
 ))]
 mod thread;
-#[cfg(all(
-    any(feature = "tokio", feature = "std_thread"),
-    not(target_family = "wasm")
-))]
-pub use thread::AktorThreadStartError;
 mod tuple;
 #[cfg(all(
     feature = "wasm_browser_workers",
@@ -68,16 +63,18 @@ pub use tuple::{AktorPairStartError, AktorTupleStartup};
     target_family = "wasm",
     target_os = "unknown"
 ))]
-pub use worker::{AktorWorkerOptions, AktorWorkerSetup};
+pub use worker::{AktorWorkerNew, AktorWorkerOptions};
 
 pub use closures::{AktorClosure, AktorEnd, AktorIntervalLogic};
-pub use impls::{start, start_in};
+use group::AktorSetupGroup;
+pub use impls::{aktor_start, aktor_start_in};
 /// Setup choices, each with its own type and executor requirements.
 pub use kind as AktorKind;
 pub use kind::{AktorExecution, AktorLifecycle, AktorMode};
 
 pub use crate::types::{
-    AktorClosures, AktorInterval, AktorName, AktorOptions, AktorSetup, AktorStarted,
+    AktorClosures, AktorInterval, AktorName, AktorNew, AktorNewOptions, AktorOptions, AktorSetup,
+    AktorStarted,
 };
 
 #[must_use = "await startup to get the actor handles"]
@@ -94,24 +91,28 @@ pub struct AktorStartup<Setup: AktorStart> {
 
 /// The original startup error and its completed rollback report.
 /// report is None if startup was rejected before adding actors to the group.
-#[derive(Er)]
-#[er(format = "{error}", no_constructors)]
 pub struct AktorStartupError<E: core::error::Error + 'static> {
-    #[er(source)]
     pub error: E,
     pub report: Option<Box<crate::ShutdownReport>>,
+    /// The source represents the group's first failure.
+    pub source_is_failure: bool,
 }
 
 #[derive(Er)]
-pub enum AktorStartError {
-    #[er(format = "{0}")]
+pub enum AktorStartError<E: 'static = ()> {
+    #[er(format = "actor initialization failed")]
+    Init(#[er(source)] AktorSetupError<E>),
+    #[er(format = "actor setup failed")]
     Setup(#[er(source)] AktorSetupError),
-    #[er(format = "{0}")]
+    #[cfg(feature = "local")]
+    #[er(format = "local actor startup failed")]
+    Local(#[er(source)] crate::local::OwnerError),
+    #[er(format = "actor thread startup failed")]
     #[cfg(all(
         any(feature = "tokio", feature = "std_thread"),
         not(target_family = "wasm")
     ))]
-    Thread(#[er(source)] DedicatedStartError<AktorSetupError>),
+    Thread(#[er(source)] DedicatedStartError<core::convert::Infallible>),
 }
 
 #[doc(hidden)]
@@ -121,7 +122,10 @@ pub trait AktorStart: Sized {
     type Error: core::error::Error + From<AktorSetupError> + 'static;
     type Startup: Future<Output = Result<Self::Handles, Self::Error>>;
 
-    fn grace(&self) -> Duration;
+    fn source_is_setup(_error: &Self::Error) -> bool {
+        false
+    }
+
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError>;
     fn start_in(self, context: AktorStartContext<Self::Group>) -> Self::Startup;
 }

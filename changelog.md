@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.5
+
+Typed setup and shutdown hooks, removed the public try calls.
+
+Fixed shutdown cleanup.
+
 ## 0.0.4
 
 Complete redesign.

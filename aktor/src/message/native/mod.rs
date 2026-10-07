@@ -7,7 +7,7 @@ use core::{
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 mod call;
 mod impls;

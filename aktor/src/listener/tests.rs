@@ -1,5 +1,6 @@
 use super::*;
 use crate::message::call;
+use futures_util::FutureExt;
 use std::{
     future::Future,
     sync::atomic::{AtomicBool, Ordering},
@@ -18,14 +19,15 @@ impl Wake for ReenterAdmission {
     fn wake_by_ref(self: &Arc<Self>) {
         if !self.called.swap(true, Ordering::SeqCst) {
             call(&self.handle, |state, ()| *state += 1, ())
-                .try_cast()
+                .cast()
+                .now_or_never()
                 .unwrap();
         }
     }
 }
 
 #[tokio::test]
-async fn receiver_waker_can_reenter_admission() {
+async fn reentrant_wake() {
     let (handle, mut listener) = spawn::channel::<usize>(2).unwrap();
     let wake = Arc::new(ReenterAdmission {
         handle: handle.new_handle(),
@@ -40,9 +42,7 @@ async fn receiver_waker_can_reenter_admission() {
         Poll::Pending
     ));
 
-    call(&handle, |state, ()| *state += 1, ())
-        .try_cast()
-        .unwrap();
+    call(&handle, |state, ()| *state += 1, ()).cast().await;
     assert!(wake.called.load(Ordering::SeqCst));
 
     drop(receiver);
@@ -58,7 +58,7 @@ async fn receiver_waker_can_reenter_admission() {
 
 #[tokio::test]
 #[cfg(feature = "tokio")]
-async fn outstanding_permit_does_not_keep_failed_runner_alive() {
+async fn failed_owner_permit() {
     let executor = tokio::task::LocalSet::new();
 
     executor

@@ -32,7 +32,8 @@ impl<S, E, C> Actor<S, E, C> {
         self.running.has_changed().is_ok() && *self.running.borrow()
     }
 
-    pub async fn wait_running(&self) -> Result<(), LifecycleError<E>> {
+    /// Wait for running state, reporting closure independently of the setup error type.
+    pub async fn wait_running(&self) -> Result<(), LifecycleError<core::convert::Infallible>> {
         let mut running = self.running.clone();
 
         loop {
@@ -166,9 +167,17 @@ impl<S, E, C> Actor<S, E, C> {
 
     /// Cleanup errors retained after a panic.
     pub fn cleanup_errors(&self) -> CleanupErrors<C> {
+        let saved = self.failed_cleanup.lock();
+
         CleanupErrors {
-            errors: self.failed_cleanup.lock().errors.clone(),
+            errors: saved.errors.clone(),
+            diagnostics: saved.diagnostics.clone(),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn group_primary(&self) -> bool {
+        self.failed_cleanup.lock().group_primary
     }
 }
 impl<S, E, C> Clone for Actor<S, E, C> {

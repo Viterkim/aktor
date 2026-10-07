@@ -1,5 +1,4 @@
 use super::*;
-use alloc::string::ToString;
 use core::{future::poll_fn, ops::AsyncFnOnce};
 
 pub struct AktorRunner<'a, S, const N: usize = 0, E = ()> {
@@ -38,16 +37,10 @@ impl<S, const N: usize, E> AktorCustomCall<'_, S, N, E> {
     pub async fn run(mut self) {
         let running = self.message.job.run(self.state, self.hooks, self.operation);
 
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         self.inner.capture(self.operation.name, running).await;
 
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         {
             let _inner = &self.inner;
             running.await;
@@ -168,7 +161,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         setup: Setup,
         cleanup: Cleanup,
         runner: Runner,
-    ) -> Result<(), Rc<OwnerError<E>>>
+    ) -> Result<(), OwnerError>
     where
         Setup: FnOnce() -> SetupFuture,
         SetupFuture: Future<Output = Result<S, AktorSetupError<E>>>,
@@ -176,30 +169,33 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
         Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S, N, E>) -> Result<(), crate::AktorError>,
     {
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
-        let initialized = self.inner.capture("setup", async { setup().await }).await;
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
-        let initialized = setup().await;
+        #[cfg(feature = "std")]
+        let (initialized, mut primary) = match self
+            .inner
+            .capture_result("setup", async { setup().await })
+            .await
+        {
+            Ok(result) => (result.map_err(OwnerError::Setup), None),
+            Err(payload) => {
+                let error = crate::AktorError::new(crate::panic::panic_message(&payload));
+
+                (Err(OwnerError::SetupPanic(error)), Some(payload))
+            }
+        };
+        #[cfg(not(feature = "std"))]
+        let initialized = setup().await.map_err(OwnerError::Setup);
+        #[cfg(feature = "std")]
+        let setup_panicked = primary.is_some();
 
         match initialized {
             Ok(state) => self.run_custom(state, cleanup, runner).await,
             Err(error) => {
-                let error = Rc::new(OwnerError::Setup(error));
+                let error = Rc::new(error);
 
                 self.inner.fail(&error);
-                #[cfg(any(
-                    feature = "tokio",
-                    all(feature = "std_thread", not(target_family = "wasm"))
-                ))]
+                #[cfg(feature = "std")]
                 {
                     let inner = self.inner.clone();
-                    let mut primary = None;
 
                     if let Err(error) = inner
                         .settle("hook drop", self.dispose_hooks(), &mut primary)
@@ -208,20 +204,59 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                         inner.completion.diagnostics.borrow_mut().push(error);
                     }
 
-                    if let Some(payload) = primary {
-                        crate::listener::failure::dispose_secondary(payload);
+                    if let Err(error) = inner
+                        .settle(
+                            "cleanup closure drop",
+                            async { drop(cleanup) },
+                            &mut primary,
+                        )
+                        .await
+                    {
+                        inner.completion.diagnostics.borrow_mut().push(error);
+                    }
+
+                    if let Err(error) = inner
+                        .settle("runner closure drop", async { drop(runner) }, &mut primary)
+                        .await
+                    {
+                        inner.completion.diagnostics.borrow_mut().push(error);
+                    }
+
+                    if !setup_panicked && let Some(payload) = primary.take() {
+                        crate::panic::dispose_secondary(payload);
                     }
                 }
-                #[cfg(not(any(
-                    feature = "tokio",
-                    all(feature = "std_thread", not(target_family = "wasm"))
-                )))]
-                self.dispose_hooks().await;
+                #[cfg(not(feature = "std"))]
+                {
+                    self.dispose_hooks().await;
+                    drop((cleanup, runner));
+                }
 
                 let result = Err(error);
 
+                #[cfg(feature = "std")]
+                {
+                    if let Err(error) = self
+                        .inner
+                        .settle(
+                            "queue drop",
+                            async {
+                                self.inner.finish(result.clone());
+                            },
+                            &mut primary,
+                        )
+                        .await
+                    {
+                        self.inner.completion.diagnostics.borrow_mut().push(error);
+                    }
+
+                    if let Some(payload) = primary {
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+                #[cfg(not(feature = "std"))]
                 self.inner.finish(result.clone());
-                result
+                result.map_err(|error| error.report())
             }
         }
     }
@@ -231,7 +266,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         mut state: S,
         cleanup: Cleanup,
         runner: Runner,
-    ) -> Result<(), Rc<OwnerError<E>>>
+    ) -> Result<(), OwnerError>
     where
         Cleanup: FnOnce(S) -> CleanupFuture,
         CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
@@ -269,26 +304,17 @@ impl<S, const N: usize, E> Owner<S, N, E> {
             .await
         };
 
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let mut primary = None;
 
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let served = self
             .inner
             .settle("runner", serving, &mut primary)
             .await
             .and_then(|result| result);
 
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         let served = serving.await;
 
         let result = served
@@ -309,10 +335,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         if let Err(error) = &result {
             self.inner.fail(error);
         }
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         if let Err(error) = self
             .inner
             .settle("close", async { self.inner.close() }, &mut primary)
@@ -320,26 +343,17 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         {
             self.inner.completion.diagnostics.borrow_mut().push(error);
         }
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         self.inner.close();
 
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let cleaned = self
             .inner
             .settle("cleanup", async { cleanup(state).await }, &mut primary)
             .await
             .map_err(|error| Rc::new(OwnerError::Runner(error)))
             .and_then(|result| result.map_err(|error| Rc::new(OwnerError::Cleanup(error))));
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         let cleaned = cleanup(state)
             .await
             .map_err(|error| Rc::new(OwnerError::Cleanup(error)));
@@ -347,10 +361,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         if let Err(error) = &cleaned {
             self.inner.fail(error);
         }
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         {
             let inner = self.inner.clone();
 
@@ -361,17 +372,11 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 inner.completion.diagnostics.borrow_mut().push(error);
             }
         }
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         self.dispose_hooks().await;
 
         let retain_cleanup = result.is_err();
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let retain_cleanup = retain_cleanup || primary.is_some();
 
         if retain_cleanup && let Err(error) = &cleaned {
@@ -379,26 +384,20 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 .completion
                 .diagnostics
                 .borrow_mut()
-                .push(crate::AktorError::new(error.to_string()));
+                .push(crate::AktorError::new(alloc::format!("{error:#}")));
         }
 
         let result = result.and(cleaned);
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         let result = if let Some(payload) = &primary {
             Err(Rc::new(OwnerError::Runner(crate::AktorError::new(
-                crate::group::shutdown::panic_message(payload),
+                crate::panic::panic_message(payload),
             ))))
         } else {
             result
         };
 
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         if let Err(error) = self
             .inner
             .settle(
@@ -413,20 +412,14 @@ impl<S, const N: usize, E> Owner<S, N, E> {
             self.inner.completion.diagnostics.borrow_mut().push(error);
         }
 
-        #[cfg(not(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        )))]
+        #[cfg(not(feature = "std"))]
         self.inner.finish(result.clone());
 
-        #[cfg(any(
-            feature = "tokio",
-            all(feature = "std_thread", not(target_family = "wasm"))
-        ))]
+        #[cfg(feature = "std")]
         if let Some(payload) = primary {
             std::panic::resume_unwind(payload);
         }
 
-        result
+        result.map_err(|error| error.report())
     }
 }

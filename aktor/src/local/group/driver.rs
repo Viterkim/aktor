@@ -9,6 +9,7 @@ impl<Clock: AktorGroupClock> Drop for Driver<Clock> {
 
         let kill = KillSwitch {
             control: self.control.clone(),
+            startup_failure: None,
         };
 
         kill.fail(ActorFailure {
@@ -17,6 +18,8 @@ impl<Clock: AktorGroupClock> Drop for Driver<Clock> {
             phase: "driver".into(),
             message: "actor group driver cancelled".into(),
         });
+
+        cancel_callers(&self.control);
 
         let entries = core::mem::take(&mut *self.owners.borrow_mut());
 
@@ -41,6 +44,12 @@ impl<Clock: AktorGroupClock> Drop for Driver<Clock> {
             }
         }
 
+        let hook = self.control.shutdown_hook.borrow_mut().take();
+
+        if let Some(error) = contain(|| drop(hook)) {
+            self.control.report.borrow_mut().application.push(error);
+        }
+
         let mut report = self.control.report.borrow().clone();
 
         report.failure = self.control.failure.borrow().clone();
@@ -54,27 +63,30 @@ pub fn contain(action: impl FnOnce()) -> Option<AktorError> {
 }
 
 pub fn capture<T>(action: impl FnOnce() -> T) -> Result<T, AktorError> {
-    #[cfg(any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm"))
-    ))]
+    #[cfg(feature = "std")]
     {
-        use crate::{group::shutdown::panic_message, listener::failure::dispose_secondary};
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
         match catch_unwind(AssertUnwindSafe(action)) {
             Ok(output) => Ok(output),
             Err(payload) => {
-                let message = panic_message(&payload);
-                dispose_secondary(payload);
+                let message = if let Some(message) = payload.downcast_ref::<&str>() {
+                    (*message).into()
+                } else if let Some(message) = payload.downcast_ref::<String>() {
+                    message.clone()
+                } else {
+                    "panic payload had no message".into()
+                };
+
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+                    core::mem::forget(payload);
+                }
+
                 Err(AktorError::new(message))
             }
         }
     }
-    #[cfg(not(any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm"))
-    )))]
+    #[cfg(not(feature = "std"))]
     {
         Ok(action())
     }
@@ -85,6 +97,8 @@ pub fn poll_owners<Clock: AktorGroupClock>(
     cx: &mut core::task::Context<'_>,
     control: &Rc<Control<Clock>>,
 ) {
+    poll_callers(control, cx);
+
     let mut entries = core::mem::take(&mut *owners.borrow_mut());
 
     for entry in entries.iter_mut() {
@@ -98,6 +112,7 @@ pub fn poll_owners<Clock: AktorGroupClock>(
             Err(error) => {
                 KillSwitch {
                     control: control.clone(),
+                    startup_failure: None,
                 }
                 .fail(ActorFailure {
                     kind: Some(entry.kind),
@@ -133,4 +148,71 @@ pub fn poll_owners<Clock: AktorGroupClock>(
 
     entries.extend(registered);
     *owners.borrow_mut() = entries;
+}
+
+pub fn cancel_callers<Clock: AktorGroupClock>(control: &Rc<Control<Clock>>) {
+    let callers = core::mem::take(&mut *control.callers.borrow_mut());
+
+    for caller in callers {
+        if let Some(error) = contain(|| drop(caller)) {
+            task_failure(control, "task drop", error);
+        }
+    }
+}
+
+fn poll_callers<Clock: AktorGroupClock>(
+    control: &Rc<Control<Clock>>,
+    cx: &mut core::task::Context<'_>,
+) {
+    let callers = core::mem::take(&mut *control.callers.borrow_mut());
+    let mut waiting = Vec::new();
+
+    for mut caller in callers {
+        let pending = if control.stopping.get() {
+            false
+        } else {
+            match capture(|| caller.as_mut().poll(cx)) {
+                Ok(Poll::Pending) => true,
+                Ok(Poll::Ready(())) => false,
+                Err(error) => {
+                    task_failure(control, "task", error);
+                    false
+                }
+            }
+        };
+
+        if pending && !control.stopping.get() {
+            waiting.push(caller);
+        } else if let Some(error) = contain(|| drop(caller)) {
+            task_failure(control, "task drop", error);
+        }
+    }
+
+    let registered = core::mem::take(&mut *control.callers.borrow_mut());
+
+    waiting.extend(registered);
+    *control.callers.borrow_mut() = waiting;
+
+    if control.stopping.get() {
+        cancel_callers(control);
+    }
+}
+
+fn task_failure<Clock: AktorGroupClock>(
+    control: &Rc<Control<Clock>>,
+    phase: &str,
+    error: AktorError,
+) {
+    let kill = KillSwitch {
+        control: control.clone(),
+        startup_failure: None,
+    };
+
+    kill.fail(ActorFailure {
+        kind: None,
+        actor: "application".into(),
+        phase: phase.into(),
+        message: error.to_string(),
+    });
+    kill.record_diagnostic(error);
 }

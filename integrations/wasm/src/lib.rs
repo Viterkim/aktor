@@ -192,9 +192,7 @@ async fn timeout_limits() -> Result<(), &'static str> {
     }
 
     let (actor, owner) = embassy::channel::<State, 1, ()>().map_err(|_| "timeout channel")?;
-    let mut reply = append::request(&actor, Line("kept".into()))
-        .try_send()
-        .map_err(|_| "timeout admission")?;
+    let mut reply = append::request(&actor, Line("kept".into())).send().await;
     let mut context = Context::from_waker(Waker::noop());
 
     let mut request =
@@ -298,31 +296,38 @@ async fn local_setup() -> Result<(), &'static str> {
     let cleaned = Rc::new(Cell::new(false));
     let ended = cleaned.clone();
     let work = async move {
-        let actors = start(AktorSetup {
-            name: AktorName::new("host executor"),
-            role: AktorNoRole,
-            kind: AktorKind::Local::<local::clock::Embassy>(move |future| {
-                spawner.borrow_mut().push(future);
-                Ok(())
-            }),
-            closures: AktorClosures {
-                start: async || {
-                    Ok(State {
-                        text: String::new(),
-                    })
+        let actors = aktor_start(AktorSetup {
+            actors: AktorNew {
+                name: AktorName::new("host executor"),
+                role: AktorNoRole,
+                kind: AktorKind::Local::<local::clock::Embassy>(move |future| {
+                    spawner.borrow_mut().push(future);
+                    Ok(())
+                }),
+                closures: AktorClosures {
+                    start: async || {
+                        Ok(State {
+                            text: String::new(),
+                        })
+                    },
+
+                    end: Some(
+                        (async move |_: State| {
+                            ended.set(true);
+                            Ok(())
+                        })
+                        .into(),
+                    ),
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
                 },
-                end: Some(
-                    (async move |_: State| {
-                        ended.set(true);
-                        Ok(())
-                    })
-                    .into(),
-                ),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
+                options: AktorNewOptions { capacity: 32 },
             },
-            options: None,
+            shutdown: |_| {},
+            options: AktorOptions {
+                shutdown_grace: core::time::Duration::from_secs(5),
+            },
         })
         .await
         .map_err(|_| "host setup")?;
@@ -421,10 +426,7 @@ async fn exercise() -> Result<(), &'static str> {
 
         drop(append::request(&actor, Line("b".into())).send().await);
 
-        let waiting = match append::request(&actor, Line("c".into())).try_send() {
-            Err(aktor::message::TrySendError::Full(request)) => request,
-            _ => return Err("queue pressure"),
-        };
+        let waiting = append::request(&actor, Line("c".into()));
 
         release.signal(());
 
@@ -482,11 +484,16 @@ async fn exercise() -> Result<(), &'static str> {
 
     let error = result.err().ok_or("cleanup failure")?;
 
-    if !error.to_string().contains("backup folder is read only") {
+    if !format!("{error:#}").contains("backup folder is read only") {
         return Err("cleanup diagnostics");
     }
 
-    let embassy::OwnerError::Cleanup(cleanup) = &*error else {
+    let typed = completion
+        .wait_with_data()
+        .await
+        .err()
+        .ok_or("typed cleanup observation")?;
+    let embassy::OwnerError::Cleanup(cleanup) = &*typed.error else {
         return Err("cleanup kind");
     };
 
@@ -494,9 +501,13 @@ async fn exercise() -> Result<(), &'static str> {
         return Err("cleanup structure");
     }
 
-    let observed = completion.await.err().ok_or("cleanup observation")?;
+    let observed = completion
+        .wait_with_data()
+        .await
+        .err()
+        .ok_or("cleanup observation")?;
 
-    if !Rc::ptr_eq(&error, &observed) {
+    if !Rc::ptr_eq(&typed.error, &observed.error) {
         return Err("retained cleanup failure");
     }
 

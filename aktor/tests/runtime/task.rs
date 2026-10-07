@@ -49,15 +49,24 @@ async fn task_echo_fixed(counter: &mut Counter, value: u32) -> u32 {
 
 #[tokio::test(flavor = "current_thread")]
 async fn cooperative() {
-    let actors = start(AktorSetup {
-        name: AktorName::new("task admission"),
-        role: AktorNoRole,
-        kind: AktorKind::TokioTask,
-        closures: AktorClosures::new(async || Ok(Counter(std::cell::RefCell::new(0)))),
-        options: Some(AktorOptions {
-            capacity: 1024,
-            ..Default::default()
-        }),
+    let actors = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: AktorName::new("task admission"),
+            role: AktorNoRole,
+            kind: AktorKind::TokioTask,
+            closures: AktorClosures {
+                start: async || Ok(Counter(std::cell::RefCell::new(0))),
+                end: None,
+                intervals: vec![],
+                before_each: None,
+                after_each: None,
+            },
+            options: AktorNewOptions { capacity: 1024 },
+        },
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_secs(5),
+        },
     })
     .await
     .unwrap();
@@ -86,40 +95,43 @@ async fn calls() {
     let before = log.clone();
     let after = log.clone();
     let end = log.clone();
-    let actors = start(AktorSetup {
-        name: AktorName::new("counter task"),
-        role: AktorNoRole,
-        kind: AktorKind::TokioTask,
-        closures: AktorClosures {
-            start: async || Ok(Counter(std::cell::RefCell::new(0))),
-            end: Some(
-                (async move |mut counter: Counter| {
-                    end.lock().unwrap().push(("end", *counter.0.get_mut()));
-                    Ok(())
-                })
-                .into(),
-            ),
-            intervals: vec![],
-            before_each: Some(
-                (move |counter: &mut Counter, _: operation::Operation| {
-                    before
-                        .lock()
-                        .unwrap()
-                        .push(("before", *counter.0.get_mut()));
-                })
-                .into(),
-            ),
-            after_each: Some(
-                (move |counter: &mut Counter, _: operation::Operation| {
-                    after.lock().unwrap().push(("after", *counter.0.get_mut()));
-                })
-                .into(),
-            ),
+    let actors = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: AktorName::new("counter task"),
+            role: AktorNoRole,
+            kind: AktorKind::TokioTask,
+            closures: AktorClosures {
+                start: async || Ok(Counter(std::cell::RefCell::new(0))),
+                end: Some(
+                    (async move |mut counter: Counter| {
+                        end.lock().unwrap().push(("end", *counter.0.get_mut()));
+                        Ok(())
+                    })
+                    .into(),
+                ),
+                intervals: vec![],
+                before_each: Some(
+                    (move |counter: &mut Counter, _: operation::Operation| {
+                        before
+                            .lock()
+                            .unwrap()
+                            .push(("before", *counter.0.get_mut()));
+                    })
+                    .into(),
+                ),
+                after_each: Some(
+                    (move |counter: &mut Counter, _: operation::Operation| {
+                        after.lock().unwrap().push(("after", *counter.0.get_mut()));
+                    })
+                    .into(),
+                ),
+            },
+            options: AktorNewOptions { capacity: 1 },
         },
-        options: Some(AktorOptions {
-            capacity: 1,
-            ..Default::default()
-        }),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_secs(5),
+        },
     })
     .await
     .unwrap();
@@ -160,14 +172,8 @@ async fn calls() {
 
     assert!((&mut request).now_or_never().is_none());
 
-    let next = request
-        .try_send()
-        .unwrap_or_else(|_| panic!("waiting queue was full"));
-
-    assert!(matches!(
-        task_add(&actors.handles, 10).try_send(),
-        Err(message::TrySendError::Full(_))
-    ));
+    let next = request.send().await;
+    assert!(task_add(&actors.handles, 10).now_or_never().is_none());
     release.notify_one();
     assert_eq!(next.await, Ok(5));
     assert_eq!(output.next().await, Some(3));
@@ -210,10 +216,6 @@ async fn calls() {
     assert!(!report.failed(), "{report}");
     assert_eq!(report.actors[0].kind, Some(AktorExecution::TokioTask));
     assert_eq!(log.lock().unwrap().last(), Some(&("end", 6)));
-    assert!(matches!(
-        task_add(&actors.handles, 1).try_send(),
-        Err(message::TrySendError::Closed(_))
-    ));
     assert!(task_add(&actors.handles, 1).now_or_never().is_none());
 }
 
@@ -221,28 +223,34 @@ async fn calls() {
 async fn intervals() {
     let tick = Arc::new(Notify::new());
     let ping = tick.clone();
-    let actors = start(AktorSetup {
-        name: AktorName::new("interval task"),
-        role: AktorNoRole,
-        kind: AktorKind::TokioTask,
-        closures: AktorClosures {
-            start: async || Ok(Counter(std::cell::RefCell::new(0))),
-            end: None,
-            intervals: vec![AktorInterval {
-                every: Duration::from_millis(10),
-                run: (move |mut counter: AktorTaskState<Counter>| {
-                    let ping = ping.clone();
-                    async move {
-                        *counter.0.get_mut() += 1;
-                        ping.notify_one();
-                    }
-                })
-                .into(),
-            }],
-            before_each: None,
-            after_each: None,
+    let actors = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: AktorName::new("interval task"),
+            role: AktorNoRole,
+            kind: AktorKind::TokioTask,
+            closures: AktorClosures {
+                start: async || Ok(Counter(std::cell::RefCell::new(0))),
+                end: None,
+                intervals: vec![AktorInterval {
+                    every: Duration::from_millis(10),
+                    run: (move |mut counter: AktorTaskState<Counter>| {
+                        let ping = ping.clone();
+                        async move {
+                            *counter.0.get_mut() += 1;
+                            ping.notify_one();
+                        }
+                    })
+                    .into(),
+                }],
+                before_each: None,
+                after_each: None,
+            },
+            options: AktorNewOptions { capacity: 32 },
         },
-        options: None,
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_secs(5),
+        },
     })
     .await
     .unwrap();
@@ -275,45 +283,51 @@ async fn cleanup() {
     let cleaned = Arc::new(Mutex::new(None));
     let saved = cleaned.clone();
     let payload = PanicPayload;
-    let actors = start((
-        AktorSetup {
-            name: AktorName::new("failed task"),
-            role: AktorNoRole,
-            kind: AktorKind::TokioTask,
-            closures: AktorClosures {
-                start: async || Ok(Counter(std::cell::RefCell::new(0))),
-                end: Some(
-                    (async move |mut counter: Counter| {
-                        *saved.lock().unwrap() = Some(*counter.0.get_mut());
-                        Ok(())
-                    })
-                    .into(),
-                ),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
+    let actors = aktor_start(AktorSetup {
+        actors: (
+            AktorNew {
+                name: AktorName::new("failed task"),
+                role: AktorNoRole,
+                kind: AktorKind::TokioTask,
+                closures: AktorClosures {
+                    start: async || Ok(Counter(std::cell::RefCell::new(0))),
+                    end: Some(
+                        (async move |mut counter: Counter| {
+                            *saved.lock().unwrap() = Some(*counter.0.get_mut());
+                            Ok(())
+                        })
+                        .into(),
+                    ),
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
+                options: AktorNewOptions { capacity: 32 },
             },
-            options: None,
-        },
-        AktorSetup {
-            name: AktorName::new("hook drop task"),
-            role: AktorNoRole,
-            kind: AktorKind::TokioTask,
-            closures: AktorClosures {
-                start: async || Ok(Counter(std::cell::RefCell::new(0))),
-                end: None,
-                intervals: vec![],
-                before_each: Some(
-                    (move |_: &mut Counter, _: operation::Operation| {
-                        std::hint::black_box(&payload);
-                    })
-                    .into(),
-                ),
-                after_each: None,
+            AktorNew {
+                name: AktorName::new("hook drop task"),
+                role: AktorNoRole,
+                kind: AktorKind::TokioTask,
+                closures: AktorClosures {
+                    start: async || Ok(Counter(std::cell::RefCell::new(0))),
+                    end: None,
+                    intervals: vec![],
+                    before_each: Some(
+                        (move |_: &mut Counter, _: operation::Operation| {
+                            std::hint::black_box(&payload);
+                        })
+                        .into(),
+                    ),
+                    after_each: None,
+                },
+                options: AktorNewOptions { capacity: 32 },
             },
-            options: None,
+        ),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_secs(5),
         },
-    ))
+    })
     .await
     .unwrap();
 
@@ -353,15 +367,21 @@ async fn mixed_cleanup() {
     for bevy_first in [false, true] {
         let ended = Arc::new(Mutex::new(false));
         let end = ended.clone();
-        let tokio = AktorSetup {
+        let tokio = AktorNew {
             name: AktorName::new("Tokio counter"),
             role: AktorNoRole,
             kind: AktorKind::TokioTask,
-            closures: AktorClosures::new(async || Ok(0_u32)),
-            options: None,
+            closures: AktorClosures {
+                start: async || Ok(0_u32),
+                end: None,
+                intervals: vec![],
+                before_each: None,
+                after_each: None,
+            },
+            options: AktorNewOptions { capacity: 32 },
         };
 
-        let bevy = AktorSetup {
+        let bevy = AktorNew {
             name: AktorName::new("Bevy counter"),
             role: AktorNoRole,
             kind: AktorKind::BevyTask(&pool),
@@ -390,13 +410,33 @@ async fn mixed_cleanup() {
                 before_each: None,
                 after_each: None,
             },
-            options: None,
+            options: AktorNewOptions { capacity: 32 },
         };
 
         let report = if bevy_first {
-            start((bevy, tokio)).await.unwrap().shutdown().await
+            aktor_start(AktorSetup {
+                actors: (bevy, tokio),
+                shutdown: |_| {},
+                options: AktorOptions {
+                    shutdown_grace: Duration::from_secs(5),
+                },
+            })
+            .await
+            .unwrap()
+            .shutdown()
+            .await
         } else {
-            start((tokio, bevy)).await.unwrap().shutdown().await
+            aktor_start(AktorSetup {
+                actors: (tokio, bevy),
+                shutdown: |_| {},
+                options: AktorOptions {
+                    shutdown_grace: Duration::from_secs(5),
+                },
+            })
+            .await
+            .unwrap()
+            .shutdown()
+            .await
         };
 
         assert!(!report.failed(), "{report}");
@@ -405,43 +445,74 @@ async fn mixed_cleanup() {
 }
 
 #[tokio::test]
-async fn admission_retry() {
+async fn admission_wait() {
     tokio::time::timeout(Duration::from_secs(3), async {
         #[cfg(feature = "bevy")]
         let pool = bevy_tasks::TaskPoolBuilder::new().num_threads(1).build();
         let modes = if cfg!(feature = "bevy") { 2 } else { 1 };
 
         for mode in 0..modes {
-            let setup = AktorSetup {
+            let setup = AktorNew {
                 name: AktorName::new("task admission"),
                 role: AktorNoRole,
                 kind: AktorKind::TokioTask,
-                closures: AktorClosures::new(async || Ok(Counter(std::cell::RefCell::new(0)))),
-                options: Some(AktorOptions {
-                    capacity: 1,
-                    ..Default::default()
-                }),
+                closures: AktorClosures {
+                    start: async || Ok(Counter(std::cell::RefCell::new(0))),
+                    end: None,
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
+                options: AktorNewOptions { capacity: 1 },
             };
 
             #[cfg(feature = "bevy")]
             let actors = if mode == 1 {
-                start(AktorSetup {
-                    name: setup.name,
-                    role: setup.role,
-                    kind: AktorKind::BevyTask(&pool),
-                    closures: AktorClosures::new(setup.closures.start),
-                    options: setup.options,
+                aktor_start(AktorSetup {
+                    actors: AktorNew {
+                        name: setup.name,
+                        role: setup.role,
+                        kind: AktorKind::BevyTask(&pool),
+                        closures: AktorClosures {
+                            start: setup.closures.start,
+                            end: None,
+                            intervals: vec![],
+                            before_each: None,
+                            after_each: None,
+                        },
+                        options: setup.options,
+                    },
+                    shutdown: |_| {},
+                    options: AktorOptions {
+                        shutdown_grace: Duration::from_secs(5),
+                    },
                 })
                 .await
                 .unwrap()
             } else {
-                start(setup).await.unwrap()
+                aktor_start(AktorSetup {
+                    actors: setup,
+                    shutdown: |_| {},
+                    options: AktorOptions {
+                        shutdown_grace: Duration::from_secs(5),
+                    },
+                })
+                .await
+                .unwrap()
             };
 
             #[cfg(not(feature = "bevy"))]
             let actors = {
                 let _ = mode;
-                start(setup).await.unwrap()
+                aktor_start(AktorSetup {
+                    actors: setup,
+                    shutdown: |_| {},
+                    options: AktorOptions {
+                        shutdown_grace: Duration::from_secs(5),
+                    },
+                })
+                .await
+                .unwrap()
             };
 
             let entered = Arc::new(Notify::new());
@@ -460,13 +531,6 @@ async fn admission_retry() {
 
             assert!((&mut request).now_or_never().is_none());
 
-            for _ in 0..2 {
-                request = match request.try_send() {
-                    Err(message::TrySendError::Full(request)) => request,
-                    _ => panic!("occupied queue accepted a call"),
-                };
-            }
-
             assert!((&mut request).now_or_never().is_none());
             first_gate.notify_one();
             entered.notified().await;
@@ -481,11 +545,9 @@ async fn admission_retry() {
             );
             assert!(second.try_take().is_none());
 
-            let next = request.try_send();
+            let next = request.send().await;
 
             second_gate.notify_one();
-
-            let next = next.unwrap_or_else(|_| panic!("request competed with its own reservation"));
 
             assert_eq!(first.await, 1);
             assert_eq!(next.await, Ok(3));
@@ -503,10 +565,8 @@ async fn admission_retry() {
             entered.notified().await;
 
             let queued = task_add(&actors.handles, 1).send().await;
-            let waiting = match task_add(&actors.handles, 1).try_send() {
-                Err(message::TrySendError::Full(request)) => request,
-                _ => panic!("occupied queue accepted a call"),
-            };
+            let mut waiting = task_add(&actors.handles, 1);
+            assert!((&mut waiting).now_or_never().is_none());
 
             first_gate.notify_one();
             assert_eq!(waiting.await, Ok(6));
@@ -525,10 +585,10 @@ async fn admission_retry() {
             assert!((&mut waiting).now_or_never().is_none());
             actors.killswitch().stop();
 
-            let closed = matches!(waiting.try_send(), Err(message::TrySendError::Closed(_)));
+            assert!((&mut waiting).now_or_never().is_none());
+            drop(waiting);
 
             first_gate.notify_one();
-            assert!(closed);
             assert_eq!(held.await, 7);
             assert_eq!(queued.await, Ok(8));
             assert!(!actors.shutdown().await.failed());
@@ -544,15 +604,24 @@ async fn parked_admission() {
         for mode in 0..4 {
             let entered = Arc::new(Notify::new());
             let release = Arc::new(Notify::new());
-            let actors = start(AktorSetup {
-                name: AktorName::new("parked admission"),
-                role: AktorNoRole,
-                kind: AktorKind::TokioTask,
-                closures: AktorClosures::new(async || Ok(Counter(std::cell::RefCell::new(0)))),
-                options: Some(AktorOptions {
-                    capacity: 1,
-                    ..Default::default()
-                }),
+            let actors = aktor_start(AktorSetup {
+                actors: AktorNew {
+                    name: AktorName::new("parked admission"),
+                    role: AktorNoRole,
+                    kind: AktorKind::TokioTask,
+                    closures: AktorClosures {
+                        start: async || Ok(Counter(std::cell::RefCell::new(0))),
+                        end: None,
+                        intervals: vec![],
+                        before_each: None,
+                        after_each: None,
+                    },
+                    options: AktorNewOptions { capacity: 1 },
+                },
+                shutdown: |_| {},
+                options: AktorOptions {
+                    shutdown_grace: Duration::from_secs(5),
+                },
             })
             .await
             .unwrap();
@@ -611,4 +680,42 @@ async fn parked_admission() {
             assert!(waiting.as_mut().now_or_never().is_none());
         }
     }
+}
+
+#[tokio::test]
+async fn consumed() {
+    let actors = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: AktorName::new("consumed task"),
+            role: AktorNoRole,
+            kind: AktorKind::TokioTask,
+            closures: AktorClosures {
+                start: async || Ok(Counter(std::cell::RefCell::new(0))),
+                end: None,
+                intervals: vec![],
+                before_each: None,
+                after_each: None,
+            },
+            options: AktorNewOptions { capacity: 32 },
+        },
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: Duration::from_secs(5),
+        },
+    })
+    .await
+    .unwrap();
+
+    let mut request = task_echo(&actors.handles, ()).into_request();
+    (&mut request).await;
+
+    let reused = std::panic::AssertUnwindSafe(async {
+        drop(request.send().await);
+    })
+    .catch_unwind()
+    .await;
+
+    assert!(reused.is_err(), "consumed task returned another reply");
+
+    assert!(!actors.shutdown().await.failed());
 }

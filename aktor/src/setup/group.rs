@@ -9,11 +9,16 @@ pub trait AktorSetupGroup: Sized + Unpin {
 
     fn new(grace: Duration) -> Self;
     fn registration(&self) -> Self;
+    fn track_startup(&mut self) {}
+    fn source_is_failure(_kill: &Self::KillSwitch) -> bool {
+        false
+    }
     fn check_started(&self) -> Result<(), AktorSetupError>;
     fn killswitch(&self) -> Self::KillSwitch;
     fn completion(&self) -> Self::Completion;
     fn stop(kill: &Self::KillSwitch);
     fn is_stopping(kill: &Self::KillSwitch) -> bool;
+    fn set_starting(kill: &Self::KillSwitch, starting: bool) -> bool;
     fn closing(&self) -> Self::Closing;
 }
 
@@ -34,11 +39,22 @@ impl AktorSetupGroup for crate::AktorGroup {
     type Closing = AktorClosingFuture;
 
     fn new(grace: Duration) -> Self {
-        Self::with_grace(grace)
+        let group = Self::with_grace(grace);
+
+        group.killswitch().set_starting(true);
+        group
     }
 
     fn registration(&self) -> Self {
         self.new_registration()
+    }
+
+    fn track_startup(&mut self) {
+        self.track_startup();
+    }
+
+    fn source_is_failure(kill: &Self::KillSwitch) -> bool {
+        kill.has_startup_failure()
     }
 
     fn check_started(&self) -> Result<(), AktorSetupError> {
@@ -59,6 +75,10 @@ impl AktorSetupGroup for crate::AktorGroup {
 
     fn is_stopping(kill: &Self::KillSwitch) -> bool {
         kill.is_stopping()
+    }
+
+    fn set_starting(kill: &Self::KillSwitch, starting: bool) -> bool {
+        kill.set_starting(starting)
     }
 
     fn closing(&self) -> Self::Closing {
@@ -76,11 +96,22 @@ impl<Clock: crate::local::clock::AktorGroupClock> AktorSetupGroup
     type Closing = crate::message::LocalFuture<'static, ShutdownReport>;
 
     fn new(grace: Duration) -> Self {
-        Self::with_grace(grace)
+        let group = Self::with_grace(grace);
+
+        group.killswitch().set_starting(true);
+        group
     }
 
     fn registration(&self) -> Self {
         self.new_registration()
+    }
+
+    fn track_startup(&mut self) {
+        self.track_startup();
+    }
+
+    fn source_is_failure(kill: &Self::KillSwitch) -> bool {
+        kill.has_startup_failure()
     }
 
     fn check_started(&self) -> Result<(), AktorSetupError> {
@@ -101,6 +132,10 @@ impl<Clock: crate::local::clock::AktorGroupClock> AktorSetupGroup
 
     fn is_stopping(kill: &Self::KillSwitch) -> bool {
         kill.is_stopping()
+    }
+
+    fn set_starting(kill: &Self::KillSwitch, starting: bool) -> bool {
+        kill.set_starting(starting)
     }
 
     fn closing(&self) -> Self::Closing {

@@ -7,7 +7,7 @@ use local::clock::Browser as Clock;
 #[cfg(not(target_family = "wasm"))]
 use local::clock::Std as Clock;
 
-impl<'pool, S: 'static, Start, Role> AktorStart for AktorSetup<S, Start, BevyLocal<'pool>, Role>
+impl<'pool, S: 'static, Start, Role> AktorStart for AktorNew<S, Start, BevyLocal<'pool>, Role>
 where
     Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
 {
@@ -16,10 +16,8 @@ where
     type Handles = local::Handle<S, 0, (), Role, Clock>;
     type Startup = LocalFuture<'pool, Result<Self::Handles, AktorStartError>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -52,8 +50,7 @@ where
         })
     }
 }
-
-impl<'pool, S, Start, Fut, Role> AktorStart for AktorSetup<S, Start, kind::BevyTask<'pool>, Role>
+impl<'pool, S, Start, Fut, Role> AktorStart for AktorNew<S, Start, kind::BevyTask<'pool>, Role>
 where
     S: Send + 'static,
     Start: FnOnce() -> Fut + Send + 'static,
@@ -68,10 +65,8 @@ where
     #[cfg(target_family = "wasm")]
     type Startup = LocalFuture<'pool, Result<Self::Handles, AktorStartError>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {

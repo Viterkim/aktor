@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Timeout, message::TrySendError, timeout::WaitStatus};
+use crate::{Timeout, message::consumed, timeout::WaitStatus};
 use core::task::{Context, Poll};
 use std::time::Duration;
 
@@ -81,6 +81,10 @@ where
     }
 
     fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.reply.taken {
+            consumed();
+        }
+
         if self.reply.admitted {
             return Poll::Ready(());
         }
@@ -127,27 +131,6 @@ where
     pub async fn send(mut self) -> AktorTaskReply<O> {
         core::future::poll_fn(|cx| self.poll_submit(cx)).await;
         self.reply
-    }
-
-    pub fn try_send(mut self) -> Result<AktorTaskReply<O>, TrySendError<Self>> {
-        if self.reply.admitted {
-            return Ok(self.reply);
-        }
-
-        self.admission = None;
-
-        if self.handle.kill.is_stopping() {
-            return Err(TrySendError::Closed(self));
-        }
-
-        match self.handle.sender.try_reserve() {
-            Ok(permit) => {
-                self.submit(|message| permit.send(message));
-                Ok(self.reply)
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => Err(TrySendError::Full(self)),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(TrySendError::Closed(self)),
-        }
     }
 }
 impl<S, I, O, Fut, Role> Future for AktorTaskRequest<'_, S, I, O, Fut, Role>
@@ -232,7 +215,8 @@ impl<O> Future for AktorTaskReply<O> {
 mod tests {
     use super::*;
     use crate::{
-        AktorClosures, AktorKind, AktorName, AktorNoRole, AktorOptions, AktorSetup, start,
+        AktorClosures, AktorKind, AktorName, AktorNew, AktorNewOptions, AktorNoRole, AktorOptions,
+        AktorSetup, aktor_start,
     };
     use std::sync::{
         Mutex as Log,
@@ -267,24 +251,31 @@ mod tests {
         for full in [false, true] {
             let ended = Arc::new(Log::new(Vec::new()));
             let cleanup = ended.clone();
-            let actors = start(AktorSetup {
-                name: AktorName::new("reserved"),
-                role: AktorNoRole,
-                kind: AktorKind::TokioTask,
-                closures: AktorClosures {
-                    end: Some(
-                        (async move |state| {
-                            *cleanup.lock().unwrap() = state;
-                            Ok(())
-                        })
-                        .into(),
-                    ),
-                    ..AktorClosures::new(async || Ok(Vec::<usize>::new()))
+            let actors = aktor_start(AktorSetup {
+                actors: AktorNew {
+                    name: AktorName::new("reserved"),
+                    role: AktorNoRole,
+                    kind: AktorKind::TokioTask,
+                    closures: AktorClosures {
+                        start: async || Ok(Vec::<usize>::new()),
+                        end: Some(
+                            (async move |state| {
+                                *cleanup.lock().unwrap() = state;
+                                Ok(())
+                            })
+                            .into(),
+                        ),
+
+                        intervals: vec![],
+                        before_each: None,
+                        after_each: None,
+                    },
+                    options: AktorNewOptions { capacity: 1 },
                 },
-                options: Some(AktorOptions {
-                    capacity: 1,
-                    ..Default::default()
-                }),
+                shutdown: async |_| Ok::<_, aktor::AktorCleanupError>(()),
+                options: AktorOptions {
+                    shutdown_grace: Duration::from_secs(5),
+                },
             })
             .await
             .unwrap();
@@ -318,8 +309,8 @@ mod tests {
                 running.notified().await;
                 drop(
                     AktorTaskRequest::new(&actors.handles, operation, second, work)
-                        .try_send()
-                        .unwrap(),
+                        .send()
+                        .await,
                 );
             } else {
                 drop((first, second));

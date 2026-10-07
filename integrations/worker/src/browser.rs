@@ -1,9 +1,10 @@
 use crate::preferences::{read::read, write::write};
 use aktor::message::CallError;
 use aktor::*;
+use futures_util::FutureExt;
 use rusqlite::Connection;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt::Display,
     future::Future,
     pin::Pin,
@@ -34,6 +35,26 @@ async fn timer(_: &Connection, millis: Rc<u32>) -> u32 {
     gloo_timers::future::TimeoutFuture::new(*millis).await;
 
     *millis
+}
+
+#[derive(serde::Deserialize)]
+struct CountInput {
+    millis: u32,
+    #[serde(skip)]
+    encoded: Rc<Cell<usize>>,
+    #[serde(skip)]
+    dropped: Rc<Cell<usize>>,
+}
+impl serde::Serialize for CountInput {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.encoded.set(self.encoded.get() + 1);
+        serde::Serialize::serialize(&(self.millis,), serializer)
+    }
+}
+impl Drop for CountInput {
+    fn drop(&mut self) {
+        self.dropped.set(self.dropped.get() + 1);
+    }
 }
 
 thread_local! {
@@ -145,12 +166,14 @@ pub async fn sqlite_listener_check(url: String) -> Result<bool, JsValue> {
 #[wasm_bindgen]
 pub struct Client {
     worker: Worker<Connection>,
+    url: String,
 }
 #[wasm_bindgen]
 impl Client {
     #[wasm_bindgen(constructor)]
     pub fn new(url: &str) -> Result<Client, JsValue> {
         Ok(Self {
+            url: url.into(),
             worker: Worker::with_options(
                 url,
                 Options {
@@ -168,6 +191,7 @@ impl Client {
 
     pub fn limited(url: &str, capacity: usize, bytes: usize) -> Result<Client, JsValue> {
         Ok(Self {
+            url: url.into(),
             worker: Worker::with_options(
                 url,
                 Options {
@@ -190,9 +214,10 @@ impl Client {
 
     pub fn abandon(&self, value: String) -> bool {
         write::request(&self.worker, "abandoned".into(), value)
-            .try_send()
+            .send()
+            .now_or_never()
             .map(drop)
-            .is_ok()
+            .is_some()
     }
 
     pub async fn queue_pause(&self, millis: u32) {
@@ -293,16 +318,101 @@ impl Client {
     }
 
     pub async fn rejection(&self) -> Result<String, JsValue> {
-        let codec = WorkerError::new(
-            CallError::NotAdmitted,
-            WorkerCause::Codec("invalid input".into()),
-        );
-        let request =
-            worker::WorkerRequest::<Connection, u32>::new(&self.worker, pause::NAME, Err(codec));
-        let codec = match request.try_send() {
-            Err(worker::TrySendError::Rejected(_, error)) => error,
-            _ => return Err(js_error("expected codec rejection")),
+        let mut group = AktorGroup::new();
+        let (closed, closing) = tokio::sync::oneshot::channel();
+        let notified = Rc::new(Cell::new(false));
+        let notification = notified.clone();
+        group
+            .on_shutdown(move |report| {
+                notification.set(true);
+                let _sent = closed.send(report);
+            })
+            .map_err(js_error)?;
+        group.start().map_err(js_error)?;
+        let worker = group
+            .worker::<u32>(
+                "codec failure",
+                &self.url.replace("/worker.js", "/group-worker.js"),
+                Options {
+                    build: "group-v1".into(),
+                    ..Options::default()
+                },
+            )
+            .await
+            .map_err(js_error)?;
+        let completed = worker.completion();
+        let continued = Rc::new(Cell::new(false));
+        let after = continued.clone();
+        let failed = async {
+            worker::WorkerRequest::<u32, u32>::new(
+                &worker,
+                pause::NAME,
+                Err(WorkerError::new(
+                    CallError::NotAdmitted,
+                    WorkerCause::Codec("invalid input".into()),
+                )),
+            )
+            .await;
+            after.set(true);
         };
+        futures_util::pin_mut!(failed);
+        let report = match futures_util::future::select(failed, closing).await {
+            futures_util::future::Either::Right((report, _)) => report.map_err(js_error)?,
+            futures_util::future::Either::Left(_) => return Err(js_error("failed call continued")),
+        };
+        assert!(!continued.get());
+        assert!(notified.get());
+        let codec = completed.wait().await.unwrap_err();
+        assert!(report.failed());
+        assert!(report.failure.unwrap().message.contains("invalid input"));
+        assert_eq!(codec.outcome, CallError::NotAdmitted);
+
+        let mut admitted = Vec::new();
+        for _ in 0..4 {
+            admitted.push(pause(&self.worker, 0).send().await);
+        }
+        use aktor::{dispatch::Transport, operation::Operation};
+        let encoded = Rc::new(Cell::new(0));
+        let dropped = Rc::new(Cell::new(0));
+        let mut waiting = <&Worker<Connection> as Transport<Connection, CountInput, u32>>::request(
+            &self.worker,
+            Operation {
+                name: pause::NAME,
+                caller: std::panic::Location::caller(),
+            },
+            CountInput {
+                millis: 0,
+                encoded: encoded.clone(),
+                dropped: dropped.clone(),
+            },
+        );
+        for _ in 0..2 {
+            assert!((&mut waiting).now_or_never().is_none());
+        }
+        assert_eq!(encoded.get(), 1);
+        assert_eq!(dropped.get(), 1);
+        for reply in admitted {
+            assert_eq!(reply.await, 0);
+        }
+        assert_eq!(waiting.send().await.await, 0);
+        assert_eq!(encoded.get(), 1);
+
+        let full_bytes = write(&self.worker, "diagnostic-budget".into(), "x".repeat(1024))
+            .send()
+            .await;
+        let mut waiting = pause::request(&self.worker, 0);
+        assert!((&mut waiting).now_or_never().is_none());
+        assert_eq!(self.worker.outstanding(), (1, 1024));
+        assert_eq!(
+            full_bytes
+                .await
+                .map_err(|error| js_error(format!("{error:?}")))?
+                .len(),
+            1024
+        );
+        assert_eq!(waiting.send().await.await, 0);
+        assert_eq!(self.worker.outstanding(), (0, 0));
+
         let healthy = read(&self.worker, "volume".into()).await;
 
         serde_json::to_string(&(codec, healthy)).map_err(js_error)
@@ -350,7 +460,7 @@ impl Client {
             futures_util::future::join(async { results.next().await.is_none() }, async {
                 drop(self.worker.shutdown());
 
-                let reply = request.try_send().map_err(js_error)?;
+                let reply = request.send().await;
                 let output = reply.await;
 
                 self.worker.completion().wait().await.map_err(js_error)?;

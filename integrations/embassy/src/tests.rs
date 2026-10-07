@@ -1,10 +1,7 @@
 extern crate std;
 
 use super::*;
-use aktor::{
-    ShutdownReport,
-    message::{LocalFuture, TrySendError},
-};
+use aktor::{ShutdownReport, message::LocalFuture};
 use alloc::{boxed::Box, vec};
 use core::{
     cell::Cell,
@@ -77,7 +74,7 @@ async fn exercise(spawner: Spawner) {
             drop(sensor.shutdown());
         }
 
-        let mut reply = request.try_send().unwrap();
+        let mut reply = request.send().await;
 
         assert!(reply.try_take().is_none());
 
@@ -123,7 +120,10 @@ async fn exercise(spawner: Spawner) {
 
     assert!((&mut consumed).await.is_err());
     assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| consumed.try_send())).is_err()
+        std::panic::AssertUnwindSafe(consumed.send())
+            .catch_unwind()
+            .await
+            .is_err()
     );
 
     let weak = sensor.downgrade();
@@ -143,12 +143,7 @@ async fn exercise(spawner: Spawner) {
     drop(record::request(&sensor, 2).send().await);
 
     let second = record::request(&sensor, 3).send().await;
-    let full = record::request(&sensor, 4).try_send();
-    let Err(TrySendError::Full(request)) = full else {
-        panic!("abandoning a reply released queue capacity")
-    };
-
-    assert!(request.send().now_or_never().is_none());
+    assert!(record::request(&sensor, 4).send().now_or_never().is_none());
 
     let completion = sensor.shutdown();
 
@@ -157,10 +152,12 @@ async fn exercise(spawner: Spawner) {
 
     let observer = completion.new_observer();
 
-    assert!(matches!(
-        record(&sensor, 5).try_send(),
-        Err(TrySendError::Closed(_))
-    ));
+    assert!(
+        std::panic::AssertUnwindSafe(record(&sensor, 5).send())
+            .catch_unwind()
+            .await
+            .is_err()
+    );
 
     release.signal(());
     first.await.unwrap_report();
@@ -196,13 +193,16 @@ async fn exercise(spawner: Spawner) {
             .is_err()
     );
 
-    let first_error = completion.wait().await.unwrap_err();
+    let first_error = completion.wait_with_data().await.unwrap_err();
 
     assert!(matches!(
-        &*first_error,
+        &*first_error.error,
         embassy::OwnerError::Setup(AktorSetupError { data: "setup", .. })
     ));
-    assert!(Rc::ptr_eq(&first_error, &sensor.ready().await.unwrap_err()));
+    assert!(Rc::ptr_eq(
+        &first_error.error,
+        &sensor.ready_with_data().await.unwrap_err().error
+    ));
 
     let (sensor, owner) = embassy::channel::<Sensor, 2, &'static str>().unwrap();
     let reply = record(&sensor, 4).send().await;
@@ -225,7 +225,7 @@ async fn exercise(spawner: Spawner) {
         .unwrap_err();
 
     assert!(matches!(
-        &*completion.wait().await.unwrap_err(),
+        &*completion.wait_with_data().await.unwrap_err().error,
         embassy::OwnerError::Cleanup(AktorCleanupError {
             data: "cleanup",
             ..
@@ -268,7 +268,7 @@ async fn exercise(spawner: Spawner) {
             .is_err()
     );
     assert!(matches!(
-        &*sensor.completion().wait().await.unwrap_err(),
+        sensor.completion().wait().await.unwrap_err(),
         embassy::OwnerError::Cancelled
     ));
     assert!(!cleaned.get());
@@ -513,7 +513,8 @@ impl std::task::Wake for QueueWake {
             QUEUED.with(|handle| {
                 drop(
                     record::request(handle.borrow().as_ref().unwrap(), 2)
-                        .try_send()
+                        .send()
+                        .now_or_never()
                         .unwrap(),
                 );
             });
@@ -543,7 +544,7 @@ fn queue_callbacks() {
             .is_pending()
     );
 
-    let mut first = record::request(&handle, 1).try_send().unwrap();
+    let mut first = record::request(&handle, 1).send().now_or_never().unwrap();
 
     handle.shutdown();
 
@@ -568,7 +569,7 @@ fn queue_callbacks() {
 fn reply_callbacks() {
     use core::task::{RawWaker, RawWakerVTable};
 
-    type Run = LocalFuture<'static, Result<(), Rc<embassy::OwnerError<()>>>>;
+    type Run = LocalFuture<'static, Result<(), embassy::OwnerError<()>>>;
     std::thread_local! {
         static OWNER: RefCell<Option<Run>> = const { RefCell::new(None) };
     }
@@ -589,7 +590,7 @@ fn reply_callbacks() {
 
     let readings = Rc::new(RefCell::new(Vec::new()));
     let (handle, owner) = embassy::channel::<Sensor, 2, ()>().unwrap();
-    let mut reply = record(&handle, 1).try_send().unwrap();
+    let mut reply = record(&handle, 1).send().now_or_never().unwrap();
 
     OWNER.with(|stored| {
         *stored.borrow_mut() = Some(Box::pin(owner.run(Sensor { readings }, async |_| Ok(()))));
@@ -706,7 +707,7 @@ fn completion_callbacks() {
         CANCEL_OWNER.with(|stored| *stored.borrow_mut() = Some(owner));
 
         let completion = handle.completion();
-        let mut waiting: LocalFuture<'_, Result<(), Rc<embassy::OwnerError<()>>>> = if ready {
+        let mut waiting: LocalFuture<'_, Result<(), embassy::OwnerError<()>>> = if ready {
             Box::pin(handle.ready())
         } else {
             Box::pin(completion.wait())
@@ -729,7 +730,7 @@ fn completion_callbacks() {
             panic!("owner cancellation did not reach its observer")
         };
 
-        assert!(matches!(&*error, embassy::OwnerError::Cancelled));
+        assert!(matches!(error, embassy::OwnerError::Cancelled));
     }
 
     struct Input;
@@ -904,8 +905,8 @@ async fn driver_cancellation() {
 
         if stage == 2 {
             let _reply = hold(&handle, Rc::new(Signal::new()), Rc::new(Signal::new()))
-                .try_send()
-                .unwrap();
+                .send()
+                .await;
 
             assert!(
                 driver
@@ -1026,7 +1027,8 @@ fn registration_from_actor() {
         },
         (),
     )
-    .try_send()
+    .send()
+    .now_or_never()
     .unwrap();
 
     assert!(
@@ -1059,7 +1061,7 @@ async fn setups(spawner: Spawner) {
     let cleaned = ended.clone();
     let tick: Gate = Rc::new(Signal::new());
     let interval = tick.clone();
-    let first = AktorSetup {
+    let first = AktorNew {
         name: AktorName::new("local readings"),
         role: AktorNoRole,
         kind: AktorKind::EmbassyLocal(move |future| {
@@ -1075,6 +1077,7 @@ async fn setups(spawner: Spawner) {
                     readings: Rc::new(RefCell::new(Vec::new())),
                 })
             },
+
             end: Some(
                 (async move |_: Sensor| {
                     cleaned.set(true);
@@ -1102,10 +1105,10 @@ async fn setups(spawner: Spawner) {
                 .into(),
             ),
         },
-        options: None,
+        options: AktorNewOptions { capacity: 32 },
     };
 
-    let second = AktorSetup {
+    let second = AktorNew {
         name: AktorName::new("another sensor"),
         role: AktorNoRole,
         kind: AktorKind::EmbassyLocal(|_| {
@@ -1117,15 +1120,24 @@ async fn setups(spawner: Spawner) {
                     readings: Rc::new(RefCell::new(Vec::new())),
                 })
             },
+
             end: None,
             intervals: vec![],
             before_each: None,
             after_each: None,
         },
-        options: None,
+        options: AktorNewOptions { capacity: 32 },
     };
 
-    let actors = start(aktor_setups! { first, second }).await.unwrap();
+    let actors = aktor_start(AktorSetup {
+        actors: aktor_setups! { first, second },
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: core::time::Duration::from_secs(5),
+        },
+    })
+    .await
+    .unwrap();
 
     assert_eq!(record(&actors.handles.first, 85).await.unwrap_report(), 1);
     assert!(record(&actors.handles.first, 0).await.is_err());
@@ -1158,33 +1170,54 @@ async fn setups(spawner: Spawner) {
             .all(|actor| actor.kind == Some(AktorExecution::EmbassyLocal))
     );
 
-    let never = || AktorSetup {
+    let never = || AktorNew {
         name: AktorName::new("unpolled"),
         role: AktorNoRole,
         kind: AktorKind::EmbassyLocal(|_| Err(AktorSetupError::new("must not spawn"))),
         closures: AktorClosures {
             start: async || Ok(85_u32),
+
             end: None,
             intervals: vec![],
             before_each: None,
             after_each: None,
         },
-        options: None,
+        options: AktorNewOptions { capacity: 32 },
     };
 
-    let startup = start(never());
+    let startup = aktor_start(AktorSetup {
+        actors: never(),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: core::time::Duration::from_secs(5),
+        },
+    });
     let completion = startup.completion();
 
     drop(startup);
     assert!(completion.await.actors.is_empty());
 
-    let startup = start(never());
+    let startup = aktor_start(AktorSetup {
+        actors: never(),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: core::time::Duration::from_secs(5),
+        },
+    });
     let completion = startup.completion();
 
     assert!(startup.await.is_err());
     assert!(completion.await.failed());
 
-    let actors = start(sensor_setup(spawner)).await.unwrap();
+    let actors = aktor_start(AktorSetup {
+        actors: sensor_setup(spawner),
+        shutdown: |_| {},
+        options: AktorOptions {
+            shutdown_grace: core::time::Duration::from_secs(5),
+        },
+    })
+    .await
+    .unwrap();
 
     assert_eq!(record(&actors.handles, 85).await.unwrap_report(), 1);
     assert!(!actors.shutdown().await.failed());

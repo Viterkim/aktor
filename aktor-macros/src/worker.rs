@@ -95,6 +95,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let input_parameter = names::binding(&mut names.reserved, "__AktorInput");
     let output_parameter = names::binding(&mut names.reserved, "__AktorOutput");
     let role_parameter = names::binding(&mut names.reserved, "__AktorRole");
+
     let latest_factory = names::binding(&mut names.reserved, "__AktorLatestFactory");
     let latest_state = names::binding(&mut names.reserved, "__AktorLatestState");
     let latest_input = names::binding(&mut names.reserved, "__AktorLatestInput");
@@ -103,11 +104,13 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let latest_lease = names::binding(&mut names.reserved, "__AktorLatestLease");
     let latest_future = names::binding(&mut names.reserved, "__AktorLatestFuture");
     let latest_inner = names::binding(&mut names.reserved, "__AktorLatestInner");
+
     let function_parameter = names::binding(&mut names.reserved, "__AktorFunction");
     let future_parameter = names::binding(&mut names.reserved, "__AktorFuture");
     let future_name = names::binding(&mut names.reserved, "__aktor_future");
     let future_lifetime = syn::Lifetime::new(&format!("'{future_name}"), future_name.span());
     let output_name = names::binding(&mut names.reserved, "__aktor_output");
+
     let lease_bound = if state.mutable {
         quote!(::core::ops::DerefMut)
     } else {

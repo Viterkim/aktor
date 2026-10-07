@@ -40,9 +40,7 @@ mod tokio {
     }
 
     impl TokioThread {
-        pub fn with_data<SetupData, CleanupData>(
-            self,
-        ) -> AktorLifecycle<Self, SetupData, CleanupData> {
+        pub fn with_cleanup<CleanupData>(self) -> AktorLifecycle<Self, CleanupData> {
             AktorLifecycle {
                 kind: self,
                 data: core::marker::PhantomData,
@@ -50,7 +48,7 @@ mod tokio {
         }
     }
 
-    impl<E: 'static, C: 'static> AktorMode for AktorLifecycle<TokioThread, E, C> {
+    impl<C: 'static> AktorMode for AktorLifecycle<TokioThread, C> {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
         type End<S: 'static> = dyn AktorEnd<S, C> + Send;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S> + Send;
@@ -72,11 +70,8 @@ mod standard {
 
         const EXECUTION: AktorExecution = AktorExecution::StdThread;
     }
-
     impl StdThread {
-        pub fn with_data<SetupData, CleanupData>(
-            self,
-        ) -> AktorLifecycle<Self, SetupData, CleanupData> {
+        pub fn with_cleanup<CleanupData>(self) -> AktorLifecycle<Self, CleanupData> {
             AktorLifecycle {
                 kind: self,
                 data: core::marker::PhantomData,
@@ -84,7 +79,7 @@ mod standard {
         }
     }
 
-    impl<E: 'static, C: 'static> AktorMode for AktorLifecycle<StdThread, E, C> {
+    impl<C: 'static> AktorMode for AktorLifecycle<StdThread, C> {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
         type End<S: 'static> = dyn AktorEnd<S, C> + Send;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S> + Send;

@@ -12,7 +12,7 @@ use core::{future::poll_fn, ops::AsyncFnOnce, task::Poll};
 use kind::EmbassyLocal;
 
 #[cfg(feature = "embassy")]
-impl<S: 'static, Start, Role> AktorStart for AktorSetup<S, Start, EmbassyLocal, Role>
+impl<S: 'static, Start, Role> AktorStart for AktorNew<S, Start, EmbassyLocal, Role>
 where
     Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
 {
@@ -21,10 +21,8 @@ where
     type Handles = crate::embassy::Handle<S, 0, (), Role>;
     type Startup = LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -48,9 +46,8 @@ where
         })
     }
 }
-
 impl<S: 'static, Start, Clock: AktorGroupClock, Role> AktorStart
-    for AktorSetup<S, Start, kind::Local<Clock>, Role>
+    for AktorNew<S, Start, kind::Local<Clock>, Role>
 where
     Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
 {
@@ -59,10 +56,8 @@ where
     type Handles = local::Handle<S, 0, (), Role, Clock>;
     type Startup = LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
 
-    fn grace(&self) -> Duration {
-        self.options
-            .as_ref()
-            .map_or(Duration::from_secs(5), |options| options.shutdown_grace)
+    fn source_is_setup(error: &Self::Error) -> bool {
+        error.source_is_setup()
     }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
@@ -86,7 +81,7 @@ where
 }
 
 pub async fn start_driven<S: 'static, Start, Kind, Clock: AktorGroupClock>(
-    setup: AktorSetup<S, Start, Kind>,
+    setup: AktorNew<S, Start, Kind>,
     context: AktorStartContext<local::AktorGroup<Clock>>,
     spawn: impl Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>,
 ) -> Result<local::Handle<S, 0, (), (), Clock>, AktorStartError>
@@ -102,7 +97,7 @@ where
 }
 
 pub async fn start_custom<S: 'static, Start, Kind, Clock: AktorGroupClock, Runner>(
-    setup: AktorSetup<S, Start, Kind>,
+    setup: AktorNew<S, Start, Kind>,
     mut context: AktorStartContext<local::AktorGroup<Clock>>,
     spawn: impl Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>,
     runner: Runner,
@@ -116,7 +111,7 @@ where
     Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
     Runner: for<'a> AsyncFnOnce(local::AktorRunner<'a, S>) -> Result<(), AktorError> + 'static,
 {
-    let options = setup.options.unwrap_or_default();
+    let options = setup.options;
     let AktorClosures {
         start,
         end,
@@ -161,10 +156,7 @@ where
         )
         .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string())))?;
 
-    handle
-        .ready()
-        .await
-        .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string())))?;
+    handle.ready().await.map_err(AktorStartError::Local)?;
 
     for interval in intervals {
         (spawn)(schedule(

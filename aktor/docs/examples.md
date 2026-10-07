@@ -1,49 +1,32 @@
 # A bit extra
 
-## Setups
-
-The [counter](../../README.md#counter) starts one actor. Give each setup a name to start several together:
+For several actors, give each one a name:
 
 ```rust
-let actors = start(aktor_setups! {
-    users: users_setup,
-    archive: archive_setup,
+let actors = aktor_start(AktorSetup {
+    actors: aktor_setups! {
+        users: users_actor,
+        archive: archive_actor,
+    },
+    shutdown: |report| close_application(report),
+    options: Default::default(),
 }).await?;
 
 let id = insert_user(&actors.handles.users, "Katten".into()).await?;
 ```
 
-Keep actors alive while using its handles. With an existing started group, `start_in(&group, setup).await?` returns handles instead. Failed or cancelled startup stops that whole group.
+A tuple works too, you get the handles back in the same order.
 
-TokioTask uses your runtime, StdThread works without Tokio. For local state, use TokioLocal(&local_set), BevyLocal(&pool) or BrowserLocal and keep that executor running. BevyTask(&pool) requires transferable state.
-
-## Setup / cleanup
+Open your database in start and close it in end. For errors:
 
 ```rust
-let setup = async || {
-    Connection::open("users.sqlite")
-        .map_err(|error| AktorSetupError::new(error.to_string()))
-};
-
-let cleanup = async |db: Connection| {
-    db.close().map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
-};
-
-let actors = start(AktorSetup {
-    name: AktorName::new("users"),
-    role: AktorNoRole,
-    kind: AktorKind::TokioThread,
-    closures: AktorClosures {
-        end: Some(cleanup.into()),
-        ..AktorClosures::new(setup)
-    },
-    options: None,
-}).await?;
+Connection::open("users.sqlite")
+    .map_err(|error| aktor_err_setup(error.to_string(), error))
 ```
 
-Here they run on the owner thread. To keep typed errors, use TokioThread.with_data::<SetupData, CleanupData>() and the matching AktorSetupError<SetupData> / AktorCleanupError<CleanupData>.
+It keeps the error in data and prints the text you gave it. For cleanup use aktor_err_cleanup, with kind.with_cleanup() to keep the error's type.
 
-The [counter example](../examples/counter.rs) adds hooks. Roles restrict which functions a handle accepts, put role: Users in the setup and #[aktor(role = Users)] on its functions.
+Print a startup error with `{error:#}` for the causes and rollback failures, or give it to your error reporter.
 
 ## Calling another query
 
@@ -65,24 +48,13 @@ The whole transaction queues once, insert_user gets the connection directly.
 ## Get the reply later
 
 ```rust
-let mut reply = insert_user(&database, "Katten".into()).send().await;
+let reply = insert_user(&database, "Katten".into()).send().await;
 
-if let Some(result) = reply.try_take() {
-    show_saved(result?);
-} else {
-    let id = reply.await?;
-}
+// do other work
+let id = reply.await?;
 ```
 
-send waits for queue space, then you can take the output once with try_take or await it. Dropping that reply leaves the operation running.
-
-```rust
-let id = insert_user(&database, "Katten".into())
-    .timeout(Duration::from_secs(2))
-    .await??;
-```
-
-The extra result is the timeout, the insert can still finish after you've stopped waiting. Check stored state before retrying a write.
+send waits for queue space, then you can do other work before awaiting the reply. Dropping it leaves the operation running. Use cast().await for a function returning () when you don't want its reply.
 
 ## Latest input
 
@@ -97,16 +69,17 @@ while let Some(rows) = results.next().await {
 }
 ```
 
-Only the latest input's result comes back. Each session keeps one pending input outside the queue limit, use ordinary replies for writes.
+Only the latest input's result comes back. Use ordinary calls for writes where each input counts.
 
-[SQLite](../examples/sqlite/main.rs)
+## Pause / resume (TokioThread)
 
-[Request guide](../examples/guide.rs)
+```rust
+database.actor.pause().await?;
+database.actor.resume(open_database).await?;
+```
 
-[Shutdown](runtime.md)
+pause finishes queued calls and closes the resource. New calls wait for resume, a failed reopen leaves it paused.
 
-[Browser workers](../../integrations/worker/README.md)
+[SQLite example](../examples/sqlite/main.rs)
 
-[Embassy](../../integrations/embassy/README.md)
-
-For your own serving loop, [Custom](../tests/runtime/setup.rs) lets you run accepted calls with call.run().await.
+[Request example](../examples/guide.rs)

@@ -294,6 +294,7 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> 
         drop(wake);
     }
 }
+
 impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static, F> Job<S>
     for LatestJob<S, I, O, F, Role>
 where

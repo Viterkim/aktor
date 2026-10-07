@@ -9,11 +9,13 @@ async fn add(count: &mut u32, amount: u32) -> u32 {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn core::error::Error>> {
-    let aktor_setup = AktorSetup {
+    let aktor_setup = AktorNew {
         name: AktorName::new("counter"),
         role: AktorNoRole,
         kind: AktorKind::TokioThread,
+
         closures: AktorClosures {
+            start: async || Ok::<_, AktorSetupError>(0_u32),
             end: Some(
                 (async |count: u32| {
                     println!("final count: {count}");
@@ -33,20 +35,28 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
                 })
                 .into(),
             ),
-            ..AktorClosures::new(async || Ok(0_u32))
+            intervals: vec![],
         },
-        options: None,
+        options: Default::default(),
     };
 
-    let actors = aktor::start(aktor_setup).await?;
+    let actors = aktor_start(AktorSetup {
+        actors: aktor_setup,
+        shutdown: |report| {
+            if report.failed() {
+                eprintln!("{report}");
+            }
+            println!("application cleanup finished");
+        },
+        options: Default::default(),
+    })
+    .await?;
 
     println!("reply: {}", add(&actors.handles, 2).await);
     println!("reply: {}", add(&actors.handles, 3).await);
-
     let report = actors.shutdown().await;
-
     if report.failed() {
-        return Err(Box::new(report).into());
+        return Err(report.into());
     }
 
     Ok(())

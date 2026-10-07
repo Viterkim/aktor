@@ -256,6 +256,7 @@ impl<S, I, O, F, Role, const N: usize, E, Clock> Output<O>
         drop(wake);
     }
 }
+
 impl<
     S: 'static,
     I: 'static,

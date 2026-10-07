@@ -77,9 +77,11 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let inner_name = &names.inner;
     let results_name = &names.results;
     let sender_name = &names.sender;
+
     let future_name = names::binding(&mut names.reserved, "__aktor_future");
     let future_lifetime = syn::Lifetime::new(&format!("'{future_name}"), future_name.span());
     let output_name = names::binding(&mut names.reserved, "__aktor_output");
+
     let bindings: Vec<_> = function
         .inputs
         .iter()

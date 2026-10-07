@@ -1,7 +1,6 @@
 use super::*;
 use crate::{
     Timeout,
-    message::TrySendError,
     task::{AktorTaskReply, AktorTaskRequest, AktorTaskState},
 };
 use core::time::Duration;
@@ -17,13 +16,6 @@ where
         self.into_request().send().await
     }
 
-    #[allow(clippy::type_complexity)]
-    pub fn try_send(
-        self,
-    ) -> Result<AktorTaskReply<O>, TrySendError<AktorTaskRequest<'a, S, I, O, Fut, Role>>> {
-        self.into_request().try_send()
-    }
-
     pub fn timeout(self, duration: Duration) -> Timeout<AktorTaskRequest<'a, S, I, O, Fut, Role>> {
         self.into_request().timeout(duration)
     }
@@ -36,10 +28,5 @@ where
 {
     pub async fn cast(self) {
         drop(self.send().await);
-    }
-
-    #[allow(clippy::type_complexity)]
-    pub fn try_cast(self) -> Result<(), TrySendError<AktorTaskRequest<'a, S, I, (), Fut, Role>>> {
-        self.try_send().map(drop)
     }
 }

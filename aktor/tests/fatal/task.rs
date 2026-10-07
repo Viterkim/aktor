@@ -52,10 +52,17 @@ fn runtime() {
         group.start_threaded().unwrap();
         let unpolled = case == "unpolled";
         let starting = unpolled.then(|| InputDrop);
-        let mut closures = AktorClosures::new(async move || {
+        let start = async move || {
             std::hint::black_box(&starting);
             Ok(0_u32)
-        });
+        };
+        let mut closures: AktorClosures<u32, _, AktorKind::TokioTask> = AktorClosures {
+            start,
+            end: None,
+            intervals: vec![],
+            before_each: None,
+            after_each: None,
+        };
 
         if case == "hooks" {
             let before = InputDrop;
@@ -102,17 +109,14 @@ fn runtime() {
             );
         }
 
-        let mut starting = Box::pin(start_in(
+        let mut starting = Box::pin(aktor_start_in(
             &group,
-            AktorSetup {
+            AktorNew {
                 name: AktorName::new("cancelled queue"),
                 role: AktorNoRole,
                 kind: AktorKind::TokioTask,
                 closures,
-                options: Some(AktorOptions {
-                    capacity: 2,
-                    ..Default::default()
-                }),
+                options: AktorNewOptions { capacity: 2 },
             },
         ));
 
@@ -182,27 +186,30 @@ async fn cancellation() {
 
     let cleaned = Arc::new(Mutex::new(None));
     let saved = cleaned.clone();
-    let actors = start(AktorSetup {
-        name: AktorName::new("cancelled task"),
-        role: AktorNoRole,
-        kind: AktorKind::TokioTask,
-        closures: AktorClosures {
-            start: async || Ok(0_u32),
-            end: Some(
-                (async move |state: u32| {
-                    *saved.lock().unwrap() = Some(state);
-                    Ok(())
-                })
-                .into(),
-            ),
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
+    let actors = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: AktorName::new("cancelled task"),
+            role: AktorNoRole,
+            kind: AktorKind::TokioTask,
+            closures: AktorClosures {
+                start: async || Ok(0_u32),
+                end: Some(
+                    (async move |state: u32| {
+                        *saved.lock().unwrap() = Some(state);
+                        Ok(())
+                    })
+                    .into(),
+                ),
+                intervals: vec![],
+                before_each: None,
+                after_each: None,
+            },
+            options: AktorNewOptions { capacity: 32 },
         },
-        options: Some(AktorOptions {
+        shutdown: |_| {},
+        options: AktorOptions {
             shutdown_grace: Duration::from_millis(400),
-            ..Default::default()
-        }),
+        },
     })
     .await
     .unwrap();

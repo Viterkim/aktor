@@ -51,61 +51,6 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
         self.reply
     }
 
-    /// Submit immediately, keeping the request if it has to wait.
-    #[allow(clippy::result_large_err)]
-    pub fn try_send(mut self) -> Result<Reply<O>, TrySendError<Self>> {
-        let pending = std::mem::replace(&mut self.submission, Submission::Consumed);
-        let message = match pending {
-            Submission::Unsent(message) => message,
-            Submission::Waiting {
-                message, admission, ..
-            } => {
-                drop(admission);
-                message
-            }
-            Submission::Submitted => return Ok(self.reply),
-            Submission::Closed => {
-                self.submission = Submission::Closed;
-                return Err(TrySendError::Closed(self));
-            }
-            Submission::Consumed => consumed(),
-        };
-
-        let Some(epoch) = self.admission.epoch() else {
-            self.submission = Submission::Unsent(message);
-            return Err(
-                if self.sender.is_closed()
-                    || matches!(self.admission.phase(), crate::queue::Phase::Closing { .. })
-                {
-                    TrySendError::Closed(self)
-                } else {
-                    TrySendError::Full(self)
-                },
-            );
-        };
-
-        match self.sender.try_reserve() {
-            Ok(permit) => match self.admission.admit(epoch, permit, message) {
-                Ok(()) => {
-                    self.submission = Submission::Submitted;
-                    Ok(self.reply)
-                }
-                Err(message) => {
-                    self.submission = Submission::Unsent(message);
-                    Err(TrySendError::Full(self))
-                }
-            },
-            Err(error) => {
-                self.submission = Submission::Unsent(message);
-
-                match error {
-                    mpsc::error::TrySendError::Full(()) => Err(TrySendError::Full(self)),
-                    mpsc::error::TrySendError::Closed(()) => Err(TrySendError::Closed(self)),
-                }
-            }
-        }
-    }
-
     fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
         loop {
             if let Some(available) = &mut self.available {
@@ -253,10 +198,5 @@ impl<S: 'static> Request<'_, S, ()> {
     /// Submit without waiting for completion.
     pub async fn cast(self) {
         drop(self.send().await);
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn try_cast(self) -> Result<(), TrySendError<Self>> {
-        self.try_send().map(drop)
     }
 }

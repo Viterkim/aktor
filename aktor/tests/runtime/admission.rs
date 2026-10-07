@@ -84,30 +84,36 @@ async fn local_stopping() {
                     let entering = entered.clone();
                     let release = Arc::new(Notify::new());
                     let released = release.clone();
-                    let actors = start(AktorSetup {
-                        name: AktorName::new("local closure"),
-                        role: AktorNoRole,
-                        kind: AktorKind::TokioLocal(&executor),
-                        closures: AktorClosures {
-                            start: async || Ok(()),
-                            end: Some(
-                                (async move |_| {
-                                    entered.notify_one();
-                                    release.notified().await;
+                    let actors = aktor_start(AktorSetup {
+                        actors: AktorNew {
+                            name: AktorName::new("local closure"),
+                            role: AktorNoRole,
+                            kind: AktorKind::TokioLocal(&executor),
+                            closures: AktorClosures {
+                                start: async || Ok(()),
+                                end: Some(
+                                    (async move |_| {
+                                        entered.notify_one();
+                                        release.notified().await;
 
-                                    if cleanup_fails {
-                                        Err(AktorCleanupError::new("real cleanup failure"))
-                                    } else {
-                                        Ok(())
-                                    }
-                                })
-                                .into(),
-                            ),
-                            intervals: vec![],
-                            before_each: None,
-                            after_each: None,
+                                        if cleanup_fails {
+                                            Err(AktorCleanupError::new("real cleanup failure"))
+                                        } else {
+                                            Ok(())
+                                        }
+                                    })
+                                    .into(),
+                                ),
+                                intervals: vec![],
+                                before_each: None,
+                                after_each: None,
+                            },
+                            options: AktorNewOptions { capacity: 32 },
                         },
-                        options: None,
+                        shutdown: |_| {},
+                        options: AktorOptions {
+                            shutdown_grace: Duration::from_secs(5),
+                        },
                     })
                     .await
                     .unwrap();
@@ -165,7 +171,7 @@ async fn retry() {
     let mut state = 0;
 
     listener.recv().await.unwrap().run(&mut state).await;
-    request.try_cast().unwrap();
+    request.cast().await;
     listener.recv().await.unwrap().run(&mut state).await;
 
     let mut submitted = call(&handle, |s, ()| *s += 100, ());
@@ -173,7 +179,7 @@ async fn retry() {
     assert!(poll(&mut submitted).is_pending());
 
     listener.close();
-    submitted.try_cast().unwrap();
+    submitted.cast().await;
     drop(handle);
 
     assert_eq!(listener.run(state).await, 111);
@@ -206,9 +212,7 @@ async fn consumed() {
 
             (&mut request).await;
 
-            let rejected =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(request.try_cast())))
-                    .is_err();
+            let rejected = panics(request.cast()).await;
 
             drop(handle);
             task.await.unwrap();
@@ -235,11 +239,6 @@ async fn closed() {
 
         listener.close();
 
-        let request = match request.try_send() {
-            Err(TrySendError::Closed(request)) => request,
-            _ => panic!("closed admission accepted a request"),
-        };
-
         drop(listener);
         assert!(panics(request.send()).await);
     }
@@ -248,16 +247,14 @@ async fn closed() {
 #[tokio::test]
 async fn reply() {
     let (handle, mut listener) = channel::<usize>(1).unwrap();
-    let first: Reply<Result<usize, String>> = call(&handle, |s, ()| Ok(*s), ()).try_send().unwrap();
+    let first: Reply<Result<usize, String>> = call(&handle, |s, ()| Ok(*s), ()).send().await;
 
-    let request = match call(&handle, |s, ()| *s + 1, ()).try_send() {
-        Err(TrySendError::Full(request)) => request,
-        _ => panic!("mailbox should be full"),
-    };
+    let mut request = call(&handle, |s, ()| *s + 1, ());
+    assert!(poll(&mut request).is_pending());
 
     listener.recv().await.unwrap().run(&mut 3).await;
 
-    let reply: Reply<usize> = request.try_send().unwrap();
+    let reply: Reply<usize> = request.send().await;
 
     drop(handle);
     listener.run(3).await;
@@ -299,8 +296,8 @@ async fn owner_failure() {
                 |_, ()| -> Result<(), &'static str> { Err("domain") },
                 (),
             )
-            .try_send()
-            .unwrap();
+            .send()
+            .await;
 
             assert_eq!(reply.await, Err("domain"));
 

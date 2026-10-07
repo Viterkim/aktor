@@ -12,6 +12,10 @@ impl fmt::Display for Failure {
             write!(f, ": {message}")?;
         }
 
+        for diagnostic in &self.diagnostics {
+            write!(f, "\n{diagnostic}")?;
+        }
+
         Ok(())
     }
 }
@@ -38,12 +42,14 @@ impl FailurePolicy {
                     std::process::abort();
                 }
             }
-            Self::Group(group) => group.fail(crate::group::ActorFailure {
-                kind: None,
-                actor: failure.actor.clone(),
-                phase: format!("{:?}", failure.kind),
-                message: failure.to_string(),
-            }),
+            Self::Group(group) => {
+                group.fail(crate::group::ActorFailure {
+                    kind: None,
+                    actor: failure.actor.clone(),
+                    phase: format!("{:?}", failure.kind),
+                    message: failure.to_string(),
+                });
+            }
             Self::Unwind => {}
         }
     }

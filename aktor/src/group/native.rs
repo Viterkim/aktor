@@ -253,7 +253,7 @@ impl AktorGroup {
             Err(_) => {
                 let error = DedicatedStartError::NoRuntime;
 
-                kill.fail(ActorFailure {
+                kill.fail_startup(ActorFailure {
                     kind: None,
                     actor: name,
                     phase: "setup".into(),
@@ -342,9 +342,12 @@ impl AktorGroup {
                         return;
                     }
 
-                    let diagnostics = error.to_string();
+                    let diagnostics = match &error {
+                        DedicatedStartError::Init(error) => error.to_string(),
+                        error => error.to_string(),
+                    };
 
-                    kill.fail(ActorFailure {
+                    kill.fail_startup(ActorFailure {
                         kind: None,
                         actor: name.clone(),
                         phase: "setup".into(),
@@ -413,8 +416,10 @@ impl AktorGroup {
             if let Err(error) = result {
                 let forced = matches!(&*error, OwnerError::Cancelled) && kill.is_stopping();
 
+                let mut first = false;
+
                 if !forced {
-                    kill.fail(ActorFailure {
+                    first = kill.fail(ActorFailure {
                         kind: None,
                         actor: outcome.actor.clone(),
                         phase: if matches!(&*error, OwnerError::Cleanup(_)) {
@@ -433,12 +438,26 @@ impl AktorGroup {
                             .diagnostics
                             .extend(errors.errors.iter().map(|error| error.report()));
                     }
-                    OwnerError::PanickedWithCleanup { cleanup, .. } => {
+                    OwnerError::PanickedWithCleanup { cause, cleanup } => {
+                        if !first && !actor.group_primary() {
+                            outcome
+                                .diagnostics
+                                .push(AktorError::new(format!("panic: {cause}")));
+                        }
                         outcome
                             .diagnostics
                             .extend(cleanup.errors.iter().map(|error| error.report()));
+                        outcome
+                            .diagnostics
+                            .extend(cleanup.diagnostics.iter().cloned());
                     }
-                    OwnerError::Panicked(_) => {}
+                    OwnerError::Panicked(cause) => {
+                        if !first && !actor.group_primary() {
+                            outcome
+                                .diagnostics
+                                .push(AktorError::new(format!("panic: {cause}")));
+                        }
+                    }
                     OwnerError::Cancelled | OwnerError::RuntimeStopped => outcome.timed_out = true,
                 }
             }
@@ -449,7 +468,7 @@ impl AktorGroup {
         if let Err(error) = scheduled {
             let kill = self.killswitch();
 
-            kill.fail(ActorFailure {
+            kill.fail_startup(ActorFailure {
                 kind: Some(kind),
                 actor: actor_name.clone(),
                 phase: "setup".into(),
@@ -474,7 +493,7 @@ impl AktorGroup {
                 matches!(error, DedicatedStartError::Closed) && self.killswitch().is_stopping();
 
             if !cancelled {
-                self.killswitch().fail(ActorFailure {
+                self.killswitch().fail_startup(ActorFailure {
                     kind: None,
                     actor: actor_name,
                     phase: "setup".into(),
@@ -486,31 +505,5 @@ impl AktorGroup {
         }
 
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn watchdog_policy() {
-        for finished in [false, true] {
-            for force_exit in [false, true] {
-                for running in [false, true] {
-                    let mut state = State {
-                        finished,
-                        force_exit,
-                        ..State::default()
-                    };
-
-                    if running {
-                        state.running.push(Arc::new("owner".into()));
-                    }
-
-                    assert_eq!(settled(&state), finished && !force_exit && !running);
-                }
-            }
-        }
     }
 }

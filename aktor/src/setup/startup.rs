@@ -14,15 +14,17 @@ impl<Setup: AktorStart> AktorStartup<Setup> {
         self.failure = Some(Box::new(error));
 
         if let Some(group) = &self.group {
-            Setup::Group::stop(&group.killswitch());
+            Setup::Group::set_starting(&self.killswitch, true);
+            Setup::Group::stop(&self.killswitch);
             self.shutdown = Some(Box::pin(group.closing()));
         }
     }
 }
 impl<Setup: AktorStart> Drop for AktorStartup<Setup> {
     fn drop(&mut self) {
-        if let Some(group) = &self.group {
-            Setup::Group::stop(&group.killswitch());
+        if self.group.is_some() {
+            Setup::Group::set_starting(&self.killswitch, true);
+            Setup::Group::stop(&self.killswitch);
         }
     }
 }
@@ -62,7 +64,13 @@ impl<Setup: AktorStart> Future for AktorStartup<Setup> {
 
             match result {
                 Ok(handles) => {
-                    if Setup::Group::is_stopping(&this.killswitch) {
+                    let initialized = if this.begin {
+                        Setup::Group::set_starting(&this.killswitch, false)
+                    } else {
+                        !Setup::Group::is_stopping(&this.killswitch)
+                    };
+
+                    if !initialized {
                         drop(handles);
                         this.closing(
                             AktorSetupError::new("actor group stopped during startup").into(),
@@ -85,6 +93,8 @@ impl<Setup: AktorStart> Future for AktorStartup<Setup> {
 
             if let Some(error) = this.failure.take() {
                 return Poll::Ready(Err(AktorStartupError {
+                    source_is_failure: Setup::source_is_setup(&error)
+                        && Setup::Group::source_is_failure(&this.killswitch),
                     error: *error,
                     report: Some(Box::new(report)),
                 }));
@@ -94,6 +104,7 @@ impl<Setup: AktorStart> Future for AktorStartup<Setup> {
         Poll::Ready(Err(AktorStartupError {
             error: AktorSetupError::new("actor startup was polled after completion").into(),
             report: None,
+            source_is_failure: false,
         }))
     }
 }

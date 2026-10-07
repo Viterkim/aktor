@@ -237,6 +237,7 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Visit<'_, V> {
         })
     }
 }
+
 impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for Access<'_, A> {
     type Error = A::Error;
 

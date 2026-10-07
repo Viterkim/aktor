@@ -17,6 +17,7 @@ mod shutdown;
 pub struct AktorGroup<Clock: AktorGroupClock> {
     stop_on_drop: bool,
     control: Rc<Control<Clock>>,
+    startup_failure: Option<Rc<Cell<bool>>>,
     owners: Rc<RefCell<Vec<Entry>>>,
 }
 
@@ -26,13 +27,17 @@ pub struct GroupCompletion<Clock: AktorGroupClock> {
 
 pub struct KillSwitch<Clock: AktorGroupClock> {
     control: Rc<Control<Clock>>,
+    startup_failure: Option<Rc<Cell<bool>>>,
 }
 
 struct Control<Clock: AktorGroupClock> {
     stopping: Cell<bool>,
+    starting: Cell<bool>,
     #[cfg(feature = "embassy_cross_core")]
     shared_stopping: Shared<AtomicBool>,
     listening: Cell<bool>,
+    shutdown_hook: RefCell<Option<ShutdownHook>>,
+    callers: RefCell<Vec<LocalFuture<'static, ()>>>,
     grace: Duration,
     deadline: Cell<Option<Clock::Deadline>>,
     kinds: RefCell<Vec<(String, crate::AktorExecution)>>,
@@ -41,6 +46,9 @@ struct Control<Clock: AktorGroupClock> {
     report: RefCell<ShutdownReport>,
     changed: Event,
 }
+
+type ShutdownHook =
+    Box<dyn FnOnce(ShutdownReport) -> LocalFuture<'static, Result<(), AktorCleanupError>>>;
 
 struct Driver<Clock: AktorGroupClock> {
     control: Rc<Control<Clock>>,

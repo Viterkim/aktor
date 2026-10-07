@@ -89,6 +89,13 @@ async fn runner() {
                         failure.payload.downcast_ref::<&str>(),
                         Some(&"operation failed")
                     );
+                    assert_eq!(
+                        failure
+                            .diagnostics
+                            .iter()
+                            .any(|error| error.diagnostics.contains("cleanup failed too")),
+                        cleanup_panics
+                    );
                     notified.send(*observed.lock().unwrap()).unwrap();
                 }),
                 setup: || Ok::<_, std::convert::Infallible>(0usize),

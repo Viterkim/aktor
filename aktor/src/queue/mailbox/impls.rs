@@ -158,6 +158,7 @@ pub fn channel<S>(capacity: usize) -> (Sender<S>, Receiver<S>) {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::FutureExt;
     std::thread_local! {
         static EMPTY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     }
@@ -177,7 +178,8 @@ mod tests {
         EMPTY.with(|empty| {
             *empty.borrow_mut() = Some(Box::new(move || {
                 crate::message::call(&handle, |state, ()| *state += 1, ())
-                    .try_cast()
+                    .cast()
+                    .now_or_never()
                     .unwrap();
                 drop(handle);
             }));
