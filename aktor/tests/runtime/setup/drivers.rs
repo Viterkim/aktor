@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(feature = "local")]
 #[tokio::test]
 async fn custom() {
     struct RunnerDrop(bool);
@@ -162,7 +161,6 @@ async fn custom() {
         .await;
 }
 
-#[cfg(feature = "local")]
 #[tokio::test]
 async fn local_panic() {
     use futures_util::FutureExt;
@@ -291,7 +289,6 @@ async fn cross_core_panic() {
     }
 }
 
-#[cfg(feature = "local")]
 #[tokio::test]
 async fn local() {
     let executor = tokio::task::LocalSet::new();
@@ -427,7 +424,6 @@ async fn local() {
         .await;
 }
 
-#[cfg(feature = "local")]
 #[tokio::test(start_paused = true)]
 async fn local_time() {
     use futures_util::FutureExt;
@@ -517,7 +513,6 @@ async fn local_time() {
         .await;
 }
 
-#[cfg(feature = "local")]
 #[tokio::test]
 async fn local_deadline() {
     use futures_util::FutureExt;
@@ -569,7 +564,6 @@ async fn local_deadline() {
     assert!(group.completion().await.timed_out);
 }
 
-#[cfg(feature = "local")]
 #[tokio::test]
 async fn local_driver_loss() {
     {

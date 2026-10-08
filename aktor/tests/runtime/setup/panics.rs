@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(feature = "std_thread")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "std_thread")]

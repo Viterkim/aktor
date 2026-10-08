@@ -63,6 +63,7 @@ let result = tokio::select! {
 
 let report = actors.shutdown().await;
 result?;
+
 if report.failed() {
     return Err(report.into());
 }
@@ -72,7 +73,7 @@ So a server error also goes through shutdown before leaving main. The select dro
 
 ## Multiplatform SQLite example (Tokio and web worker)
 
-The query and the code calling is the same.
+Write the query once and call it the same way on either platform.
 
 ```rust
 #[aktor(data)]

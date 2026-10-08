@@ -36,7 +36,9 @@ async fn cleanup_primary() {
     assert!(handle.completion().wait().await.is_err());
 }
 
+#[cfg(feature = "local")]
 struct QueuedDrop;
+#[cfg(feature = "local")]
 impl Drop for QueuedDrop {
     fn drop(&mut self) {
         panic!("queued input drop died");

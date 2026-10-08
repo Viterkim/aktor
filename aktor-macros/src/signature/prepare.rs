@@ -1,6 +1,7 @@
 use super::*;
 use crate::names::Names;
-use syn::{FnArg, GenericParam, ReturnType, Signature};
+use quote::quote;
+use syn::{FnArg, GenericParam, Generics, ReturnType, Signature};
 
 pub fn output(signature: &Signature) -> Type {
     let mut output = match &signature.output {
@@ -72,4 +73,25 @@ pub fn inputs(signature: &Signature) -> Type {
         .collect();
 
     parse_quote!((#(#types,)*))
+}
+
+pub fn arguments(generics: &Generics) -> Vec<TokenStream> {
+    generics
+        .params
+        .iter()
+        .map(|parameter| match parameter {
+            GenericParam::Lifetime(parameter) => {
+                let lifetime = &parameter.lifetime;
+                quote!(#lifetime)
+            }
+            GenericParam::Type(parameter) => {
+                let name = &parameter.ident;
+                quote!(#name)
+            }
+            GenericParam::Const(parameter) => {
+                let name = &parameter.ident;
+                quote!({ #name })
+            }
+        })
+        .collect()
 }

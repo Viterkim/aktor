@@ -1,6 +1,6 @@
 # Closing the app
 
-Close and Ctrl C call actors.killswitch().stop(). An actor failure starts shutdown too, while an ordinary error returned by your function goes back to its caller.
+Have your Close or Ctrl C handler call actors.killswitch().stop(). An actor failure starts shutdown too, while an ordinary error returned by your function goes back to its caller.
 
 The shutdown closure runs after actor cleanup, so the app can finish closing when it receives the report:
 

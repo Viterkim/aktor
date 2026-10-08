@@ -111,11 +111,6 @@ impl<Starting: Future, Handles, Error> Future for AktorTupleStartup<Starting, Ha
     }
 }
 
-macro_rules! nested_type {
-    ($last:ident) => { $last };
-    ($first:ident, $($rest:ident),+) => { ($first, nested_type!($($rest),+)) };
-}
-
 macro_rules! nested {
     ($last:ident) => { $last };
     ($first:ident, $($rest:ident),+) => { ($first, nested!($($rest),+)) };
@@ -126,17 +121,17 @@ macro_rules! tuple {
         impl<$first: AktorStart, $($type: AktorStart<Group = $first::Group>),+>
             AktorStart for ($first, $($type,)+)
         {
-            type Error = <nested_type!($first, $($type),+) as AktorStart>::Error;
+            type Error = <nested!($first, $($type),+) as AktorStart>::Error;
             type Group = $first::Group;
             type Handles = ($first::Handles, $($type::Handles,)+);
             type Startup = AktorTupleStartup<
-                <nested_type!($first, $($type),+) as AktorStart>::Startup,
+                <nested!($first, $($type),+) as AktorStart>::Startup,
                 Self::Handles,
                 Self::Error,
             >;
 
             fn source_is_setup(error: &Self::Error) -> bool {
-                <nested_type!($first, $($type),+) as AktorStart>::source_is_setup(error)
+                <nested!($first, $($type),+) as AktorStart>::source_is_setup(error)
             }
 
             fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {

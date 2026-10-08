@@ -10,7 +10,7 @@ struct Row {
     bytes: Vec<u8>,
 }
 #[derive(AktorData, Debug, PartialEq)]
-struct Nested<T> {
+struct Nested<r#T> {
     rows: Vec<Result<T, Choice>>,
     pair: (u32, Option<String>),
 }
@@ -31,9 +31,9 @@ struct Array<const N: usize> {
     values: [u64; N],
 }
 #[derive(AktorData, Debug, PartialEq)]
-enum Tree<T> {
-    Leaf(T),
-    Branch(Vec<Tree<T>>),
+enum Tree<r#T> {
+    Leaf(r#T),
+    Branch(Vec<Tree<r#T>>),
 }
 #[derive(AktorData)]
 struct Node {

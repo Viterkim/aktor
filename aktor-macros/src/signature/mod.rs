@@ -10,7 +10,7 @@ pub mod impls;
 pub mod prepare;
 pub mod scope;
 pub use body::implementation;
-pub use prepare::{dispatch_output, inputs, normalize, output};
+pub use prepare::{arguments, dispatch_output, inputs, normalize, output};
 
 pub struct Inputs<'a> {
     pub reserved: &'a mut HashSet<String>,

@@ -1,9 +1,12 @@
+#[cfg(feature = "local")]
 mod drivers;
 mod intervals;
+#[cfg(any(feature = "local", feature = "std_thread"))]
 mod lifecycle;
 mod panics;
 mod startup;
 
+#[cfg(feature = "local")]
 use super::support;
 use aktor::*;
 use futures_util::FutureExt;

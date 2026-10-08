@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
             if report.failed() {
                 eprintln!("{report}");
             }
+
             println!("application cleanup finished");
         },
         options: Default::default(),
@@ -54,7 +55,9 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
 
     println!("reply: {}", add(&actors.handles, 2).await);
     println!("reply: {}", add(&actors.handles, 3).await);
+
     let report = actors.shutdown().await;
+
     if report.failed() {
         return Err(report.into());
     }
