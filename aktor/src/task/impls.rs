@@ -5,6 +5,7 @@ use core::ops::{Deref, DerefMut};
 impl<S, Role> AktorTask<S, Role> {
     pub fn new_handle(&self) -> Self {
         Self {
+            cleanup: self.cleanup.clone(),
             name: self.name.clone(),
             sender: self.sender.clone(),
             services: self.services.clone(),
@@ -17,6 +18,7 @@ impl<S, Role> AktorTask<S, Role> {
 
     pub fn with_role<NewRole>(self) -> AktorTask<S, NewRole> {
         AktorTask {
+            cleanup: self.cleanup,
             name: self.name,
             sender: self.sender,
             services: self.services,

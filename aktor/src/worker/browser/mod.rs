@@ -26,6 +26,7 @@ pub use server::{Server, serve, serve_for, serve_with, setup_failed};
 pub use setup::serve_setup;
 
 type State<S, Role, E> = PhantomData<fn() -> (S, Role, E)>;
+type Answer = Box<dyn FnOnce(Result<Vec<u8>, WireError>) -> Option<WireError>>;
 type EncodeInput<'a> = Box<dyn FnOnce() -> Result<Vec<u8>, WireError> + 'a>;
 
 pub struct Worker<S, Role = (), E = ()> {
@@ -36,6 +37,7 @@ pub struct Worker<S, Role = (), E = ()> {
 pub struct Completion<E = ()> {
     data: PhantomData<fn() -> E>,
     result: watch::Receiver<Option<Result<(), WireError>>>,
+    diagnostics: Rc<RefCell<Vec<crate::AktorError>>>,
 }
 
 #[must_use = "await the request, or explicitly send or cast it"]
@@ -54,20 +56,18 @@ pub struct WorkerRequest<'a, S, O, Role = ()> {
 
 #[must_use = "await the reply to receive the operation's result"]
 pub struct WorkerReply<O> {
-    response: oneshot::Receiver<Result<Vec<u8>, WireError>>,
+    response: oneshot::Receiver<Result<O, WireError>>,
     inner: Weak<Inner>,
     group: Option<(String, crate::group::KillSwitch)>,
     id: u64,
     parked: bool,
     taken: bool,
-    output: PhantomData<fn() -> O>,
-    decoder: fn(&[u8]) -> Result<O, WorkerError>,
 }
 
 type Callback<Event> = RefCell<Option<Closure<dyn FnMut(Event)>>>;
 
 struct Work {
-    answer: Option<oneshot::Sender<Result<Vec<u8>, WireError>>>,
+    answer: Option<Answer>,
     input: Option<Incoming>,
     service: Option<Box<dyn latest::Service>>,
     _count: Option<OwnedSemaphorePermit>,
@@ -86,6 +86,8 @@ struct Inner {
     handles: Cell<usize>,
     closed: Cell<bool>,
     failed: Cell<bool>,
+    failure: RefCell<Option<WireError>>,
+    diagnostics: Rc<RefCell<Vec<crate::AktorError>>>,
     options: Options,
     buffers: Buffers,
     initialize: RefCell<Option<Vec<u8>>>,

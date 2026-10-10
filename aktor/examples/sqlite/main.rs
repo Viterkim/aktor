@@ -31,21 +31,21 @@ pub struct Owner {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::result::Result<(), Box<dyn core::error::Error>> {
     let setup = async || {
-        Connection::open_in_memory().map_err(|error| aktor_err_setup(error.to_string(), error))
+        Connection::open_in_memory().map_err(|error| AktorSetupError::new(error.to_string()))
     };
     let cleanup = async |db: Connection| {
         db.close()
-            .map_err(|(_, error)| aktor_err_cleanup(error.to_string(), error))
+            .map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
     };
 
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
             name: AktorName::new("sqlite"),
             role: AktorNoRole,
-            kind: AktorKind::TokioThread.with_cleanup(),
+            kind: AktorKind::TokioThread,
             closures: AktorClosures {
                 start: setup,
-                end: Some(cleanup.into()),
+                end: cleanup,
                 intervals: vec![],
                 before_each: None,
                 after_each: None,

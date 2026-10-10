@@ -1,5 +1,6 @@
 use super::*;
-use alloc::string::ToString;
+#[cfg(feature = "std")]
+use crate::panic::{dispose_secondary, panic_message};
 
 impl<Clock: AktorGroupClock> Drop for Driver<Clock> {
     fn drop(&mut self) {
@@ -70,18 +71,9 @@ pub fn capture<T>(action: impl FnOnce() -> T) -> Result<T, AktorError> {
         match catch_unwind(AssertUnwindSafe(action)) {
             Ok(output) => Ok(output),
             Err(payload) => {
-                let message = if let Some(message) = payload.downcast_ref::<&str>() {
-                    (*message).into()
-                } else if let Some(message) = payload.downcast_ref::<String>() {
-                    message.clone()
-                } else {
-                    "panic payload had no message".into()
-                };
+                let message = panic_message(&payload);
 
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
-                    core::mem::forget(payload);
-                }
-
+                dispose_secondary(payload);
                 Err(AktorError::new(message))
             }
         }
@@ -118,7 +110,7 @@ pub fn poll_owners<Clock: AktorGroupClock>(
                     kind: Some(entry.kind),
                     actor: entry.name.clone(),
                     phase: "owner".into(),
-                    message: error.to_string(),
+                    message: error.diagnostics.clone(),
                 });
 
                 let owner = core::mem::replace(&mut entry.owner, Box::pin(async { None }));
@@ -208,11 +200,13 @@ fn task_failure<Clock: AktorGroupClock>(
         startup_failure: None,
     };
 
-    kill.fail(ActorFailure {
+    let primary = kill.fail(ActorFailure {
         kind: None,
         actor: "application".into(),
         phase: phase.into(),
-        message: error.to_string(),
+        message: error.diagnostics.clone(),
     });
-    kill.record_diagnostic(error);
+    if !primary {
+        kill.record_diagnostic(error);
+    }
 }

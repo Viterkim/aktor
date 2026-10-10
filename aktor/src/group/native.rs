@@ -4,6 +4,8 @@ use crate::{
     Aktor, AktorSetupError, FailurePolicy, SpawnArgs, listener::DedicatedJoinError,
     listener::DedicatedStartError, owner::OwnerError,
 };
+#[cfg(any(feature = "tokio", feature = "std_thread"))]
+use crate::{AktorCleanupOutput, AktorExecution, AktorFailure};
 
 pub fn watchdog(kill: &KillSwitch) {
     let control = kill.control.clone();
@@ -119,27 +121,22 @@ impl AktorGroup {
         &mut self,
         name: impl Into<String>,
         value: S,
-    ) -> Result<Aktor<S, AktorSetupError, AktorCleanupError>, DedicatedStartError<AktorSetupError>>
-    {
+    ) -> Result<Aktor<S>, DedicatedStartError<AktorFailure>> {
         let setup = move || Ok::<_, AktorSetupError>(value);
         let cleanup = |_| Ok::<_, AktorCleanupError>(());
         self.spawn(ActorArgs::new(name, setup, cleanup)).await
     }
 
     /// Start an actor in this group.
-    pub async fn spawn<S, E, C, Setup, Cleanup>(
+    pub async fn spawn<S, Setup, Cleanup, Output>(
         &mut self,
         args: ActorArgs<Setup, Cleanup>,
-    ) -> Result<
-        Aktor<S, AktorSetupError<E>, AktorCleanupError<C>>,
-        DedicatedStartError<AktorSetupError<E>>,
-    >
+    ) -> Result<Aktor<S>, DedicatedStartError<AktorFailure>>
     where
         S: 'static,
-        E: Send + 'static,
-        C: Send + Sync + 'static,
-        Setup: FnOnce() -> Result<S, AktorSetupError<E>> + Send + 'static,
-        Cleanup: FnMut(S) -> Result<(), AktorCleanupError<C>> + Send + 'static,
+        Output: AktorCleanupOutput,
+        Setup: FnOnce() -> Result<S, crate::AktorSetupError> + Send + 'static,
+        Cleanup: FnMut(S) -> Output + Send + 'static,
     {
         let ActorArgs {
             name,
@@ -157,42 +154,34 @@ impl AktorGroup {
         .await
     }
 
-    pub async fn spawn_async<S, E, C, Setup, SetupFuture, Cleanup, CleanupFuture>(
+    pub async fn spawn_async<S, Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         &mut self,
         args: ActorArgs<Setup, Cleanup>,
-    ) -> Result<
-        Aktor<S, AktorSetupError<E>, AktorCleanupError<C>>,
-        DedicatedStartError<AktorSetupError<E>>,
-    >
+    ) -> Result<Aktor<S>, DedicatedStartError<AktorFailure>>
     where
         S: 'static,
-        E: Send + 'static,
-        C: Send + Sync + 'static,
+        Output: AktorCleanupOutput,
         Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, AktorSetupError<E>>>,
+        SetupFuture: Future<Output = Result<S, crate::AktorSetupError>>,
         Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<C>>>,
+        CleanupFuture: Future<Output = Output>,
     {
         self.spawn_async_with_hooks(args, crate::listener::hooks::AktorHooks::default())
             .await
     }
 
-    pub async fn spawn_async_with_hooks<S, E, C, Setup, SetupFuture, Cleanup, CleanupFuture>(
+    pub async fn spawn_async_with_hooks<S, Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         &mut self,
         args: ActorArgs<Setup, Cleanup>,
         hooks: crate::listener::hooks::AktorHooks<S>,
-    ) -> Result<
-        Aktor<S, AktorSetupError<E>, AktorCleanupError<C>>,
-        DedicatedStartError<AktorSetupError<E>>,
-    >
+    ) -> Result<Aktor<S>, DedicatedStartError<AktorFailure>>
     where
         S: 'static,
-        E: Send + 'static,
-        C: Send + Sync + 'static,
+        Output: AktorCleanupOutput,
         Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, AktorSetupError<E>>>,
+        SetupFuture: Future<Output = Result<S, crate::AktorSetupError>>,
         Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<C>>>,
+        CleanupFuture: Future<Output = Output>,
     {
         #[cfg(feature = "std_thread")]
         let standard = self
@@ -206,23 +195,82 @@ impl AktorGroup {
     }
 
     #[doc(hidden)]
-    pub async fn spawn_async_on<S, E, C, Setup, SetupFuture, Cleanup, CleanupFuture>(
+    pub async fn spawn_async_on<S, Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         &mut self,
         args: ActorArgs<Setup, Cleanup>,
         hooks: crate::listener::hooks::AktorHooks<S>,
         standard: bool,
-    ) -> Result<
-        Aktor<S, AktorSetupError<E>, AktorCleanupError<C>>,
-        DedicatedStartError<AktorSetupError<E>>,
-    >
+    ) -> Result<Aktor<S>, DedicatedStartError<AktorFailure>>
     where
         S: 'static,
-        E: Send + 'static,
-        C: Send + Sync + 'static,
+        Output: AktorCleanupOutput,
         Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, AktorSetupError<E>>>,
+        SetupFuture: Future<Output = Result<S, crate::AktorSetupError>>,
         Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<C>>>,
+        CleanupFuture: Future<Output = Output>,
+    {
+        let ActorArgs {
+            name,
+            capacity,
+            setup,
+            mut cleanup,
+        } = args;
+        let kill = self.killswitch();
+        let actor = name.clone();
+        let kind = if standard {
+            AktorExecution::StdThread
+        } else {
+            AktorExecution::TokioThread
+        };
+
+        self.spawn_async_initial_on_reported::<S, _, _, _, _, _>(
+            ActorArgs {
+                name,
+                capacity,
+                setup: move || async move {
+                    match setup().await {
+                        Ok(state) => Ok(state),
+                        Err(error) => Err(kill.startup_error(actor, kind, error)),
+                    }
+                },
+                cleanup: move |state| {
+                    let future = cleanup(state);
+                    async move {
+                        AktorCleanupOutput::into_cleanup(future.await).map_err(AktorFailure::from)
+                    }
+                },
+            },
+            hooks,
+            standard,
+            |error| error.diagnostics.clone(),
+            |error| (error.diagnostics.clone(), error.primary),
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn spawn_async_initial_on_reported<
+        S,
+        Initial,
+        Setup,
+        SetupFuture,
+        Cleanup,
+        CleanupFuture,
+    >(
+        &mut self,
+        args: ActorArgs<Setup, Cleanup>,
+        hooks: crate::listener::hooks::AktorHooks<S>,
+        standard: bool,
+        describe_cleanup: fn(&AktorFailure) -> String,
+        describe_initial: fn(&Initial) -> (String, bool),
+    ) -> Result<Aktor<S>, DedicatedStartError<Initial>>
+    where
+        S: 'static,
+        Initial: Send + 'static,
+        Setup: FnOnce() -> SetupFuture + Send + 'static,
+        SetupFuture: Future<Output = Result<S, Initial>>,
+        Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
+        CleanupFuture: Future<Output = Result<(), AktorFailure>>,
     {
         let kind = if standard {
             AktorExecution::StdThread
@@ -313,7 +361,7 @@ impl AktorGroup {
         let actor_name = name.clone();
 
         let scheduled = runtime.spawn_named("aktor supervisor", async move {
-            let (owner, observing) = match Aktor::spawn_observed(
+            let (owner, observing) = match Aktor::<S>::spawn_observed(
                 SpawnArgs {
                     name: name.clone(),
                     capacity,
@@ -331,7 +379,8 @@ impl AktorGroup {
                     if matches!(error, DedicatedStartError::Closed) && kill.is_stopping() {
                         kill.control.lock().report.timed_out = true;
 
-                        let _sent = started.send(Err(error));
+                        let sent = started.send(Err(error));
+                        super::shutdown::contain_drop(sent, &kill, "startup reply drop");
                         let _sent = completed.send(ActorOutcome {
                             kind: None,
                             actor: name,
@@ -342,23 +391,45 @@ impl AktorGroup {
                         return;
                     }
 
-                    let diagnostics = match &error {
-                        DedicatedStartError::Init(error) => error.to_string(),
-                        error => error.to_string(),
-                    };
-
-                    kill.fail_startup(ActorFailure {
+                    let first = kill.fail_startup(ActorFailure {
                         kind: None,
                         actor: name.clone(),
                         phase: "setup".into(),
-                        message: diagnostics,
+                        message: "actor initialization failed".into(),
                     });
 
-                    let _sent = started.send(Err(error));
+                    let (diagnostics, primary) = match &error {
+                        DedicatedStartError::Init(error) => describe_initial(error),
+                        DedicatedStartError::NotStarted => {
+                            ("actor group has not started".into(), false)
+                        }
+                        DedicatedStartError::Closed => {
+                            ("actor group closed during startup".into(), false)
+                        }
+                        DedicatedStartError::NoRuntime => ("no actor runtime".into(), false),
+                        DedicatedStartError::InvalidCapacity => {
+                            ("invalid actor capacity".into(), false)
+                        }
+                        DedicatedStartError::Thread(error) => (error.to_string(), false),
+                        DedicatedStartError::Panicked { actor, cause } => {
+                            (format!("actor {actor} startup panicked: {cause}"), false)
+                        }
+                    };
+
+                    if first && let Some(failure) = &mut kill.control.lock().report.failure {
+                        failure.message = diagnostics.clone();
+                    }
+
+                    let sent = started.send(Err(error));
+                    super::shutdown::contain_drop(sent, &kill, "startup reply drop");
                     let _sent = completed.send(ActorOutcome {
                         kind: None,
                         actor: name,
-                        diagnostics: Vec::new(),
+                        diagnostics: if first || primary {
+                            Vec::new()
+                        } else {
+                            vec![AktorError::new(diagnostics)]
+                        },
                         timed_out: false,
                     });
 
@@ -419,24 +490,42 @@ impl AktorGroup {
                 let mut first = false;
 
                 if !forced {
+                    let (phase, message) = match &*error {
+                        OwnerError::Cleanup(errors) => (
+                            "cleanup",
+                            format!(
+                                "actor cleanup failed {} time(s)",
+                                errors.errors.len() + errors.diagnostics.len()
+                            ),
+                        ),
+                        OwnerError::Panicked(cause)
+                        | OwnerError::PanickedWithCleanup { cause, .. } => {
+                            ("completion", format!("actor thread failed: {cause}"))
+                        }
+                        OwnerError::Cancelled | OwnerError::RuntimeStopped => {
+                            ("completion", error.to_string())
+                        }
+                    };
+
                     first = kill.fail(ActorFailure {
                         kind: None,
                         actor: outcome.actor.clone(),
-                        phase: if matches!(&*error, OwnerError::Cleanup(_)) {
-                            "cleanup"
-                        } else {
-                            "completion"
-                        }
-                        .into(),
-                        message: error.to_string(),
+                        phase: phase.into(),
+                        message,
                     });
                 }
 
                 match &*error {
                     OwnerError::Cleanup(errors) => {
+                        outcome.diagnostics.extend(
+                            errors
+                                .errors
+                                .iter()
+                                .map(|error| AktorError::new(describe_cleanup(error))),
+                        );
                         outcome
                             .diagnostics
-                            .extend(errors.errors.iter().map(|error| error.report()));
+                            .extend(errors.diagnostics.iter().cloned());
                     }
                     OwnerError::PanickedWithCleanup { cause, cleanup } => {
                         if !first && !actor.group_primary() {
@@ -444,9 +533,12 @@ impl AktorGroup {
                                 .diagnostics
                                 .push(AktorError::new(format!("panic: {cause}")));
                         }
-                        outcome
-                            .diagnostics
-                            .extend(cleanup.errors.iter().map(|error| error.report()));
+                        outcome.diagnostics.extend(
+                            cleanup
+                                .errors
+                                .iter()
+                                .map(|error| AktorError::new(describe_cleanup(error))),
+                        );
                         outcome
                             .diagnostics
                             .extend(cleanup.diagnostics.iter().cloned());

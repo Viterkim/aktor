@@ -1,4 +1,5 @@
 use super::*;
+use er::ErErrorPresentationExt;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -83,7 +84,7 @@ async fn resume() {
         name: "restart".into(),
         capacity: 1,
         failure: FailurePolicy::Abort,
-        setup: || Ok::<_, &'static str>(0usize),
+        setup: || Ok::<_, std::io::Error>(0usize),
         cleanup: move |state| {
             records.lock().unwrap().push(state);
 
@@ -129,10 +130,27 @@ async fn resume() {
             .is_err()
     );
 
-    assert!(matches!(
-        actor.resume(|| Err("not yet")).await,
-        Err(LifecycleError::Failed("not yet"))
-    ));
+    let error = actor
+        .resume_async(async || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "not yet",
+            ))
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.er_report_string().matches("not yet").count(), 1);
+
+    match error {
+        LifecycleError::Failed(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        }
+        LifecycleError::Closed | LifecycleError::AlreadyRunning => {
+            panic!("resume lost its setup error");
+        }
+    }
+
     assert!(poll(parked.as_mut()).is_pending());
 
     controller.resume(|| Ok(100)).await.unwrap();

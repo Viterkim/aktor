@@ -7,18 +7,15 @@ use local::clock::Browser as Clock;
 #[cfg(not(target_family = "wasm"))]
 use local::clock::Std as Clock;
 
-impl<'pool, S: 'static, Start, Role> AktorStart for AktorNew<S, Start, BevyLocal<'pool>, Role>
+impl<'pool, S: 'static, Start, Role, End, CM> AktorStart<CM>
+    for AktorNew<S, Start, BevyLocal<'pool>, Role, End>
 where
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
+    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
 {
-    type Error = AktorStartError;
     type Group = crate::AktorGroup;
     type Handles = local::Handle<S, 0, (), Role, Clock>;
     type Startup = LocalFuture<'pool, Result<Self::Handles, AktorStartError>>;
-
-    fn source_is_setup(error: &Self::Error) -> bool {
-        error.source_is_setup()
-    }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         #[cfg(not(target_family = "wasm"))]
@@ -36,7 +33,7 @@ where
         let setup = self.with_role(AktorNoRole);
 
         Box::pin(async move {
-            super::local::start_local::<_, _, _, Clock>(
+            super::local::start_local::<_, _, _, Clock, _, _>(
                 setup,
                 context,
                 |future| executor.spawn_local(future).detach(),
@@ -50,13 +47,14 @@ where
         })
     }
 }
-impl<'pool, S, Start, Fut, Role> AktorStart for AktorNew<S, Start, kind::BevyTask<'pool>, Role>
+impl<'pool, S, Start, Fut, Role, End, CM> AktorStart<CM>
+    for AktorNew<S, Start, kind::BevyTask<'pool>, Role, End>
 where
     S: Send + 'static,
     Start: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<S, AktorSetupError>> + Send + 'static,
+    Fut: Future<Output = Result<S, crate::AktorSetupError>> + Send + 'static,
+    End: crate::setup::closures::AktorSendEnd<S, CM>,
 {
-    type Error = AktorStartError;
     type Group = crate::AktorGroup;
     type Handles = crate::AktorTask<S, Role>;
     #[cfg(not(target_family = "wasm"))]
@@ -64,10 +62,6 @@ where
         Pin<Box<dyn Future<Output = Result<Self::Handles, AktorStartError>> + Send + 'pool>>;
     #[cfg(target_family = "wasm")]
     type Startup = LocalFuture<'pool, Result<Self::Handles, AktorStartError>>;
-
-    fn source_is_setup(error: &Self::Error) -> bool {
-        error.source_is_setup()
-    }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         #[cfg(not(target_family = "wasm"))]

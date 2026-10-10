@@ -1,6 +1,6 @@
 use aktor::{
-    AktorCleanupError, AktorClosures, AktorError, AktorGroup,
-    worker::{self, Options, Server},
+    AktorCleanupError, AktorClosures, AktorError, AktorGroup, AktorSetupError,
+    worker::{self, Options, Server, WorkerCause},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,6 +17,14 @@ thread_local! { static CLOSING: RefCell<Option<worker::Worker<u32>>> = const { R
 #[wasm_bindgen(inline_js = r#"
 export function gate() {
     return globalThis.aktorGate;
+}
+
+export function fail_gate() {
+    return new Promise(() => {
+        globalThis.aktorGate.then(() => {
+            setTimeout(() => { throw new Error('secondary worker sentinel'); }, 0);
+        });
+    });
 }
 
 export function release_gate() {
@@ -53,6 +61,7 @@ export function restore_post() {
 "#)]
 extern "C" {
     fn gate() -> js_sys::Promise;
+    fn fail_gate() -> js_sys::Promise;
     fn release_gate();
     fn cleanup_gate() -> js_sys::Promise;
     fn note_cleanup();
@@ -109,6 +118,9 @@ pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> 
     assert_eq!(failed.cause, worker::WorkerCause::Closed);
     let report = actors.completion().wait().await;
     assert!(report.failed());
+    assert!(!report.timed_out);
+    assert!(report.actors.iter().all(|actor| !actor.timed_out));
+
     let mut actors = AktorGroup::new();
     actors.start().unwrap();
     let worker = actors
@@ -126,6 +138,19 @@ pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> 
         .expect_err("posting failure");
     assert!(matches!(failed.cause, worker::WorkerCause::Codec(_)));
     assert!(actors.completion().wait().await.failed());
+
+    let mut actors = AktorGroup::new();
+    actors.start().unwrap();
+    let worker = actors
+        .worker::<u32>("explicit termination", &url, options())
+        .await
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    worker.terminate();
+
+    let report = actors.completion().wait().await;
+    assert!(report.failed());
+    assert!(!report.timed_out);
+    assert!(report.actors.iter().all(|actor| !actor.timed_out));
 
     Ok(closed)
 }
@@ -150,6 +175,12 @@ async fn operation(_: &u32, mode: u32) -> Result<u32, String> {
             Ok(mode)
         }
         9 => panic!("unadmitted request executed"),
+        10 => {
+            wasm_bindgen_futures::JsFuture::from(fail_gate())
+                .await
+                .unwrap();
+            Ok(mode)
+        }
         _ => Ok(mode),
     }
 }
@@ -182,6 +213,7 @@ impl<'de> Deserialize<'de> for RejectedInput {
 struct RejectedOutput;
 impl<'de> Deserialize<'de> for RejectedOutput {
     fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        REJECTED_DECODES.with(|count| count.set(count.get() + 1));
         Err(serde::de::Error::custom("output refused"))
     }
 }
@@ -328,11 +360,11 @@ pub async fn start_unready_worker() -> Result<(), JsValue> {
         let start = async move || {
             note_configured();
             wasm_bindgen_futures::JsFuture::from(gate()).await.unwrap();
-            Ok(state)
+            Ok::<_, AktorSetupError>(state)
         };
         AktorClosures {
             start,
-            end: None,
+            end: (),
             intervals: vec![],
             before_each: None,
             after_each: None,
@@ -582,8 +614,9 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
                     8 => {
                         let mut reply = bad_output(&storage).send().await;
 
-                        storage.shutdown().await.unwrap();
-                        assert!(!kill.is_stopping());
+                        let error = storage.shutdown().await.unwrap_err();
+                        assert!(matches!(error.cause, WorkerCause::Codec(_)));
+                        assert!(kill.is_stopping());
                         assert!(reply.try_take().is_none());
                         core::future::pending::<()>().await;
                     }
@@ -609,6 +642,13 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
         .await;
 
     let report = completed.wait().await;
+    assert_eq!(
+        report
+            .to_string()
+            .matches("backup folder is read only")
+            .count(),
+        usize::from(mode == 4 || mode == 6 || mode == 7)
+    );
     let typed_cleanup = if mode == 4 {
         let completion = retained.borrow_mut().take().unwrap();
         let error = completion.wait().await.unwrap_err();
@@ -949,4 +989,195 @@ impl std::task::Wake for ReplyWake {
     fn wake(self: std::sync::Arc<Self>) {
         self.changed.notify_one();
     }
+}
+
+#[wasm_bindgen]
+pub async fn start_group_setup_worker() -> Result<(), JsValue> {
+    let server = worker::serve_setup((), options(), |()| AktorClosures {
+        start: async || Ok::<_, aktor::AktorSetupError>(0_u32),
+        end: (),
+        intervals: vec![],
+        before_each: None,
+        after_each: None,
+    })
+    .await
+    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+
+    SERVER.with(|slot| *slot.borrow_mut() = Some(server));
+    Ok(())
+}
+
+async fn managed_worker(
+    group: &mut AktorGroup,
+    name: &str,
+    url: &str,
+    prepared: bool,
+) -> worker::Worker<u32> {
+    if prepared {
+        aktor::aktor_start_in(
+            group,
+            aktor::AktorWorkerNew {
+                name: aktor::AktorName::new(name),
+                role: aktor::AktorNoRole,
+                kind: aktor::AktorKind::BrowserWebWorker(format!("{url}?configured")),
+                config: (),
+                options: aktor::AktorWorkerOptions {
+                    transport: options(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+    } else {
+        group.worker(name, url, options()).await.unwrap()
+    }
+}
+
+#[wasm_bindgen]
+pub async fn worker_failure_check(
+    url: String,
+    prepared: bool,
+    same_worker: bool,
+) -> Result<bool, JsValue> {
+    use futures_util::FutureExt;
+
+    let mut group = AktorGroup::with_grace(Duration::from_secs(2));
+    group.start().unwrap();
+    let primary = managed_worker(&mut group, "primary", &url, prepared).await;
+    let secondary = if same_worker {
+        None
+    } else {
+        Some(managed_worker(&mut group, "secondary", &url, prepared).await)
+    };
+    let draining = secondary.as_ref().unwrap_or(&primary);
+    let mut reply = operation(draining, 10).send().await;
+
+    while !draining.executing() {
+        gloo_timers::future::TimeoutFuture::new(1).await;
+    }
+
+    let rejection = worker::WorkerRequest::<u32, ()>::new(
+        &primary,
+        operation::NAME,
+        Err(worker::WorkerError::new(
+            aktor::message::CallError::NotAdmitted,
+            worker::WorkerCause::Codec("primary worker sentinel".into()),
+        )),
+    );
+    assert!(rejection.now_or_never().is_none());
+    release_gate();
+
+    let report = group.shutdown().await;
+    assert!(!report.timed_out, "{report}");
+    assert_eq!(report.failure.as_ref().unwrap().actor, "primary");
+    assert_eq!(
+        report
+            .to_string()
+            .matches("primary worker sentinel")
+            .count(),
+        1
+    );
+    let label = if same_worker { "primary" } else { "secondary" };
+    let outcome = report
+        .actors
+        .iter()
+        .find(|actor| actor.actor == label)
+        .unwrap();
+    assert!(!outcome.timed_out);
+    if outcome.diagnostics.len() != 1 {
+        return Err(JsValue::from_str(&format!(
+            "secondary worker failure was lost: {report}"
+        )));
+    }
+    assert!(
+        outcome.diagnostics[0]
+            .diagnostics
+            .contains("secondary worker sentinel"),
+        "{report}"
+    );
+    assert_eq!(
+        report
+            .to_string()
+            .matches("secondary worker sentinel")
+            .count(),
+        1
+    );
+    assert!(reply.try_take().is_none());
+    assert!(reply.try_take().is_none());
+    assert!(operation(draining, 0).now_or_never().is_none());
+    assert_eq!(
+        group.completion().wait().await.to_string(),
+        report.to_string()
+    );
+    drop(reply);
+    Ok(true)
+}
+
+thread_local! {
+    static REJECTED_DECODES: Cell<usize> = const { Cell::new(0) };
+    static COUNTED_DECODES: Cell<usize> = const { Cell::new(0) };
+}
+
+struct CountedOutput(Rc<Cell<usize>>);
+impl<'de> Deserialize<'de> for CountedOutput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let _result = Result::<u32, String>::deserialize(deserializer)?;
+        let count = COUNTED_DECODES.with(|count| {
+            count.set(count.get() + 1);
+            count.get()
+        });
+
+        Ok(Self(Rc::new(Cell::new(count))))
+    }
+}
+
+#[wasm_bindgen]
+pub async fn deferred_reply_check(url: String, drop_worker: bool) -> Result<bool, JsValue> {
+    REJECTED_DECODES.with(|count| count.set(0));
+    COUNTED_DECODES.with(|count| count.set(0));
+    let mut group = AktorGroup::new();
+    let completed = group.start().unwrap();
+    let worker = group
+        .worker::<u32>("deferred", &url, options())
+        .await
+        .unwrap();
+    let mut counted = worker::WorkerRequest::<u32, CountedOutput>::new(
+        &worker,
+        operation::NAME,
+        worker::encode(&(0_u32,)),
+    )
+    .send()
+    .await;
+    let mut reply = bad_output(&worker).send().await;
+    let retained = if drop_worker {
+        None
+    } else {
+        Some(worker.new_handle())
+    };
+    drop(worker);
+
+    let published = group.shutdown().await;
+    assert!(reply.try_take().is_none());
+    assert!(reply.try_take().is_none());
+    if !published.failed() {
+        return Err(JsValue::from_str(&format!(
+            "deferred decode escaped group completion: {published}"
+        )));
+    }
+    assert!(!published.timed_out);
+    assert!(
+        published
+            .failure
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("output refused")
+    );
+    assert_eq!(completed.wait().await.to_string(), published.to_string());
+    assert_eq!(REJECTED_DECODES.with(Cell::get), 1);
+    assert_eq!(COUNTED_DECODES.with(Cell::get), 1);
+    assert_eq!(counted.try_take().unwrap().0.get(), 1);
+    assert_eq!(COUNTED_DECODES.with(Cell::get), 1);
+    drop(retained);
+    Ok(true)
 }

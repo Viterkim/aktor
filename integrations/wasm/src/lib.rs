@@ -306,18 +306,15 @@ async fn local_setup() -> Result<(), &'static str> {
                 }),
                 closures: AktorClosures {
                     start: async || {
-                        Ok(State {
+                        Ok::<_, AktorSetupError>(State {
                             text: String::new(),
                         })
                     },
 
-                    end: Some(
-                        (async move |_: State| {
-                            ended.set(true);
-                            Ok(())
-                        })
-                        .into(),
-                    ),
+                    end: async move |_: State| {
+                        ended.set(true);
+                        Ok::<_, AktorCleanupError>(())
+                    },
                     intervals: vec![],
                     before_each: None,
                     after_each: None,

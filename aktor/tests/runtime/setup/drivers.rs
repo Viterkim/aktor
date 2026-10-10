@@ -1,6 +1,94 @@
 use super::*;
 
-#[cfg(feature = "local")]
+#[tokio::test]
+async fn interval_launch() {
+    let executor = tokio::task::LocalSet::new();
+
+    executor
+        .run_until(async {
+            for accepted in [0, 1] {
+                let launches = Rc::new(Cell::new(0));
+                let launched = launches.clone();
+                let cleaned = Rc::new(Cell::new(0));
+                let end = cleaned.clone();
+                let observed = Rc::new(std::cell::RefCell::new(None));
+                let callback = observed.clone();
+                let tasks = Rc::new(std::cell::RefCell::new(Vec::new()));
+                let spawned = tasks.clone();
+                let startup = aktor_start(AktorSetup {
+                    actors: AktorNew {
+                        name: AktorName::new("local interval launch"),
+                        role: AktorNoRole,
+                        kind: AktorKind::Local::<local::clock::Tokio>(move |future| {
+                            let index = launched.get();
+                            launched.set(index + 1);
+
+                            if index == accepted + 1 {
+                                return Err(AktorSetupError::new("interval launcher rejected"));
+                            }
+
+                            spawned.borrow_mut().push(tokio::task::spawn_local(future));
+                            Ok(())
+                        }),
+                        closures: AktorClosures {
+                            start: async || Ok(()),
+                            end: async move |_: ()| end.set(end.get() + 1),
+                            intervals: (0..=accepted)
+                                .map(|_| AktorInterval {
+                                    every: Duration::from_secs(60),
+                                    run: (async |_: &mut ()| {}).into(),
+                                })
+                                .collect(),
+                            before_each: None,
+                            after_each: None,
+                        },
+                        options: Default::default(),
+                    },
+                    shutdown: move |report| *callback.borrow_mut() = Some(report),
+                    options: AktorOptions {
+                        shutdown_grace: Duration::from_secs(1),
+                    },
+                });
+                let completion = startup.completion();
+                let error = match startup.await {
+                    Ok(_) => panic!("rejected interval launch returned an actor"),
+                    Err(error) => error,
+                };
+                let report = completion.await;
+                let tasks = std::mem::take(&mut *tasks.borrow_mut());
+
+                for task in tasks {
+                    tokio::time::timeout(Duration::from_secs(1), task)
+                        .await
+                        .expect("accepted launcher task survived rollback")
+                        .unwrap();
+                }
+
+                assert!(error.to_string().contains("interval launcher rejected"));
+                assert_eq!(cleaned.get(), 1);
+                assert_eq!(launches.get(), accepted + 2);
+
+                for report in [&report, observed.borrow().as_ref().unwrap()] {
+                    assert!(report.failed(), "{report}");
+                    assert!(!report.timed_out, "{report}");
+                    let failure = report.failure.as_ref().unwrap();
+
+                    assert_eq!(failure.actor, "local interval launch");
+                    assert_eq!(failure.kind, Some(AktorExecution::Local));
+                    assert_eq!(failure.message, "interval launcher rejected");
+                    assert_eq!(
+                        report
+                            .to_string()
+                            .matches("interval launcher rejected")
+                            .count(),
+                        1
+                    );
+                }
+            }
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn custom() {
     struct RunnerDrop(bool);
@@ -37,7 +125,7 @@ async fn custom() {
                                 spawn.spawn_local(future);
                                 Ok(())
                             },
-                            async move |mut runner: AktorRunner<'_, Counter>| {
+                            async move |mut runner: AktorRunner<'_, Counter, 0, ()>| {
                                 let _keep = &held;
 
                                 if mode == 2 {
@@ -62,15 +150,14 @@ async fn custom() {
                             },
                         ),
                         closures: AktorClosures {
-                            start: async || Ok(Counter(Rc::new(Cell::new(0)))),
-                            end: Some(
-                                (async move |state: Counter| {
-                                    count.set(count.get() + 1);
-                                    end.set(Some(state.0.get()));
-                                    Ok(())
-                                })
-                                .into(),
-                            ),
+                            start: async || {
+                                Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0))))
+                            },
+                            end: async move |state: Counter| {
+                                count.set(count.get() + 1);
+                                end.set(Some(state.0.get()));
+                                Ok::<_, AktorCleanupError>(())
+                            },
                             intervals: vec![],
                             before_each: Some(
                                 (move |_: &mut Counter, _: operation::Operation| {
@@ -97,11 +184,11 @@ async fn custom() {
 
                     assert!(report.timed_out, "{report}");
                     assert_eq!(ended.get(), None);
-                    assert!(
-                        report
-                            .application
-                            .iter()
-                            .any(|error| error.to_string().contains("pending runner drop"))
+                    let text = report.to_string();
+                    assert_eq!(
+                        text.matches("pending runner drop died").count(),
+                        1,
+                        "{text}"
                     );
                 } else if mode == 2 {
                     entered.notify_one();
@@ -162,7 +249,6 @@ async fn custom() {
         .await;
 }
 
-#[cfg(feature = "local")]
 #[tokio::test]
 async fn local_panic() {
     use futures_util::FutureExt;
@@ -238,7 +324,7 @@ async fn local_panic() {
             assert_eq!(diagnostics.len(), usize::from(cleanup_failure != 0));
             if cleanup_failure == 1 {
                 assert_eq!(
-                    diagnostics[0].to_string(),
+                    diagnostics[0].diagnostics,
                     "actor cleanup failed: cleanup refused"
                 );
             }
@@ -291,7 +377,6 @@ async fn cross_core_panic() {
     }
 }
 
-#[cfg(feature = "local")]
 #[tokio::test]
 async fn local() {
     let executor = tokio::task::LocalSet::new();
@@ -305,7 +390,7 @@ async fn local() {
         kind: AktorKind::TokioThread,
         closures: AktorClosures {
             start: async || Ok::<_, AktorSetupError>(85_u32),
-            end: None,
+            end: (),
             intervals: vec![],
             before_each: None,
             after_each: None,
@@ -322,14 +407,11 @@ async fn local() {
                     role: aktors::Users,
                     kind: AktorKind::TokioLocal(&executor),
                     closures: AktorClosures {
-                        start: async || Ok(Counter(Rc::new(Cell::new(0)))),
-                        end: Some(
-                            (async move |counter: Counter| {
-                                end.set(counter.0.get());
-                                Ok(())
-                            })
-                            .into(),
-                        ),
+                        start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
+                        end: async move |counter: Counter| {
+                            end.set(counter.0.get());
+                            Ok::<_, AktorCleanupError>(())
+                        },
                         before_each: Some(
                             (move |_: &mut Counter, _: operation::Operation| {
                                 before.set(before.get() + 1);
@@ -396,8 +478,8 @@ async fn local() {
                         Ok(())
                     }),
                     closures: AktorClosures {
-                        start: async || Ok(Counter(Rc::new(Cell::new(0)))),
-                        end: None,
+                        start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
+                        end: (),
                         intervals: vec![],
                         before_each: None,
                         after_each: None,
@@ -427,7 +509,6 @@ async fn local() {
         .await;
 }
 
-#[cfg(feature = "local")]
 #[tokio::test(start_paused = true)]
 async fn local_time() {
     use futures_util::FutureExt;
@@ -462,15 +543,12 @@ async fn local_time() {
                         Ok(())
                     }),
                     closures: AktorClosures {
-                        start: async || Ok(()),
-                        end: Some(
-                            (async move |_: ()| {
-                                tokio::time::sleep(Duration::from_secs(4)).await;
-                                end.set(end.get() + 1);
-                                Ok(())
-                            })
-                            .into(),
-                        ),
+                        start: async || Ok::<_, AktorSetupError>(()),
+                        end: async move |_: ()| {
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            end.set(end.get() + 1);
+                            Ok::<_, AktorCleanupError>(())
+                        },
                         intervals: vec![AktorInterval {
                             every: Duration::from_secs(5),
                             run: (async move |_: &mut ()| {
@@ -517,7 +595,6 @@ async fn local_time() {
         .await;
 }
 
-#[cfg(feature = "local")]
 #[tokio::test]
 async fn local_deadline() {
     use futures_util::FutureExt;
@@ -569,7 +646,6 @@ async fn local_deadline() {
     assert!(group.completion().await.timed_out);
 }
 
-#[cfg(feature = "local")]
 #[tokio::test]
 async fn local_driver_loss() {
     {
@@ -587,10 +663,8 @@ async fn local_driver_loss() {
             let driver = group
                 .listen_with(async move |_| {
                     if error {
-                        Err(AktorCleanupError {
-                            diagnostics: "local final hook failed".into(),
-                            data: HookError,
-                        })
+                        let _resource = HookError;
+                        Err(AktorCleanupError::new("local final hook failed"))
                     } else {
                         std::panic::panic_any(HookError)
                     }
@@ -609,16 +683,13 @@ async fn local_driver_loss() {
 
             assert!(report.failed());
 
-            if error {
-                assert!(
-                    report
-                        .application
-                        .iter()
-                        .any(|error| error.to_string().contains("local final hook failed"))
-                );
+            assert_eq!(report.failure.as_ref().unwrap().phase, "cleanup");
+            let sentinel = if error {
+                "local final hook data drop died"
             } else {
-                assert_eq!(report.failure.unwrap().phase, "cleanup");
-            }
+                "panic payload had no message"
+            };
+            assert!(report.to_string().contains(sentinel));
 
             assert!(group.completion().await.failed());
         }
@@ -668,7 +739,7 @@ async fn local_driver_loss() {
             report
                 .application
                 .iter()
-                .any(|error| error.to_string().contains("unpolled hook"))
+                .any(|error| error.diagnostics.contains("unpolled hook"))
         );
     }
 
@@ -688,14 +759,11 @@ async fn local_driver_loss() {
                     Ok(())
                 }),
                 closures: AktorClosures {
-                    start: async || Ok(Counter(Rc::new(Cell::new(0)))),
-                    end: Some(
-                        (async move |_: Counter| {
-                            failed_end.set(true);
-                            Ok(())
-                        })
-                        .into(),
-                    ),
+                    start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
+                    end: async move |_: Counter| {
+                        failed_end.set(true);
+                        Ok::<_, AktorCleanupError>(())
+                    },
                     intervals: vec![],
                     before_each: Some(
                         (|_: &mut Counter, _: operation::Operation| panic!("local operation died"))
@@ -713,14 +781,11 @@ async fn local_driver_loss() {
                     Err(AktorError::new("driver already started"))
                 }),
                 closures: AktorClosures {
-                    start: async || Ok(Counter(Rc::new(Cell::new(0)))),
-                    end: Some(
-                        (async move |_: Counter| {
-                            end.set(true);
-                            Ok(())
-                        })
-                        .into(),
-                    ),
+                    start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
+                    end: async move |_: Counter| {
+                        end.set(true);
+                        Ok::<_, AktorCleanupError>(())
+                    },
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -768,8 +833,8 @@ async fn local_driver_loss() {
                 role: AktorNoRole,
                 kind: AktorKind::TokioLocal(&executor),
                 closures: AktorClosures {
-                    start: async || Ok(Counter(Rc::new(Cell::new(0)))),
-                    end: None,
+                    start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -805,8 +870,8 @@ async fn local_driver_loss() {
                     role: AktorNoRole,
                     kind: AktorKind::TokioLocal(&executor),
                     closures: AktorClosures {
-                        start: async || Ok(Counter(Rc::new(Cell::new(0)))),
-                        end: None,
+                        start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
+                        end: (),
                         intervals: vec![],
                         before_each: Some(
                             (|_: &mut Counter, _: operation::Operation| {
@@ -850,17 +915,14 @@ async fn local_driver_loss() {
                         role: aktors::Users,
                         kind: AktorKind::TokioLocal(&executor),
                         closures: AktorClosures {
-                            start: async || Ok(85_u32),
-                            end: Some(
-                                (async move |_: u32| {
-                                    if cleanup_fails {
-                                        Err(AktorCleanupError::new("primary cleanup failed"))
-                                    } else {
-                                        Ok(())
-                                    }
-                                })
-                                .into(),
-                            ),
+                            start: async || Ok::<_, AktorSetupError>(85_u32),
+                            end: async move |_: u32| {
+                                if cleanup_fails {
+                                    Err(AktorCleanupError::new("primary cleanup failed"))
+                                } else {
+                                    Ok::<_, AktorCleanupError>(())
+                                }
+                            },
                             intervals: vec![],
                             before_each: Some(
                                 (move |_: &mut u32, _: operation::Operation| {

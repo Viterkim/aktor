@@ -68,19 +68,21 @@ impl Spawner {
         future: impl Future<Output = ()> + Send + 'static,
     ) -> io::Result<()> {
         #[cfg(test)]
-        let failure = FAIL_SPAWN.with(|failure| failure.get());
-
-        #[cfg(test)]
-        if failure == Some(name) {
-            return Err(io::Error::other("injected scheduling failure"));
-        }
+        let failure = check_spawn(name)?;
 
         let _ = name;
 
         match self {
             #[cfg(feature = "tokio")]
             Self::Tokio(runtime) => {
+                #[cfg(not(test))]
                 runtime.spawn(future);
+                #[cfg(test)]
+                runtime.spawn(async move {
+                    FAIL_SPAWN.with(|setting| setting.set(failure));
+                    future.await;
+                });
+
                 Ok(())
             }
             #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
@@ -112,8 +114,26 @@ impl Spawner {
 }
 
 #[cfg(test)]
+pub fn check_spawn(name: &str) -> io::Result<Option<&'static str>> {
+    let failure = FAIL_SPAWN.with(|failure| failure.get());
+
+    if failure == Some(name)
+        && FAIL_SPAWN_AFTER.with(|remaining| {
+            let count = remaining.get();
+            remaining.set(count.saturating_sub(1));
+            count == 0
+        })
+    {
+        return Err(io::Error::other("injected scheduling failure"));
+    }
+
+    Ok(failure)
+}
+
+#[cfg(test)]
 thread_local! {
     pub static FAIL_SPAWN: core::cell::Cell<Option<&'static str>> = const { core::cell::Cell::new(None) };
+    pub static FAIL_SPAWN_AFTER: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 struct ThreadWake(thread::Thread);

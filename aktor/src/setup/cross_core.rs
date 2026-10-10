@@ -3,18 +3,15 @@ use crate::{cross_core, local::hooks::AktorHooks};
 use core::ops::AsyncFnOnce;
 use kind::EmbassyCrossCore;
 
-impl<S: 'static, Start, Role> AktorStart for AktorNew<S, Start, EmbassyCrossCore, Role>
+impl<S: 'static, Start, Role, End, CM> AktorStart<CM>
+    for AktorNew<S, Start, EmbassyCrossCore, Role, End>
 where
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
+    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
 {
-    type Error = AktorStartError;
     type Group = crate::embassy::AktorGroup;
     type Handles = cross_core::Handle<S, Role>;
     type Startup = crate::message::LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
-
-    fn source_is_setup(error: &Self::Error) -> bool {
-        error.source_is_setup()
-    }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         let driver = group.listen()?;
@@ -38,9 +35,26 @@ where
             } = setup.closures;
 
             if intervals.iter().any(|interval| interval.every.is_zero()) {
-                return Err(AktorStartError::Setup(AktorSetupError::new(
-                    "interval duration must be positive",
-                )));
+                return Err(validation_error(
+                    &context.group,
+                    &setup.name.name,
+                    AktorExecution::EmbassyCrossCore,
+                    AktorStartError::Setup(AktorSetupError::new(
+                        "interval duration must be positive",
+                    )),
+                ));
+            }
+
+            if options.capacity == 0 {
+                return Err(validation_error(
+                    &context.group,
+                    &setup.name.name,
+                    AktorExecution::EmbassyCrossCore,
+                    AktorStartError::Setup(AktorSetupError::new(alloc::format!(
+                        "{}",
+                        crate::message::ActorError::InvalidCapacity
+                    ))),
+                ));
             }
 
             let (handle, mut owner) = cross_core::channel(options.capacity).map_err(|error| {
@@ -62,6 +76,9 @@ where
                 .map_err(AktorStartError::Setup)?;
             owner.manage(setup.name.name.clone(), context.group.killswitch());
 
+            let (ready, initialized) = super::ready::channel();
+            let startup_kill = context.group.killswitch();
+            let startup_name = setup.name.name.clone();
             let shutdown = handle.new_handle();
 
             context
@@ -75,14 +92,26 @@ where
                     Box::pin(async move {
                         owner
                             .run_with(
-                                async move || start().await,
-                                async move |state| {
-                                    if let Some(end) = &mut end {
-                                        end.0.run(state).await
-                                    } else {
-                                        drop(state);
-                                        Ok(())
+                                async move || match start().await {
+                                    Ok(state) => {
+                                        ready.send(Ok(()));
+                                        Ok(state)
                                     }
+                                    Err(error) => {
+                                        let error = startup_kill.startup_error(
+                                            startup_name,
+                                            AktorExecution::EmbassyCrossCore,
+                                            error,
+                                        );
+                                        let report = error.report();
+
+                                        ready.send(Err(AktorStartError::Init(error)));
+                                        Err(report)
+                                    }
+                                },
+                                async move |state| match end.run(state).await {
+                                    Ok(()) => Ok(()),
+                                    Err(error) => Err(error.report()),
                                 },
                             )
                             .await
@@ -92,7 +121,11 @@ where
                 .map_err(|error| {
                     AktorStartError::Setup(AktorSetupError::new(alloc::format!("{error}")))
                 })?;
-            handle.ready().await.map_err(AktorStartError::Init)?;
+            initialized.await.ok_or_else(|| {
+                AktorStartError::Setup(AktorSetupError::new(
+                    "cross core actor stopped during startup",
+                ))
+            })??;
             Ok(handle.with_role::<Role>())
         })
     }

@@ -113,6 +113,15 @@ pub fn expand(input: Setups) -> syn::Result<TokenStream> {
         .ok_or_else(|| syn::Error::new(proc_macro2::Span::call_site(), "missing actor setup"))?;
     let other_types = &types[1..];
 
+    let modes: Vec<_> = types
+        .iter()
+        .enumerate()
+        .map(|(index, _)| quote::format_ident!("__AktorMode{index}"))
+        .collect();
+    let first_mode = &modes[0];
+    let other_modes = &modes[1..];
+    let nested_mode = pairs(modes.iter().map(|mode| quote!(#mode)).collect())?;
+
     let nested_type = pairs(types.iter().map(|ty| quote!(#ty)).collect())?;
     let nested_setup = pairs(fields.iter().map(|field| quote!(self.#field)).collect())?;
     let nested_handles = pairs(bindings.iter().map(|binding| quote!(#binding)).collect())?;
@@ -125,22 +134,17 @@ pub fn expand(input: Setups) -> syn::Result<TokenStream> {
         struct #handles<#(#types),*> {
             #(pub #fields: #types),*
         }
-        impl<#first_type: #aktor::setup::AktorStart,
-            #(#other_types: #aktor::setup::AktorStart<Group = #first_type::Group>),*>
-            #aktor::setup::AktorStart for #inputs<#(#types),*>
+        impl<#first_type: #aktor::setup::AktorStart<#first_mode>, #first_mode,
+            #(#other_types: #aktor::setup::AktorStart<#other_modes, Group = #first_type::Group>, #other_modes),*>
+            #aktor::setup::AktorStart<(#(#modes),*)> for #inputs<#(#types),*>
         {
-            type Error = <#nested_type as #aktor::setup::AktorStart>::Error;
             type Group = #first_type::Group;
             type Handles = #handles<#(#types::Handles),*>;
             type Startup = #aktor::setup::AktorTupleStartup<
-                <#nested_type as #aktor::setup::AktorStart>::Startup,
+                <#nested_type as #aktor::setup::AktorStart<#nested_mode>>::Startup,
                 Self::Handles,
-                Self::Error,
+                #aktor::AktorStartError,
             >;
-
-            fn source_is_setup(#result: &Self::Error) -> bool {
-                <#nested_type as #aktor::setup::AktorStart>::source_is_setup(#result)
-            }
 
             fn begin(&self, #context: &mut Self::Group) -> ::core::result::Result<(), #aktor::AktorSetupError> {
                 #aktor::setup::AktorStart::begin(&self.#first_field, #context)

@@ -24,11 +24,11 @@ pub fn check() -> Result<(), String> {
                     start: async || {
                         Err::<Counter, _>(AktorSetupError {
                             diagnostics: "storage refused".into(),
-                            data: Cell::new(23),
+                            data: (),
                         })
                     },
 
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -48,7 +48,7 @@ pub fn check() -> Result<(), String> {
                 report: Some(report),
                 ..
             }) => {
-                assert_eq!(error.data.get(), 23);
+                assert_eq!(error.diagnostics, "storage refused");
                 if !report.failed() {
                     return Err("typed startup lost its rollback report".into());
                 }
@@ -68,17 +68,13 @@ pub fn check() -> Result<(), String> {
                     closures: AktorClosures {
                         start: async move || {
                             assert_ne!(thread::current().id(), caller);
-                            Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0))))
+                            Ok(Counter(Rc::new(Cell::new(0))))
                         },
 
-                        end: Some(
-                            (async move |counter: Counter| {
-                                end.send(counter.0.get())
-                                    .map_err(|error| AktorCleanupError::new(error.to_string()))?;
-                                Ok(())
-                            })
-                            .into(),
-                        ),
+                        end: async move |counter: Counter| {
+                            end.send(counter.0.get())
+                                .map_err(|error| AktorCleanupError::new(error.to_string()))
+                        },
                         intervals: vec![AktorInterval {
                             every: Duration::from_millis(1),
                             run: (async move |_: &mut Counter| {
@@ -98,7 +94,7 @@ pub fn check() -> Result<(), String> {
                     closures: AktorClosures {
                         start: async || Ok::<_, AktorSetupError>(0_u32),
 
-                        end: None,
+                        end: (),
                         intervals: vec![],
                         before_each: None,
                         after_each: None,

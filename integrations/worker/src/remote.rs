@@ -1,4 +1,9 @@
-use aktor::*;
+use aktor::{
+    latest::{SendLatest, Session},
+    operation::Operation,
+    *,
+};
+use er::ErPresentationExt;
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::{cell::Cell, rc::Rc, time::Duration};
@@ -24,6 +29,18 @@ struct Config {
     fail_start: bool,
     fail_end: bool,
     setup_delay: u32,
+}
+
+#[derive(Deserialize)]
+struct RejectedInput(bool);
+impl Serialize for RejectedInput {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0 {
+            ().serialize(serializer)
+        } else {
+            Err(serde::ser::Error::custom("invalid input"))
+        }
+    }
 }
 
 struct Counter {
@@ -112,6 +129,13 @@ pub async fn start_legacy_setup_worker() -> Result<(), JsValue> {
     .map_err(error)
 }
 
+#[derive(er::Er)]
+#[er(format = "counter setup failed")]
+struct SetupErr;
+#[derive(er::Er)]
+#[er(format = "counter cleanup failed")]
+struct CloseErr;
+
 #[wasm_bindgen]
 pub async fn start_setup_worker(build: String) -> Result<(), JsValue> {
     worker::serve_setup(
@@ -126,7 +150,8 @@ pub async fn start_setup_worker(build: String) -> Result<(), JsValue> {
                 gloo_timers::future::TimeoutFuture::new(config.setup_delay).await;
 
                 if config.fail_start {
-                    return Err(AktorSetupError::new("counter setup failed"));
+                    return Err(er::ErTree::new(SetupErr, [] as [std::io::Error; 0]))
+                        .er_into(|_| {});
                 }
 
                 Ok(Counter {
@@ -138,18 +163,16 @@ pub async fn start_setup_worker(build: String) -> Result<(), JsValue> {
             };
             AktorClosures {
                 start,
-                end: Some(
-                    (async move |counter: Counter| {
-                        note_end();
+                end: move |counter: Counter| {
+                    note_end();
 
-                        if counter.before != counter.after || config.fail_end {
-                            return Err(AktorCleanupError::new("counter cleanup failed"));
-                        }
+                    if counter.before != counter.after || config.fail_end {
+                        return Err(er::ErTree::new(CloseErr, [] as [std::io::Error; 0]))
+                            .er_into(|_| {});
+                    }
 
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                    Ok(())
+                },
                 intervals: vec![AktorInterval {
                     every: Duration::from_millis(5),
                     run: (async |counter: &mut Counter| {
@@ -309,7 +332,89 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
             "explicit termination was marked as a timeout: {report}"
         )));
     }
-    assert!(!report.actors[0].diagnostics.is_empty());
+    assert!(report.actors[0].diagnostics.is_empty());
+
+    for latest in [false, true] {
+        for remote in [false, true] {
+            for fail_end in [false, true] {
+                let rejected = aktor_start(AktorSetup {
+                    actors: setup(
+                        &program,
+                        Config {
+                            initial: 0,
+                            fail_start: false,
+                            fail_end,
+                            setup_delay: 0,
+                        },
+                    ),
+                    shutdown: |_| {},
+                    options: AktorOptions::default(),
+                })
+                .await
+                .map_err(error)?;
+                let mut running = wait(&rejected.handles, 20).send().await;
+                let mut queued = add(&rejected.handles, 3).send().await;
+                let input = if remote {
+                    Ok(Vec::new())
+                } else {
+                    Err(worker::WorkerError::new(
+                        message::CallError::NotAdmitted,
+                        worker::WorkerCause::Codec("invalid input".into()),
+                    ))
+                };
+                let request = async {
+                    if latest {
+                        let (sender, mut output) = <&worker::Worker<Counter> as Session<
+                            Counter,
+                            RejectedInput,
+                            u32,
+                        >>::session(
+                            &rejected.handles,
+                            Operation {
+                                name: add::NAME,
+                                caller: std::panic::Location::caller(),
+                            },
+                            async |_: &mut Counter, _: RejectedInput| 0,
+                        );
+
+                        sender.send(RejectedInput(remote));
+                        output.next().await;
+                    } else {
+                        worker::WorkerRequest::<Counter, u32>::new(
+                            &rejected.handles,
+                            add::NAME,
+                            input,
+                        )
+                        .await;
+                    }
+                };
+                futures_util::pin_mut!(request);
+
+                let completed = rejected.completion();
+                let closing = completed.wait();
+                futures_util::pin_mut!(closing);
+
+                let report = match futures_util::future::select(request, closing).await {
+                    futures_util::future::Either::Right((report, _)) => report,
+                    futures_util::future::Either::Left(_) => {
+                        return Err(error("rejected call continued"));
+                    }
+                };
+
+                let failure = report.failure.as_ref().unwrap();
+                assert!(failure.message.contains("Codec"));
+                assert_eq!(report.to_string().matches(&failure.message).count(), 1);
+                assert_eq!(running.try_take(), Some(1));
+                assert_eq!(queued.try_take(), Some(Ok(4)));
+                assert!(!report.timed_out);
+                assert_eq!(report.actors[0].diagnostics.len(), usize::from(fail_end));
+
+                if fail_end {
+                    assert!(report.to_string().contains("counter cleanup failed"));
+                }
+            }
+        }
+    }
 
     let actors = aktor_start(AktorSetup {
         actors: setup(
@@ -499,6 +604,10 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     {
         return Err(error("remote cleanup report was lost"));
     }
+    assert_eq!(
+        report.to_string().matches("counter cleanup failed").count(),
+        1
+    );
 
     let failed = aktor_start(AktorSetup {
         actors: (

@@ -96,6 +96,10 @@ async fn runner() {
                             .any(|error| error.diagnostics.contains("cleanup failed too")),
                         cleanup_panics
                     );
+                    let text = failure.to_string();
+
+                    assert!(text.contains("operation failed"));
+                    assert_eq!(text.contains("cleanup failed too"), cleanup_panics);
                     notified.send(*observed.lock().unwrap()).unwrap();
                 }),
                 setup: || Ok::<_, std::convert::Infallible>(0usize),

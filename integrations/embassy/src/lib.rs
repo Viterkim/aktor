@@ -99,8 +99,11 @@ async fn setup_driver(driver: aktor::message::LocalFuture<'static, ()>) {
 
 pub fn sensor_setup(
     spawner: embassy_executor::Spawner,
-) -> impl aktor::setup::AktorStart<Group = embassy::AktorGroup, Handles = embassy::Handle<Sensor, 0, ()>>
-{
+) -> AktorNew<
+    Sensor,
+    impl core::ops::AsyncFnOnce() -> Result<Sensor, AktorSetupError>,
+    aktor::AktorKind::EmbassyLocal,
+> {
     AktorNew {
         name: AktorName::new("sensor"),
         role: AktorNoRole,
@@ -118,7 +121,7 @@ pub fn sensor_setup(
                 })
             },
 
-            end: None,
+            end: (),
             intervals: Vec::new(),
             before_each: None,
             after_each: None,
@@ -129,8 +132,11 @@ pub fn sensor_setup(
 
 pub fn shared_sensor_setup(
     spawner: embassy_executor::Spawner,
-) -> impl aktor::setup::AktorStart<Group = embassy::AktorGroup, Handles = cross_core::Handle<Sensor>>
-{
+) -> AktorNew<
+    Sensor,
+    impl core::ops::AsyncFnOnce() -> Result<Sensor, AktorSetupError>,
+    aktor::AktorKind::EmbassyCrossCore,
+> {
     AktorNew {
         name: AktorName::new("shared sensor"),
         role: AktorNoRole,
@@ -148,7 +154,7 @@ pub fn shared_sensor_setup(
                 })
             },
 
-            end: None,
+            end: (),
             intervals: Vec::new(),
             before_each: None,
             after_each: None,

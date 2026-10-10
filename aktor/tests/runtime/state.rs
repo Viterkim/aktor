@@ -1,6 +1,6 @@
 use super::*;
 use aktor::listener::spawn_async;
-use std::rc::Rc;
+use std::{convert::Infallible, rc::Rc};
 use std::{
     future::Future,
     sync::{Arc, Mutex},
@@ -84,7 +84,7 @@ async fn startup_panic() {
 
 #[tokio::test]
 async fn async_lifecycle() {
-    fn setup(value: usize) -> impl Future<Output = Result<usize, ()>> {
+    fn setup(value: usize) -> impl Future<Output = Result<usize, Infallible>> {
         let timer = tokio::time::sleep(Duration::from_millis(1));
 
         async move {
@@ -128,28 +128,35 @@ async fn async_lifecycle() {
 
 #[test]
 fn sources() {
+    use er::ErErrorPresentationExt;
     use std::{error::Error, io, sync::Arc};
 
     let errors: Vec<Box<dyn Error>> = vec![
-        Box::new(DedicatedStartError::Init(io::Error::other("setup"))),
+        Box::new(DedicatedStartError::Init(io::Error::other(
+            "setup sentinel",
+        ))),
         Box::new(DedicatedStartError::<io::Error>::Thread(io::Error::other(
-            "thread",
+            "thread sentinel",
         ))),
         Box::new(ReplaceError::<io::Error, io::Error>::Setup(
-            io::Error::other("setup"),
+            io::Error::other("setup sentinel"),
         )),
         Box::new(ReplaceError::<io::Error, io::Error>::Cleanup(Arc::new(
-            io::Error::other("cleanup"),
+            io::Error::other("cleanup sentinel"),
         ))),
-        Box::new(RunError::Failed(io::Error::other("serve"))),
+        Box::new(RunError::Failed(io::Error::other("serve sentinel"))),
     ];
 
     for error in errors {
-        assert!(
+        let source = error.source().unwrap();
+
+        assert_eq!(
             error
-                .source()
-                .is_some_and(|source| source.is::<io::Error>()),
-            "missing source: {error}"
+                .er_report_string()
+                .matches(&source.to_string())
+                .count(),
+            1,
         );
+        assert!(source.is::<io::Error>(), "missing source: {error}");
     }
 }

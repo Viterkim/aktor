@@ -1,5 +1,6 @@
 use super::*;
 use crate::worker::{Options, Worker, WorkerCause, WorkerError};
+use core::cell::Cell;
 
 impl AktorGroup {
     /// Open a worker and keep it with the group.
@@ -82,6 +83,8 @@ impl AktorGroup {
             let cancel = worker.new_handle();
             let completion = worker.completion();
             let label = name.clone();
+            let timed_out = Rc::new(Cell::new(false));
+            let forced = timed_out.clone();
 
             entries.push(Entry {
                 kind: AktorExecution::BrowserWebWorker,
@@ -89,7 +92,10 @@ impl AktorGroup {
                 start: Box::new(move || {
                     shutdown.shutdown();
                 }),
-                cancel: Box::new(move || cancel.terminate()),
+                cancel: Box::new(move || {
+                    forced.set(true);
+                    cancel.terminate();
+                }),
                 outcome: Box::pin(async move {
                     let mut outcome = ActorOutcome {
                         kind: None,
@@ -98,18 +104,8 @@ impl AktorGroup {
                         timed_out: false,
                     };
 
-                    if let Err(error) = completion.wait_report().await {
-                        match error.cause {
-                            WorkerCause::Cleanup(message) => {
-                                outcome.diagnostics.push(AktorCleanupError {
-                                    diagnostics: message,
-                                    data: (),
-                                })
-                            }
-                            WorkerCause::Closed => outcome.timed_out = true,
-                            _ => {}
-                        }
-                    }
+                    outcome.diagnostics = completion.wait_diagnostics().await;
+                    outcome.timed_out = timed_out.get();
 
                     outcome
                 }),

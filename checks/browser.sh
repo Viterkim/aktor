@@ -16,9 +16,11 @@ cargo +1.89.0 check -p aktor --no-default-features --features macros,wasm_browse
 cargo clippy -p aktor --no-default-features --features macros,wasm_browser_workers --target wasm32-unknown-unknown -- -D warnings
 cargo +1.89.0 check --manifest-path integrations/Cargo.toml -p aktor-worker-proof --target wasm32-unknown-unknown
 cargo clippy --manifest-path integrations/Cargo.toml -p aktor-worker-proof --target wasm32-unknown-unknown -- -D warnings
-bash integrations/worker/build.sh
-cargo run --quiet --locked --manifest-path "$extras_dir/checks/Cargo.toml" \
-    --bin browser -- "$PWD"
+for profile in debug release; do
+    bash integrations/worker/build.sh "$profile"
+    cargo run --quiet --locked --manifest-path "$extras_dir/checks/Cargo.toml" \
+        --bin browser -- "$PWD"
+done
 
 role_output=$(mktemp)
 trap 'rm -f "$role_output"' EXIT

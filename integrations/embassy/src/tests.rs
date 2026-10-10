@@ -1073,18 +1073,15 @@ async fn setups(spawner: Spawner) {
         }),
         closures: AktorClosures {
             start: async || {
-                Ok(Sensor {
+                Ok::<_, AktorSetupError>(Sensor {
                     readings: Rc::new(RefCell::new(Vec::new())),
                 })
             },
 
-            end: Some(
-                (async move |_: Sensor| {
-                    cleaned.set(true);
-                    Ok(())
-                })
-                .into(),
-            ),
+            end: async move |_: Sensor| {
+                cleaned.set(true);
+                Ok::<_, AktorCleanupError>(())
+            },
             intervals: vec![AktorInterval {
                 every: core::time::Duration::from_millis(1),
                 run: (async move |_: &mut Sensor| {
@@ -1116,12 +1113,12 @@ async fn setups(spawner: Spawner) {
         }),
         closures: AktorClosures {
             start: async || {
-                Ok(Sensor {
+                Ok::<_, AktorSetupError>(Sensor {
                     readings: Rc::new(RefCell::new(Vec::new())),
                 })
             },
 
-            end: None,
+            end: (),
             intervals: vec![],
             before_each: None,
             after_each: None,
@@ -1175,9 +1172,9 @@ async fn setups(spawner: Spawner) {
         role: AktorNoRole,
         kind: AktorKind::EmbassyLocal(|_| Err(AktorSetupError::new("must not spawn"))),
         closures: AktorClosures {
-            start: async || Ok(85_u32),
+            start: async || Ok::<_, AktorSetupError>(85_u32),
 
-            end: None,
+            end: (),
             intervals: vec![],
             before_each: None,
             after_each: None,

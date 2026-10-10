@@ -59,10 +59,10 @@ impl AktorGroup {
         }
     }
 
-    pub(super) async fn finish<Cleanup, CleanupFuture, E>(self, cleanup: Cleanup) -> ShutdownReport
+    pub(super) async fn finish<Cleanup, CleanupFuture>(self, cleanup: Cleanup) -> ShutdownReport
     where
         Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
+        CleanupFuture: Future<Output = Result<(), AktorError>>,
     {
         let kill = self.killswitch();
 
@@ -284,22 +284,21 @@ async fn browser_deadline<F: Future<Output = ()>>(
     }
 }
 
-pub async fn finish_hook<Cleanup, CleanupFuture, E>(
+pub async fn finish_hook<Cleanup, CleanupFuture>(
     cleanup: Cleanup,
     report: ShutdownReport,
     kill: &KillSwitch,
     deadline: Instant,
 ) where
     Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
-    CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
+    CleanupFuture: Future<Output = Result<(), AktorError>>,
 {
     let mut hook = Box::pin(AssertUnwindSafe(async { cleanup(report).await }).catch_unwind());
 
     match kill.bounded(deadline, &mut hook).await {
         Some(Ok(Ok(()))) => {}
         Some(Ok(Err(error))) => {
-            kill.control.lock().report.application.push(error.report());
-            contain_drop(error, kill, "cleanup error drop");
+            kill.control.lock().report.application.push(error);
         }
         Some(Err(payload)) => {
             fail_application(kill, "cleanup", panic_message(&payload));
@@ -313,18 +312,20 @@ pub async fn finish_hook<Cleanup, CleanupFuture, E>(
 }
 
 pub fn fail_application(kill: &KillSwitch, phase: &str, message: String) {
-    kill.control
-        .lock()
-        .report
-        .application
-        .push(AktorError::new(format!("{phase}: {message}")));
-
-    kill.fail(ActorFailure {
+    let primary = kill.fail(ActorFailure {
         kind: None,
         actor: "application".into(),
         phase: phase.into(),
-        message,
+        message: message.clone(),
     });
+
+    if !primary {
+        kill.control
+            .lock()
+            .report
+            .application
+            .push(AktorError::new(format!("{phase}: {message}")));
+    }
 }
 
 pub fn contain_drop(value: impl Sized, kill: &KillSwitch, phase: &str) {

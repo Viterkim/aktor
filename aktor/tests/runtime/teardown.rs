@@ -206,10 +206,10 @@ fn teardown() {
                     )
                     .await;
 
-                assert!(format!("{:#}", result.unwrap_err()).contains("primary setup"));
+                assert!(result.unwrap_err().diagnostics.contains("primary setup"));
                 assert_eq!(handle.completion().diagnostics().len(), 2);
                 let error = handle.completion().wait().await.unwrap_err();
-                assert!(format!("{error:#}").contains("primary setup"));
+                assert!(error.diagnostics.contains("primary setup"));
                 assert_eq!(count.load(Ordering::SeqCst), 2);
                 return;
             }
@@ -235,8 +235,8 @@ fn teardown() {
                 role: AktorNoRole,
                 kind: AktorKind::TokioTask,
                 closures: AktorClosures {
-                    start: async || Ok(()),
-                    end: None,
+                    start: async || Ok::<_, AktorSetupError>(()),
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -329,7 +329,11 @@ fn teardown() {
             let report = actors.completion().await;
 
             assert!(report.failed(), "{report}");
-            assert_eq!(report.actors[0].diagnostics.len(), 2, "{report}");
+            assert_eq!(
+                report.to_string().matches("independent destructor").count(),
+                2,
+                "{report}"
+            );
 
             if mode.ends_with("queue") || mode.ends_with("before") {
                 assert!(

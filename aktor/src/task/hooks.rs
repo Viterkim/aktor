@@ -1,29 +1,18 @@
 use super::{AktorTaskFuture, AktorTaskState};
-use crate::{AktorCleanupError, AktorClosure};
+use crate::AktorClosure;
 use core::future::Future;
 
 pub trait AktorTaskEnd<S> {
-    fn run(self: Box<Self>, state: S) -> AktorTaskFuture<'static, Result<(), AktorCleanupError>>;
+    fn run(self: Box<Self>, state: S) -> AktorTaskFuture<'static, Result<(), crate::AktorFailure>>;
 }
 impl<S, F, Fut> AktorTaskEnd<S> for F
 where
     S: 'static,
     F: FnOnce(S) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<(), AktorCleanupError>> + Send + 'static,
+    Fut: Future<Output = Result<(), crate::AktorFailure>> + Send + 'static,
 {
-    fn run(self: Box<Self>, state: S) -> AktorTaskFuture<'static, Result<(), AktorCleanupError>> {
+    fn run(self: Box<Self>, state: S) -> AktorTaskFuture<'static, Result<(), crate::AktorFailure>> {
         Box::pin(self(state))
-    }
-}
-
-impl<S, F, Fut> From<F> for AktorClosure<dyn AktorTaskEnd<S> + Send>
-where
-    S: 'static,
-    F: FnOnce(S) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<(), AktorCleanupError>> + Send + 'static,
-{
-    fn from(function: F) -> Self {
-        Self(Box::new(function))
     }
 }
 

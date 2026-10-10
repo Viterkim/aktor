@@ -17,13 +17,9 @@ async fn cancel() {
                         closures: AktorClosures {
         start: async || Ok::<_, AktorSetupError>(0_u32),
 
-                            end: Some(
-                                (async move |_: u32| {
+                            end: async move |_: u32| {
                                     end.notify_one();
-                                    Ok(())
-                                })
-                                .into(),
-                            ),
+                                },
                             intervals: vec![],
                             before_each: None,
                             after_each: None,
@@ -41,7 +37,7 @@ async fn cancel() {
                             std::future::pending::<Result<u32, AktorSetupError>>().await
                         },
 
-                            end: None,
+                            end: (),
                             intervals: vec![],
                             before_each: None,
                             after_each: None,
@@ -80,7 +76,7 @@ async fn cancel() {
             kind: AktorKind::TokioThread,
             closures: AktorClosures {
                 start: async || -> Result<u32, AktorSetupError> { panic!("stopped startup ran") },
-                end: None::<AktorClosure<dyn setup::AktorEnd<u32> + Send>>,
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -107,7 +103,7 @@ async fn cancel() {
             kind: AktorKind::TokioThread,
             closures: AktorClosures {
                 start: async || -> Result<u32, AktorSetupError> { panic!("discarded startup ran") },
-                end: None::<AktorClosure<dyn setup::AktorEnd<u32> + Send>>,
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -137,8 +133,8 @@ async fn cancel() {
 #[cfg(feature = "std_thread")]
 #[tokio::test]
 async fn stopping() {
-    async fn stop<Setup: setup::AktorStart>(
-        startup: setup::AktorStartup<Setup>,
+    async fn stop<Setup: setup::AktorStart<Mode>, Mode>(
+        startup: setup::AktorStartup<Setup, Mode>,
         entered: Arc<Notify>,
         release: Arc<Notify>,
     ) where
@@ -177,12 +173,12 @@ async fn stopping() {
                 let setup = async move || {
                     begin.notify_one();
                     gate.notified().await;
-                    Ok(0_u32)
+                    Ok::<_, AktorSetupError>(0_u32)
                 };
 
                 let cleanup = async move |_: u32| {
                     end.set(end.get() + 1);
-                    Ok(())
+                    Ok::<_, AktorSetupError>(())
                 };
 
                 if driven {
@@ -193,11 +189,11 @@ async fn stopping() {
                                 role: AktorNoRole,
                                 kind: AktorKind::Local::<local::clock::Tokio>(|future| {
                                     tokio::task::spawn_local(future);
-                                    Ok(())
+                                    Ok::<_, AktorSetupError>(())
                                 }),
                                 closures: AktorClosures {
                                     start: setup,
-                                    end: Some(cleanup.into()),
+                                    end: cleanup,
 
                                     intervals: vec![],
                                     before_each: None,
@@ -223,7 +219,7 @@ async fn stopping() {
                                 kind: AktorKind::TokioLocal(&executor),
                                 closures: AktorClosures {
                                     start: setup,
-                                    end: Some(cleanup.into()),
+                                    end: cleanup,
 
                                     intervals: vec![],
                                     before_each: None,
@@ -259,7 +255,7 @@ async fn existing() {
         kind: AktorKind::TokioThread,
         closures: AktorClosures {
             start: async || Ok::<_, AktorSetupError>(17_u32),
-            end: None,
+            end: (),
             intervals: vec![],
             before_each: None,
             after_each: None,
@@ -288,7 +284,7 @@ async fn existing() {
                 role: aktors::Users,
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
-start: async || Ok::<_, AktorSetupError>(17_u32),  end: None, intervals: vec![], before_each: None, after_each: None },
+start: async || Ok::<_, AktorSetupError>(17_u32),  end: (), intervals: vec![], before_each: None, after_each: None },
                 options: AktorNewOptions { capacity: 32 },
             },
             second: AktorNew {
@@ -297,7 +293,7 @@ start: async || Ok::<_, AktorSetupError>(17_u32),  end: None, intervals: vec![],
                 role: aktors::Users,
                 kind: AktorKind::TokioTask,
                 closures: AktorClosures {
-start: async || Ok(23_u32),  end: None, intervals: vec![], before_each: None, after_each: None },
+start: async || Ok::<_, AktorSetupError>(23_u32),  end: (), intervals: vec![], before_each: None, after_each: None },
                 options: AktorNewOptions { capacity: 32 },
             },
         },
@@ -330,14 +326,11 @@ async fn existing_cancel() {
             role: AktorNoRole,
             kind: AktorKind::TokioTask,
             closures: AktorClosures {
-                start: async || Ok(()),
-                end: Some(
-                    (async move |_: ()| {
-                        previous.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                start: async || Ok::<_, AktorSetupError>(()),
+                end: async move |_: ()| {
+                    previous.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, AktorCleanupError>(())
+                },
 
                 intervals: vec![],
                 before_each: None,
@@ -365,13 +358,9 @@ async fn existing_cancel() {
                 gate.notified().await;
                 Ok::<_, AktorSetupError>(17_u32)
             },
-            end: Some(
-                (async move |_: u32| {
-                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(())
-                })
-                .into(),
-            ),
+            end: async move |_: u32| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
             intervals: vec![],
             before_each: None,
             after_each: None,
@@ -417,11 +406,11 @@ async fn existing_local() {
                     role: aktors::Users,
                     kind: AktorKind::Local::<local::clock::Tokio>(|future| {
                         tokio::task::spawn_local(future);
-                        Ok(())
+                        Ok::<_, AktorSetupError>(())
                     }),
                     closures: AktorClosures {
-                        start: async || Ok(17_u32),
-                        end: None,
+                        start: async || Ok::<_, AktorSetupError>(17_u32),
+                        end: (),
                         intervals: vec![],
                         before_each: None,
                         after_each: None,
@@ -452,17 +441,14 @@ async fn existing_local() {
                         role: AktorNoRole,
                         kind: AktorKind::Local::<local::clock::Tokio>(|future| {
                             tokio::task::spawn_local(future);
-                            Ok(())
+                            Ok::<_, AktorSetupError>(())
                         }),
                         closures: AktorClosures {
-                            start: async || Ok(()),
-                            end: Some(
-                                (async move |_: ()| {
-                                    counted.set(counted.get() + 1);
-                                    Err(AktorCleanupError::new("local rollback refused"))
-                                })
-                                .into(),
-                            ),
+                            start: async || Ok::<_, AktorSetupError>(()),
+                            end: async move |_: ()| {
+                                counted.set(counted.get() + 1);
+                                Err(AktorCleanupError::new("local rollback refused"))
+                            },
 
                             intervals: vec![],
                             before_each: None,
@@ -475,13 +461,13 @@ async fn existing_local() {
                         role: AktorNoRole,
                         kind: AktorKind::Local::<local::clock::Tokio>(|future| {
                             tokio::task::spawn_local(future);
-                            Ok(())
+                            Ok::<_, AktorSetupError>(())
                         }),
                         closures: AktorClosures {
                             start: async || {
                                 Err::<(), _>(AktorSetupError::new("local setup refused"))
                             },
-                            end: None,
+                            end: (),
                             intervals: vec![],
                             before_each: None,
                             after_each: None,
@@ -495,19 +481,11 @@ async fn existing_local() {
             .unwrap();
 
             assert!(format!("{error:#}").contains("local setup refused"));
-            let mut source = std::error::Error::source(&error);
-            let mut owner = None;
+            let AktorStartError::Init(original) = &error.error else {
+                panic!("local startup lost its typed error");
+            };
 
-            while let Some(error) = source {
-                if let Some(error) = error.downcast_ref::<local::OwnerError>() {
-                    owner = Some(error);
-                    break;
-                }
-
-                source = error.source();
-            }
-
-            assert!(matches!(owner, Some(local::OwnerError::Setup(_))));
+            assert_eq!(original.diagnostics, "local setup refused");
 
             let report = error.report.unwrap();
 
@@ -589,7 +567,7 @@ async fn origin() {
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
                     start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -627,7 +605,7 @@ async fn origin() {
 
                             Err::<u32, _>(AktorSetupError::new("invalid settings"))
                         },
-                        end: None,
+                        end: (),
                         intervals: vec![],
                         before_each: None,
                         after_each: None,
@@ -686,7 +664,7 @@ async fn overlapping() {
                     gate_a.notified().await;
                     Err::<(), _>(AktorSetupError::new("first initialization refused"))
                 },
-                end: None,
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -704,9 +682,9 @@ async fn overlapping() {
                 start: async move || {
                     beginning_b.notify_one();
                     gate_b.notified().await;
-                    Ok(())
+                    Ok::<_, AktorSetupError>(())
                 },
-                end: None,
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,

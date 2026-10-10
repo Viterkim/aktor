@@ -31,34 +31,74 @@ impl Inner {
         sessions.push(Rc::downgrade(callback));
     }
 
-    pub fn lost<O>(&self, error: WireError) -> core::task::Poll<O> {
+    pub fn park<O>(&self, error: WireError) -> core::task::Poll<O> {
         if self.group.borrow().is_some() {
-            self.notify(&error);
+            core::task::Poll::Pending
+        } else {
+            fatal(error)
+        }
+    }
 
-            if self.finished.borrow().is_none() {
-                self.fail_error(error);
-            }
-
+    pub fn lost<O>(self: &Rc<Self>, error: WireError) -> core::task::Poll<O> {
+        if self.group.borrow().is_some() {
+            self.reject(error);
             return core::task::Poll::Pending;
         }
 
         fatal(error)
     }
 
-    fn notify(&self, error: &WireError) {
-        if let Some((name, group)) = &*self.group.borrow() {
-            let failure = crate::group::ActorFailure {
-                kind: None,
-                actor: name.clone(),
-                phase: "worker".into(),
-                message: error.to_string(),
-            };
+    pub fn reject(self: &Rc<Self>, error: WireError) {
+        if self.finished.borrow().is_some()
+            || self
+                .group
+                .borrow()
+                .as_ref()
+                .is_some_and(|(_, group)| group.is_finished())
+        {
+            fatal(error);
+        }
 
-            if matches!(&*self.ready.borrow(), Some(Ok(()))) {
-                group.fail(failure);
-            } else {
-                group.fail_startup(failure);
-            }
+        self.record(&error);
+        self.failure.borrow_mut().get_or_insert(error);
+        self.shutdown();
+    }
+
+    fn record(&self, error: &WireError) {
+        let primary = self.notify(error);
+        let message = match &error.cause {
+            WorkerCause::Cleanup(message) => Some(message.clone()),
+            _ if !primary => Some(error.to_string()),
+            _ => None,
+        };
+
+        if let Some(message) = message {
+            self.diagnostics
+                .borrow_mut()
+                .push(crate::AktorError::new(message));
+        }
+    }
+
+    fn notify(&self, error: &WireError) -> bool {
+        let group = self.group.borrow();
+        let Some((name, group)) = &*group else {
+            return false;
+        };
+        let (phase, message) = match &error.cause {
+            WorkerCause::Cleanup(_) => ("cleanup", "worker cleanup failed".into()),
+            _ => ("worker", error.to_string()),
+        };
+        let failure = crate::group::ActorFailure {
+            kind: None,
+            actor: name.clone(),
+            phase: phase.into(),
+            message,
+        };
+
+        if matches!(&*self.ready.borrow(), Some(Ok(()))) {
+            group.fail(failure)
+        } else {
+            group.fail_startup(failure)
         }
     }
 
@@ -73,7 +113,7 @@ impl Inner {
             return;
         }
 
-        self.notify(&error);
+        self.record(&error);
         self.closed.set(true);
         self.count.close();
         self.bytes.close();
@@ -96,21 +136,32 @@ impl Inner {
             }
 
             if let Some(answer) = work.answer {
-                let _sent = answer.send(Err(WireError::new(outcome, cause.clone())));
+                answer(Err(WireError::new(outcome, cause.clone())));
             }
         }
 
         self.queue.borrow_mut().clear();
         self.active.set(None);
         self.executing.set(false);
-        self.finish(Err(error));
+        self.failure.borrow_mut().take();
+        self.complete(Err(error));
     }
 
     pub fn finish(&self, result: Result<(), WireError>) {
         if let Err(error) = &result {
-            self.notify(error);
+            self.record(error);
         }
 
+        let failure = self.failure.borrow_mut().take();
+        let result = result.and(match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        });
+
+        self.complete(result);
+    }
+
+    fn complete(&self, result: Result<(), WireError>) {
         if self.finished.borrow().is_none() {
             self.finished.send_replace(Some(result));
         }
@@ -159,8 +210,12 @@ impl Inner {
                     }),
                     Ok(None) => None,
                     Err(error) => {
-                        self.fail(error.cause);
-                        return;
+                        self.active.set(None);
+                        if let Some(error) = service.answer(Err(error)) {
+                            self.reject(error);
+                        }
+
+                        continue;
                     }
                 }
             } else {

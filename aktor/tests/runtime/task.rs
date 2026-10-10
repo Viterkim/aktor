@@ -55,8 +55,8 @@ async fn cooperative() {
             role: AktorNoRole,
             kind: AktorKind::TokioTask,
             closures: AktorClosures {
-                start: async || Ok(Counter(std::cell::RefCell::new(0))),
-                end: None,
+                start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -101,14 +101,11 @@ async fn calls() {
             role: AktorNoRole,
             kind: AktorKind::TokioTask,
             closures: AktorClosures {
-                start: async || Ok(Counter(std::cell::RefCell::new(0))),
-                end: Some(
-                    (async move |mut counter: Counter| {
-                        end.lock().unwrap().push(("end", *counter.0.get_mut()));
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
+                end: async move |mut counter: Counter| {
+                    end.lock().unwrap().push(("end", *counter.0.get_mut()));
+                    Ok::<_, AktorCleanupError>(())
+                },
                 intervals: vec![],
                 before_each: Some(
                     (move |counter: &mut Counter, _: operation::Operation| {
@@ -229,8 +226,8 @@ async fn intervals() {
             role: AktorNoRole,
             kind: AktorKind::TokioTask,
             closures: AktorClosures {
-                start: async || Ok(Counter(std::cell::RefCell::new(0))),
-                end: None,
+                start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
+                end: (),
                 intervals: vec![AktorInterval {
                     every: Duration::from_millis(10),
                     run: (move |mut counter: AktorTaskState<Counter>| {
@@ -259,6 +256,18 @@ async fn intervals() {
         .await
         .unwrap();
     assert!(task_add(&actors.handles, 1).await.unwrap() >= 2);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = tick.notified() => break,
+                result = task_add(&actors.handles, 1) => { result.unwrap(); },
+            }
+        }
+    })
+    .await
+    .unwrap();
 
     let report = actors.shutdown().await;
 
@@ -290,14 +299,11 @@ async fn cleanup() {
                 role: AktorNoRole,
                 kind: AktorKind::TokioTask,
                 closures: AktorClosures {
-                    start: async || Ok(Counter(std::cell::RefCell::new(0))),
-                    end: Some(
-                        (async move |mut counter: Counter| {
-                            *saved.lock().unwrap() = Some(*counter.0.get_mut());
-                            Ok(())
-                        })
-                        .into(),
-                    ),
+                    start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
+                    end: async move |mut counter: Counter| {
+                        *saved.lock().unwrap() = Some(*counter.0.get_mut());
+                        Ok::<_, AktorCleanupError>(())
+                    },
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -309,8 +315,8 @@ async fn cleanup() {
                 role: AktorNoRole,
                 kind: AktorKind::TokioTask,
                 closures: AktorClosures {
-                    start: async || Ok(Counter(std::cell::RefCell::new(0))),
-                    end: None,
+                    start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
+                    end: (),
                     intervals: vec![],
                     before_each: Some(
                         (move |_: &mut Counter, _: operation::Operation| {
@@ -354,9 +360,60 @@ async fn cleanup() {
     assert!(
         hook.diagnostics
             .iter()
-            .any(|error| error.to_string().contains("task hook drop"))
+            .any(|error| error.diagnostics.contains("task hook drop"))
     );
     assert!(reply.now_or_never().is_none());
+
+    for mode in 0..3 {
+        let held = (mode == 2).then(|| PanicPayload);
+        let actors = aktor_start(AktorSetup {
+            actors: AktorNew {
+                name: AktorName::new("cleanup reporting task"),
+                role: AktorNoRole,
+                kind: AktorKind::TokioTask,
+                closures: AktorClosures {
+                    start: async || Ok(0_u32),
+                    end: async move |_: u32| {
+                        if mode == 1 {
+                            panic!("cleanup sentinel");
+                        }
+
+                        if mode == 0 {
+                            Err(AktorCleanupError::new("cleanup sentinel"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    intervals: vec![],
+                    before_each: Some(
+                        (move |_: &mut u32, _| {
+                            std::hint::black_box(&held);
+                        })
+                        .into(),
+                    ),
+                    after_each: None,
+                },
+                options: Default::default(),
+            },
+            shutdown: |_| {},
+            options: Default::default(),
+        })
+        .await
+        .unwrap();
+
+        let report = actors.shutdown().await;
+        let message = if mode == 2 {
+            "panic payload drop failed"
+        } else {
+            "cleanup sentinel"
+        };
+        let failure = report.failure.as_ref().unwrap();
+
+        assert_eq!(failure.actor, "cleanup reporting task");
+        assert!(failure.message.contains(message), "{report}");
+        assert_eq!(report.to_string().matches(message).count(), 1, "{report}");
+        assert!(!report.timed_out);
+    }
 }
 
 #[cfg(feature = "bevy")]
@@ -372,8 +429,8 @@ async fn mixed_cleanup() {
             role: AktorNoRole,
             kind: AktorKind::TokioTask,
             closures: AktorClosures {
-                start: async || Ok(0_u32),
-                end: None,
+                start: async || Ok::<_, AktorSetupError>(0_u32),
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -386,26 +443,23 @@ async fn mixed_cleanup() {
             role: AktorNoRole,
             kind: AktorKind::BevyTask(&pool),
             closures: AktorClosures {
-                start: async || Ok(0_u32),
-                end: Some(
-                    (async move |_: u32| {
-                        let mut yielded = false;
+                start: async || Ok::<_, AktorSetupError>(0_u32),
+                end: async move |_: u32| {
+                    let mut yielded = false;
 
-                        core::future::poll_fn(|cx| {
-                            if yielded {
-                                std::task::Poll::Ready(())
-                            } else {
-                                yielded = true;
-                                cx.waker().wake_by_ref();
-                                std::task::Poll::Pending
-                            }
-                        })
-                        .await;
-                        *end.lock().unwrap() = true;
-                        Ok(())
+                    core::future::poll_fn(|cx| {
+                        if yielded {
+                            std::task::Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
                     })
-                    .into(),
-                ),
+                    .await;
+                    *end.lock().unwrap() = true;
+                    Ok::<_, AktorCleanupError>(())
+                },
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -457,8 +511,8 @@ async fn admission_wait() {
                 role: AktorNoRole,
                 kind: AktorKind::TokioTask,
                 closures: AktorClosures {
-                    start: async || Ok(Counter(std::cell::RefCell::new(0))),
-                    end: None,
+                    start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -475,7 +529,7 @@ async fn admission_wait() {
                         kind: AktorKind::BevyTask(&pool),
                         closures: AktorClosures {
                             start: setup.closures.start,
-                            end: None,
+                            end: (),
                             intervals: vec![],
                             before_each: None,
                             after_each: None,
@@ -610,8 +664,10 @@ async fn parked_admission() {
                     role: AktorNoRole,
                     kind: AktorKind::TokioTask,
                     closures: AktorClosures {
-                        start: async || Ok(Counter(std::cell::RefCell::new(0))),
-                        end: None,
+                        start: async || {
+                            Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0)))
+                        },
+                        end: (),
                         intervals: vec![],
                         before_each: None,
                         after_each: None,
@@ -690,8 +746,8 @@ async fn consumed() {
             role: AktorNoRole,
             kind: AktorKind::TokioTask,
             closures: AktorClosures {
-                start: async || Ok(Counter(std::cell::RefCell::new(0))),
-                end: None,
+                start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,

@@ -26,7 +26,7 @@ impl<C: fmt::Display> fmt::Display for CleanupErrors<C> {
         }
 
         for diagnostic in &self.diagnostics {
-            write!(f, ": {diagnostic}")?;
+            write!(f, ": {}", diagnostic.diagnostics)?;
         }
 
         Ok(())

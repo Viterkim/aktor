@@ -1,6 +1,7 @@
 import init, {
     start_group_worker,
     start_role_worker,
+    start_group_setup_worker,
     typed_setup_failed
 } from './pkg/aktor_worker_proof.js';
 
@@ -8,7 +9,9 @@ await init();
 
 const parameters = new URL(location.href).searchParams;
 
-if (parameters.has('fail_setup')) {
+if (parameters.has('configured')) {
+    await start_group_setup_worker();
+} else if (parameters.has('fail_setup')) {
     typed_setup_failed();
 } else if (parameters.has('other')) {
     start_role_worker();

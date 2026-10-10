@@ -4,7 +4,7 @@ mod ownership;
 mod startup;
 mod watchdog;
 use aktor::{
-    ActorArgs, AktorCleanupError, AktorError, AktorGroup,
+    ActorArgs, AktorCleanupError, AktorError, AktorFailure, AktorGroup,
     message::{call, call_async},
 };
 use er::*;
@@ -26,8 +26,6 @@ pub mod support;
 #[er(format = "Flush the settings")]
 struct FlushErr;
 
-struct CleanupData(u32);
-
 #[tokio::test]
 async fn cleanup_timeout() {
     let result = AktorGroup::new()
@@ -41,7 +39,7 @@ async fn cleanup_timeout() {
                         cleanup: |_| {
                             Err(AktorError {
                                 diagnostics: "could not flush".into(),
-                                data: CleanupData(17),
+                                data: (),
                             })
                         },
                     })
@@ -92,7 +90,7 @@ async fn cleanup_timeout() {
                     panic!("cleanup error was lost");
                 };
 
-                assert_eq!(errors.errors[0].data.0, 17);
+                assert_eq!(errors.errors[0].diagnostics, "could not flush");
                 assert_eq!(completion.await.unwrap_err().to_string(), error.to_string());
                 Ok::<_, AktorError>(())
             },
@@ -129,11 +127,7 @@ async fn failure_report() {
                                 "backup folder is read only",
                             ))
                             .er::<FlushErr>(())
-                            .er_report_string()
-                            .map_err(|diagnostics| AktorError {
-                                diagnostics,
-                                data: (),
-                            })
+                            .er_into::<AktorCleanupError>(|_| ())
                         },
                     })
                     .await
@@ -377,7 +371,11 @@ async fn pause() {
                         .await
                         .is_err()
                 );
-                database.actor.resume(|| Ok(19usize)).await.unwrap();
+                database
+                    .actor
+                    .resume(|| Ok::<_, AktorError>(19usize))
+                    .await
+                    .unwrap();
                 assert_eq!(
                     tokio::time::timeout(Duration::from_secs(1), &mut request)
                         .await
@@ -552,7 +550,7 @@ async fn cleanup_failure() {
             |_| {
                 Err::<(), _>(AktorCleanupError {
                     diagnostics: "could not flush".into(),
-                    data: CleanupData(31),
+                    data: (),
                 })
             },
         ))
@@ -569,6 +567,7 @@ async fn cleanup_failure() {
     let report = closing.wait().await;
 
     assert!(hook.load(Ordering::SeqCst));
+    assert_eq!(report.to_string().matches("could not flush").count(), 1);
     assert_eq!(report.failure.unwrap().actor, "storage");
     assert!(
         report.actors.iter().any(|actor| actor.actor == "storage"
@@ -581,5 +580,5 @@ async fn cleanup_failure() {
         panic!("typed cleanup error was lost");
     };
 
-    assert_eq!(errors.errors[0].data.0, 31);
+    assert_eq!(errors.errors[0].diagnostics, "could not flush");
 }

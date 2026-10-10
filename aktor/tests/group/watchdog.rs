@@ -49,6 +49,118 @@ fn shutdown() {
             .build()
             .unwrap();
 
+        if mode == "runtime exit run" {
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let cleanup = cleaned.clone();
+            let completed = runtime.block_on(async {
+                let group = AktorGroup::with_grace(Duration::from_millis(200));
+                let completed = group.completion();
+                let (entered, ready) = tokio::sync::oneshot::channel();
+
+                tokio::spawn(group.run(
+                    async move |app| {
+                        let _actor = app
+                            .spawn(ActorArgs::new(
+                                "abandoned run",
+                                || Ok::<_, AktorError>(()),
+                                move |_| {
+                                    cleanup.store(true, Ordering::SeqCst);
+                                    Ok::<_, AktorError>(())
+                                },
+                            ))
+                            .await
+                            .unwrap();
+
+                        entered.send(()).unwrap();
+                        core::future::pending::<Result<(), AktorError>>().await
+                    },
+                    |_| {},
+                ));
+
+                ready.await.unwrap();
+                completed
+            });
+
+            drop(runtime);
+            std::thread::sleep(Duration::from_millis(300));
+
+            let report = completed.try_report().expect("run lost shutdown progress");
+
+            assert!(cleaned.load(Ordering::SeqCst));
+            assert!(!report.timed_out);
+            return;
+        }
+
+        if mode == "formatter panic" {
+            struct Broken;
+            impl std::fmt::Display for Broken {
+                fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    panic!("error display broke");
+                }
+            }
+            impl std::fmt::Debug for Broken {
+                fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    panic!("error debug broke");
+                }
+            }
+            impl std::error::Error for Broken {}
+
+            runtime.block_on(async {
+                let mut group = AktorGroup::with_grace(Duration::from_millis(200));
+
+                group.start().unwrap();
+                let actor = group
+                    .spawn(ActorArgs::new(
+                        "broken formatter",
+                        || Ok::<_, AktorError>(()),
+                        |_| Err::<(), _>(AktorError::new(format!("{broken}", broken = Broken))),
+                    ))
+                    .await
+                    .unwrap();
+                let _error = actor.shutdown().await.unwrap_err();
+                let report = group.shutdown().await;
+
+                assert!(report.to_string().contains("error display broke"));
+                assert!(!report.timed_out);
+            });
+
+            return;
+        }
+
+        if mode == "runtime exit" || mode == "runtime exit actor" {
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let cleanup = cleaned.clone();
+            let completed = runtime.block_on(async {
+                let mut group = AktorGroup::with_grace(Duration::from_millis(200));
+                let completed = group
+                    .start_with(async move |_| {
+                        cleanup.store(true, Ordering::SeqCst);
+                        Ok::<_, AktorError>(())
+                    })
+                    .unwrap();
+
+                if mode == "runtime exit actor" {
+                    group.spawn_value("abandoned", 7_u32).await.unwrap();
+                }
+
+                completed
+            });
+
+            drop(runtime);
+            std::thread::sleep(Duration::from_millis(300));
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let report = runtime.block_on(completed.wait());
+
+            assert!(cleaned.load(Ordering::SeqCst));
+            assert!(!report.failed());
+            assert!(!report.timed_out);
+            return;
+        }
+
         if mode == "stderr failure" {
             std::panic::set_hook(Box::new(|_| {}));
             runtime.block_on(async {
@@ -286,6 +398,10 @@ fn shutdown() {
     }
 
     for mode in [
+        "runtime exit",
+        "runtime exit actor",
+        "runtime exit run",
+        "formatter panic",
         "actor",
         "application",
         "setup",
@@ -324,7 +440,16 @@ fn shutdown() {
         }
 
         let output = child.wait_with_output().unwrap();
-        let forced_exit = !matches!(mode, "pending setup" | "settling thread" | "stderr failure");
+        let forced_exit = !matches!(
+            mode,
+            "runtime exit"
+                | "runtime exit actor"
+                | "runtime exit run"
+                | "formatter panic"
+                | "pending setup"
+                | "settling thread"
+                | "stderr failure"
+        );
 
         assert!(
             String::from_utf8_lossy(&output.stderr)
@@ -338,7 +463,12 @@ fn shutdown() {
             #[cfg(unix)]
             {
                 use std::os::unix::process::ExitStatusExt;
-                assert_eq!(output.status.signal(), Some(9));
+                assert_eq!(
+                    output.status.signal(),
+                    Some(9),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
         } else {
             assert!(

@@ -55,6 +55,18 @@ impl Encoder {
         self.string(v);
     }
 }
+
+macro_rules! numbers {
+    ($($method:ident($ty:ty) => $tag:ident),* $(,)?) => { $(
+        fn $method(self, value: $ty) -> Result<(), Error> {
+            self.check()?;
+            self.bytes.push($tag);
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
+    )* };
+}
+
 impl<'a> ser::Serializer for &'a mut Encoder {
     type Ok = ();
     type Error = Error;
@@ -70,89 +82,20 @@ impl<'a> ser::Serializer for &'a mut Encoder {
         false
     }
 
-    fn serialize_i8(self, v: i8) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(I8);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_u8(self, v: u8) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(U8);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_i16(self, v: i16) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(I16);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_u16(self, v: u16) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(U16);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_i32(self, v: i32) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(I32);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_u32(self, v: u32) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(U32);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_i64(self, v: i64) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(I64);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_u64(self, v: u64) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(U64);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_i128(self, v: i128) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(I128);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_u128(self, v: u128) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(U128);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_f32(self, v: f32) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(F32);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
-
-    fn serialize_f64(self, v: f64) -> Result<(), Error> {
-        self.check()?;
-        self.bytes.push(F64);
-        self.bytes.extend_from_slice(&v.to_le_bytes());
-        Ok(())
-    }
+    numbers!(
+        serialize_i8(i8) => I8,
+        serialize_u8(u8) => U8,
+        serialize_i16(i16) => I16,
+        serialize_u16(u16) => U16,
+        serialize_i32(i32) => I32,
+        serialize_u32(u32) => U32,
+        serialize_i64(i64) => I64,
+        serialize_u64(u64) => U64,
+        serialize_i128(i128) => I128,
+        serialize_u128(u128) => U128,
+        serialize_f32(f32) => F32,
+        serialize_f64(f64) => F64,
+    );
 
     fn serialize_bool(self, v: bool) -> Result<(), Error> {
         self.check()?;
@@ -304,54 +247,30 @@ impl Drop for Compound<'_> {
         self.encoder.depth = self.parent;
     }
 }
-impl SerializeSeq for Compound<'_> {
-    type Ok = ();
-    type Error = Error;
 
-    fn serialize_element<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), Error> {
-        v.serialize(&mut *self.encoder)
-    }
+macro_rules! elements {
+    ($($trait:ident: $method:ident),* $(,)?) => { $(
+        impl $trait for Compound<'_> {
+            type Ok = ();
+            type Error = Error;
 
-    fn end(self) -> Result<(), Error> {
-        self.finish()
-    }
+            fn $method<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Error> {
+                value.serialize(&mut *self.encoder)
+            }
+
+            fn end(self) -> Result<(), Error> {
+                self.finish()
+            }
+        }
+    )* };
 }
-impl SerializeTuple for Compound<'_> {
-    type Ok = ();
-    type Error = Error;
+elements!(
+    SerializeSeq: serialize_element,
+    SerializeTuple: serialize_element,
+    SerializeTupleStruct: serialize_field,
+    SerializeTupleVariant: serialize_field,
+);
 
-    fn serialize_element<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), Error> {
-        v.serialize(&mut *self.encoder)
-    }
-
-    fn end(self) -> Result<(), Error> {
-        self.finish()
-    }
-}
-impl SerializeTupleStruct for Compound<'_> {
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), Error> {
-        v.serialize(&mut *self.encoder)
-    }
-
-    fn end(self) -> Result<(), Error> {
-        self.finish()
-    }
-}
-impl SerializeTupleVariant for Compound<'_> {
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), Error> {
-        v.serialize(&mut *self.encoder)
-    }
-
-    fn end(self) -> Result<(), Error> {
-        self.finish()
-    }
-}
 impl SerializeMap for Compound<'_> {
     type Ok = ();
     type Error = Error;

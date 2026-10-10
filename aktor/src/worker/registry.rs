@@ -19,6 +19,20 @@ pub struct Registered {
     codec: &'static str,
     run: Run,
 }
+impl Registered {
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub(super) fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub(super) fn execute<'a>(
+        &self,
+        state: &'a mut dyn Any,
+        input: &'a [u8],
+    ) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>> {
+        (self.run)(state, input)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Operations(pub Vec<String>);
@@ -40,6 +54,23 @@ impl Operations {
 
 pub struct Registry(Vec<Registered>);
 impl Registry {
+    pub(super) fn resolve(&self, name: &str) -> Option<&Registered> {
+        if self.0.len() <= 16 {
+            return self.0.iter().find(|operation| operation.name == name);
+        }
+
+        if let Some(first) = self.0.first()
+            && first.name == name
+        {
+            return Some(first);
+        }
+
+        self.0
+            .binary_search_by_key(&name, |operation| operation.name)
+            .ok()
+            .map(|index| &self.0[index])
+    }
+
     pub fn for_actor<S: 'static, Role: 'static>() -> Result<Self, WorkerError> {
         let mut operations: Vec<_> = registered::<S, Role>().collect();
 
@@ -74,29 +105,17 @@ impl Registry {
         Operations(operations)
     }
 
-    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-    pub fn operation_name(&self, name: &str) -> Option<&'static str> {
-        self.0
-            .iter()
-            .find(|operation| operation.name == name)
-            .map(|operation| operation.name)
-    }
-
     pub async fn dispatch<S: 'static>(
         &self,
         state: &mut S,
         name: String,
         input: Vec<u8>,
     ) -> Result<Vec<u8>, WorkerError> {
-        let operation = self
-            .0
-            .iter()
-            .find(|operation| operation.name == name)
-            .ok_or_else(|| {
-                WorkerError::new(CallError::Discarded, WorkerCause::UnknownOperation(name))
-            })?;
+        let operation = self.resolve(&name).ok_or_else(|| {
+            WorkerError::new(CallError::Discarded, WorkerCause::UnknownOperation(name))
+        })?;
 
-        (operation.run)(state, &input).await
+        operation.execute(state, &input).await
     }
 }
 
@@ -252,5 +271,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.0, 18);
+
+        let unknown = dispatch::<State, First>(&mut state, "unknown".into(), Vec::new())
+            .await
+            .unwrap_err();
+
+        assert!(format!("{unknown}").contains("unknown"));
+        assert_eq!(state.0, 18);
+    }
+
+    #[test]
+    fn lookup() {
+        for count in [0, 1, 16, 17, 85, 256] {
+            let registry = Registry(
+                (0..count)
+                    .map(|index| {
+                        let mut operation = operation::<First>(first).unwrap();
+
+                        operation.name =
+                            Box::leak(format!("catalogue::operation_{index:03}").into_boxed_str());
+                        operation
+                    })
+                    .collect(),
+            );
+
+            for operation in &registry.0 {
+                assert!(core::ptr::eq(
+                    registry.resolve(operation.name).unwrap(),
+                    operation
+                ));
+            }
+
+            for unknown in [
+                "",
+                "catalogue::operation_000_extra",
+                "catalogue::operation_missing",
+            ] {
+                assert!(registry.resolve(unknown).is_none());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run in release mode for catalogue lookup measurements"]
+    fn lookup_cost() {
+        use std::{hint::black_box, time::Instant};
+
+        println!("catalogue,position,lookups,ns_per_lookup");
+
+        for count in [1, 16, 85, 256] {
+            let registry = Registry(
+                (0..count)
+                    .map(|index| {
+                        let mut operation = operation::<First>(first).unwrap();
+
+                        operation.name =
+                            Box::leak(format!("catalogue::operation_{index:03}").into_boxed_str());
+                        operation
+                    })
+                    .collect(),
+            );
+
+            for (position, name) in [
+                ("first", registry.0[0].name),
+                ("last", registry.0[count - 1].name),
+                ("unknown", "catalogue::operation_missing"),
+            ] {
+                let calls = 1_000_000;
+                let start = Instant::now();
+
+                for _ in 0..calls {
+                    black_box(registry.resolve(black_box(name)));
+                }
+
+                println!(
+                    "{count},{position},{calls},{:.2}",
+                    start.elapsed().as_nanos() as f64 / calls as f64
+                );
+            }
+        }
     }
 }

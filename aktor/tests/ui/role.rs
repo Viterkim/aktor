@@ -17,9 +17,9 @@ async fn queued() {
             role: Audio,
             kind: AktorKind::TokioThread,
             closures: AktorClosures {
-start: async || Ok(0_usize),
+start: async || Ok::<_, AktorSetupError>(0_usize),
 
-                end: None,
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,

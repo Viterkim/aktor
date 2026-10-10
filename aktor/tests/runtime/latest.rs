@@ -1,4 +1,5 @@
 use super::*;
+use std::convert::Infallible;
 
 #[tokio::test]
 async fn registrations() {
@@ -216,7 +217,7 @@ async fn pause_and_shutdown() {
         capacity: 1,
         failure: FailurePolicy::Unwind,
         setup: move || {
-            Ok::<_, ()>(Database {
+            Ok::<_, Infallible>(Database {
                 started: entered,
                 release: finish,
                 calls: observed,

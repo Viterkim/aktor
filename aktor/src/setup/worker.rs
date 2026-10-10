@@ -23,14 +23,9 @@ pub struct AktorWorkerOptions {
 impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
     for AktorWorkerNew<S, Config, Role>
 {
-    type Error = AktorStartError;
     type Group = AktorGroup;
     type Handles = Worker<S, Role>;
     type Startup = crate::message::LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
-
-    fn source_is_setup(error: &Self::Error) -> bool {
-        error.source_is_setup()
-    }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         group.start().map(|_| ())
@@ -43,7 +38,14 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
                 self.options.transport,
                 &self.config,
             )
-            .map_err(|error| AktorStartError::Setup(AktorSetupError::new(error.to_string())))?;
+            .map_err(|error| {
+                validation_error(
+                    &context.group,
+                    &self.name.name,
+                    AktorExecution::BrowserWebWorker,
+                    AktorStartError::Setup(AktorSetupError::new(error.to_string())),
+                )
+            })?;
 
             let kill = context.group.killswitch();
 
@@ -74,12 +76,8 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
                         timed_out: false,
                     };
 
-                    if let Err(error) = completion.wait_report().await {
-                        report.timed_out = timed_out.get();
-                        report
-                            .diagnostics
-                            .push(AktorSetupError::new(error.to_string()));
-                    }
+                    report.diagnostics = completion.wait_diagnostics().await;
+                    report.timed_out = timed_out.get();
 
                     report
                 }),
@@ -88,10 +86,11 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
                 return Err(AktorStartError::Setup(error));
             }
 
-            worker
-                .ready()
-                .await
-                .map_err(|error| AktorStartError::Init(AktorSetupError::new(error.to_string())))?;
+            worker.ready().await.map_err(|error| {
+                AktorStartError::Init(crate::AktorFailure::from(AktorSetupError::new(
+                    error.to_string(),
+                )))
+            })?;
             Ok(worker)
         })
     }

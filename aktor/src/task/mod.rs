@@ -41,6 +41,7 @@ pub enum AktorTaskStatus {
 }
 
 pub struct AktorTask<S, Role = crate::AktorNoRole> {
+    pub cleanup: Arc<parking_lot::Mutex<Vec<Arc<crate::AktorFailure>>>>,
     pub name: Arc<String>,
     sender: mpsc::Sender<Message<S>>,
     services: Arc<service::Services<S>>,

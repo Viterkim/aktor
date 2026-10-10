@@ -34,6 +34,12 @@ impl<'de> Decoder<'de> {
         Ok(self.take(1)?[0])
     }
 
+    fn number<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| error("invalid number"))
+    }
+
     fn length(&mut self) -> Result<usize, Error> {
         usize::try_from(u64::from_le_bytes(
             self.take(8)?
@@ -63,78 +69,18 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
                 1 => visitor.visit_bool(true),
                 _ => Err(error("invalid boolean")),
             },
-            I8 => visitor.visit_i8(i8::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<i8>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            U8 => visitor.visit_u8(u8::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<u8>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            I16 => visitor.visit_i16(i16::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<i16>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            U16 => visitor.visit_u16(u16::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<u16>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            I32 => visitor.visit_i32(i32::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<i32>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            U32 => visitor.visit_u32(u32::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<u32>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            I64 => visitor.visit_i64(i64::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<i64>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            U64 => visitor.visit_u64(u64::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<u64>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            I128 => visitor.visit_i128(i128::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<i128>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            U128 => visitor.visit_u128(u128::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<u128>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            F32 => visitor.visit_f32(f32::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<f32>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
-            F64 => visitor.visit_f64(f64::from_le_bytes(
-                decoder
-                    .take(core::mem::size_of::<f64>())?
-                    .try_into()
-                    .map_err(|_| error("invalid number"))?,
-            )),
+            I8 => visitor.visit_i8(i8::from_le_bytes(decoder.number()?)),
+            U8 => visitor.visit_u8(u8::from_le_bytes(decoder.number()?)),
+            I16 => visitor.visit_i16(i16::from_le_bytes(decoder.number()?)),
+            U16 => visitor.visit_u16(u16::from_le_bytes(decoder.number()?)),
+            I32 => visitor.visit_i32(i32::from_le_bytes(decoder.number()?)),
+            U32 => visitor.visit_u32(u32::from_le_bytes(decoder.number()?)),
+            I64 => visitor.visit_i64(i64::from_le_bytes(decoder.number()?)),
+            U64 => visitor.visit_u64(u64::from_le_bytes(decoder.number()?)),
+            I128 => visitor.visit_i128(i128::from_le_bytes(decoder.number()?)),
+            U128 => visitor.visit_u128(u128::from_le_bytes(decoder.number()?)),
+            F32 => visitor.visit_f32(f32::from_le_bytes(decoder.number()?)),
+            F64 => visitor.visit_f64(f64::from_le_bytes(decoder.number()?)),
             CHAR => visitor.visit_char(
                 char::from_u32(u32::from_le_bytes(
                     decoder

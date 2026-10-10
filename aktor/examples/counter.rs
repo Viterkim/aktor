@@ -16,13 +16,9 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
 
         closures: AktorClosures {
             start: async || Ok::<_, AktorSetupError>(0_u32),
-            end: Some(
-                (async |count: u32| {
-                    println!("final count: {count}");
-                    Ok(())
-                })
-                .into(),
-            ),
+            end: async |count: u32| {
+                println!("final count: {count}");
+            },
             before_each: Some(
                 (|_: &mut u32, operation: operation::Operation| {
                     println!("starting {}", operation.name);
@@ -46,6 +42,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
             if report.failed() {
                 eprintln!("{report}");
             }
+
             println!("application cleanup finished");
         },
         options: Default::default(),
@@ -54,7 +51,9 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
 
     println!("reply: {}", add(&actors.handles, 2).await);
     println!("reply: {}", add(&actors.handles, 3).await);
+
     let report = actors.shutdown().await;
+
     if report.failed() {
         return Err(report.into());
     }

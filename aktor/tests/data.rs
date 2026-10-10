@@ -10,7 +10,7 @@ struct Row {
     bytes: Vec<u8>,
 }
 #[derive(AktorData, Debug, PartialEq)]
-struct Nested<T> {
+struct Nested<r#T> {
     rows: Vec<Result<T, Choice>>,
     pair: (u32, Option<String>),
 }
@@ -31,9 +31,9 @@ struct Array<const N: usize> {
     values: [u64; N],
 }
 #[derive(AktorData, Debug, PartialEq)]
-enum Tree<T> {
-    Leaf(T),
-    Branch(Vec<Tree<T>>),
+enum Tree<r#T> {
+    Leaf(r#T),
+    Branch(Vec<Tree<r#T>>),
 }
 #[derive(AktorData)]
 struct Node {
@@ -98,6 +98,12 @@ struct Hidden {
     #[aktor(skip)]
     #[serde(skip)]
     cache: Cache,
+}
+#[derive(AktorData, Serialize, Deserialize, Debug, PartialEq)]
+struct Receipt {
+    id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance: Option<String>,
 }
 #[derive(AktorData)]
 enum WithCache<T> {
@@ -313,6 +319,19 @@ fn independent_representation() {
         data::encode(&custom).unwrap(),
         postcard::to_allocvec(&custom).unwrap()
     );
+}
+
+#[test]
+fn optional_provenance() {
+    for provenance in [None, Some("attachment owner".into())] {
+        let receipt = Receipt { id: 7, provenance };
+
+        assert_eq!(
+            worker::decode::<Receipt>(&worker::encode(&receipt).unwrap()).unwrap(),
+            receipt
+        );
+        roundtrip(receipt);
+    }
 }
 
 #[test]

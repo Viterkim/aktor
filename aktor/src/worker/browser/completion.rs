@@ -2,6 +2,12 @@ use super::*;
 use core::future::IntoFuture;
 
 impl<E> Completion<E> {
+    #[doc(hidden)]
+    pub async fn wait_diagnostics(&self) -> Vec<crate::AktorError> {
+        let _result = observe(self.result.clone()).await;
+        self.diagnostics.borrow().clone()
+    }
+
     /// The lifecycle report, without decoding the optional application data.
     pub async fn wait_report(&self) -> Result<(), WorkerError> {
         observe(self.result.clone())
@@ -13,6 +19,7 @@ impl<E: DeserializeOwned> Completion<E> {
     pub fn new_observer(&self) -> Self {
         Self {
             result: self.result.clone(),
+            diagnostics: self.diagnostics.clone(),
             data: PhantomData,
         }
     }

@@ -119,6 +119,8 @@ impl AktorGroup {
             runtime: Mutex::new(None),
             #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
             standard: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+            intervals: Mutex::new(None),
             state: Mutex::new(State::default()),
             changed: watch::channel(None).0,
             completed: watch::channel(None).0,
@@ -146,73 +148,7 @@ impl AktorGroup {
     #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
     #[doc(hidden)]
     pub fn start_threaded(&mut self) -> Result<GroupCompletion, AktorError> {
-        tokio::runtime::Handle::try_current()
-            .map_err(|_| AktorError::new("starting an actor group needs a Tokio runtime"))?;
-
-        let completed = self.completion();
-        let closing = self.listen(async |_| Ok::<_, AktorCleanupError>(()))?;
-        let (started, ready) = std::sync::mpsc::sync_channel(1);
-
-        let launch = || {
-            #[cfg(test)]
-            if crate::executor::FAIL_SPAWN.with(|setting| setting.get()) == Some("aktor group") {
-                return Err(std::io::Error::other("injected scheduling failure"));
-            }
-
-            std::thread::Builder::new()
-                .name("aktor group".into())
-                .spawn(move || {
-                    match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(runtime) => {
-                            if started.send(Ok(runtime.handle().clone())).is_ok() {
-                                runtime.block_on(closing);
-                            }
-                        }
-                        Err(error) => {
-                            let _sent = started.send(Err(error));
-                        }
-                    }
-                })
-        };
-        let runtime = launch().and_then(|_| {
-            ready.recv().unwrap_or_else(|_| {
-                Err(std::io::Error::other(
-                    "actor group thread stopped during startup",
-                ))
-            })
-        });
-
-        match runtime {
-            Ok(runtime) => {
-                *self
-                    .control
-                    .runtime
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = Some(runtime);
-                self.stop_on_drop = true;
-                Ok(completed)
-            }
-            Err(error) => {
-                {
-                    let mut state = self.control.lock();
-                    state.listening = false;
-                    state.finished = true;
-                    state
-                        .report
-                        .application
-                        .push(AktorError::new(error.to_string()));
-                };
-
-                self.killswitch().dispose_shutdown_hook();
-                let report = self.control.lock().report.clone();
-                self.control.completed.send_replace(Some(report));
-                self.control.wake.notify_all();
-                Err(AktorError::new(error.to_string()))
-            }
-        }
+        self.start()
     }
 
     #[cfg(all(
@@ -347,43 +283,108 @@ impl AktorGroup {
         any(feature = "tokio", feature = "wasm_browser_workers"),
         not(target_family = "wasm")
     ))]
-    /// Start shutdown handling alongside your app. The completion can be awaited later.
-    pub fn start_with<Cleanup, CleanupFuture, E>(
+    /// Keep shutdown running after the calling runtime exits. Await the completion later.
+    pub fn start_with<Cleanup, Output, Mode>(
         &mut self,
         cleanup: Cleanup,
     ) -> Result<GroupCompletion, AktorError>
     where
-        Cleanup: FnOnce(ShutdownReport) -> CleanupFuture + Send + 'static,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>> + Send + 'static,
-        E: 'static,
+        Cleanup: FnOnce(ShutdownReport) -> Output + Send + 'static,
+        Output: AktorShutdownOutput<Mode>,
+        Output::Future: Send + 'static,
     {
-        let runtime = tokio::runtime::Handle::try_current()
+        tokio::runtime::Handle::try_current()
             .map_err(|_| AktorError::new("starting an actor group needs a Tokio runtime"))?;
+
         let completed = self.completion();
-        let closing = self.listen(cleanup)?;
+        let closing = self.listen(move |report| cleanup(report).into_shutdown())?;
+        let (started, ready) = std::sync::mpsc::sync_channel(1);
 
-        self.stop_on_drop = true;
+        let launch = || {
+            #[cfg(all(test, feature = "tokio"))]
+            if crate::executor::FAIL_SPAWN.with(|setting| setting.get()) == Some("aktor group") {
+                return Err(std::io::Error::other("injected scheduling failure"));
+            }
 
-        runtime.spawn(closing);
-        Ok(completed)
+            std::thread::Builder::new()
+                .name("aktor group".into())
+                .spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => {
+                            if started.send(Ok(runtime.handle().clone())).is_ok() {
+                                runtime.block_on(closing);
+                            }
+                        }
+                        Err(error) => {
+                            let _sent = started.send(Err(error));
+                        }
+                    }
+                })
+        };
+        let runtime = launch().and_then(|_| {
+            ready.recv().unwrap_or_else(|_| {
+                Err(std::io::Error::other(
+                    "actor group thread stopped during startup",
+                ))
+            })
+        });
+
+        match runtime {
+            Ok(runtime) => {
+                #[cfg(feature = "tokio")]
+                {
+                    *self
+                        .control
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(runtime);
+                }
+                #[cfg(not(feature = "tokio"))]
+                let _ = runtime;
+
+                self.stop_on_drop = true;
+                Ok(completed)
+            }
+            Err(error) => {
+                {
+                    let mut state = self.control.lock();
+                    state.listening = false;
+                    state.finished = true;
+                    state
+                        .report
+                        .application
+                        .push(AktorError::new(error.to_string()));
+                };
+
+                self.killswitch().dispose_shutdown_hook();
+                let report = self.control.lock().report.clone();
+                self.control.completed.send_replace(Some(report));
+                self.control.wake.notify_all();
+                Err(AktorError::new(error.to_string()))
+            }
+        }
     }
+
     #[cfg(all(
         any(feature = "wasm_browser_workers", feature = "browser_local"),
         target_family = "wasm",
         target_os = "unknown"
     ))]
     /// Start shutdown handling on the browser executor.
-    pub fn start_with<Cleanup, CleanupFuture, E>(
+    pub fn start_with<Cleanup, Output, Mode>(
         &mut self,
         cleanup: Cleanup,
     ) -> Result<GroupCompletion, AktorError>
     where
-        Cleanup: FnOnce(ShutdownReport) -> CleanupFuture + 'static,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>> + 'static,
-        E: 'static,
+        Cleanup: FnOnce(ShutdownReport) -> Output + 'static,
+        Output: AktorShutdownOutput<Mode>,
+        Output::Future: 'static,
     {
         let completed = self.completion();
-        let closing = self.listen(cleanup)?;
+        let closing = self.listen(move |report| cleanup(report).into_shutdown())?;
 
         self.stop_on_drop = true;
 
@@ -401,13 +402,13 @@ impl AktorGroup {
             target_os = "unknown"
         )
     ))]
-    fn listen<Cleanup, CleanupFuture, E>(
+    fn listen<Cleanup, CleanupFuture>(
         &mut self,
         cleanup: Cleanup,
-    ) -> Result<impl Future<Output = ShutdownReport> + use<Cleanup, CleanupFuture, E>, AktorError>
+    ) -> Result<impl Future<Output = ShutdownReport> + use<Cleanup, CleanupFuture>, AktorError>
     where
         Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
+        CleanupFuture: Future<Output = Result<(), AktorError>>,
     {
         self.claim_listener()?;
 
@@ -422,10 +423,14 @@ impl AktorGroup {
 
         let kill = self.killswitch();
 
-        Ok(async move {
+        let closing = async move {
             kill.wait_stopping().await;
             group.finish(cleanup).await
-        })
+        };
+        #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+        let closing = super::intervals::drive(self.control.clone(), closing);
+
+        Ok(closing)
     }
 
     pub(super) fn claim_listener(&self) -> Result<(), AktorError> {
@@ -514,6 +519,11 @@ impl KillSwitch {
     }
 
     #[doc(hidden)]
+    pub fn is_finished(&self) -> bool {
+        self.control.lock().finished
+    }
+
+    #[doc(hidden)]
     pub fn set_starting(&self, starting: bool) -> bool {
         let mut state = self.control.lock();
 
@@ -545,9 +555,33 @@ impl KillSwitch {
         self.record_failure(failure, false)
     }
 
+    #[doc(hidden)]
+    pub fn startup_error(
+        &self,
+        actor: String,
+        kind: crate::AktorExecution,
+        error: crate::AktorSetupError,
+    ) -> crate::AktorFailure {
+        let primary = self.fail_startup(ActorFailure {
+            actor,
+            kind: Some(kind),
+            phase: "setup".into(),
+            message: error.diagnostics.clone(),
+        });
+
+        crate::AktorFailure {
+            diagnostics: error.diagnostics,
+            primary,
+        }
+    }
+
     fn record_failure(&self, mut failure: ActorFailure, startup: bool) -> bool {
         let first = {
             let mut state = self.control.lock();
+
+            if state.finished {
+                return false;
+            }
 
             if failure.kind.is_none() {
                 failure.kind = state.kind(&failure.actor);
@@ -751,7 +785,7 @@ mod tests {
             let result = start(&mut group);
             crate::executor::FAIL_SPAWN.with(|setting| setting.set(None));
 
-            assert!(result.err().unwrap().to_string().contains("injected"));
+            assert!(result.err().unwrap().diagnostics.contains("injected"));
             assert!(completed.wait().await.failed());
             assert!(group.check_started().is_err());
         }

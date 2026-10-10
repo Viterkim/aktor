@@ -206,33 +206,37 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     }
 
     #[doc(hidden)]
-    pub fn spawn_with_custom<S: 'static, E: 'static, Runner>(
+    pub fn spawn_with_custom<S: 'static, E: 'static, Runner, SetupOutput, CleanupOutput>(
         &mut self,
         args: ActorArgs<
-            impl AsyncFnOnce() -> Result<S, AktorSetupError<E>> + 'static,
-            impl AsyncFnOnce(S) -> Result<(), AktorCleanupError<E>> + 'static,
+            impl AsyncFnOnce() -> SetupOutput + 'static,
+            impl AsyncFnOnce(S) -> CleanupOutput + 'static,
         >,
         hooks: hooks::AktorHooks<S>,
         kind: crate::AktorExecution,
         runner: Runner,
     ) -> Result<Handle<S, 0, E, (), Clock>, ActorError>
     where
+        SetupOutput: crate::local::impls::runner::LocalSetupOutput<S, E>,
+        CleanupOutput: crate::local::impls::runner::LocalCleanupOutput<E>,
         Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S, 0, E>) -> Result<(), AktorError> + 'static,
     {
         self.spawn_in(args, hooks, kind, runner)
     }
 
-    fn spawn_in<S: 'static, const N: usize, E: 'static, Runner>(
+    fn spawn_in<S: 'static, const N: usize, E: 'static, Runner, SetupOutput, CleanupOutput>(
         &mut self,
         args: ActorArgs<
-            impl AsyncFnOnce() -> Result<S, AktorSetupError<E>> + 'static,
-            impl AsyncFnOnce(S) -> Result<(), AktorCleanupError<E>> + 'static,
+            impl AsyncFnOnce() -> SetupOutput + 'static,
+            impl AsyncFnOnce(S) -> CleanupOutput + 'static,
         >,
         hooks: hooks::AktorHooks<S>,
         kind: crate::AktorExecution,
         runner: Runner,
     ) -> Result<Handle<S, N, E, (), Clock>, ActorError>
     where
+        SetupOutput: crate::local::impls::runner::LocalSetupOutput<S, E>,
+        CleanupOutput: crate::local::impls::runner::LocalCleanupOutput<E>,
         Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S, N, E>) -> Result<(), AktorError> + 'static,
     {
         if self.killswitch().is_stopping() {
@@ -263,7 +267,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
             }),
             owner: Box::pin(async move {
                 match owner
-                    .run_with_custom(
+                    .run_prepared(
                         async move || (args.setup)().await,
                         async move |state| (args.cleanup)(state).await,
                         runner,
@@ -273,8 +277,22 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
                     Ok(()) => None,
                     Err(error) => match &error {
                         OwnerError::Setup(_) | OwnerError::SetupPanic(_) => None,
+                        OwnerError::SetupDiagnostic(error, primary) => {
+                            if *primary {
+                                None
+                            } else {
+                                Some(error.clone())
+                            }
+                        }
                         OwnerError::Cleanup(error) => Some(error.report()),
                         OwnerError::Runner(error) => Some(error.clone()),
+                        OwnerError::CleanupFailure(error) => {
+                            if error.primary {
+                                None
+                            } else {
+                                Some(error.report())
+                            }
+                        }
                         OwnerError::Cancelled => Some(AktorError::new("actor owner cancelled")),
                     },
                 }
@@ -288,14 +306,14 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
 
     /// Move this future onto your local executor to drive the actors.
     /// Dropping it cancels the actors and publishes a failed report.
-    pub fn listen_with<'a, Cleanup, CleanupFuture, E>(
+    pub fn listen_with<'a, Cleanup, Output, Mode>(
         &mut self,
         cleanup: Cleanup,
     ) -> Result<LocalFuture<'a, ShutdownReport>, AktorError>
     where
-        Cleanup: FnOnce(ShutdownReport) -> CleanupFuture + 'a,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>> + 'a,
-        E: 'a,
+        Cleanup: FnOnce(ShutdownReport) -> Output + 'a,
+        Output: AktorShutdownOutput<Mode>,
+        Output::Future: 'a,
     {
         self.claim_listener()?;
         self.stop_on_drop = true;
@@ -328,7 +346,9 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
 
             drop(changed);
 
-            let report = group.finish(cleanup).await;
+            let report = group
+                .finish(move |report| cleanup(report).into_shutdown())
+                .await;
 
             drop(driver);
             report
@@ -442,6 +462,26 @@ impl<Clock: AktorGroupClock> KillSwitch<Clock> {
 
     pub fn fail(&self, reason: ActorFailure) -> bool {
         self.record_failure(reason, false)
+    }
+
+    #[doc(hidden)]
+    pub fn startup_error(
+        &self,
+        actor: String,
+        kind: crate::AktorExecution,
+        error: crate::AktorSetupError,
+    ) -> crate::AktorFailure {
+        let primary = self.fail_startup(ActorFailure {
+            actor,
+            kind: Some(kind),
+            phase: "setup".into(),
+            message: error.diagnostics.clone(),
+        });
+
+        crate::AktorFailure {
+            diagnostics: error.diagnostics,
+            primary,
+        }
     }
 
     fn record_failure(&self, mut reason: ActorFailure, startup: bool) -> bool {

@@ -15,7 +15,7 @@ for package in aktor aktor-macros; do
 done
 test -f "$package_dir/aktor/src/dispatch/call.rs"
 test -f "$package_dir/aktor/src/data/decode.rs"
-test -f "$package_dir/aktor-macros/src/data.rs"
+test -f "$package_dir/aktor-macros/src/data/generate.rs"
 tar --exclude=target --exclude=pkg -cf - integrations \
     | tar -xf - -C "$package_dir"
 cp rust-toolchain.toml "$package_dir/"

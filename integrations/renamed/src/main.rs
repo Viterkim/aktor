@@ -84,9 +84,9 @@ async fn main() -> Result<(), ErReport<MainError>> {
                                     role: AktorNoRole,
                                     kind: AktorKind::TokioTask,
                                     closures: AktorClosures {
-                start: async || Ok(State::default()),
+                start: async || Ok::<_, AktorSetupError>(State::default()),
 
-                                        end: None,
+                                        end: (),
                                         intervals: vec![],
                                         before_each: None,
                                         after_each: None,

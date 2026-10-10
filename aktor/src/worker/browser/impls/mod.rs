@@ -1,36 +1,9 @@
 use super::*;
 use crate::dispatch::{OwnedState, ReadState, Transport, WriteState};
-use core::{
-    pin::Pin,
-    task::{Context, Poll},
-};
 
 pub mod inner;
 mod reply;
 mod request;
-
-impl<O> WorkerReply<O> {
-    fn poll_result(&mut self, context: &mut Context<'_>) -> Poll<Result<O, WireError>> {
-        if self.taken {
-            crate::message::consumed();
-        }
-
-        let result = match Pin::new(&mut self.response).poll(context) {
-            Poll::Ready(Ok(Ok(output))) => {
-                (self.decoder)(&output).map_err(|error| error.without_data())
-            }
-            Poll::Ready(Ok(Err(error))) => Err(error),
-            Poll::Ready(Err(_)) => Err(WireError::new(
-                CallError::OutcomeUnknown,
-                WorkerCause::Closed,
-            )),
-            Poll::Pending => return Poll::Pending,
-        };
-
-        self.taken = true;
-        Poll::Ready(result)
-    }
-}
 
 impl<S, Role, E> Worker<S, Role, E> {
     #[doc(hidden)]
@@ -77,6 +50,7 @@ impl<S, Role, E> Worker<S, Role, E> {
     pub fn completion(&self) -> Completion<E> {
         Completion {
             result: self.inner.finished.subscribe(),
+            diagnostics: self.inner.diagnostics.clone(),
             data: PhantomData,
         }
     }
@@ -96,7 +70,7 @@ impl<S, Role, E> Worker<S, Role, E> {
         )
     }
 
-    pub fn request<O: DeserializeOwned>(
+    pub fn request<O: DeserializeOwned + 'static>(
         &self,
         operation: &str,
         input: Result<Vec<u8>, WorkerError>,
@@ -115,7 +89,7 @@ impl<S, Role, E> Drop for Worker<S, Role, E> {
         }
     }
 }
-impl<'a, S, I: 'a, O, Role, E, C> Transport<S, I, O, Role, C> for &'a Worker<S, Role, E>
+impl<'a, S, I: 'a, O: 'static, Role, E, C> Transport<S, I, O, Role, C> for &'a Worker<S, Role, E>
 where
     C: Codec<I> + Codec<O>,
 {

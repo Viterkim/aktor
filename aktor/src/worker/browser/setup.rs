@@ -1,5 +1,8 @@
 use super::*;
-use crate::{AktorClosures, local::hooks::AktorHooks, setup::kind::BrowserWebWorker};
+use crate::{
+    AktorClosures, local::hooks::AktorHooks, setup::closures::AktorEndCall,
+    setup::kind::BrowserWebWorker,
+};
 use core::ops::AsyncFnOnce;
 use server::{WorkerInterval, respond, scope};
 use wasm_bindgen::JsCast;
@@ -74,13 +77,21 @@ async fn configuration<Config: DeserializeOwned + 'static>(
         .unwrap_or_else(|_| Err(WireError::new(CallError::NotAdmitted, WorkerCause::Closed)))
 }
 
-pub async fn serve_setup<Role: 'static, S: 'static, Config: DeserializeOwned + 'static, Start>(
+pub async fn serve_setup<
+    Role: 'static,
+    S: 'static,
+    Config: DeserializeOwned + 'static,
+    Start,
+    End,
+    CM,
+>(
     _: Role,
     options: Options,
-    logic: impl FnOnce(Config) -> AktorClosures<S, Start, BrowserWebWorker<S>>,
+    logic: impl FnOnce(Config) -> AktorClosures<S, Start, BrowserWebWorker<S>, End>,
 ) -> Result<Server, WireError>
 where
     Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError>,
+    End: AktorEndCall<S, CM> + 'static,
 {
     options.validate().map_err(WorkerError::without_data)?;
 
@@ -98,7 +109,7 @@ where
     let closures = logic(config);
     let AktorClosures {
         start,
-        end,
+        mut end,
         intervals,
         before_each,
         after_each,
@@ -127,13 +138,9 @@ where
 
     server::serve_logic::<Role, _, _, _, ()>(
         state,
-        async move |state| {
-            if let Some(mut end) = end {
-                end.0.run(state).await
-            } else {
-                drop(state);
-                Ok(())
-            }
+        async move |state| match end.run(state).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.report()),
         },
         options,
         AktorHooks {

@@ -42,16 +42,13 @@ async fn shutdown() {
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
                     start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: Some(
-                        (async move |_: u32| {
-                            while cleanup_disposed.load(Ordering::SeqCst) != 4 {
-                                tokio::task::yield_now().await;
-                            }
-                            cleanup_done.store(true, Ordering::SeqCst);
-                            Err(AktorCleanupError::new("cleanup report"))
-                        })
-                        .into(),
-                    ),
+                    end: async move |_: u32| {
+                        while cleanup_disposed.load(Ordering::SeqCst) != 4 {
+                            tokio::task::yield_now().await;
+                        }
+                        cleanup_done.store(true, Ordering::SeqCst);
+                        Err(AktorCleanupError::new("cleanup report"))
+                    },
 
                     intervals: vec![],
                     before_each: None,
@@ -144,7 +141,7 @@ async fn shutdown() {
                 .actors
                 .iter()
                 .flat_map(|actor| &actor.diagnostics)
-                .any(|error| error.to_string().contains("cleanup report"))
+                .any(|error| error.diagnostics.contains("cleanup report"))
         );
         assert_eq!(completion.wait().await.to_string(), result.to_string());
     }
@@ -194,7 +191,7 @@ async fn callers() {
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
                     start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -266,15 +263,11 @@ async fn cleanup() {
             kind: AktorKind::TokioThread,
             closures: AktorClosures {
                 start: async || Ok::<_, AktorSetupError>(0_u32),
-                end: Some(
-                    (async move |_: u32| {
-                        let (done, changed) = &*cleanup;
-                        *done.lock().unwrap() = true;
-                        changed.notify_all();
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                end: async move |_: u32| {
+                    let (done, changed) = &*cleanup;
+                    *done.lock().unwrap() = true;
+                    changed.notify_all();
+                },
 
                 intervals: vec![],
                 before_each: None,
@@ -332,7 +325,7 @@ async fn shutdown_hook_errors() {
             kind: AktorKind::TokioThread,
             closures: AktorClosures {
                 start: async || Ok::<_, AktorSetupError>(0_u32),
-                end: None,
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -364,7 +357,7 @@ async fn shutdown_hook_errors() {
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
                     start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -383,7 +376,7 @@ async fn shutdown_hook_errors() {
             },
         });
         let actors = startup.await.unwrap();
-        assert!(actors.group.on_shutdown(async |_| Ok(())).is_err());
+        assert!(actors.group.on_shutdown(async |_| {}).is_err());
         if actor_failed {
             message::call(
                 &actors.handles.handle,
@@ -418,13 +411,16 @@ async fn shutdown_hook_errors() {
             "shutdown hook failed"
         };
 
-        assert!(
-            report
-                .application
-                .iter()
-                .any(|error| error.to_string().contains(message)),
-            "{report}"
-        );
-        assert!(report.to_string().contains(message));
+        let text = report.to_string();
+        assert_eq!(text.matches(message).count(), 1, "{text}");
+        if actor_failed || !panic {
+            assert!(
+                report
+                    .application
+                    .iter()
+                    .any(|error| error.diagnostics.contains(message)),
+                "{text}"
+            );
+        }
     }
 }

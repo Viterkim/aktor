@@ -75,7 +75,7 @@ async fn value() {
         .start_with(async |_| {
             Err::<(), _>(AktorCleanupError {
                 diagnostics: "application cleanup error".into(),
-                data: std::rc::Rc::new(17u32),
+                data: (),
             })
         })
         .unwrap();
@@ -150,7 +150,7 @@ async fn drop_group() {
 
 struct StopWake {
     kill: aktor::KillSwitch,
-    actor: Option<aktor::listener::Actor<(), AktorError, AktorError>>,
+    actor: Option<aktor::owner::Lifecycle<()>>,
 }
 
 impl std::task::Wake for StopWake {
@@ -193,7 +193,7 @@ fn shutdown() {
                 let stopping = kill.clone();
 
                 let task = tokio::spawn(group.run(
-                    async move |app| -> Result<(), AktorError<BrokenDrop>> {
+                    async move |app| -> Result<(), AktorError> {
                         let _actor = app
                             .spawn_async(ActorArgs::new(
                                 "resource",
@@ -225,10 +225,8 @@ fn shutdown() {
                         }
 
                         if app_mode == "application error" {
-                            return Err(AktorError {
-                                diagnostics: "original application error".into(),
-                                data: BrokenDrop,
-                            });
+                            let _resource = BrokenDrop;
+                            return Err(AktorError::new("original application error"));
                         }
 
                         if app_mode == "driver" {
@@ -238,7 +236,7 @@ fn shutdown() {
                         stopping.stop();
                         Ok(())
                     },
-                    async move |_| -> Result<(), AktorError<BrokenDrop>> {
+                    async move |_| -> Result<(), AktorError> {
                         hook_entered.notify_one();
 
                         if hook_mode == "hook payload" {
@@ -246,10 +244,8 @@ fn shutdown() {
                         }
 
                         if hook_mode == "hook error" {
-                            return Err(AktorError {
-                                diagnostics: "original hook error".into(),
-                                data: BrokenDrop,
-                            });
+                            let _resource = BrokenDrop;
+                            return Err(AktorError::new("original hook error"));
                         }
 
                         if hook_mode == "hook driver" {
@@ -346,12 +342,7 @@ fn shutdown() {
                 }
 
                 if mode.ends_with("error") {
-                    assert!(
-                        report
-                            .application
-                            .iter()
-                            .any(|error| error.diagnostics.contains("original"))
-                    );
+                    assert!(report.to_string().contains("application destructor failed"));
                 }
             });
 

@@ -1,12 +1,11 @@
 use super::driver::{cancel_callers, capture, contain, poll_owners};
 use super::*;
-use alloc::string::ToString;
 
 impl<Clock: AktorGroupClock> AktorGroup<Clock> {
-    pub(super) async fn finish<Cleanup, CleanupFuture, E>(self, cleanup: Cleanup) -> ShutdownReport
+    pub(super) async fn finish<Cleanup, CleanupFuture>(self, cleanup: Cleanup) -> ShutdownReport
     where
         Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
+        CleanupFuture: Future<Output = Result<(), AktorError>>,
     {
         let owners = self.owners.clone();
         let kill = self.killswitch();
@@ -96,7 +95,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     }
 }
 
-async fn finish_hook<Clock, Cleanup, CleanupFuture, E>(
+async fn finish_hook<Clock, Cleanup, CleanupFuture>(
     kill: &KillSwitch<Clock>,
     cleanup: Cleanup,
     timer: &mut LocalFuture<'static, ()>,
@@ -104,7 +103,7 @@ async fn finish_hook<Clock, Cleanup, CleanupFuture, E>(
 ) where
     Clock: AktorGroupClock,
     Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
-    CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
+    CleanupFuture: Future<Output = Result<(), AktorError>>,
 {
     let mut before_hook = kill.control.report.borrow().clone();
 
@@ -115,15 +114,7 @@ async fn finish_hook<Clock, Cleanup, CleanupFuture, E>(
     poll_fn(|cx| match capture(|| hook.as_mut().poll(cx)) {
         Ok(Poll::Ready(Ok(()))) => Poll::Ready(()),
         Ok(Poll::Ready(Err(error))) => {
-            kill.control
-                .report
-                .borrow_mut()
-                .application
-                .push(error.report());
-
-            if let Some(error) = contain(|| drop(error)) {
-                record_hook(kill, "cleanup error drop", error);
-            }
+            kill.control.report.borrow_mut().application.push(error);
 
             Poll::Ready(())
         }
@@ -155,26 +146,30 @@ fn record_drop<Clock: AktorGroupClock>(
     error: Option<AktorError>,
 ) {
     if let Some(error) = error {
-        kill.fail(ActorFailure {
+        let primary = kill.fail(ActorFailure {
             actor: name.into(),
             kind: Some(kind),
             phase: "owner drop".into(),
-            message: error.to_string(),
+            message: error.diagnostics.clone(),
         });
 
-        kill.control.report.borrow_mut().application.push(error);
+        if !primary {
+            kill.control.report.borrow_mut().application.push(error);
+        }
     }
 }
 
 fn record_hook<Clock: AktorGroupClock>(kill: &KillSwitch<Clock>, phase: &str, error: AktorError) {
-    kill.fail(ActorFailure {
+    let primary = kill.fail(ActorFailure {
         kind: None,
         actor: "application".into(),
         phase: phase.into(),
-        message: error.to_string(),
+        message: error.diagnostics.clone(),
     });
 
-    kill.control.report.borrow_mut().application.push(error);
+    if !primary {
+        kill.control.report.borrow_mut().application.push(error);
+    }
 }
 
 #[cfg(all(test, feature = "std"))]

@@ -1,8 +1,9 @@
 #![cfg(all(feature = "tokio", feature = "local"))]
 
 use aktor::{
-    ActorArgs, AktorClosures, AktorError, AktorKind, AktorName, AktorNew, AktorNewOptions,
-    AktorNoRole, AktorOptions, AktorSetup, aktor_start, local, operation::Operation,
+    ActorArgs, AktorCleanupError, AktorClosures, AktorError, AktorKind, AktorName, AktorNew,
+    AktorNewOptions, AktorNoRole, AktorOptions, AktorSetup, AktorSetupError, aktor_start, local,
+    operation::Operation,
 };
 use futures_util::FutureExt;
 use std::{cell::Cell, panic::AssertUnwindSafe, rc::Rc, time::Duration};
@@ -25,7 +26,7 @@ impl Drop for DropFailure {
 async fn shutdown() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            for fault in 0..4 {
+            for fault in 0..6 {
                 let cleaned = Rc::new(Cell::new(0));
                 let clean = cleaned.clone();
                 let checked = cleaned.clone();
@@ -46,24 +47,26 @@ async fn shutdown() {
                             Ok(())
                         }),
                         closures: AktorClosures {
-                            start: async || Ok(()),
-                            end: Some(
-                                (async move |_| {
-                                    core::future::poll_fn(|cx| {
-                                        if release.get() {
-                                            core::task::Poll::Ready(())
-                                        } else {
-                                            cx.waker().wake_by_ref();
-                                            core::task::Poll::Pending
-                                        }
-                                    })
-                                    .await;
-                                    tokio::task::yield_now().await;
-                                    clean.set(clean.get() + 1);
-                                    Ok(())
+                            start: async || Ok::<_, AktorSetupError>(()),
+                            end: async move |_| {
+                                core::future::poll_fn(|cx| {
+                                    if release.get() {
+                                        core::task::Poll::Ready(())
+                                    } else {
+                                        cx.waker().wake_by_ref();
+                                        core::task::Poll::Pending
+                                    }
                                 })
-                                .into(),
-                            ),
+                                .await;
+                                tokio::task::yield_now().await;
+                                clean.set(clean.get() + 1);
+
+                                if fault >= 4 {
+                                    Err(AktorCleanupError::new("local cleanup sentinel"))
+                                } else {
+                                    Ok(())
+                                }
+                            },
 
                             intervals: vec![],
                             before_each: None,
@@ -117,7 +120,7 @@ async fn shutdown() {
                 assert_eq!(domain, Err("query refused"));
                 assert!(!actors.killswitch().is_stopping());
 
-                if fault == 1 || fault == 2 {
+                if fault == 1 || fault == 2 || fault == 5 {
                     let request = local::Request::new(
                         &actors.handles,
                         operation,
@@ -145,8 +148,29 @@ async fn shutdown() {
                 assert!(!report.timed_out, "{report}");
                 assert_eq!(report.failed(), fault != 0, "{report}");
 
-                if fault == 1 || fault == 2 {
-                    assert_eq!(report.failure.unwrap().message, "local owner failed");
+                if fault >= 4 {
+                    assert_eq!(
+                        report.to_string().matches("local cleanup sentinel").count(),
+                        1
+                    );
+                    assert_eq!(report.actors[0].diagnostics.is_empty(), fault == 4);
+                    if fault == 4 {
+                        let error = actors
+                            .handles
+                            .completion()
+                            .wait_with_data()
+                            .await
+                            .unwrap_err();
+
+                        assert!(format!("{error:#}").contains("local cleanup sentinel"));
+                    }
+                }
+
+                if fault == 1 || fault == 2 || fault == 5 {
+                    assert_eq!(
+                        report.failure.as_ref().unwrap().message,
+                        "local owner failed"
+                    );
                 } else if fault == 3 {
                     assert!(report.to_string().contains("application destructor failed"));
                 }
@@ -170,8 +194,8 @@ async fn shutdown() {
                         panic!("unpolled startup installed a driver");
                     }),
                     closures: AktorClosures {
-                        start: async || Ok(()),
-                        end: None,
+                        start: async || Ok::<_, AktorSetupError>(()),
+                        end: (),
                         intervals: vec![],
                         before_each: None,
                         after_each: None,
@@ -244,10 +268,8 @@ async fn panic_cleanup() {
                 };
 
                 if mode == 1 {
-                    return Err(AktorError {
-                        diagnostics: "application domain failure".into(),
-                        data: captured,
-                    });
+                    let _captured = captured;
+                    return Err(AktorError::new("application domain failure"));
                 }
 
                 group.killswitch().stop();
@@ -277,12 +299,15 @@ async fn panic_cleanup() {
                 report.failure.as_ref().unwrap().message,
                 "application poll failed"
             );
+            assert_eq!(
+                report
+                    .to_string()
+                    .matches("application poll failed")
+                    .count(),
+                1
+            );
         } else {
             assert!(report.to_string().contains("application destructor failed"));
-
-            if mode == 1 {
-                assert!(report.to_string().contains("application domain failure"));
-            }
         }
     }
 }

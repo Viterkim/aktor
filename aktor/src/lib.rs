@@ -1,21 +1,14 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
-#![doc = include_str!("../docs/functions.md")]
+#![doc = include_str!("../docs/examples.md")]
 
 extern crate alloc;
 extern crate self as aktor;
 
 mod impls;
-#[cfg(all(
-    feature = "std",
-    any(
-        feature = "local",
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm")),
-        feature = "wasm_browser_workers"
-    )
-))]
+#[cfg(feature = "std")]
 mod panic;
+mod report;
 pub use impls::{aktor_err_cleanup, aktor_err_setup};
 pub mod types;
 pub use types::*;
@@ -103,6 +96,11 @@ mod queue;
 pub mod setup;
 #[cfg(any(all(feature = "tokio", not(target_family = "wasm")), feature = "bevy"))]
 pub mod task;
+#[cfg(all(
+    any(feature = "tokio", feature = "std_thread"),
+    not(target_family = "wasm")
+))]
+pub use setup::AktorDefinition;
 #[cfg(any(
     feature = "local",
     all(

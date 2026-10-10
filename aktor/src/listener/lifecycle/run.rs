@@ -3,13 +3,13 @@ use crate::FailurePolicy;
 use crate::listener::{FailureKind, Failures};
 
 #[allow(clippy::too_many_arguments)]
-pub fn run<S, E, C, CleanupFuture>(
+pub fn run<S, E, Initial, C, CleanupFuture>(
     runtime: &crate::executor::Driver,
     state: S,
     mut listener: Listener<S>,
     mut commands: mpsc::Receiver<Command<S, E, C>>,
     status: watch::Sender<bool>,
-    started: oneshot::Sender<Result<(), DedicatedStartError<E>>>,
+    started: oneshot::Sender<Result<(), DedicatedStartError<Initial>>>,
     mut cleanup: impl FnMut(S) -> CleanupFuture,
     abandoned_setup: Arc<parking_lot::Mutex<Vec<AbandonedSetup<E>>>>,
     failed_cleanup: Arc<parking_lot::Mutex<FailedCleanup<C>>>,

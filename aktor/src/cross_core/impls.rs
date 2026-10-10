@@ -4,7 +4,6 @@ use crate::panic::{dispose_secondary, panic_message};
 use crate::{
     ActorFailure, AktorCleanupError, AktorExecution, AktorSetupError, message::ActorError,
 };
-use alloc::string::ToString;
 use core::{
     future::{Future, poll_fn},
     task::Poll,
@@ -473,7 +472,7 @@ impl<S> Owner<S> {
                 actor: name.clone(),
                 kind: Some(AktorExecution::EmbassyCrossCore),
                 phase: phase.into(),
-                message: error.to_string(),
+                message: error.diagnostics.clone(),
             });
         }
     }
@@ -484,7 +483,7 @@ impl<S> Owner<S> {
                 actor: name.clone(),
                 kind: Some(AktorExecution::EmbassyCrossCore),
                 phase: "setup".into(),
-                message: error.to_string(),
+                message: error.diagnostics.clone(),
             });
         }
     }
@@ -497,7 +496,10 @@ impl<S> Owner<S> {
             .lock(|state| state.borrow_mut().diagnostics.push(error.clone()));
 
         if let Some((name, kill)) = &self.supervisor {
-            kill.record_diagnostic(AktorError::new(alloc::format!("{name}: {error}")));
+            kill.record_diagnostic(AktorError::new(alloc::format!(
+                "{name}: {}",
+                error.diagnostics
+            )));
         }
     }
 

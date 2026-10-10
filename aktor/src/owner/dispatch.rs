@@ -6,8 +6,8 @@ use crate::{
 };
 use core::{future::Future, ops::AsyncFnOnce};
 
-impl<'a, S: 'static, E, C, I: Send + 'static, O: Send + 'static, Role> Read<S, I, O, Role>
-    for &'a Aktor<S, E, C, Role>
+impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Read<S, I, O, Role>
+    for &'a Aktor<S, Role>
 {
     type Request = Request<'a, S, O>;
 
@@ -18,8 +18,8 @@ impl<'a, S: 'static, E, C, I: Send + 'static, O: Send + 'static, Role> Read<S, I
         Read::dispatch(&self.handle, operation, function, input)
     }
 }
-impl<'a, S: 'static, E, C, I: Send + 'static, O: Send + 'static, Role> Write<S, I, O, Role>
-    for &'a Aktor<S, E, C, Role>
+impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Write<S, I, O, Role>
+    for &'a Aktor<S, Role>
 {
     type Request = Request<'a, S, O>;
 
@@ -31,8 +31,8 @@ impl<'a, S: 'static, E, C, I: Send + 'static, O: Send + 'static, Role> Write<S, 
     }
 }
 
-impl<S: 'static, I: Send + 'static, O: Send + 'static, E, C, Role: 'static>
-    crate::latest::Session<S, I, O, Role> for &Aktor<S, E, C, Role>
+impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static>
+    crate::latest::Session<S, I, O, Role> for &Aktor<S, Role>
 {
     type Sender = crate::message::LatestSender<I>;
     type Results = crate::message::LatestResults<O>;
@@ -45,8 +45,8 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, E, C, Role: 'static>
     }
 }
 
-impl<'a, S: 'static, E, C, I: Send + 'static, O: Send + 'static, Role> ReadCall<S, I, O, Role>
-    for &'a Aktor<S, E, C, Role>
+impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> ReadCall<S, I, O, Role>
+    for &'a Aktor<S, Role>
 {
     type Request<Fut> = Request<'a, S, O>;
 
@@ -65,8 +65,8 @@ impl<'a, S: 'static, E, C, I: Send + 'static, O: Send + 'static, Role> ReadCall<
     }
 }
 
-impl<'a, S: 'static, E, C, I: Send + 'static, O: Send + 'static, Role> WriteCall<S, I, O, Role>
-    for &'a Aktor<S, E, C, Role>
+impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> WriteCall<S, I, O, Role>
+    for &'a Aktor<S, Role>
 {
     type Request<Fut> = Request<'a, S, O>;
 
@@ -85,15 +85,15 @@ impl<'a, S: 'static, E, C, I: Send + 'static, O: Send + 'static, Role> WriteCall
     }
 }
 
-impl<S: 'static, E, C, Role> ReadState<S, Role> for &Aktor<S, E, C, Role> {
+impl<S: 'static, Role> ReadState<S, Role> for &Aktor<S, Role> {
     type Lease = OwnedState<S>;
 }
-impl<S: 'static, E, C, Role> WriteState<S, Role> for &Aktor<S, E, C, Role> {
+impl<S: 'static, Role> WriteState<S, Role> for &Aktor<S, Role> {
     type Lease = OwnedState<S>;
 }
 
-impl<S, I, O, Lease, Role, E, C, Wire> crate::latest::TypedSession<S, I, O, Lease, Role, Wire>
-    for &Aktor<S, E, C, Role>
+impl<S, I, O, Lease, Role, Wire> crate::latest::TypedSession<S, I, O, Lease, Role, Wire>
+    for &Aktor<S, Role>
 where
     Self: crate::latest::Session<S, I, O, Role>,
 {

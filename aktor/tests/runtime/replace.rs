@@ -58,10 +58,13 @@ async fn cancel() {
 
     assert_eq!(reply.await, 11);
 
-    assert!(matches!(
-        actor.replace(|| Err("setup failed")).await,
-        Err(ReplaceError::Setup("setup failed"))
-    ));
+    match actor.replace(|| Err("setup failed")).await.unwrap_err() {
+        ReplaceError::Setup(error) => assert_eq!(error, "setup failed"),
+        ReplaceError::Closed | ReplaceError::Cleanup(_) => {
+            panic!("replace lost its setup error");
+        }
+    }
+
     assert!(!actor.is_running());
     assert!(actor.take_abandoned_setup().is_empty());
     assert!(

@@ -8,19 +8,15 @@ use crate::{
 };
 use core::ops::AsyncFnOnce;
 
-impl<S, Start, Role> AktorStart for AktorNew<S, Start, BrowserLocal, Role>
+impl<S, Start, Role, End, CM> AktorStart<CM> for AktorNew<S, Start, BrowserLocal, Role, End>
 where
     S: 'static,
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
+    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
 {
-    type Error = AktorStartError;
     type Group = crate::AktorGroup;
     type Handles = Handle<S, 0, (), Role, local::clock::Browser>;
     type Startup = LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
-
-    fn source_is_setup(error: &Self::Error) -> bool {
-        error.source_is_setup()
-    }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         group.start().map(|_| ())

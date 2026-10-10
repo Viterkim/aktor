@@ -51,15 +51,12 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
             role: aktors::Counter,
             kind: AktorKind::BrowserLocal,
             closures: AktorClosures {
-                start: async move || Ok(Counter { value: count }),
+                start: async move || Ok::<_, AktorSetupError>(Counter { value: count }),
 
-                end: Some(
-                    (async move |_: Counter| {
-                        end.set(true);
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                end: async move |_: Counter| {
+                    end.set(true);
+                    Ok::<_, AktorCleanupError>(())
+                },
                 intervals: vec![AktorInterval {
                     every: Duration::from_millis(5),
                     run: (async move |_: &mut Counter| {
@@ -147,12 +144,12 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
             }),
             closures: AktorClosures {
                 start: async || {
-                    Ok(Counter {
+                    Ok::<_, AktorSetupError>(Counter {
                         value: Rc::new(Cell::new(0)),
                     })
                 },
 
-                end: None,
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -195,7 +192,7 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
                     wasm_bindgen_futures::spawn_local(future);
                     Ok(())
                 },
-                async |mut runner: AktorRunner<'_, Counter>| {
+                async |mut runner: AktorRunner<'_, Counter, 0, ()>| {
                     while let Some(call) = runner.next().await {
                         call.run().await;
                     }
@@ -205,12 +202,12 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
             ),
             closures: AktorClosures {
                 start: async || {
-                    Ok(Counter {
+                    Ok::<_, AktorSetupError>(Counter {
                         value: Rc::new(Cell::new(0)),
                     })
                 },
 
-                end: None,
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -280,9 +277,9 @@ async fn browser_budget() -> Result<(), JsValue> {
                             role: AktorNoRole,
                             kind: $kind,
                             closures: AktorClosures {
-                                start: async || Ok(Cell::new(0)),
+                                start: async || Ok::<_, AktorSetupError>(Cell::new(0)),
                                 before_each: Some(before.into()),
-                                end: Some(end.into()),
+                                end,
                                 intervals: vec![],
                                 after_each: None,
                             },
@@ -382,12 +379,12 @@ pub async fn bevy_setup_check() -> Result<bool, JsValue> {
         kind: AktorKind::BevyLocal(&pool),
         closures: AktorClosures {
             start: async || {
-                Ok(Counter {
+                Ok::<_, AktorSetupError>(Counter {
                     value: Rc::new(Cell::new(0)),
                 })
             },
 
-            end: None,
+            end: (),
             intervals: vec![],
             before_each: None,
             after_each: None,
@@ -400,18 +397,15 @@ pub async fn bevy_setup_check() -> Result<bool, JsValue> {
         role: AktorNoRole,
         kind: AktorKind::BevyTask(&pool),
         closures: AktorClosures {
-            start: async || Ok(Cell::new(0)),
+            start: async || Ok::<_, AktorSetupError>(Cell::new(0)),
 
-            end: Some(
-                (async |counter: Cell<u32>| {
-                    if counter.get() == 7 {
-                        Ok(())
-                    } else {
-                        Err(AktorError::new("Bevy task lost admitted work"))
-                    }
-                })
-                .into(),
-            ),
+            end: async |counter: Cell<u32>| {
+                if counter.get() == 7 {
+                    Ok::<_, AktorCleanupError>(())
+                } else {
+                    Err(AktorError::new("Bevy task lost admitted work"))
+                }
+            },
             intervals: vec![],
             before_each: None,
             after_each: None,

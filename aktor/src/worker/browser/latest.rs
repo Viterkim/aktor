@@ -62,7 +62,7 @@ trait Output<O> {
 pub trait Service {
     fn operation(&self) -> &str;
     fn take(&self) -> Result<Option<Vec<u8>>, WireError>;
-    fn answer(&self, output: Result<Vec<u8>, WireError>);
+    fn answer(&self, output: Result<Vec<u8>, WireError>) -> Option<WireError>;
 }
 
 struct Shared<I, O> {
@@ -169,7 +169,7 @@ impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
             .map_err(|error| error.without_data())
     }
 
-    fn answer(&self, output: Result<Vec<u8>, WireError>) {
+    fn answer(&self, output: Result<Vec<u8>, WireError>) -> Option<WireError> {
         let output =
             output.and_then(|bytes| (self.0.decoder)(&bytes).map_err(|error| error.without_data()));
         let (discarded, pending) = {
@@ -194,12 +194,9 @@ impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
 
         let failure = self.0.slot.borrow().failed.clone();
 
-        if let Some(error) = failure {
-            self.0.inner.fail(error.cause);
-        }
-
         self.0.schedule();
         self.0.wake();
+        failure
     }
 }
 
@@ -244,7 +241,7 @@ impl<I, O> Output<O> for Shared<I, O> {
 
         if let Some(error) = slot.failed.clone() {
             drop(slot);
-            return self.inner.lost(error);
+            return self.inner.park(error);
         }
 
         let terminal = self
@@ -257,7 +254,7 @@ impl<I, O> Output<O> for Shared<I, O> {
 
         if let Some(error) = terminal {
             drop(slot);
-            return self.inner.lost(error);
+            return self.inner.park(error);
         }
 
         if (slot.senders == 0 || self.inner.closed.get())

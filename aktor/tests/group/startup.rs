@@ -134,11 +134,11 @@ async fn cancelled_startup() {
 
         assert_eq!(failure.actor, "cancelled startup");
         assert_eq!(failure.phase, if setup_fails { "setup" } else { "cleanup" });
-        assert!(failure.message.contains(expected));
+        assert_eq!(result.to_string().matches(expected).count(), 1);
 
         if setup_fails {
             assert!(result.actors[0].diagnostics.is_empty());
-            assert_eq!(result.to_string().matches(expected).count(), 1);
+            assert!(failure.message.contains(expected));
         } else {
             assert!(
                 result.actors[0]
@@ -337,13 +337,13 @@ async fn startup_rollback() {
                 || {
                     Err::<(), _>(AktorError {
                         diagnostics: "could not open".into(),
-                        data: 23u32,
+                        data: (),
                     })
                 },
                 |_| Ok::<_, AktorError>(()),
             ))
             .await?;
-        Ok::<_, aktor::listener::DedicatedStartError<AktorError<u32>>>(())
+        Ok::<_, aktor::listener::DedicatedStartError<AktorFailure>>(())
     });
 
     let failed = tokio::time::timeout(Duration::from_secs(2), startup)
@@ -356,7 +356,7 @@ async fn startup_rollback() {
         panic!("typed setup error was lost");
     };
 
-    assert_eq!(error.data, 23);
+    assert_eq!(error.diagnostics, "could not open");
     assert!(cleaned.load(Ordering::SeqCst));
     assert!(hooks.load(Ordering::SeqCst));
 
@@ -424,11 +424,11 @@ async fn listener_cancel() {
 
         assert_eq!(failure.actor, "storage");
         assert_eq!(failure.phase, if setup_fails { "setup" } else { "cleanup" });
-        assert!(failure.message.contains(expected));
+        assert_eq!(report.to_string().matches(expected).count(), 1);
 
         if setup_fails {
             assert!(actor.diagnostics.is_empty());
-            assert_eq!(report.to_string().matches(expected).count(), 1);
+            assert!(failure.message.contains(expected));
         } else {
             assert!(
                 actor

@@ -290,8 +290,9 @@ where
                 fatal(error);
             }
 
-            let metadata = registry.operation_name(&operation).map(|name| Operation {
-                name,
+            let registered = registry.resolve(&operation);
+            let metadata = registered.map(|operation| Operation {
+                name: operation.name(),
                 caller: core::panic::Location::caller(),
             });
 
@@ -299,10 +300,17 @@ where
                 hooks.before(&mut state, operation);
             }
 
-            let output = registry
-                .dispatch(&mut state, operation, input)
-                .await
-                .map_err(|error| error.without_data());
+            let output = match registered {
+                Some(operation) => operation
+                    .execute(&mut state, &input)
+                    .await
+                    .map_err(|error| error.without_data()),
+                None => Err(WireError::new(
+                    CallError::Discarded,
+                    WorkerCause::UnknownOperation(operation),
+                )),
+            };
+            drop(input);
 
             if let Some(operation) = metadata {
                 hooks.after(&mut state, operation);

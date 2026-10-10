@@ -7,19 +7,15 @@ use crate::{
 };
 use core::ops::AsyncFnOnce;
 
-impl<'a, S, Start, Role> AktorStart for AktorNew<S, Start, TokioLocal<'a>, Role>
+impl<'a, S, Start, Role, End, CM> AktorStart<CM> for AktorNew<S, Start, TokioLocal<'a>, Role, End>
 where
     S: 'static,
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
+    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
 {
-    type Error = AktorStartError;
     type Group = crate::AktorGroup;
     type Handles = Handle<S, 0, (), Role, local::clock::Tokio>;
     type Startup = LocalFuture<'a, Result<Self::Handles, AktorStartError>>;
-
-    fn source_is_setup(error: &Self::Error) -> bool {
-        error.source_is_setup()
-    }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         group.start().map(|_| ())

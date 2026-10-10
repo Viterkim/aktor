@@ -35,16 +35,13 @@ pub fn check() -> Result<(), String> {
                 role: AktorNoRole,
                 kind: AktorKind::BevyLocal(&pool),
                 closures: AktorClosures {
-                    start: async || Ok(Counter(Rc::new(Cell::new(0)))),
+                    start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
 
-                    end: Some(
-                        (async move |counter: Counter| {
-                            assert_eq!(counter.0.get(), 7);
-                            end.set(true);
-                            Ok(())
-                        })
-                        .into(),
-                    ),
+                    end: async move |counter: Counter| {
+                        assert_eq!(counter.0.get(), 7);
+                        end.set(true);
+                        Ok::<_, AktorCleanupError>(())
+                    },
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -57,9 +54,9 @@ pub fn check() -> Result<(), String> {
                 role: AktorNoRole,
                 kind: AktorKind::BevyTask(&pool),
                 closures: AktorClosures {
-                    start: async || Ok(Movable(Cell::new(0))),
+                    start: async || Ok::<_, AktorSetupError>(Movable(Cell::new(0))),
 
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -112,9 +109,9 @@ pub fn check() -> Result<(), String> {
                     role: AktorNoRole,
                     kind: AktorKind::BevyLocal(&pool),
                     closures: AktorClosures {
-                        start: async || Ok(Counter(Rc::new(Cell::new(0)))),
+                        start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
 
-                        end: None,
+                        end: (),
                         intervals: vec![AktorInterval {
                             every: Duration::from_millis(1),
                             run: (async move |_: &mut Counter| {
@@ -190,7 +187,7 @@ fn cooperative() -> Result<(), String> {
                 kind: AktorKind::BevyTask(&pool),
                 closures: AktorClosures {
                     start: async move || {
-                        Ok(Busy {
+                        Ok::<_, AktorSetupError>(Busy {
                             count: counted,
                             heartbeat: Some(heartbeat),
                             done: Some(done),
@@ -211,7 +208,7 @@ fn cooperative() -> Result<(), String> {
                         .into(),
                     ),
 
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     after_each: None,
                 },
@@ -272,15 +269,12 @@ async fn task(pool: &bevy_tasks::TaskPool) -> Result<(), String> {
             role: AktorNoRole,
             kind: AktorKind::BevyTask(pool),
             closures: AktorClosures {
-                start: async || Ok(Movable(Cell::new(0))),
+                start: async || Ok::<_, AktorSetupError>(Movable(Cell::new(0))),
 
-                end: Some(
-                    (async move |counter: Movable| {
-                        *end.lock().unwrap() = Some(counter.0.get());
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                end: async move |counter: Movable| {
+                    *end.lock().unwrap() = Some(counter.0.get());
+                    Ok::<_, AktorCleanupError>(())
+                },
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -329,9 +323,9 @@ async fn task(pool: &bevy_tasks::TaskPool) -> Result<(), String> {
             role: AktorNoRole,
             kind: AktorKind::BevyTask(pool),
             closures: AktorClosures {
-                start: async || Ok(Movable(Cell::new(0))),
+                start: async || Ok::<_, AktorSetupError>(Movable(Cell::new(0))),
 
-                end: None,
+                end: (),
                 intervals: vec![AktorInterval {
                     every: Duration::from_millis(1),
                     run: (move |_counter: AktorTaskState<Movable>| {

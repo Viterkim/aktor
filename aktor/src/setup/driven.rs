@@ -12,18 +12,15 @@ use core::{future::poll_fn, ops::AsyncFnOnce, task::Poll};
 use kind::EmbassyLocal;
 
 #[cfg(feature = "embassy")]
-impl<S: 'static, Start, Role> AktorStart for AktorNew<S, Start, EmbassyLocal, Role>
+impl<S: 'static, Start, Role, End, CM> AktorStart<CM>
+    for AktorNew<S, Start, EmbassyLocal, Role, End>
 where
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
+    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
 {
-    type Error = AktorStartError;
     type Group = crate::embassy::AktorGroup;
     type Handles = crate::embassy::Handle<S, 0, (), Role>;
     type Startup = LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
-
-    fn source_is_setup(error: &Self::Error) -> bool {
-        error.source_is_setup()
-    }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         let driver = group.listen()?;
@@ -38,7 +35,7 @@ where
         let setup = self.with_role(AktorNoRole);
 
         Box::pin(async move {
-            start_driven::<_, _, _, local::clock::Embassy>(setup, context, move |future| {
+            start_driven::<_, _, _, local::clock::Embassy, _, _>(setup, context, move |future| {
                 spawn(future)
             })
             .await
@@ -46,19 +43,15 @@ where
         })
     }
 }
-impl<S: 'static, Start, Clock: AktorGroupClock, Role> AktorStart
-    for AktorNew<S, Start, kind::Local<Clock>, Role>
+impl<S: 'static, Start, Clock: AktorGroupClock, Role, End, CM> AktorStart<CM>
+    for AktorNew<S, Start, kind::Local<Clock>, Role, End>
 where
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
+    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
 {
-    type Error = AktorStartError;
     type Group = local::AktorGroup<Clock>;
     type Handles = local::Handle<S, 0, (), Role, Clock>;
     type Startup = LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
-
-    fn source_is_setup(error: &Self::Error) -> bool {
-        error.source_is_setup()
-    }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         let driver = group.listen()?;
@@ -73,78 +66,95 @@ where
         let setup = self.with_role(AktorNoRole);
 
         Box::pin(async move {
-            start_driven::<_, _, _, Clock>(setup, context, move |future| spawn(future))
+            start_driven::<_, _, _, Clock, _, _>(setup, context, move |future| spawn(future))
                 .await
                 .map(local::Handle::with_role)
         })
     }
 }
 
-pub async fn start_driven<S: 'static, Start, Kind, Clock: AktorGroupClock>(
-    setup: AktorNew<S, Start, Kind>,
+pub async fn start_driven<S: 'static, Start, Kind, Clock: AktorGroupClock, End, CM>(
+    setup: AktorNew<S, Start, Kind, AktorNoRole, End>,
     context: AktorStartContext<local::AktorGroup<Clock>>,
     spawn: impl Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>,
 ) -> Result<local::Handle<S, 0, (), (), Clock>, AktorStartError>
 where
-    Kind: AktorMode<
-            Each<S> = dyn FnMut(&mut S, Operation),
-            End<S> = dyn AktorEnd<S>,
-            Interval<S> = dyn AktorIntervalLogic<S>,
-        >,
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
+    Kind:
+        AktorMode<Each<S> = dyn FnMut(&mut S, Operation), Interval<S> = dyn AktorIntervalLogic<S>>,
+    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
 {
     start_custom(setup, context, spawn, local::serve_on::<Clock, _, 0, ()>).await
 }
 
-pub async fn start_custom<S: 'static, Start, Kind, Clock: AktorGroupClock, Runner>(
-    setup: AktorNew<S, Start, Kind>,
+pub async fn start_custom<S: 'static, Start, Kind, Clock: AktorGroupClock, Runner, End, CM>(
+    setup: AktorNew<S, Start, Kind, AktorNoRole, End>,
     mut context: AktorStartContext<local::AktorGroup<Clock>>,
     spawn: impl Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>,
     runner: Runner,
 ) -> Result<local::Handle<S, 0, (), (), Clock>, AktorStartError>
 where
-    Kind: AktorMode<
-            Each<S> = dyn FnMut(&mut S, Operation),
-            End<S> = dyn AktorEnd<S>,
-            Interval<S> = dyn AktorIntervalLogic<S>,
-        >,
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
-    Runner: for<'a> AsyncFnOnce(local::AktorRunner<'a, S>) -> Result<(), AktorError> + 'static,
+    Kind:
+        AktorMode<Each<S> = dyn FnMut(&mut S, Operation), Interval<S> = dyn AktorIntervalLogic<S>>,
+    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
+    Runner:
+        for<'a> AsyncFnOnce(local::AktorRunner<'a, S, 0, ()>) -> Result<(), AktorError> + 'static,
 {
     let options = setup.options;
     let AktorClosures {
         start,
-        end,
+        mut end,
         intervals,
         before_each,
         after_each,
     } = setup.closures;
 
     if intervals.iter().any(|interval| interval.every.is_zero()) {
-        return Err(AktorStartError::Setup(AktorError::new(
-            "interval duration must be positive",
-        )));
+        return Err(validation_error(
+            &context.group,
+            &setup.name.name,
+            Kind::EXECUTION,
+            AktorStartError::Setup(AktorError::new("interval duration must be positive")),
+        ));
+    }
+
+    if options.capacity == 0 {
+        return Err(validation_error(
+            &context.group,
+            &setup.name.name,
+            Kind::EXECUTION,
+            AktorStartError::Setup(AktorError::new(
+                crate::message::ActorError::InvalidCapacity.to_string(),
+            )),
+        ));
     }
 
     let LocalIntervals {
         scheduled: intervals,
         retained,
     } = LocalIntervals::new(intervals);
+    let (ready, initialized) = super::ready::channel();
+    let startup_kill = context.group.killswitch();
+    let name = setup.name.name.clone();
+    let startup_name = name.clone();
     let handle = context
         .group
         .spawn_with_custom(
             ActorArgs {
                 name: setup.name.name,
                 capacity: options.capacity,
-                setup: async move || start().await,
-                cleanup: async move |state| {
-                    if let Some(mut end) = end {
-                        end.0.run(state).await
-                    } else {
-                        drop(state);
-                        Ok(())
-                    }
+                setup: async move || {
+                    let result = match start().await {
+                        Ok(state) => Ok(state),
+                        Err(error) => {
+                            Err(startup_kill.startup_error(startup_name, Kind::EXECUTION, error))
+                        }
+                    };
+
+                    (result, ready)
                 },
+                cleanup: async move |state| end.run(state).await,
             },
             AktorHooks {
                 before_each: before_each.map(|hook| hook.0),
@@ -156,7 +166,16 @@ where
         )
         .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string())))?;
 
-    handle.ready().await.map_err(AktorStartError::Local)?;
+    match initialized.await {
+        Some(result) => result?,
+        None => {
+            let error = handle.completion().wait().await.err().unwrap_or_else(|| {
+                local::OwnerError::Runner(AktorError::new("local actor stopped during startup"))
+            });
+
+            return Err(AktorStartError::Local(error));
+        }
+    }
 
     for interval in intervals {
         (spawn)(schedule(
@@ -164,15 +183,22 @@ where
             handle.new_handle(),
             context.group.killswitch(),
         ))
-        .map_err(AktorStartError::Setup)?;
+        .map_err(|error| {
+            validation_error(
+                &context.group,
+                &name,
+                Kind::EXECUTION,
+                AktorStartError::Setup(error),
+            )
+        })?;
     }
 
     Ok(handle)
 }
 
-async fn while_running<S, Clock: AktorGroupClock, F: Future>(
+async fn while_running<S, Clock: AktorGroupClock, F: Future, C>(
     kill: &local::KillSwitch<Clock>,
-    handle: &local::Handle<S, 0, (), (), Clock>,
+    handle: &local::Handle<S, 0, C, (), Clock>,
     future: F,
 ) -> Option<F::Output> {
     let mut stopping = Box::pin(kill.wait_stopping());
@@ -189,9 +215,9 @@ async fn while_running<S, Clock: AktorGroupClock, F: Future>(
     .await
 }
 
-fn schedule<S: 'static, Clock: AktorGroupClock>(
+fn schedule<S: 'static, Clock: AktorGroupClock, C: 'static>(
     interval: LocalInterval<S>,
-    handle: local::Handle<S, 0, (), (), Clock>,
+    handle: local::Handle<S, 0, C, (), Clock>,
     kill: local::KillSwitch<Clock>,
 ) -> LocalFuture<'static, ()> {
     let callback = interval.callback;

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.6
+
+Fixed startup and cleanup reporting, worker failures and shutdown after the caller runtime exits.
+
 ## 0.0.5
 
 Typed setup and shutdown hooks, removed the public try calls.

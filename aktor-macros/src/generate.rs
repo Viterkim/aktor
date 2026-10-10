@@ -156,29 +156,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         }
     }
 
-    let factory_arguments: Vec<_> = latest_generics
-        .params
-        .iter()
-        .rev()
-        .skip(1)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|parameter| match parameter {
-            syn::GenericParam::Lifetime(parameter) => {
-                let lifetime = &parameter.lifetime;
-                quote!(#lifetime)
-            }
-            syn::GenericParam::Type(parameter) => {
-                let name = &parameter.ident;
-                quote!(#name)
-            }
-            syn::GenericParam::Const(parameter) => {
-                let name = &parameter.ident;
-                quote!({ #name })
-            }
-        })
-        .collect();
+    let mut factory_arguments = signature::arguments(&latest_generics);
+    factory_arguments.pop();
 
     let raw_output = function.signature.output.clone();
 
@@ -213,25 +192,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let visibility = &function.visibility;
     let signature = &function.signature;
     let name = &signature.ident;
-    let generic_arguments: Vec<_> = signature
-        .generics
-        .params
-        .iter()
-        .map(|parameter| match parameter {
-            syn::GenericParam::Lifetime(parameter) => {
-                let lifetime = &parameter.lifetime;
-                quote!(#lifetime)
-            }
-            syn::GenericParam::Type(parameter) => {
-                let name = &parameter.ident;
-                quote!(#name)
-            }
-            syn::GenericParam::Const(parameter) => {
-                let name = &parameter.ident;
-                quote!({ #name })
-            }
-        })
-        .collect();
+    let generic_arguments = signature::arguments(&signature.generics);
 
     let wrapper = quote! {
         #(#attributes)*
@@ -370,24 +331,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         scope.visit_generics_mut(&mut user_generics);
         user_generics.params.pop();
 
-        let arguments: Vec<_> = user_generics
-            .params
-            .iter()
-            .map(|parameter| match parameter {
-                syn::GenericParam::Lifetime(parameter) => {
-                    let lifetime = &parameter.lifetime;
-                    quote!(#lifetime)
-                }
-                syn::GenericParam::Type(parameter) => {
-                    let name = &parameter.ident;
-                    quote!(#name)
-                }
-                syn::GenericParam::Const(parameter) => {
-                    let name = &parameter.ident;
-                    quote!({ #name })
-                }
-            })
-            .collect();
+        let arguments = signature::arguments(&user_generics);
 
         let markers: Vec<_> = user_generics
             .params

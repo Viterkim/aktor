@@ -12,13 +12,12 @@ impl<O> WorkerReply<O> {
         }
 
         let result = match self.response.try_recv() {
-            Ok(Ok(output)) => self.decode(&output),
-            Ok(Err(error)) => Err(error),
+            Ok(output) => output,
             Err(oneshot::error::TryRecvError::Empty) => return None,
-            Err(oneshot::error::TryRecvError::Closed) => Err(WireError::new(
-                CallError::OutcomeUnknown,
-                WorkerCause::Closed,
-            )),
+            Err(oneshot::error::TryRecvError::Closed) => {
+                let _parked = self.missing();
+                return None;
+            }
         };
 
         match self.ready(result) {
@@ -27,8 +26,27 @@ impl<O> WorkerReply<O> {
         }
     }
 
-    fn decode(&self, output: &[u8]) -> Result<O, WireError> {
-        (self.decoder)(output).map_err(|error| error.without_data())
+    fn missing(&mut self) -> Poll<O> {
+        self.parked = true;
+        let error = WireError::new(CallError::OutcomeUnknown, WorkerCause::Closed);
+
+        if let Some(inner) = self.inner.upgrade() {
+            inner.lost(error)
+        } else if let Some((name, group)) = &self.group {
+            if group.is_finished() {
+                fatal(error);
+            }
+
+            group.fail(crate::ActorFailure {
+                kind: None,
+                actor: name.clone(),
+                phase: "worker".into(),
+                message: error.to_string(),
+            });
+            Poll::Pending
+        } else {
+            fatal(error)
+        }
     }
 
     fn ready(&mut self, result: Result<O, WireError>) -> Poll<O> {
@@ -40,16 +58,7 @@ impl<O> WorkerReply<O> {
             Err(error) => {
                 self.parked = true;
 
-                if let Some(inner) = self.inner.upgrade() {
-                    inner.lost(error)
-                } else if let Some((name, group)) = &self.group {
-                    group.fail(crate::ActorFailure {
-                        kind: None,
-                        actor: name.clone(),
-                        phase: "worker".into(),
-                        message: error.to_string(),
-                    });
-
+                if self.group.is_some() {
                     Poll::Pending
                 } else {
                     fatal(error)
@@ -96,8 +105,13 @@ impl<O> Future for WorkerReply<O> {
             return Poll::Pending;
         }
 
-        match this.poll_result(context) {
-            Poll::Ready(result) => this.ready(result),
+        if this.taken {
+            crate::message::consumed();
+        }
+
+        match Pin::new(&mut this.response).poll(context) {
+            Poll::Ready(Ok(result)) => this.ready(result),
+            Poll::Ready(Err(_)) => this.missing(),
             Poll::Pending => Poll::Pending,
         }
     }

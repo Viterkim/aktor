@@ -8,7 +8,8 @@ type Admission<'a, S> =
 type Pending<S, I, Fut> = (I, fn(AktorTaskState<S>, I) -> Fut);
 
 pub struct AktorTaskRequest<'a, S, I, O, Fut, Role = crate::AktorNoRole> {
-    handle: &'a AktorTask<S, Role>,
+    sender_queue: &'a mpsc::Sender<Message<S>>,
+    role: PhantomData<fn() -> Role>,
     operation: Operation,
     pending: Option<Pending<S, I, Fut>>,
     admission: Option<Admission<'a, S>>,
@@ -28,7 +29,8 @@ impl<'a, S, I, O, Fut, Role> AktorTaskRequest<'a, S, I, O, Fut, Role> {
         let (sender, receiver) = oneshot::channel();
 
         Self {
-            handle,
+            sender_queue: &handle.sender,
+            role: PhantomData,
             operation,
             pending: Some((input, factory)),
             admission: None,
@@ -46,11 +48,11 @@ impl<'a, S, I, O, Fut, Role> AktorTaskRequest<'a, S, I, O, Fut, Role> {
     }
 
     pub fn timeout(self, duration: Duration) -> Timeout<Self> {
-        self.handle
+        self.reply
             .clock
             .timeout(self, duration, |request| WaitStatus {
                 admitted: request.reply.admitted,
-                stopping: request.handle.kill.is_stopping(),
+                stopping: request.reply.kill.is_stopping(),
             })
     }
 }
@@ -89,13 +91,13 @@ where
             return Poll::Ready(());
         }
 
-        if self.parked || self.handle.kill.is_stopping() {
+        if self.parked || self.reply.kill.is_stopping() {
             self.admission = None;
             return Poll::Pending;
         }
 
         if self.admission.is_none()
-            && let Ok(permit) = self.handle.sender.try_reserve()
+            && let Ok(permit) = self.sender_queue.try_reserve()
         {
             #[cfg(feature = "tokio")]
             core::task::ready!(core::pin::pin!(tokio::task::coop::consume_budget()).poll(cx));
@@ -105,7 +107,7 @@ where
 
         let admission = self
             .admission
-            .get_or_insert_with(|| Box::pin(self.handle.sender.reserve()));
+            .get_or_insert_with(|| Box::pin(self.sender_queue.reserve()));
         let result = match admission.as_mut().poll(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(result) => result,
@@ -122,7 +124,7 @@ where
             }
             Err(_) => {
                 self.parked = true;
-                self.handle.kill.stop();
+                self.reply.kill.stop();
                 Poll::Pending
             }
         }
@@ -215,8 +217,8 @@ impl<O> Future for AktorTaskReply<O> {
 mod tests {
     use super::*;
     use crate::{
-        AktorClosures, AktorKind, AktorName, AktorNew, AktorNewOptions, AktorNoRole, AktorOptions,
-        AktorSetup, aktor_start,
+        AktorCleanupError, AktorClosures, AktorKind, AktorName, AktorNew, AktorNewOptions,
+        AktorNoRole, AktorOptions, AktorSetup, AktorSetupError, aktor_start,
     };
     use std::sync::{
         Mutex as Log,
@@ -257,14 +259,11 @@ mod tests {
                     role: AktorNoRole,
                     kind: AktorKind::TokioTask,
                     closures: AktorClosures {
-                        start: async || Ok(Vec::<usize>::new()),
-                        end: Some(
-                            (async move |state| {
-                                *cleanup.lock().unwrap() = state;
-                                Ok(())
-                            })
-                            .into(),
-                        ),
+                        start: async || Ok::<_, AktorSetupError>(Vec::<usize>::new()),
+                        end: async move |state| {
+                            *cleanup.lock().unwrap() = state;
+                            Ok::<_, AktorCleanupError>(())
+                        },
 
                         intervals: vec![],
                         before_each: None,

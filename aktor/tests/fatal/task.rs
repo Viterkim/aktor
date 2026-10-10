@@ -54,11 +54,14 @@ fn runtime() {
         let starting = unpolled.then(|| InputDrop);
         let start = async move || {
             std::hint::black_box(&starting);
-            Ok(0_u32)
+            Ok::<_, AktorSetupError>(0_u32)
         };
-        let mut closures: AktorClosures<u32, _, AktorKind::TokioTask> = AktorClosures {
+        let ending = unpolled.then(|| InputDrop);
+        let mut closures: AktorClosures<u32, _, AktorKind::TokioTask, _> = AktorClosures {
             start,
-            end: None,
+            end: async move |_: u32| {
+                std::hint::black_box(&ending);
+            },
             intervals: vec![],
             before_each: None,
             after_each: None,
@@ -95,18 +98,6 @@ fn runtime() {
                     .into(),
                 });
             }
-        }
-
-        if unpolled {
-            let capture = InputDrop;
-
-            closures.end = Some(
-                (async move |_: u32| {
-                    std::hint::black_box(&capture);
-                    Ok(())
-                })
-                .into(),
-            );
         }
 
         let mut starting = Box::pin(aktor_start_in(
@@ -162,11 +153,11 @@ fn runtime() {
     let report = executor::block_on(complete.wait());
     assert!(report.failed(), "{report}");
     assert!(!report.timed_out, "{report}");
-    assert_eq!(
-        report.application.len(),
-        if case == "wake" { 3 } else { 2 },
-        "{report}"
-    );
+    let text = report.to_string();
+    assert_eq!(text.matches("input drop failed").count(), 2, "{text}");
+    if case == "wake" {
+        assert_eq!(text.matches("queue wake failed").count(), 1, "{text}");
+    }
     drop(waiting);
     drop(handle);
 }
@@ -192,14 +183,11 @@ async fn cancellation() {
             role: AktorNoRole,
             kind: AktorKind::TokioTask,
             closures: AktorClosures {
-                start: async || Ok(0_u32),
-                end: Some(
-                    (async move |state: u32| {
-                        *saved.lock().unwrap() = Some(state);
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                start: async || Ok::<_, AktorSetupError>(0_u32),
+                end: async move |state: u32| {
+                    *saved.lock().unwrap() = Some(state);
+                    Ok::<_, AktorCleanupError>(())
+                },
                 intervals: vec![],
                 before_each: None,
                 after_each: None,

@@ -1,19 +1,18 @@
 use super::driver::{capture, contain, poll_owners};
 use super::*;
 use crate::AktorShutdownOutput;
-use alloc::string::ToString;
 use core::{pin::Pin, task::Context};
 
 impl<Clock: AktorGroupClock> AktorGroup<Clock> {
-    pub async fn run<O, A, Application, Cleanup, Output, Mode, E>(
+    pub async fn run<O, Application, Cleanup, Output, Mode>(
         mut self,
         application: Application,
         cleanup: Cleanup,
     ) -> Result<Option<O>, Box<ShutdownReport>>
     where
-        Application: AsyncFnOnce(&mut AktorGroup<Clock>) -> Result<O, AktorError<A>>,
+        Application: AsyncFnOnce(&mut AktorGroup<Clock>) -> Result<O, AktorError>,
         Cleanup: FnOnce(ShutdownReport) -> Output,
-        Output: AktorShutdownOutput<Mode, E>,
+        Output: AktorShutdownOutput<Mode>,
     {
         if let Err(error) = self.claim_listener() {
             return Err(Box::new(ShutdownReport {
@@ -46,15 +45,8 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
                 match capture(|| Pin::new(&mut app).poll(cx)) {
                     Ok(Poll::Ready(Ok(value))) => Poll::Ready(Some(value)),
                     Ok(Poll::Ready(Err(error))) => {
-                        kill.control
-                            .report
-                            .borrow_mut()
-                            .application
-                            .push(error.report());
-
-                        if let Some(error) = contain(|| drop(error)) {
-                            record_failure(&kill, "application error drop", error);
-                        }
+                        kill.stop();
+                        kill.control.report.borrow_mut().application.push(error);
 
                         Poll::Ready(None)
                     }
@@ -115,14 +107,16 @@ fn record_failure<Clock: AktorGroupClock>(
     phase: &str,
     error: AktorError,
 ) {
-    kill.fail(ActorFailure {
+    let primary = kill.fail(ActorFailure {
         kind: None,
         actor: "application".into(),
         phase: phase.into(),
-        message: error.to_string(),
+        message: error.diagnostics.clone(),
     });
 
-    kill.control.report.borrow_mut().application.push(error);
+    if !primary {
+        kill.control.report.borrow_mut().application.push(error);
+    }
 }
 
 #[cfg(all(test, feature = "std"))]

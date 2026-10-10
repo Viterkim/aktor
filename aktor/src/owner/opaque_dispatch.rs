@@ -5,9 +5,7 @@ use crate::{
 };
 use core::{future::Future, ops::AsyncFnOnce};
 
-impl<'a, S: 'static, E, C, I: Send + 'static, Role> ReadOpaque<S, I, Role>
-    for &'a Aktor<S, E, C, Role>
-{
+impl<'a, S: 'static, I: Send + 'static, Role> ReadOpaque<S, I, Role> for &'a Aktor<S, Role> {
     type Output<Fut: Future>
         = Queued<'a, S, I, <Fut::Output as CallOutput>::Output, Role>
     where
@@ -30,9 +28,7 @@ impl<'a, S: 'static, E, C, I: Send + 'static, Role> ReadOpaque<S, I, Role>
     }
 }
 
-impl<'a, S: 'static, E, C, I: Send + 'static, Role> WriteOpaque<S, I, Role>
-    for &'a Aktor<S, E, C, Role>
-{
+impl<'a, S: 'static, I: Send + 'static, Role> WriteOpaque<S, I, Role> for &'a Aktor<S, Role> {
     type Output<Fut: Future>
         = Queued<'a, S, I, <Fut::Output as CallOutput>::Output, Role>
     where

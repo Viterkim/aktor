@@ -71,6 +71,31 @@ where
     Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
     CleanupFuture: core::future::Future<Output = Result<(), C>>,
 {
+    spawn_async_initial_on::<S, E, E, C, _, _, _, _>(args, hooks, standard).await
+}
+
+pub async fn spawn_async_initial_on<S, E, Initial, C, Setup, SetupFuture, Cleanup, CleanupFuture>(
+    args: SpawnArgs<Setup, Cleanup>,
+    hooks: crate::listener::hooks::AktorHooks<S>,
+    standard: bool,
+) -> Result<
+    (
+        Handle<S>,
+        Actor<S, E, C>,
+        Dedicated<Result<(), CleanupErrors<C>>>,
+    ),
+    DedicatedStartError<Initial>,
+>
+where
+    S: 'static,
+    E: Send + 'static,
+    Initial: Send + 'static,
+    C: Send + Sync + 'static,
+    Setup: FnOnce() -> SetupFuture + Send + 'static,
+    SetupFuture: core::future::Future<Output = Result<S, Initial>>,
+    Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
+    CleanupFuture: core::future::Future<Output = Result<(), C>>,
+{
     let SpawnArgs {
         name,
         capacity,
@@ -261,13 +286,9 @@ mod tests {
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
                     start: async || Ok::<_, AktorSetupError>(()),
-                    end: Some(
-                        (async move |_: ()| {
-                            count.fetch_add(1, Ordering::SeqCst);
-                            Ok(())
-                        })
-                        .into(),
-                    ),
+                    end: async move |_: ()| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    },
 
                     intervals: vec![],
                     before_each: None,
@@ -293,7 +314,7 @@ mod tests {
                     start: async || -> Result<(), AktorSetupError> {
                         panic!("setup ran after thread creation failed")
                     },
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,

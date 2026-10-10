@@ -28,10 +28,8 @@ sed -i -E \
     -e "s@\]\((\./)?integrations/@](${release_url}/integrations/@g" \
     "$release_dir/README.md"
 sed -i -E \
-    -e "s@\]\((\./)?\.\./\.\./README\.md@](${release_url}/README.md@g" \
-    -e "s@\]\((\./)?examples\.md@](${release_url}/aktor/docs/examples.md@g" \
-    -e "s@\]\((\./)?runtime\.md@](${release_url}/aktor/docs/runtime.md@g" \
-    "$release_dir/aktor/docs/functions.md"
+    -e "s@\]\((\./)?\.\./examples/@](${release_url}/aktor/examples/@g" \
+    "$release_dir/aktor/docs/examples.md"
 sed -i -E \
     -e "s@\]\((\./)?\.\./README\.md@](${release_url}/README.md@g" \
     -e "s@\]\((\./)?\.\./aktor/@](${release_url}/aktor/@g" \

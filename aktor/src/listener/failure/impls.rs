@@ -13,7 +13,7 @@ impl fmt::Display for Failure {
         }
 
         for diagnostic in &self.diagnostics {
-            write!(f, "\n{diagnostic}")?;
+            write!(f, "\n{}", diagnostic.diagnostics)?;
         }
 
         Ok(())

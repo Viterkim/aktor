@@ -5,7 +5,7 @@ use crate::{
 };
 use core::time::Duration;
 
-impl<'a, T, I, S, O, Role, L> Call<T, I, WorkerRequest<'a, S, O, Role>, L> {
+impl<'a, T, I, S, O: 'static, Role, L> Call<T, I, WorkerRequest<'a, S, O, Role>, L> {
     pub async fn send(self) -> WorkerReply<O> {
         self.into_request().send().await
     }

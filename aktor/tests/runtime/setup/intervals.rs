@@ -17,7 +17,7 @@ async fn backup() {
 
                     db.execute_batch("CREATE TABLE saved(value); INSERT INTO saved VALUES(85)")
                         .map_err(|error| AktorSetupError::new(error.to_string()))?;
-                    Ok(db)
+                    Ok::<_, AktorSetupError>(db)
                 },
                 intervals: vec![AktorInterval {
                     every: Duration::from_millis(1),
@@ -36,7 +36,7 @@ async fn backup() {
                     .into(),
                 }],
 
-                end: None,
+                end: (),
                 before_each: None,
                 after_each: None,
             },
@@ -69,7 +69,7 @@ async fn backup() {
             kind: AktorKind::TokioThread,
             closures: AktorClosures {
                 start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
-                end: None,
+                end: (),
                 intervals: vec![AktorInterval {
                     every: Duration::from_millis(1),
                     run: (async move |counter: &mut Counter| {
@@ -112,8 +112,8 @@ async fn backup() {
                         role: AktorNoRole,
                         kind: AktorKind::TokioLocal(&executor),
                         closures: AktorClosures {
-                            start: async || Ok(0_u32),
-                            end: None,
+                            start: async || Ok::<_, AktorSetupError>(0_u32),
+                            end: (),
                             intervals: vec![AktorInterval {
                                 every: Duration::from_millis(1),
                                 run: (async move |_: &mut u32| {
@@ -149,8 +149,10 @@ async fn backup() {
                         role: AktorNoRole,
                         kind: AktorKind::TokioLocal(&executor),
                         closures: AktorClosures {
-                            start: async || Ok(Counter(Rc::new(Cell::new(0)))),
-                            end: None,
+                            start: async || {
+                                Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0))))
+                            },
+                            end: (),
                             intervals: vec![AktorInterval {
                                 every: Duration::from_secs(3600),
                                 run: (async move |_: &mut Counter| {
@@ -190,7 +192,7 @@ async fn backup() {
             kind: AktorKind::TokioThread,
             closures: AktorClosures {
                 start: async || Ok::<_, AktorSetupError>(0u32),
-                end: None,
+                end: (),
                 intervals: vec![AktorInterval {
                     every: Duration::from_secs(3600),
                     run: (async move |_: &mut u32| {
@@ -230,10 +232,9 @@ async fn close_interval(waiting: bool) {
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
 start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: Some((async move |_: u32| {
+                    end: async move |_: u32| {
                         end.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Ok(())
-                    }).into()),
+                    },
                     intervals: vec![AktorInterval {
                         every: Duration::from_secs(1),
                         run: (async |value: &mut u32| { *value += 1; }).into(),
@@ -248,7 +249,7 @@ start: async || Ok::<_, AktorSetupError>(0_u32),
                 role: AktorNoRole,
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
-start: async || Ok::<_, AktorSetupError>(0_u32),  end: None, intervals: vec![], before_each: None, after_each: None },
+start: async || Ok::<_, AktorSetupError>(0_u32),  end: (), intervals: vec![], before_each: None, after_each: None },
                 options: AktorNewOptions { capacity: 32 },
             },
         },
@@ -346,15 +347,21 @@ async fn interval_admission() {
 }
 
 #[cfg(feature = "local")]
+#[allow(clippy::type_complexity)]
 fn local_interval<Kind>(
     kind: Kind,
     timed: bool,
     cleaned: Arc<std::sync::atomic::AtomicUsize>,
-) -> AktorNew<u32, impl core::ops::AsyncFnOnce() -> Result<u32, AktorSetupError> + 'static, Kind>
+) -> AktorNew<
+    u32,
+    impl core::ops::AsyncFnOnce() -> Result<u32, AktorSetupError> + 'static,
+    Kind,
+    AktorNoRole,
+    impl core::ops::AsyncFnMut(u32) -> Result<(), AktorCleanupError> + 'static,
+>
 where
     Kind: setup::kind::AktorMode<
             Each<u32> = dyn FnMut(&mut u32, operation::Operation),
-            End<u32> = dyn setup::AktorEnd<u32>,
             Interval<u32> = dyn setup::AktorIntervalLogic<u32>,
         >,
 {
@@ -363,14 +370,11 @@ where
         role: AktorNoRole,
         kind,
         closures: AktorClosures {
-            start: async || Ok(0_u32),
-            end: Some(
-                (async move |_: u32| {
-                    cleaned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Ok(())
-                })
-                .into(),
-            ),
+            start: async || Ok::<_, AktorSetupError>(0_u32),
+            end: async move |_: u32| {
+                cleaned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, AktorCleanupError>(())
+            },
             intervals: if timed {
                 vec![AktorInterval {
                     every: Duration::from_secs(1),
@@ -602,13 +606,9 @@ async fn pause() {
             kind: AktorKind::TokioThread,
             closures: AktorClosures {
                 start: async || Ok::<_, AktorSetupError>(0_u32),
-                end: Some(
-                    (async move |state: u32| {
-                        end.lock().unwrap().push(state);
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                end: async move |state: u32| {
+                    end.lock().unwrap().push(state);
+                },
                 intervals: vec![AktorInterval {
                     every: Duration::from_secs(1),
                     run: (async move |state: &mut u32| {
@@ -658,7 +658,12 @@ async fn pause() {
     tokio::time::advance(Duration::from_secs(3600)).await;
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 
-    actors.handles.actor.resume(|| Ok(100)).await.unwrap();
+    actors
+        .handles
+        .actor
+        .resume(|| Ok::<_, AktorSetupError>(100))
+        .await
+        .unwrap();
     observed.notified().await;
     assert_eq!(
         message::call(&actors.handles.handle, |state, ()| *state, ()).await,

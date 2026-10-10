@@ -7,6 +7,7 @@ use crate::{
     local::{self, Handle, hooks::AktorHooks},
     message::LocalFuture,
     operation::Operation,
+    setup::closures::AktorEndCall,
 };
 use alloc::format;
 use core::ops::AsyncFnOnce;
@@ -24,7 +25,7 @@ impl Completion {
 impl Drop for Completion {
     fn drop(&mut self) {
         if self.completed.is_some() {
-            self.kill.fail(ActorFailure {
+            let primary = self.kill.fail(ActorFailure {
                 kind: Some(self.kind),
                 actor: self.name.clone(),
                 phase: "owner".into(),
@@ -34,15 +35,19 @@ impl Drop for Completion {
             self.publish(ActorOutcome {
                 kind: Some(self.kind),
                 actor: self.name.clone(),
-                diagnostics: vec![AktorError::new("local actor task cancelled")],
+                diagnostics: if primary {
+                    Vec::new()
+                } else {
+                    vec![AktorError::new("local actor task cancelled")]
+                },
                 timed_out: false,
             });
         }
     }
 }
 
-pub async fn start_local<S, Start, Kind, Clock>(
-    setup: AktorNew<S, Start, Kind>,
+pub async fn start_local<S, Start, Kind, Clock, End, CM>(
+    setup: AktorNew<S, Start, Kind, AktorNoRole, End>,
     mut context: AktorStartContext<crate::AktorGroup>,
     spawn: impl Fn(LocalFuture<'static, ()>),
     sleep: fn(Duration) -> LocalFuture<'static, ()>,
@@ -50,12 +55,10 @@ pub async fn start_local<S, Start, Kind, Clock>(
 where
     S: 'static,
     Clock: 'static,
-    Kind: AktorMode<
-            Each<S> = dyn FnMut(&mut S, Operation),
-            End<S> = dyn AktorEnd<S>,
-            Interval<S> = dyn AktorIntervalLogic<S>,
-        >,
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
+    Kind:
+        AktorMode<Each<S> = dyn FnMut(&mut S, Operation), Interval<S> = dyn AktorIntervalLogic<S>>,
+    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    End: AktorEndCall<S, CM> + 'static,
 {
     let AktorNew {
         name,
@@ -68,16 +71,30 @@ where
     let name = name.name;
     let AktorClosures {
         start,
-        end,
+        mut end,
         intervals,
         before_each,
         after_each,
     } = closures;
 
     if intervals.iter().any(|interval| interval.every.is_zero()) {
-        return Err(AktorStartError::Setup(AktorError::new(
-            "interval duration must be positive",
-        )));
+        return Err(validation_error(
+            &context.group,
+            &name,
+            Kind::EXECUTION,
+            AktorStartError::Setup(AktorError::new("interval duration must be positive")),
+        ));
+    }
+
+    if options.capacity == 0 {
+        return Err(validation_error(
+            &context.group,
+            &name,
+            Kind::EXECUTION,
+            AktorStartError::Setup(AktorError::new(
+                crate::message::ActorError::InvalidCapacity.to_string(),
+            )),
+        ));
     }
 
     let LocalIntervals {
@@ -132,19 +149,25 @@ where
         completed: Some(completed),
     };
 
+    let (ready, initialized) = super::super::ready::channel();
+    let startup_kill = kill.clone();
+    let startup_name = completion.name.clone();
+
     spawn(Box::pin(async move {
         let retained = owner.completion();
         let mut driver = Box::pin(
-            AssertUnwindSafe(owner.run_with_custom(
-                async move || start().await,
-                async move |state| {
-                    if let Some(mut end) = end {
-                        end.0.run(state).await
-                    } else {
-                        drop(state);
-                        Ok(())
-                    }
+            AssertUnwindSafe(owner.run_prepared(
+                async move || {
+                    let result = match start().await {
+                        Ok(state) => Ok(state),
+                        Err(error) => {
+                            Err(startup_kill.startup_error(startup_name, Kind::EXECUTION, error))
+                        }
+                    };
+
+                    (result, ready)
                 },
+                async move |state| end.run(state).await,
                 async |runner| {
                     #[cfg(target_family = "wasm")]
                     {
@@ -174,7 +197,16 @@ where
                     match result {
                         Ok(Ok(())) => {},
                         Ok(Err(error)) => {
-                            report.diagnostics.push(AktorError::new(format!("{error:#}")));
+                            match error {
+                                local::OwnerError::SetupDiagnostic(_, true) => {},
+                                local::OwnerError::SetupDiagnostic(error, false) => report.diagnostics.push(error),
+                                local::OwnerError::CleanupFailure(error) => {
+                                    if !error.primary {
+                                        report.diagnostics.push(error.report());
+                                    }
+                                },
+                                error => report.diagnostics.push(AktorError::new(format!("{error:#}"))),
+                            }
                         },
                         Err(payload) => {
                             let message = panic_message(&payload);
@@ -214,8 +246,15 @@ where
         completion.publish(report);
     }));
 
-    if let Err(error) = handle.ready().await {
-        return Err(AktorStartError::Local(error));
+    match initialized.await {
+        Some(result) => result?,
+        None => {
+            let error = handle.completion().wait().await.err().unwrap_or_else(|| {
+                local::OwnerError::Runner(AktorError::new("local actor stopped during startup"))
+            });
+
+            return Err(AktorStartError::Local(error));
+        }
     }
 
     for interval in intervals {
@@ -225,9 +264,9 @@ where
     Ok(handle)
 }
 
-fn schedule<S: 'static, Clock: 'static>(
+fn schedule<S: 'static, Clock: 'static, C: 'static>(
     interval: LocalInterval<S>,
-    handle: Handle<S, 0, (), (), Clock>,
+    handle: Handle<S, 0, C, (), Clock>,
     kill: KillSwitch,
     sleep: fn(Duration) -> LocalFuture<'static, ()>,
 ) -> LocalFuture<'static, ()> {

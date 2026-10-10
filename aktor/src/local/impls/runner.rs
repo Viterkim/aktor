@@ -157,7 +157,7 @@ async fn next<S, const N: usize, E>(inner: &Inner<S, N, E>) -> Option<Message<S>
 
 impl<S, const N: usize, E> Owner<S, N, E> {
     pub async fn run_with_custom<Setup, SetupFuture, Cleanup, CleanupFuture, Runner>(
-        mut self,
+        self,
         setup: Setup,
         cleanup: Cleanup,
         runner: Runner,
@@ -169,13 +169,32 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
         Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S, N, E>) -> Result<(), crate::AktorError>,
     {
+        self.run_prepared(setup, cleanup, runner).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_prepared<Setup, SetupFuture, Cleanup, CleanupFuture, Runner>(
+        mut self,
+        setup: Setup,
+        cleanup: Cleanup,
+        runner: Runner,
+    ) -> Result<(), OwnerError>
+    where
+        Setup: FnOnce() -> SetupFuture,
+        SetupFuture: Future,
+        SetupFuture::Output: LocalSetupOutput<S, E>,
+        Cleanup: FnOnce(S) -> CleanupFuture,
+        CleanupFuture: Future,
+        CleanupFuture::Output: LocalCleanupOutput<E>,
+        Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S, N, E>) -> Result<(), crate::AktorError>,
+    {
         #[cfg(feature = "std")]
         let (initialized, mut primary) = match self
             .inner
-            .capture_result("setup", async { setup().await })
+            .capture_result("setup", async { setup().await.into_owner_setup() })
             .await
         {
-            Ok(result) => (result.map_err(OwnerError::Setup), None),
+            Ok(result) => (result, None),
             Err(payload) => {
                 let error = crate::AktorError::new(crate::panic::panic_message(&payload));
 
@@ -183,7 +202,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
             }
         };
         #[cfg(not(feature = "std"))]
-        let initialized = setup().await.map_err(OwnerError::Setup);
+        let initialized = setup().await.into_owner_setup();
         #[cfg(feature = "std")]
         let setup_panicked = primary.is_some();
 
@@ -269,7 +288,8 @@ impl<S, const N: usize, E> Owner<S, N, E> {
     ) -> Result<(), OwnerError>
     where
         Cleanup: FnOnce(S) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
+        CleanupFuture: Future,
+        CleanupFuture::Output: LocalCleanupOutput<E>,
         Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S, N, E>) -> Result<(), crate::AktorError>,
     {
         *self.inner.completion.ready.borrow_mut() = Some(Ok(()));
@@ -347,19 +367,25 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         self.inner.close();
 
         #[cfg(feature = "std")]
-        let cleaned = self
+        let mut cleaned = self
             .inner
-            .settle("cleanup", async { cleanup(state).await }, &mut primary)
+            .settle(
+                "cleanup",
+                async { cleanup(state).await.into_owner_cleanup() },
+                &mut primary,
+            )
             .await
             .map_err(|error| Rc::new(OwnerError::Runner(error)))
-            .and_then(|result| result.map_err(|error| Rc::new(OwnerError::Cleanup(error))));
+            .and_then(|result| result.map_err(Rc::new));
         #[cfg(not(feature = "std"))]
-        let cleaned = cleanup(state)
-            .await
-            .map_err(|error| Rc::new(OwnerError::Cleanup(error)));
+        let mut cleaned = cleanup(state).await.into_owner_cleanup().map_err(Rc::new);
 
-        if let Err(error) = &cleaned {
-            self.inner.fail(error);
+        if let Err(error) = &mut cleaned {
+            let primary = self.inner.fail(error);
+
+            if let Some(OwnerError::CleanupFailure(failure)) = Rc::get_mut(error) {
+                failure.primary = primary;
+            }
         }
         #[cfg(feature = "std")]
         {
@@ -379,7 +405,10 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         #[cfg(feature = "std")]
         let retain_cleanup = retain_cleanup || primary.is_some();
 
-        if retain_cleanup && let Err(error) = &cleaned {
+        if retain_cleanup
+            && let Err(error) = &cleaned
+            && !matches!(&**error, OwnerError::CleanupFailure(failure) if failure.primary)
+        {
             self.inner
                 .completion
                 .diagnostics
@@ -421,5 +450,51 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         }
 
         result.map_err(|error| error.report())
+    }
+}
+
+pub trait LocalCleanupOutput<E> {
+    fn into_owner_cleanup(self) -> Result<(), OwnerError<E>>;
+}
+impl<E> LocalCleanupOutput<E> for Result<(), AktorCleanupError<E>> {
+    fn into_owner_cleanup(self) -> Result<(), OwnerError<E>> {
+        self.map_err(OwnerError::Cleanup)
+    }
+}
+impl LocalCleanupOutput<()> for Result<(), crate::AktorFailure> {
+    fn into_owner_cleanup(self) -> Result<(), OwnerError<()>> {
+        self.map_err(OwnerError::CleanupFailure)
+    }
+}
+
+pub trait LocalSetupOutput<S, C> {
+    fn into_owner_setup(self) -> Result<S, OwnerError<C>>;
+}
+impl<S, C> LocalSetupOutput<S, C> for Result<S, AktorSetupError<C>> {
+    fn into_owner_setup(self) -> Result<S, OwnerError<C>> {
+        self.map_err(OwnerError::Setup)
+    }
+}
+impl<S, C> LocalSetupOutput<S, C>
+    for (
+        Result<S, crate::AktorFailure>,
+        crate::setup::ready::Sender<Result<(), crate::AktorStartError<crate::AktorFailure>>>,
+    )
+{
+    fn into_owner_setup(self) -> Result<S, OwnerError<C>> {
+        let (result, ready) = self;
+
+        match result {
+            Ok(state) => {
+                ready.send(Ok(()));
+                Ok(state)
+            }
+            Err(error) => {
+                let diagnostic = error.report();
+                let primary = error.primary;
+                ready.send(Err(crate::AktorStartError::Init(error)));
+                Err(OwnerError::SetupDiagnostic(diagnostic, primary))
+            }
+        }
     }
 }

@@ -90,20 +90,17 @@ async fn local_stopping() {
                             role: AktorNoRole,
                             kind: AktorKind::TokioLocal(&executor),
                             closures: AktorClosures {
-                                start: async || Ok(()),
-                                end: Some(
-                                    (async move |_| {
-                                        entered.notify_one();
-                                        release.notified().await;
+                                start: async || Ok::<_, AktorSetupError>(()),
+                                end: async move |_| {
+                                    entered.notify_one();
+                                    release.notified().await;
 
-                                        if cleanup_fails {
-                                            Err(AktorCleanupError::new("real cleanup failure"))
-                                        } else {
-                                            Ok(())
-                                        }
-                                    })
-                                    .into(),
-                                ),
+                                    if cleanup_fails {
+                                        Err(AktorCleanupError::new("real cleanup failure"))
+                                    } else {
+                                        Ok::<_, AktorCleanupError>(())
+                                    }
+                                },
                                 intervals: vec![],
                                 before_each: None,
                                 after_each: None,

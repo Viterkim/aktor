@@ -1,9 +1,12 @@
+#[cfg(feature = "local")]
 mod drivers;
 mod intervals;
+#[cfg(any(feature = "local", feature = "std_thread"))]
 mod lifecycle;
 mod panics;
 mod startup;
 
+#[cfg(feature = "local")]
 use super::support;
 use aktor::*;
 use futures_util::FutureExt;
@@ -20,7 +23,7 @@ struct Counter(Rc<Cell<u32>>);
 #[test]
 fn caller_runtime() {
     let Ok(case) = std::env::var("AKTOR_CHILD") else {
-        for case in ["stop", "drop", "live"] {
+        for case in ["stop", "drop", "live", "task stop", "task runtime exit"] {
             let output = super::support::child("setup::caller_runtime", case);
             assert!(
                 output.status.success(),
@@ -36,6 +39,69 @@ fn caller_runtime() {
         .enable_all()
         .build()
         .unwrap();
+    if case.starts_with("task ") {
+        let (entered, running) = tokio::sync::oneshot::channel();
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let (cleaned, cleanup) = tokio::sync::oneshot::channel();
+        let actors = runtime
+            .block_on(aktor_start(AktorSetup {
+                actors: AktorNew {
+                    name: AktorName::new("caller task"),
+                    role: AktorNoRole,
+                    kind: AktorKind::TokioTask,
+                    closures: AktorClosures {
+                        start: async || Ok::<_, AktorSetupError>(()),
+                        end: async move |_: ()| {
+                            entered.send(()).unwrap();
+                            finishing.await.unwrap();
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            cleaned.send(()).unwrap();
+                            Ok::<_, AktorCleanupError>(())
+                        },
+                        intervals: vec![],
+                        before_each: None,
+                        after_each: None,
+                    },
+                    options: Default::default(),
+                },
+                shutdown: |_| {},
+                options: AktorOptions {
+                    shutdown_grace: Duration::from_secs(1),
+                },
+            }))
+            .unwrap();
+        let completion = actors.completion();
+        actors.killswitch().stop();
+        runtime.block_on(running).unwrap();
+
+        if case == "task stop" {
+            finish.send(()).unwrap();
+            let report = runtime.block_on(completion.wait());
+
+            assert!(!report.failed(), "{report}");
+            runtime.block_on(cleanup).unwrap();
+            drop(runtime);
+        } else {
+            drop(runtime);
+            assert!(finish.send(()).is_err());
+            assert!(executor::block_on(cleanup).is_err());
+
+            let report = executor::block_on(completion.wait());
+
+            assert!(report.failed(), "{report}");
+            assert!(!report.timed_out, "{report}");
+            assert!(
+                report
+                    .to_string()
+                    .contains("actor task cancelled before cleanup completed")
+            );
+            assert_eq!(report.actors[0].kind, Some(AktorExecution::TokioTask));
+        }
+
+        drop(actors);
+        return;
+    }
+
     let (entered, running) = std::sync::mpsc::channel();
     let (release, released) = tokio::sync::oneshot::channel();
     let (cleaned, cleanup) = std::sync::mpsc::channel();
@@ -65,15 +131,11 @@ fn caller_runtime() {
                     } else {
                         Vec::new()
                     },
-                    end: Some(
-                        (async move |state: usize| {
-                            cleaned.send(state).unwrap();
-                            finishing.take().unwrap().await.unwrap();
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                            Ok(())
-                        })
-                        .into(),
-                    ),
+                    end: async move |state: usize| {
+                        cleaned.send(state).unwrap();
+                        finishing.take().unwrap().await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    },
 
                     before_each: None,
                     after_each: None,
@@ -173,13 +235,9 @@ async fn counter() {
         kind: AktorKind::TokioThread,
         closures: AktorClosures {
             start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
-            end: Some(
-                (async move |counter: Counter| {
-                    end.lock().unwrap().push(("end", counter.0.get()));
-                    Ok(())
-                })
-                .into(),
-            ),
+            end: async move |counter: Counter| {
+                end.lock().unwrap().push(("end", counter.0.get()));
+            },
             intervals: vec![],
             before_each: Some(
                 (move |counter: &mut Counter, operation: operation::Operation| {
@@ -223,7 +281,7 @@ async fn counter() {
     actors
         .handles
         .actor
-        .resume(|| Ok(Counter(Rc::new(Cell::new(10)))))
+        .resume(|| Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(10)))))
         .await
         .unwrap();
 
@@ -267,7 +325,7 @@ async fn multiple() {
         name: &str,
         fail: bool,
         cleaned: Arc<Notify>,
-    ) -> impl setup::AktorStart<Group = AktorGroup> {
+    ) -> impl setup::AktorStart<setup::closures::AktorCleanupCallback, Group = AktorGroup> {
         AktorNew {
             name: AktorName::new(name),
             role: AktorNoRole,
@@ -280,13 +338,9 @@ async fn multiple() {
                         Ok(Counter(Rc::new(Cell::new(0))))
                     }
                 },
-                end: Some(
-                    (async move |_: Counter| {
-                        cleaned.notify_one();
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                end: async move |_: Counter| {
+                    cleaned.notify_one();
+                },
                 intervals: vec![],
                 before_each: None,
                 after_each: None,
@@ -319,7 +373,7 @@ async fn multiple() {
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
                     start: async || Ok::<_, AktorSetupError>(1_u32),
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -332,7 +386,7 @@ async fn multiple() {
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
                     start: async || Ok::<_, AktorSetupError>(85_u32),
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -366,8 +420,8 @@ async fn named() {
         role: aktors::Users,
         kind: AktorKind::TokioTask,
         closures: AktorClosures {
-            start: async || Ok(85_u32),
-            end: None,
+            start: async || Ok::<_, AktorSetupError>(85_u32),
+            end: (),
             intervals: vec![],
             before_each: None,
             after_each: None,
@@ -392,7 +446,7 @@ async fn named() {
                 closures: AktorClosures {
     start: async || Ok::<_, AktorSetupError>(7_u32),
 
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,
@@ -429,25 +483,43 @@ fn standard() {
         let before = log.clone();
         let after = log.clone();
         let end = log.clone();
+        let owner_thread = Arc::new(Mutex::new(None));
+        let started_thread = owner_thread.clone();
+        let interval_thread = owner_thread.clone();
+        let tick = Arc::new(Notify::new());
+        let ping = tick.clone();
+
         let actors = aktor_start(AktorSetup {
             actors: AktorNew {
                 name: AktorName::new("standard counter"),
                 role: AktorNoRole,
                 kind: AktorKind::StdThread,
                 closures: AktorClosures {
-                    start: async || {
+                    start: async move || {
                         assert!(tokio::runtime::Handle::try_current().is_err());
+                        *started_thread.lock().unwrap() = Some(std::thread::current().id());
                         Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0))))
                     },
-                    end: Some(
-                        (async move |counter: Counter| {
+                    end: async move |counter: Counter| {
+                        assert!(tokio::runtime::Handle::try_current().is_err());
+                        assert_eq!(
+                            *owner_thread.lock().unwrap(),
+                            Some(std::thread::current().id())
+                        );
+                        end.lock().unwrap().push(("end", counter.0.get()));
+                    },
+                    intervals: vec![AktorInterval {
+                        every: Duration::from_millis(10),
+                        run: (async move |_: &mut Counter| {
                             assert!(tokio::runtime::Handle::try_current().is_err());
-                            end.lock().unwrap().push(("end", counter.0.get()));
-                            Ok(())
+                            assert_eq!(
+                                *interval_thread.lock().unwrap(),
+                                Some(std::thread::current().id())
+                            );
+                            ping.notify_one();
                         })
                         .into(),
-                    ),
-                    intervals: vec![],
+                    }],
                     before_each: Some(
                         (move |counter: &mut Counter, _: operation::Operation| {
                             before.lock().unwrap().push(("before", counter.0.get()));
@@ -470,6 +542,13 @@ fn standard() {
         })
         .await
         .unwrap();
+
+        tokio::select! {
+            _ = tick.notified() => {},
+            _ = executor::sleep_until(std::time::Instant::now() + Duration::from_secs(2)) => {
+                panic!("standard interval did not run");
+            },
+        }
 
         assert_eq!(add(&actors.handles, 2).await, Ok(2));
         assert_eq!(add(&actors.handles, 0).await, Err("give me something"));
@@ -513,7 +592,7 @@ fn standard() {
                 kind: AktorKind::StdThread,
                 closures: AktorClosures {
                     start: async || Ok::<_, AktorSetupError>(0u32),
-                    end: Some((async |_: u32| core::future::pending().await).into()),
+                    end: async |_: u32| core::future::pending::<()>().await,
                     intervals: vec![],
                     before_each: None,
                     after_each: None,

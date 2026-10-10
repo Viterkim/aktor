@@ -22,14 +22,17 @@ pub type AktorNoRole = ();
 #[allow(non_upper_case_globals)]
 pub const AktorNoRole: AktorNoRole = ();
 
-/// The text you want printed, plus any data you want to keep.
+/// Setup and cleanup diagnostics, with optional data for low-level APIs.
 #[cfg_attr(
     feature = "wasm_browser_workers",
     derive(serde::Serialize, serde::Deserialize)
 )]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, er::Er)]
+#[er(no_constructors)]
 pub struct AktorError<T = ()> {
+    #[er(into_report_string, skip)]
     pub diagnostics: String,
+    #[er(skip)]
     pub data: T,
 }
 
@@ -37,15 +40,32 @@ pub type AktorSetupError<T = ()> = AktorError<T>;
 pub type AktorCleanupError<T = ()> = AktorError<T>;
 
 #[doc(hidden)]
+#[derive(Clone)]
+pub struct AktorFailure {
+    pub diagnostics: String,
+    pub primary: bool,
+}
+
+pub type AktorCleanupFailure = AktorFailure;
+
+pub trait AktorCleanupOutput {
+    fn into_cleanup(self) -> Result<(), AktorCleanupError>;
+}
+#[doc(hidden)]
 pub struct AktorShutdownSync;
 #[doc(hidden)]
 pub struct AktorShutdownAsync;
 
 #[doc(hidden)]
-pub trait AktorShutdownOutput<Mode, Data = ()> {
-    type Future: core::future::Future<Output = Result<(), AktorCleanupError<Data>>>;
+pub trait AktorShutdownOutput<Mode> {
+    type Future: core::future::Future<Output = Result<(), AktorCleanupError>>;
 
     fn into_shutdown(self) -> Self::Future;
+}
+
+#[doc(hidden)]
+pub struct AktorShutdownFuture<F> {
+    pub future: core::pin::Pin<alloc::boxed::Box<F>>,
 }
 
 /// Setup and cleanup for an actor owned by the application.
@@ -105,12 +125,12 @@ mod prepared {
     use core::time::Duration;
 
     pub use crate::setup::{
-        AktorClosure, AktorKind, AktorLifecycle, AktorStartError, AktorStartup, AktorStartupError,
+        AktorClosure, AktorKind, AktorStartError, AktorStartup, AktorStartupError,
     };
 
-    pub struct AktorClosures<S: 'static, Start, Kind: AktorMode> {
+    pub struct AktorClosures<S: 'static, Start, Kind: AktorMode, End = ()> {
         pub start: Start,
-        pub end: Option<AktorClosure<Kind::End<S>>>,
+        pub end: End,
         pub intervals: Vec<AktorInterval<S, Kind>>,
         pub before_each: Option<AktorClosure<Kind::Each<S>>>,
         pub after_each: Option<AktorClosure<Kind::Each<S>>>,
@@ -125,11 +145,11 @@ mod prepared {
         pub name: String,
     }
 
-    pub struct AktorNew<S: 'static, Start, Kind: AktorMode, Role = AktorNoRole> {
+    pub struct AktorNew<S: 'static, Start, Kind: AktorMode, Role = AktorNoRole, End = ()> {
         pub name: AktorName,
         pub role: Role,
         pub kind: Kind,
-        pub closures: AktorClosures<S, Start, Kind>,
+        pub closures: AktorClosures<S, Start, Kind, End>,
         pub options: AktorNewOptions,
     }
 

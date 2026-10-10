@@ -1,0 +1,2 @@
+expected `Result<u32, AktorError>`
+found `Result<u32, Error>`

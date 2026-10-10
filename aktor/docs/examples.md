@@ -1,4 +1,4 @@
-# A bit extra
+# Examples 
 
 For several actors, give each one a name:
 
@@ -17,16 +17,19 @@ let id = insert_user(&actors.handles.users, "Katten".into()).await?;
 
 A tuple works too, you get the handles back in the same order.
 
-Open your database in start and close it in end. For errors:
+Setup returns `Result<State, AktorSetupError>`, cleanup returns `Result<(), AktorCleanupError>`. Put the diagnostic you want kept in the report:
 
 ```rust
-Connection::open("users.sqlite")
-    .map_err(|error| aktor_err_setup(error.to_string(), error))
+start: async || {
+    Connection::open("users.sqlite")
+        .map_err(|error| AktorSetupError::new(error.to_string()))
+},
+end: async |db: Connection| {
+    db.close().map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
+},
 ```
 
-It keeps the error in data and prints the text you gave it. For cleanup use aktor_err_cleanup, with kind.with_cleanup() to keep the error's type.
-
-Print a startup error with `{error:#}` for the causes and rollback failures, or give it to your error reporter.
+Use any error library inside those closures, then finish into Aktor's report. With Er, .er_into(|_| {}) fills diagnostics with the full tree. Infallible cleanup can return (), and end: () leaves it out.
 
 ## Calling another query
 

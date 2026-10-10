@@ -364,6 +364,12 @@ impl Client {
         assert!(notified.get());
         let codec = completed.wait().await.unwrap_err();
         assert!(report.failed());
+        assert!(
+            report
+                .actors
+                .iter()
+                .all(|actor| actor.diagnostics.is_empty())
+        );
         assert!(report.failure.unwrap().message.contains("invalid input"));
         assert_eq!(codec.outcome, CallError::NotAdmitted);
 

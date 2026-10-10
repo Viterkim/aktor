@@ -76,18 +76,15 @@ pub async fn check(spawner: Spawner) {
         }),
         closures: AktorClosures {
             start: async || {
-                Ok(Sensor {
+                Ok::<_, AktorSetupError>(Sensor {
                     readings: Rc::new(RefCell::new(Vec::new())),
                 })
             },
 
-            end: Some(
-                (async move |sensor: Sensor| {
-                    *cleaned.borrow_mut() = sensor.readings.borrow().clone();
-                    Ok(())
-                })
-                .into(),
-            ),
+            end: async move |sensor: Sensor| {
+                *cleaned.borrow_mut() = sensor.readings.borrow().clone();
+                Ok::<_, AktorCleanupError>(())
+            },
             intervals: vec![AktorInterval {
                 every: Duration::from_millis(1),
                 run: (async move |_: &mut Sensor| {
@@ -416,18 +413,15 @@ async fn cancellation() {
         }),
         closures: AktorClosures {
             start: async || {
-                Ok(Sensor {
+                Ok::<_, AktorSetupError>(Sensor {
                     readings: Rc::new(RefCell::new(Vec::new())),
                 })
             },
 
-            end: Some(
-                (async move |_: Sensor| {
-                    cleanup.set(true);
-                    Ok(())
-                })
-                .into(),
-            ),
+            end: async move |_: Sensor| {
+                cleanup.set(true);
+                Ok::<_, AktorCleanupError>(())
+            },
             intervals: vec![],
             before_each: None,
             after_each: None,
@@ -765,15 +759,12 @@ async fn stopping_startup() {
                 start: async move || {
                     begin.signal(());
                     gate.wait().await;
-                    Ok(0_u32)
+                    Ok::<_, AktorSetupError>(0_u32)
                 },
-                end: Some(
-                    (async move |_: u32| {
-                        end.set(end.get() + 1);
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                end: async move |_: u32| {
+                    end.set(end.get() + 1);
+                    Ok::<_, AktorCleanupError>(())
+                },
 
                 intervals: vec![],
                 before_each: None,
@@ -838,7 +829,7 @@ async fn startup_origin() {
                         gate.wait().await;
                         Err::<u32, _>(AktorSetupError::new("invalid settings"))
                     },
-                    end: None,
+                    end: (),
                     intervals: vec![],
                     before_each: None,
                     after_each: None,

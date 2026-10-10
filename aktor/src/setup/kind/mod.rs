@@ -5,6 +5,7 @@
 use crate::{AktorSetupError, local::clock::AktorGroupClock, message::LocalFuture};
 #[cfg(feature = "local")]
 use alloc::rc::Rc;
+#[cfg(feature = "local")]
 use core::marker::PhantomData;
 
 mod impls;
@@ -88,16 +89,9 @@ pub struct EmbassyCrossCore {
     pub spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>>,
 }
 
-/// Keep typed cleanup data on this execution kind.
-pub struct AktorLifecycle<Kind, CleanupData> {
-    pub kind: Kind,
-    pub data: PhantomData<fn() -> CleanupData>,
-}
-
 #[doc(hidden)]
 pub trait AktorMode {
     type Each<S: 'static>: ?Sized;
-    type End<S: 'static>: ?Sized;
     type Interval<S: 'static>: ?Sized;
 
     const EXECUTION: AktorExecution;

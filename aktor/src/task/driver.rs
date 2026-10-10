@@ -3,8 +3,7 @@ use super::*;
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 use crate::setup::kind::TokioTask;
 use crate::{
-    ActorFailure, ActorOutcome, AktorClosures, AktorError, AktorGroup, AktorNew, AktorSetupError,
-    AktorStartError,
+    ActorFailure, ActorOutcome, AktorClosures, AktorError, AktorGroup, AktorNew, AktorStartError,
     group::shutdown::{contain_drop, panic_message},
     operation::hooks::AktorHooks,
     setup::kind::AktorMode,
@@ -43,6 +42,7 @@ struct TaskInterval<S: 'static> {
 }
 
 struct Completion {
+    cleanup: Arc<parking_lot::Mutex<Vec<Arc<crate::AktorFailure>>>>,
     report: ActorOutcome,
     kill: KillSwitch,
     completed: Option<oneshot::Sender<ActorOutcome>>,
@@ -60,24 +60,25 @@ impl Completion {
         })
     }
 
-    fn fail_startup(&mut self, message: String) {
+    fn fail_startup(&mut self, message: String) -> bool {
         self.failed = true;
         self.kill.fail_startup(ActorFailure {
             actor: self.report.actor.clone(),
             kind: self.report.kind,
             phase: "setup".into(),
             message,
-        });
+        })
     }
 
     fn dispose(&mut self, value: impl Sized, phase: &str) {
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
             let message = panic_message(&payload);
 
-            self.fail(phase, message.clone());
-            self.report
-                .diagnostics
-                .push(AktorError::new(format!("{phase}: {message}")));
+            if !self.fail(phase, message.clone()) {
+                self.report
+                    .diagnostics
+                    .push(AktorError::new(format!("{phase}: {message}")));
+            }
             contain_drop(payload, &self.kill, "task panic payload drop");
         }
     }
@@ -119,10 +120,11 @@ impl Completion {
 impl Drop for Completion {
     fn drop(&mut self) {
         if self.completed.is_some() {
-            self.fail("owner", "actor task cancelled".into());
-            self.report.diagnostics.push(AktorError::new(
-                "actor task cancelled before cleanup completed",
-            ));
+            let message = "actor task cancelled before cleanup completed";
+
+            if !self.fail("owner", message.into()) {
+                self.report.diagnostics.push(AktorError::new(message));
+            }
             self.publish();
         }
     }
@@ -130,14 +132,15 @@ impl Drop for Completion {
 
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 #[doc(hidden)]
-pub async fn start<S, Start, Fut>(
-    setup: AktorNew<S, Start, TokioTask>,
+pub async fn start<S, Start, Fut, End, CM>(
+    setup: AktorNew<S, Start, TokioTask, crate::AktorNoRole, End>,
     group: &mut AktorGroup,
-) -> Result<AktorTask<S>, AktorStartError>
+) -> Result<AktorTask<S, crate::AktorNoRole>, AktorStartError>
 where
     S: Send + 'static,
     Start: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<S, AktorSetupError>> + Send + 'static,
+    Fut: Future<Output = Result<S, crate::AktorSetupError>> + Send + 'static,
+    End: crate::setup::closures::AktorSendEnd<S, CM>,
 {
     start_on(setup, group, TaskClock::Tokio, |future| {
         TaskJoin::Tokio(tokio::spawn(future))
@@ -146,40 +149,46 @@ where
 }
 
 #[doc(hidden)]
-pub async fn start_on<S, Start, Fut, Kind>(
-    setup: AktorNew<S, Start, Kind>,
+pub async fn start_on<S, Start, Fut, Kind, End, CM>(
+    setup: AktorNew<S, Start, Kind, crate::AktorNoRole, End>,
     group: &mut AktorGroup,
     clock: TaskClock,
     spawn: impl FnOnce(TaskOwnerFuture) -> TaskJoin,
-) -> Result<AktorTask<S>, AktorStartError>
+) -> Result<AktorTask<S, crate::AktorNoRole>, AktorStartError>
 where
     S: Send + 'static,
     Start: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<S, AktorSetupError>> + Send + 'static,
+    Fut: Future<Output = Result<S, crate::AktorSetupError>> + Send + 'static,
+    End: crate::setup::closures::AktorSendEnd<S, CM>,
     Kind: AktorMode<
             Each<S> = dyn FnMut(&mut S, Operation) + Send,
-            End<S> = dyn AktorTaskEnd<S> + Send,
             Interval<S> = dyn AktorTaskInterval<S> + Send,
         >,
 {
     let kind = Kind::EXECUTION;
     let options = setup.options;
 
-    if options.capacity == 0 || options.capacity > tokio::sync::Semaphore::MAX_PERMITS {
-        return Err(AktorStartError::Setup(AktorError::new(
-            "queue capacity must be positive and fit the semaphore",
-        )));
-    }
-
-    if setup
+    let invalid = if options.capacity == 0 || options.capacity > tokio::sync::Semaphore::MAX_PERMITS
+    {
+        Some("queue capacity must be positive and fit the semaphore")
+    } else if setup
         .closures
         .intervals
         .iter()
         .any(|interval| interval.every.is_zero())
     {
-        return Err(AktorStartError::Setup(AktorError::new(
-            "interval duration must be positive",
-        )));
+        Some("interval duration must be positive")
+    } else {
+        None
+    };
+
+    if let Some(reason) = invalid {
+        return Err(crate::setup::validation_error(
+            group,
+            &setup.name.name,
+            kind,
+            AktorStartError::Setup(AktorError::new(reason)),
+        ));
     }
 
     let name = Arc::new(setup.name.name);
@@ -226,7 +235,9 @@ where
         )
         .map_err(AktorStartError::Setup)?;
 
+    let cleanup_errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let completion = Completion {
+        cleanup: cleanup_errors.clone(),
         report: ActorOutcome {
             actor: (*name).clone(),
             kind: Some(kind),
@@ -250,9 +261,17 @@ where
         after_each,
     } = setup.closures;
 
+    let startup_kill = kill.clone();
+    let startup_name = (*name).clone();
+    let startup_kind = kind;
     let logic = TaskLogic {
-        start: Some(start),
-        end,
+        start: Some(move || async move {
+            match start().await {
+                Ok(state) => Ok(state),
+                Err(error) => Err(startup_kill.startup_error(startup_name, startup_kind, error)),
+            }
+        }),
+        end: Some(AktorClosure(Box::new(move |state| end.finish(state)))),
         hooks: AktorHooks {
             before_each: before_each.map(|hook| hook.0),
             after_each: after_each.map(|hook| hook.0),
@@ -290,10 +309,11 @@ where
 
     let _sent = joining.send(join);
 
-    started
-        .await
-        .unwrap_or_else(|_| Err(AktorError::new("actor task cancelled during setup")))
-        .map_err(AktorStartError::Init)?;
+    started.await.unwrap_or_else(|_| {
+        Err(AktorStartError::Setup(AktorError::new(
+            "actor task cancelled during setup",
+        )))
+    })?;
 
     if kill.is_stopping() {
         return Err(AktorStartError::Setup(AktorError::new(
@@ -302,6 +322,7 @@ where
     }
 
     Ok(AktorTask {
+        cleanup: cleanup_errors,
         name,
         sender,
         services,
@@ -382,23 +403,24 @@ async fn drive<S, Start, Fut>(
     service_driver: service::ServiceDriver<S>,
     closed: oneshot::Receiver<()>,
     mut forced: oneshot::Receiver<()>,
-    ready: oneshot::Sender<Result<(), AktorSetupError>>,
+    ready: oneshot::Sender<Result<(), AktorStartError>>,
     mut completion: Completion,
 ) where
     S: Send + 'static,
     Start: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<S, AktorSetupError>> + Send + 'static,
+    Fut: Future<Output = Result<S, crate::AktorFailure>> + Send + 'static,
 {
     let clock = closures.clock;
 
     let mut setup = Box::pin(
         AssertUnwindSafe(async {
-            let start = closures
-                .start
-                .take()
-                .ok_or_else(|| AktorError::new("actor task setup already consumed"))?;
+            let Some(start) = closures.start.take() else {
+                return Err(AktorStartError::Setup(AktorError::new(
+                    "actor task setup already consumed",
+                )));
+            };
 
-            start().await
+            start().await.map_err(AktorStartError::Init)
         })
         .catch_unwind(),
     );
@@ -408,20 +430,29 @@ async fn drive<S, Start, Fut>(
         _ = &mut forced => None,
     };
 
-    match &result {
-        Some(Ok(Err(error))) => completion.fail_startup(error.to_string()),
+    let primary = match &result {
+        Some(Ok(Err(AktorStartError::Init(error)))) => {
+            completion.failed = true;
+            error.primary
+        }
+        Some(Ok(Err(error))) => completion.fail_startup(crate::setup::start_diagnostics(error)),
         Some(Err(payload)) => completion.fail_startup(panic_message(payload)),
-        _ => {}
-    }
+        _ => false,
+    };
 
     completion.dispose(setup, "task setup drop");
 
     let state = match result {
         Some(Ok(Ok(state))) => state,
         Some(Ok(Err(error))) => {
-            completion.fail_startup(error.to_string());
+            if let AktorStartError::Init(error) = &error
+                && !error.primary
+            {
+                completion.report.diagnostics.push(error.report());
+            }
 
-            let _sent = ready.send(Err(error));
+            let sent = ready.send(Err(error));
+            completion.dispose(sent, "startup reply drop");
 
             completion.dispose_hooks(std::mem::take(&mut closures.hooks));
             completion.dispose_intervals(std::mem::take(&mut closures.intervals));
@@ -433,10 +464,15 @@ async fn drive<S, Start, Fut>(
         Some(Err(payload)) => {
             let message = panic_message(&payload);
 
-            completion.fail_startup(message.clone());
+            if !primary {
+                completion
+                    .report
+                    .diagnostics
+                    .push(AktorError::new(message.clone()));
+            }
             completion.dispose(payload, "task setup panic drop");
 
-            let _sent = ready.send(Err(AktorError::new(message)));
+            let _sent = ready.send(Err(AktorStartError::Setup(AktorError::new(message))));
 
             completion.dispose_hooks(std::mem::take(&mut closures.hooks));
             completion.dispose_intervals(std::mem::take(&mut closures.intervals));
@@ -448,7 +484,9 @@ async fn drive<S, Start, Fut>(
         None => {
             completion.report.timed_out = true;
 
-            let _sent = ready.send(Err(AktorError::new("actor task setup cancelled")));
+            let _sent = ready.send(Err(AktorStartError::Setup(AktorError::new(
+                "actor task setup cancelled",
+            ))));
 
             completion.dispose_hooks(std::mem::take(&mut closures.hooks));
             completion.dispose_intervals(std::mem::take(&mut closures.intervals));
@@ -493,6 +531,12 @@ async fn drive<S, Start, Fut>(
         TaskClock::Browser => true,
     };
     let mut remaining = 32;
+    let mut due = next_interval(&next);
+    #[cfg(not(target_family = "wasm"))]
+    let timer = wait_interval(due);
+
+    #[cfg(not(target_family = "wasm"))]
+    tokio::pin!(timer);
 
     loop {
         if ordinary_done && services_done {
@@ -505,34 +549,36 @@ async fn drive<S, Start, Fut>(
             services.close();
         }
 
-        let due = next
-            .iter()
-            .enumerate()
-            .filter_map(|(index, deadline)| deadline.map(|deadline| (index, deadline)))
-            .min_by_key(|(_, deadline)| *deadline);
+        let work = {
+            #[cfg(target_family = "wasm")]
+            let timer = wait_interval(due);
+            #[cfg(target_family = "wasm")]
+            tokio::pin!(timer);
 
-        let work = tokio::select! {
-            _ = &mut closing, if !stopping => {
-                stopping = true;
-                receiver.close();
-                services.close();
-                continue;
-            },
-            _ = &mut forcing => { completion.report.timed_out = true; break; },
-            message = receiver.receiver.recv(), if !ordinary_done => match message {
-                Some(message) => Some(message),
-                None => { ordinary_done = true; stopping = true; services.close(); continue; }
-            },
-            message = &mut service, if !services_done => match message {
-                Some(message) => {
-                    service.set(services.next());
-                    Some(message)
+            tokio::select! {
+                _ = &mut closing, if !stopping => {
+                    stopping = true;
+                    receiver.close();
+                    services.close();
+                    continue;
                 },
-                None => { services_done = true; continue; }
-            },
-            _ = wait_interval(due), if !stopping && due.is_some() => None,
+                _ = &mut forcing => { completion.report.timed_out = true; break; },
+                message = receiver.receiver.recv(), if !ordinary_done => match message {
+                    Some(message) => Some(message),
+                    None => { ordinary_done = true; stopping = true; services.close(); continue; }
+                },
+                message = &mut service, if !services_done => match message {
+                    Some(message) => {
+                        service.set(services.next());
+                        Some(message)
+                    },
+                    None => { services_done = true; continue; }
+                },
+                _ = &mut timer, if !stopping && due.is_some() => None,
+            }
         };
 
+        let interval = work.is_none();
         let operation = work.as_ref().map_or(
             Operation {
                 name: "interval",
@@ -617,6 +663,12 @@ async fn drive<S, Start, Fut>(
             }
         }
 
+        if interval {
+            due = next_interval(&next);
+            #[cfg(not(target_family = "wasm"))]
+            timer.set(wait_interval(due));
+        }
+
         if portable_budget {
             remaining -= 1;
 
@@ -658,29 +710,31 @@ async fn drive<S, Start, Fut>(
             _ = clock.wait_for_force(&completion.kill) => None,
         };
 
-        match &result {
-            Some(Ok(Err(error))) => {
-                completion.fail("cleanup", error.to_string());
-            }
-            Some(Err(payload)) => {
-                completion.fail("cleanup", panic_message(payload));
-            }
-            _ => {}
-        }
+        let primary = match &result {
+            Some(Ok(Err(error))) => completion.fail("cleanup", error.diagnostics.clone()),
+            Some(Err(payload)) => completion.fail("cleanup", panic_message(payload)),
+            _ => false,
+        };
 
         completion.dispose(cleanup, "task cleanup drop");
 
         match result {
             Some(Ok(Ok(()))) => {}
-            Some(Ok(Err(error))) => {
-                completion.fail("cleanup", error.to_string());
-                completion.report.diagnostics.push(error);
+            Some(Ok(Err(mut error))) => {
+                error.primary = primary;
+
+                if !primary {
+                    completion.report.diagnostics.push(error.report());
+                }
+                completion.cleanup.lock().push(Arc::new(error));
             }
             Some(Err(payload)) => {
-                let message = panic_message(&payload);
-
-                completion.fail("cleanup", message.clone());
-                completion.report.diagnostics.push(AktorError::new(message));
+                if !primary {
+                    completion
+                        .report
+                        .diagnostics
+                        .push(AktorError::new(panic_message(&payload)));
+                }
                 completion.dispose(payload, "task cleanup panic drop");
             }
             None => {
@@ -696,6 +750,13 @@ async fn drive<S, Start, Fut>(
     completion.dispose_hooks(std::mem::take(&mut closures.hooks));
     completion.dispose_intervals(std::mem::take(&mut closures.intervals));
     completion.publish();
+}
+
+fn next_interval(next: &[Option<TaskDeadline>]) -> Option<(usize, TaskDeadline)> {
+    next.iter()
+        .enumerate()
+        .filter_map(|(index, deadline)| deadline.map(|deadline| (index, deadline)))
+        .min_by_key(|(_, deadline)| *deadline)
 }
 
 async fn wait_interval(due: Option<(usize, TaskDeadline)>) {
@@ -788,6 +849,7 @@ mod tests {
             let (finished, _observed) = watch::channel(AktorTaskStatus::Running);
 
             let completion = Completion {
+                cleanup: Arc::new(parking_lot::Mutex::new(Vec::new())),
                 report: ActorOutcome {
                     actor: "chain".into(),
                     kind: Some(crate::AktorExecution::BevyTask),
@@ -801,14 +863,11 @@ mod tests {
             };
 
             let logic = TaskLogic {
-                start: Some(async || Ok(())),
-                end: Some(
-                    (async move |_: ()| {
-                        cleanup.store(true, Ordering::Relaxed);
-                        Ok(())
-                    })
-                    .into(),
-                ),
+                start: Some(async || Ok::<_, crate::AktorFailure>(())),
+                end: Some(AktorClosure(Box::new(async move |_: ()| {
+                    cleanup.store(true, Ordering::Relaxed);
+                    Ok::<_, crate::AktorFailure>(())
+                }))),
                 intervals: vec![],
                 hooks: AktorHooks {
                     before_each: None,

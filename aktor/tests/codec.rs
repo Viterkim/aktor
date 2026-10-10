@@ -28,6 +28,7 @@ struct Portable {
     choice: Vec<Choice>,
     cleanup: AktorCleanupError<Vec<u32>>,
     limits: (i128, u128, char),
+    numbers: (i8, u8, i16, u16, i32, u32, i64, u64, f32, f64),
 }
 
 #[test]
@@ -49,6 +50,18 @@ fn portable_values() {
             data: vec![7, 17],
         },
         limits: (i128::MIN, u128::MAX, 'ø'),
+        numbers: (
+            i8::MIN,
+            u8::MAX,
+            i16::MIN,
+            u16::MAX,
+            i32::MIN,
+            u32::MAX,
+            i64::MIN,
+            u64::MAX,
+            f32::MIN,
+            f64::MAX,
+        ),
     };
 
     let bytes = worker::encode(&value).unwrap();

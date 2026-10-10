@@ -9,9 +9,9 @@ fn missing_shutdown() {
             role: AktorNoRole,
             kind: AktorKind::TokioThread,
             closures: AktorClosures {
-start: async || Ok(0_u32),
+start: async || Ok::<_, AktorSetupError>(0_u32),
 
-                end: None,
+                end: (),
                 intervals: vec![],
                 before_each: None,
                 after_each: None,

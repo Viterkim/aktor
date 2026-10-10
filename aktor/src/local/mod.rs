@@ -92,8 +92,10 @@ pub type Channel<S, const N: usize, E = core::convert::Infallible, Clock = ()> =
 
 pub enum OwnerError<E = ()> {
     Setup(AktorSetupError<E>),
+    SetupDiagnostic(crate::AktorError, bool),
     SetupPanic(crate::AktorError),
     Cleanup(AktorCleanupError<E>),
+    CleanupFailure(crate::AktorFailure),
     Runner(crate::AktorError),
     Cancelled,
 }

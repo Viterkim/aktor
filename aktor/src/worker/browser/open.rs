@@ -49,6 +49,8 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
             handles: Cell::new(1),
             closed: Cell::new(false),
             failed: Cell::new(false),
+            failure: RefCell::new(None),
+            diagnostics: Rc::new(RefCell::new(Vec::new())),
             count: Arc::new(Semaphore::new(options.capacity)),
             bytes: Arc::new(Semaphore::new(options.max_outstanding_bytes)),
             buffers: Buffers::new(options.max_outstanding_bytes),
@@ -154,27 +156,29 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
                         return;
                     }
 
-                    if let Err(error) = output {
-                        inner.fail_error(error);
-                        return;
-                    }
-
                     inner.active.set(None);
                     inner.executing.set(false);
 
+                    let wire_failure = output.as_ref().err().cloned();
                     let work = inner.outstanding.borrow_mut().remove(&id);
-
-                    if let Some(work) = work {
-                        match (work.service, work.answer) {
+                    let failure = match work {
+                        Some(work) => match (work.service, work.answer) {
                             (Some(service), None) => service.answer(output),
-                            (None, Some(answer)) => {
-                                let _sent = answer.send(output);
+                            (None, Some(answer)) => answer(output),
+                            (None, None) => wire_failure,
+                            (Some(_), Some(_)) => {
+                                inner.fail(WorkerCause::Protocol);
+                                return;
                             }
-                            (None, None) => {}
-                            (Some(_), Some(_)) => inner.fail(WorkerCause::Protocol),
+                        },
+                        None => {
+                            inner.fail(WorkerCause::Protocol);
+                            return;
                         }
-                    } else {
-                        inner.fail(WorkerCause::Protocol);
+                    };
+
+                    if let Some(error) = failure {
+                        inner.reject(error);
                     }
 
                     inner.pump();

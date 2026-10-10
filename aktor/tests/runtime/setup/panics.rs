@@ -1,5 +1,36 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "std_thread")]
+use std::{
+    error::Error,
+    fmt,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+#[cfg(feature = "std_thread")]
+#[derive(Debug)]
+struct FormatPanic(bool);
+
+#[cfg(feature = "std_thread")]
+impl fmt::Display for FormatPanic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0 {
+            f.write_str("source panic context")
+        } else {
+            panic!("rollback panic sentinel");
+        }
+    }
+}
+
+#[cfg(feature = "std_thread")]
+impl Error for FormatPanic {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        if self.0 {
+            panic!("source panic sentinel");
+        }
+
+        None
+    }
+}
 
 #[cfg(feature = "std_thread")]
 #[tokio::test]
@@ -78,13 +109,10 @@ async fn native() {
                             kind: $kind,
                             closures: AktorClosures {
                                 start: async || Ok::<_, AktorSetupError>(()),
-                                end: Some(
-                                    (async move |_| -> Result<(), AktorCleanupError> {
-                                        count.fetch_add(1, Ordering::SeqCst);
-                                        panic!("rollback panic sentinel");
-                                    })
-                                    .into(),
-                                ),
+                                end: async move |_| {
+                                    count.fetch_add(1, Ordering::SeqCst);
+                                    Err(AktorCleanupError::new(format!("{}", FormatPanic(false))))
+                                },
                                 intervals: vec![],
                                 before_each: None,
                                 after_each: None,
@@ -97,9 +125,12 @@ async fn native() {
                             kind: $kind,
                             closures: AktorClosures {
                                 start: async || {
-                                    Err::<(), _>(AktorSetupError::new("sibling setup sentinel"))
+                                    Err::<(), _>(AktorSetupError::new(format!(
+                                        "{}",
+                                        FormatPanic(false)
+                                    )))
                                 },
-                                end: None,
+                                end: (),
                                 intervals: vec![],
                                 before_each: None,
                                 after_each: None,
@@ -120,6 +151,14 @@ async fn native() {
         } else {
             rollback!(AktorKind::TokioThread)
         };
+        let printed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (format!("{error:#}"), format!("{error:?}"))
+        }))
+        .expect("public startup formatting panicked");
+        assert_eq!(printed.0, printed.1);
+        assert!(printed.0.contains("failed setup"));
+        assert_eq!(printed.0.matches("rollback panic sentinel").count(), 2);
+
         let report = error.report.as_ref().unwrap();
 
         assert_eq!(cleaned.load(Ordering::SeqCst), 1);
@@ -129,7 +168,7 @@ async fn native() {
                 .as_ref()
                 .unwrap()
                 .message
-                .contains("sibling setup sentinel")
+                .contains("rollback panic sentinel")
         );
         if !report.actors.iter().any(|actor| {
             actor.actor == "ready"
@@ -140,6 +179,55 @@ async fn native() {
         }) {
             missing.push(format!("standard={standard}: missing rollback panic"));
         }
+    }
+
+    for source in [false, true] {
+        let error = aktor_start(AktorSetup {
+            actors: AktorNew {
+                name: AktorName::new("hostile startup"),
+                role: AktorNoRole,
+                kind: AktorKind::TokioThread,
+                closures: AktorClosures {
+                    start: async move || {
+                        let error = FormatPanic(source);
+                        error.source();
+                        Err::<(), _>(AktorSetupError::new(format!("{error}")))
+                    },
+                    end: (),
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
+                options: Default::default(),
+            },
+            shutdown: |_| {},
+            options: Default::default(),
+        })
+        .await
+        .err()
+        .unwrap();
+        let printed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (format!("{error:#}"), format!("{error:?}"))
+        }))
+        .expect("public startup formatting panicked");
+
+        assert_eq!(printed.0, printed.1);
+        assert!(printed.0.contains("hostile startup"));
+        let sentinel = if source {
+            "source panic sentinel"
+        } else {
+            "rollback panic sentinel"
+        };
+        assert_eq!(printed.0.matches(sentinel).count(), 1);
+        assert!(
+            error
+                .report
+                .unwrap()
+                .failure
+                .unwrap()
+                .message
+                .contains(sentinel)
+        );
     }
 
     assert!(missing.is_empty(), "{missing:?}");
@@ -166,7 +254,7 @@ async fn siblings() {
                         kind: $kind,
                         closures: AktorClosures {
                             start: async || Ok::<_, AktorSetupError>(0u32),
-                            end: None,
+                            end: (),
                             intervals: vec![],
                             before_each: None,
                             after_each: None,
@@ -303,7 +391,12 @@ fn closures() {
 
         assert!(matches!(error, local::OwnerError::Setup(_)));
         assert_eq!(dropped.get(), 3);
-        let diagnostics = format!("{:?}", completion.diagnostics());
+        let diagnostics = completion
+            .diagnostics()
+            .iter()
+            .map(|error| error.diagnostics.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(diagnostics.contains("cleanup capture sentinel"));
         assert!(diagnostics.contains("runner capture sentinel"));
     });

@@ -6,21 +6,17 @@ use crate::{
 };
 use core::ops::AsyncFnOnce;
 
-impl<S: 'static, Start, Clock, Runner, Role> AktorStart
-    for AktorNew<S, Start, kind::Custom<Clock, Runner>, Role>
+impl<S: 'static, Start, Clock, Runner, Role, End, CM> AktorStart<CM>
+    for AktorNew<S, Start, kind::Custom<Clock, Runner>, Role, End>
 where
     Clock: AktorGroupClock,
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + 'static,
-    Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S>) -> Result<(), AktorError> + 'static,
+    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
+    Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S, 0, ()>) -> Result<(), AktorError> + 'static,
 {
-    type Error = AktorStartError;
     type Group = local::AktorGroup<Clock>;
     type Handles = local::Handle<S, 0, (), Role, Clock>;
     type Startup = LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
-
-    fn source_is_setup(error: &Self::Error) -> bool {
-        error.source_is_setup()
-    }
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         let driver = group.listen()?;

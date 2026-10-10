@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "aktor"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "aktor-macros",
  "bevy_platform",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "aktor-macros"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -102,6 +102,7 @@ version = "0.0.0"
 dependencies = [
  "aktor",
  "bevy_tasks",
+ "er",
  "futures-util",
  "gloo-timers",
  "js-sys",

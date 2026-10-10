@@ -4,6 +4,6 @@ use aktor::AktorData;
 #[serde(crate = "aktor::data::__serde")]
 #[aktor(crate = aktor)]
 pub struct Message {
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(skip_serializing)]
     pub secret: String,
 }

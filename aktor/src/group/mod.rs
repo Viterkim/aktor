@@ -29,6 +29,8 @@ mod browser;
 #[cfg(target_family = "wasm")]
 mod clock;
 mod impls;
+#[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+mod intervals;
 #[cfg(not(target_family = "wasm"))]
 mod native;
 #[cfg(any(
@@ -109,6 +111,8 @@ struct Control {
     runtime: Mutex<Option<tokio::runtime::Handle>>,
     #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
     standard: std::sync::atomic::AtomicBool,
+    #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+    intervals: Mutex<Option<tokio::sync::mpsc::UnboundedSender<intervals::Pending>>>,
     state: Mutex<State>,
     changed: watch::Sender<Option<Instant>>,
     completed: watch::Sender<Option<ShutdownReport>>,

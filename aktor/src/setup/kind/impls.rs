@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    operation::Operation,
-    setup::{AktorEnd, AktorIntervalLogic},
-};
+use crate::{operation::Operation, setup::AktorIntervalLogic};
 
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 mod tokio {
@@ -16,7 +13,6 @@ mod tokio {
 
     impl AktorMode for TokioTask {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
-        type End<S: 'static> = dyn crate::task::hooks::AktorTaskEnd<S> + Send;
         type Interval<S: 'static> = dyn crate::task::hooks::AktorTaskInterval<S> + Send;
 
         const EXECUTION: AktorExecution = AktorExecution::TokioTask;
@@ -24,7 +20,6 @@ mod tokio {
 
     impl AktorMode for TokioThread {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
-        type End<S: 'static> = dyn AktorEnd<S> + Send;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S> + Send;
 
         const EXECUTION: AktorExecution = AktorExecution::TokioThread;
@@ -33,26 +28,9 @@ mod tokio {
     #[cfg(feature = "local")]
     impl AktorMode for TokioLocal<'_> {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
-        type End<S: 'static> = dyn AktorEnd<S>;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
         const EXECUTION: AktorExecution = AktorExecution::TokioLocal;
-    }
-
-    impl TokioThread {
-        pub fn with_cleanup<CleanupData>(self) -> AktorLifecycle<Self, CleanupData> {
-            AktorLifecycle {
-                kind: self,
-                data: core::marker::PhantomData,
-            }
-        }
-    }
-
-    impl<C: 'static> AktorMode for AktorLifecycle<TokioThread, C> {
-        type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
-        type End<S: 'static> = dyn AktorEnd<S, C> + Send;
-        type Interval<S: 'static> = dyn AktorIntervalLogic<S> + Send;
-        const EXECUTION: AktorExecution = AktorExecution::TokioThread;
     }
 }
 
@@ -65,24 +43,8 @@ mod standard {
 
     impl AktorMode for StdThread {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
-        type End<S: 'static> = dyn AktorEnd<S> + Send;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S> + Send;
 
-        const EXECUTION: AktorExecution = AktorExecution::StdThread;
-    }
-    impl StdThread {
-        pub fn with_cleanup<CleanupData>(self) -> AktorLifecycle<Self, CleanupData> {
-            AktorLifecycle {
-                kind: self,
-                data: core::marker::PhantomData,
-            }
-        }
-    }
-
-    impl<C: 'static> AktorMode for AktorLifecycle<StdThread, C> {
-        type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
-        type End<S: 'static> = dyn AktorEnd<S, C> + Send;
-        type Interval<S: 'static> = dyn AktorIntervalLogic<S> + Send;
         const EXECUTION: AktorExecution = AktorExecution::StdThread;
     }
 }
@@ -103,7 +65,6 @@ mod bevy {
 
     impl AktorMode for BevyLocal<'_> {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
-        type End<S: 'static> = dyn AktorEnd<S>;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
         const EXECUTION: AktorExecution = AktorExecution::BevyLocal;
@@ -111,7 +72,6 @@ mod bevy {
 
     impl AktorMode for BevyTask<'_> {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
-        type End<S: 'static> = dyn crate::task::hooks::AktorTaskEnd<S> + Send;
         type Interval<S: 'static> = dyn crate::task::hooks::AktorTaskInterval<S> + Send;
 
         const EXECUTION: AktorExecution = AktorExecution::BevyTask;
@@ -152,7 +112,6 @@ mod local {
 
     impl<Clock: crate::local::clock::AktorGroupClock, Runner> AktorMode for Custom<Clock, Runner> {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
-        type End<S: 'static> = dyn AktorEnd<S>;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
         const EXECUTION: AktorExecution = AktorExecution::Custom;
@@ -160,7 +119,6 @@ mod local {
 
     impl<Clock: crate::local::clock::AktorGroupClock> AktorMode for Local<Clock> {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
-        type End<S: 'static> = dyn AktorEnd<S>;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
         const EXECUTION: AktorExecution = AktorExecution::Local;
@@ -186,7 +144,6 @@ mod embassy {
 
     impl AktorMode for EmbassyLocal {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
-        type End<S: 'static> = dyn AktorEnd<S>;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
         const EXECUTION: AktorExecution = AktorExecution::EmbassyLocal;
@@ -212,7 +169,6 @@ mod cross_core {
 
     impl AktorMode for EmbassyCrossCore {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
-        type End<S: 'static> = dyn AktorEnd<S>;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
         const EXECUTION: AktorExecution = AktorExecution::EmbassyCrossCore;
     }
@@ -231,7 +187,6 @@ mod browser {
 
     impl AktorMode for BrowserLocal {
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
-        type End<S: 'static> = dyn AktorEnd<S>;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
         const EXECUTION: AktorExecution = AktorExecution::BrowserLocal;
@@ -258,7 +213,6 @@ mod worker {
 
     impl<S> AktorMode for BrowserWebWorker<S> {
         type Each<T: 'static> = dyn FnMut(&mut T, Operation);
-        type End<T: 'static> = dyn AktorEnd<T>;
         type Interval<T: 'static> = dyn AktorIntervalLogic<T>;
 
         const EXECUTION: AktorExecution = AktorExecution::BrowserWebWorker;

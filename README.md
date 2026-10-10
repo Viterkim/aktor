@@ -1,13 +1,13 @@
 # Aktor, not an actor framework
 
-Write some sql in a normal function, pass your handle and `.await` it. One owner runs the calls one after the other, 'go to definition' takes you to the function you wrote.
+Write normal functions, call them with a handle and .await. Go to definition takes you to the actual SQL or whatever you wrote. One owner runs the calls one after the other, and the same functions work on a native thread or a browser worker.
 
 ```toml
 [dependencies]
-aktor = { version = "0.0.5", features = ["tokio"] }
+aktor = { version = "0.0.6", features = ["tokio"] }
 ```
 
-Anything up to 0.1 will not have a stable api.
+The API can change before 0.1.
 
 ## Counter
 
@@ -26,8 +26,8 @@ let actors = aktor_start(AktorSetup {
         role: AktorNoRole,
         kind: AktorKind::TokioThread,
         closures: AktorClosures {
-            start: async || Ok::<_, AktorSetupError>(0_u32),
-            end: None,
+            start: async || Ok(0_u32),
+            end: (),
             intervals: vec![],
             before_each: None,
             after_each: None,
@@ -45,7 +45,7 @@ let actors = aktor_start(AktorSetup {
 let count = add(&actors.handles, 5).await;
 ```
 
-TokioThread keeps the counter on its own thread. Calls wait for queue space, and dropping actors starts shutdown and runs its cleanup.
+TokioThread owns the counter on its own thread. Calls wait for queue space. Keep actors alive while using its handles, dropping it starts shutdown.
 
 ## A Tokio app
 
@@ -63,16 +63,17 @@ let result = tokio::select! {
 
 let report = actors.shutdown().await;
 result?;
+
 if report.failed() {
     return Err(report.into());
 }
 ```
 
-So a server error also goes through shutdown before leaving main. The select drops the server future when stopping begins, releasing what it held while actor cleanup runs. Keep the Tokio runtime alive until shutdown finishes.
+So a server error also goes through shutdown before leaving main. The select drops the server future when stopping begins, releasing what it held while actor cleanup runs. Native groups keep their shutdown runtime alive until cleanup finishes.
 
 ## Multiplatform SQLite example (Tokio and web worker)
 
-The query and the code calling is the same.
+Write the query once and call it the same way on either platform.
 
 ```rust
 #[aktor(data)]
@@ -110,7 +111,7 @@ let actors = aktor_start(AktorSetup {
 let id = insert_user(&actors.handles, "Katten".into()).await?;
 ```
 
-sqlite_closures opens the connection in start and closes it in end. In the worker, start those closures with:
+sqlite_closures opens the connection in start and closes it in end. The worker entry point serves those closures:
 
 ```rust
 worker::serve_setup(AktorNoRole, Default::default(), |()| sqlite_closures())
@@ -119,14 +120,18 @@ worker::serve_setup(AktorNoRole, Default::default(), |()| sqlite_closures())
 
 #[aktor(data)] uses AktorData for worker arguments and results, including the query's error. Derive AktorData on your own transported types. The connection stays with its owner. Inside another query, pass that connection directly, passing its handle queues behind yourself.
 
-The [browser example](integrations/worker/src/browser.rs) has the SQLite WASM and persistent storage setup.
+## More
 
 [Examples](aktor/docs/examples.md)
-
-[Shutdown](aktor/docs/runtime.md)
 
 [Browser workers](integrations/worker/README.md)
 
 [Embassy](integrations/embassy/README.md)
 
+## Links
+
 [Docs.rs](https://docs.rs/aktor/latest/aktor/)
+
+[Crates.io for the lib](https://crates.io/crates/aktor)
+
+[Crates.io for the macros](https://crates.io/crates/aktor-macros/)

@@ -5,7 +5,7 @@ use core::{
     task::{Context, Poll, ready},
 };
 
-impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
+impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
     pub fn new(
         worker: &'a Worker<S, Role, impl Sized>,
         operation: &str,
@@ -76,6 +76,19 @@ impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
             .take()
             .ok_or_else(|| WireError::new(CallError::NotAdmitted, WorkerCause::Closed))??;
         let (answer, response) = oneshot::channel();
+        let decoder = self.decoder;
+        let answer: Answer = Box::new(move |output| {
+            if answer.is_closed() {
+                return output.err();
+            }
+
+            let output =
+                output.and_then(|bytes| decoder(&bytes).map_err(|error| error.without_data()));
+            let failure = output.as_ref().err().cloned();
+
+            let _sent = answer.send(output);
+            failure
+        });
 
         inner.outstanding.borrow_mut().insert(
             id,
@@ -102,8 +115,6 @@ impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
             id,
             parked: false,
             taken: false,
-            output: PhantomData,
-            decoder: self.decoder,
         });
 
         Ok(())
@@ -154,7 +165,13 @@ impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
             }
             Poll::Ready(Err(error)) => {
                 self.admission = None;
-                Poll::Ready(Err(error))
+
+                if self.inner.failed.get() {
+                    self.parked = true;
+                    self.inner.park(error)
+                } else {
+                    Poll::Ready(Err(error))
+                }
             }
             Poll::Pending => Poll::Pending,
         }
@@ -173,7 +190,6 @@ impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
                 if error.outcome == CallError::NotAdmitted
                     && error.cause == WorkerCause::Closed
                     && self.inner.closed.get()
-                    && !self.inner.failed.get()
                 {
                     let stopping = self
                         .inner
@@ -219,7 +235,7 @@ impl<'a, S, O, Role> WorkerRequest<'a, S, O, Role> {
         }
     }
 }
-impl<S, O, Role> Future for WorkerRequest<'_, S, O, Role> {
+impl<S, O: 'static, Role> Future for WorkerRequest<'_, S, O, Role> {
     type Output = O;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
@@ -231,13 +247,9 @@ impl<S, O, Role> Future for WorkerRequest<'_, S, O, Role> {
 
         ready!(this.poll_send(cx));
 
-        match this.reply.as_mut().map(|reply| reply.poll_result(cx)) {
-            Some(Poll::Ready(Ok(output))) => Poll::Ready(output),
-            Some(Poll::Ready(Err(error))) => {
-                this.parked = true;
-                this.inner.lost(error)
-            }
-            _ => Poll::Pending,
+        match this.reply.as_mut() {
+            Some(reply) => Pin::new(reply).poll(cx),
+            None => Poll::Pending,
         }
     }
 }
