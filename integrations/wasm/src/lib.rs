@@ -279,7 +279,7 @@ async fn timeout_limits() -> Result<(), &'static str> {
                 if state.text == "kept" {
                     Ok(())
                 } else {
-                    Err(AktorCleanupError::new("timed out operation was lost"))
+                    Err(AktorCleanupError::new("timed out operation was lost", ()))
                 }
             },
         )

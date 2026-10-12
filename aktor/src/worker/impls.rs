@@ -1,4 +1,5 @@
 use super::*;
+use core::fmt;
 
 impl Options {
     pub fn validate(&self) -> Result<(), WorkerError> {
@@ -33,6 +34,26 @@ impl Default for Options {
 }
 
 impl<T> WorkerError<T> {
+    #[doc(hidden)]
+    pub fn fmt_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match &self.cause {
+            WorkerCause::Setup(_) => Some("worker setup failed"),
+            WorkerCause::Cleanup(_) => Some("worker cleanup failed"),
+            _ => None,
+        };
+
+        if let Some(message) = message {
+            write!(f, "worker call {:?}: {message}", self.outcome)
+        } else {
+            self.fmt_details(f)
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "worker call {:?}: {:?}", self.outcome, self.cause)
+    }
+
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     #[doc(hidden)]
     pub fn data_error(mut self, error: WorkerError) -> Self {
@@ -42,7 +63,7 @@ impl<T> WorkerError<T> {
         };
 
         message.push_str("\nOptional lifecycle data: ");
-        message.push_str(&error.to_string());
+        message.push_str(&alloc::format!("{error:#}"));
         self
     }
 

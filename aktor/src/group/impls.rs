@@ -52,7 +52,7 @@ impl AktorGroup {
                 &self.killswitch(),
                 "rejected shutdown closure drop",
             );
-            return Err(AktorError::new(error));
+            return Err(AktorError::new(error, ()));
         }
 
         #[cfg(not(target_family = "wasm"))]
@@ -87,11 +87,12 @@ impl AktorGroup {
         if !state.listening {
             return Err(AktorError::new(
                 "start the actor group before spawning actors",
+                (),
             ));
         }
 
         if state.deadline.is_some() {
-            return Err(AktorError::new("actor group is closing"));
+            return Err(AktorError::new("actor group is closing", ()));
         }
 
         state.kinds.push((name.clone(), kind));
@@ -192,14 +193,14 @@ impl AktorGroup {
                 state
                     .report
                     .application
-                    .push(AktorError::new(error.to_string()));
+                    .push(AktorError::new(error.to_string(), ()));
             };
 
             self.killswitch().dispose_shutdown_hook();
             let report = self.control.lock().report.clone();
             self.control.completed.send_replace(Some(report));
             self.control.wake.notify_all();
-            return Err(AktorError::new(error.to_string()));
+            return Err(AktorError::new(error.to_string(), ()));
         }
 
         self.stop_on_drop = true;
@@ -209,7 +210,7 @@ impl AktorGroup {
     #[doc(hidden)]
     pub fn check_started(&self) -> Result<(), AktorError> {
         if !self.control.lock().listening {
-            return Err(AktorError::new("actor group has no shutdown listener"));
+            return Err(AktorError::new("actor group has no shutdown listener", ()));
         }
 
         Ok(())
@@ -269,6 +270,7 @@ impl AktorGroup {
         {
             Err(AktorError::new(
                 "use AktorKind::StdThread or enable the tokio feature",
+                (),
             ))
         }
     }
@@ -294,7 +296,7 @@ impl AktorGroup {
         Output::Future: Send + 'static,
     {
         tokio::runtime::Handle::try_current()
-            .map_err(|_| AktorError::new("starting an actor group needs a Tokio runtime"))?;
+            .map_err(|_| AktorError::new("starting an actor group needs a Tokio runtime", ()))?;
 
         let completed = self.completion();
         let closing = self.listen(move |report| cleanup(report).into_shutdown())?;
@@ -356,14 +358,14 @@ impl AktorGroup {
                     state
                         .report
                         .application
-                        .push(AktorError::new(error.to_string()));
+                        .push(AktorError::new(error.to_string(), ()));
                 };
 
                 self.killswitch().dispose_shutdown_hook();
                 let report = self.control.lock().report.clone();
                 self.control.completed.send_replace(Some(report));
                 self.control.wake.notify_all();
-                Err(AktorError::new(error.to_string()))
+                Err(AktorError::new(error.to_string(), ()))
             }
         }
     }
@@ -437,12 +439,13 @@ impl AktorGroup {
         let mut state = self.control.lock();
 
         if state.finished {
-            return Err(AktorError::new("this group has already stopped"));
+            return Err(AktorError::new("this group has already stopped", ()));
         }
 
         if state.listening {
             return Err(AktorError::new(
                 "this group already has a shutdown listener",
+                (),
             ));
         }
 

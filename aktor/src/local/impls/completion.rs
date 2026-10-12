@@ -22,7 +22,7 @@ impl<E> Completion<E> {
     pub async fn wait(&self) -> Result<(), OwnerError> {
         self.wait_with_data()
             .await
-            .map_err(|error| error.error.report())
+            .map_err(|error| error.error.without_data())
     }
 
     /// Observe the exact lifecycle error and its data on this executor.

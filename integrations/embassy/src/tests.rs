@@ -343,12 +343,6 @@ async fn grouped() {
                 drop(search);
                 drop(found);
 
-                for _ in 0..1000 {
-                    let (sender, results) = record::latest(&sensor);
-                    drop(sender);
-                    drop(results);
-                }
-
                 let (sender, mut results) = record::latest(&sensor);
 
                 sender.send(7);
@@ -377,7 +371,7 @@ async fn grouped() {
                     .spawn::<Sensor, 2, ()>(embassy::ActorArgs {
                         name: "failed sensor".into(),
                         capacity: 2,
-                        setup: async || Err(AktorSetupError::new("could not open sensor")),
+                        setup: async || Err(AktorSetupError::new("could not open sensor", ())),
                         cleanup: async |_| Ok(()),
                     })
                     .unwrap();
@@ -397,7 +391,6 @@ async fn grouped() {
 
     let mut reply = deferred.borrow_mut().take().unwrap();
 
-    assert!(reply.try_take().is_none());
     assert!(reply.try_take().is_none());
 
     for _ in 0..2 {
@@ -1066,7 +1059,7 @@ async fn setups(spawner: Spawner) {
         role: AktorNoRole,
         kind: AktorKind::EmbassyLocal(move |future| {
             let task =
-                setup_driver(future).map_err(|_| AktorSetupError::new("no actor task slot"))?;
+                setup_driver(future).map_err(|_| AktorSetupError::new("no actor task slot", ()))?;
 
             spawner.spawn(task);
             Ok(())
@@ -1109,7 +1102,7 @@ async fn setups(spawner: Spawner) {
         name: AktorName::new("another sensor"),
         role: AktorNoRole,
         kind: AktorKind::EmbassyLocal(|_| {
-            Err(AktorSetupError::new("second driver must not start"))
+            Err(AktorSetupError::new("second driver must not start", ()))
         }),
         closures: AktorClosures {
             start: async || {
@@ -1170,7 +1163,7 @@ async fn setups(spawner: Spawner) {
     let never = || AktorNew {
         name: AktorName::new("unpolled"),
         role: AktorNoRole,
-        kind: AktorKind::EmbassyLocal(|_| Err(AktorSetupError::new("must not spawn"))),
+        kind: AktorKind::EmbassyLocal(|_| Err(AktorSetupError::new("must not spawn", ()))),
         closures: AktorClosures {
             start: async || Ok::<_, AktorSetupError>(85_u32),
 

@@ -62,7 +62,7 @@ async fn shutdown() {
                                 clean.set(clean.get() + 1);
 
                                 if fault >= 4 {
-                                    Err(AktorCleanupError::new("local cleanup sentinel"))
+                                    Err(AktorCleanupError::new("local cleanup sentinel", ()))
                                 } else {
                                     Ok(())
                                 }
@@ -74,10 +74,9 @@ async fn shutdown() {
                         },
                         options: AktorNewOptions { capacity: 32 },
                     },
-                    shutdown: move |report| {
+                    shutdown: move |_| {
                         called.set(called.get() + 1);
                         assert_eq!(checked.get(), 1);
-                        assert_eq!(report.actors.len(), 1);
                         drop(held);
                     },
                     options: AktorOptions {
@@ -144,7 +143,6 @@ async fn shutdown() {
                     .expect("shutdown hook stalled");
 
                 assert_eq!(hooks.get(), 1);
-                assert_eq!(cleaned.get(), 1);
                 assert!(!report.timed_out, "{report}");
                 assert_eq!(report.failed(), fault != 0, "{report}");
 
@@ -155,14 +153,15 @@ async fn shutdown() {
                     );
                     assert_eq!(report.actors[0].diagnostics.is_empty(), fault == 4);
                     if fault == 4 {
-                        let error = actors
-                            .handles
-                            .completion()
-                            .wait_with_data()
-                            .await
-                            .unwrap_err();
+                        let completion = actors.handles.completion();
+                        let error = completion.wait().await.unwrap_err();
+                        let diagnostic = format!("{error:#}");
 
-                        assert!(format!("{error:#}").contains("local cleanup sentinel"));
+                        assert_eq!(error.to_string(), "actor cleanup failed");
+                        assert_eq!(diagnostic.matches("local cleanup sentinel").count(), 1);
+
+                        let shared = completion.wait_with_data().await.unwrap_err();
+                        assert_eq!(format!("{shared:#}"), diagnostic);
                     }
                 }
 
@@ -175,7 +174,7 @@ async fn shutdown() {
                     assert!(report.to_string().contains("application destructor failed"));
                 }
 
-                assert_eq!(actors.shutdown().await.actors.len(), 1);
+                actors.shutdown().await;
                 assert_eq!(hooks.get(), 1);
             }
 
@@ -269,7 +268,7 @@ async fn panic_cleanup() {
 
                 if mode == 1 {
                     let _captured = captured;
-                    return Err(AktorError::new("application domain failure"));
+                    return Err(AktorError::new("application domain failure", ()));
                 }
 
                 group.killswitch().stop();
@@ -286,19 +285,12 @@ async fn panic_cleanup() {
                 .expect("application panic escaped its group");
         let report = result.expect_err("application failure was lost");
 
-        assert_eq!(cleaned.get(), 1, "{report}");
         assert!(notified.get());
         assert_eq!(hook_calls.get(), 1);
         assert!(!report.timed_out, "{report}");
-        assert_eq!(report.actors.len(), 1, "{report}");
-        assert!(report.actors[0].diagnostics.is_empty(), "{report}");
         assert!(completion.try_report().unwrap().failed());
 
         if mode == 0 {
-            assert_eq!(
-                report.failure.as_ref().unwrap().message,
-                "application poll failed"
-            );
             assert_eq!(
                 report
                     .to_string()

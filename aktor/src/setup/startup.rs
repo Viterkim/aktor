@@ -72,7 +72,7 @@ impl<Setup: AktorStart<Mode>, Mode> Future for AktorStartup<Setup, Mode> {
                     if !initialized {
                         drop(handles);
                         this.closing(
-                            AktorSetupError::new("actor group stopped during startup").into(),
+                            AktorSetupError::new("actor group stopped during startup", ()).into(),
                         );
                     } else if let Some(group) = this.group.take() {
                         return Poll::Ready(Ok(AktorStarted { handles, group }));
@@ -103,7 +103,7 @@ impl<Setup: AktorStart<Mode>, Mode> Future for AktorStartup<Setup, Mode> {
 
         Poll::Ready(Err(AktorStartupError {
             diagnostics: "actor startup was polled after completion".into(),
-            error: AktorSetupError::new("actor startup was polled after completion").into(),
+            error: AktorSetupError::new("actor startup was polled after completion", ()).into(),
             report: None,
             source_is_failure: false,
         }))

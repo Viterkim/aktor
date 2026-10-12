@@ -149,7 +149,10 @@ impl<S: 'static> Aktor<S> {
             if let Err(cleanup) = owner.completion.wait().await {
                 return Err(DedicatedStartError::Thread(std::io::Error::new(
                     error.kind(),
-                    format!("{error}; {cleanup}"),
+                    CompletionScheduleError {
+                        cause: error,
+                        cleanup,
+                    },
                 )));
             }
 
@@ -280,30 +283,46 @@ impl fmt::Display for OwnerError {
                     error.errors.len() + error.diagnostics.len()
                 )?;
 
-                for failure in &error.errors {
-                    write!(formatter, ": {}", failure.diagnostics)?;
-                }
+                if formatter.alternate() {
+                    for failure in &error.errors {
+                        write!(formatter, ": {}", failure.diagnostics)?;
+                    }
 
-                for diagnostic in &error.diagnostics {
-                    write!(formatter, ": {}", diagnostic.diagnostics)?;
+                    for diagnostic in &error.diagnostics {
+                        write!(formatter, ": {}", diagnostic.diagnostics)?;
+                    }
                 }
 
                 Ok(())
             }
-            Self::Panicked(error) => write!(formatter, "actor thread failed: {error}"),
-            Self::PanickedWithCleanup { cause, cleanup } => {
-                write!(formatter, "actor thread failed: {cause}")?;
+            Self::Panicked(error) => {
+                formatter.write_str("actor thread failed")?;
 
-                if !cleanup.errors.is_empty() {
+                if formatter.alternate() {
+                    write!(formatter, ": {error}")?;
+                }
+
+                Ok(())
+            }
+            Self::PanickedWithCleanup { cause, cleanup } => {
+                formatter.write_str("actor thread failed")?;
+
+                if formatter.alternate() {
+                    write!(formatter, ": {cause}")?;
+                }
+
+                if !cleanup.errors.is_empty() || !cleanup.diagnostics.is_empty() {
                     write!(formatter, "; cleanup failed")?;
                 }
 
-                for error in &cleanup.errors {
-                    write!(formatter, ": {}", error.diagnostics)?;
-                }
+                if formatter.alternate() {
+                    for error in &cleanup.errors {
+                        write!(formatter, ": {}", error.diagnostics)?;
+                    }
 
-                for diagnostic in &cleanup.diagnostics {
-                    write!(formatter, "; {}", diagnostic.diagnostics)?;
+                    for diagnostic in &cleanup.diagnostics {
+                        write!(formatter, "; {}", diagnostic.diagnostics)?;
+                    }
                 }
 
                 Ok(())
@@ -314,6 +333,17 @@ impl fmt::Display for OwnerError {
     }
 }
 impl core::error::Error for OwnerError {}
+
+impl fmt::Display for CompletionScheduleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if f.alternate() {
+            write!(f, "{}; {:#}", self.cause, self.cleanup)
+        } else {
+            write!(f, "{}; {}", self.cause, self.cleanup)
+        }
+    }
+}
+impl core::error::Error for CompletionScheduleError {}
 
 impl core::future::IntoFuture for OwnerCompletion {
     type Output = Result<(), Arc<OwnerError>>;
@@ -388,7 +418,7 @@ mod tests {
                         cleanup.fetch_add(1, Ordering::Relaxed);
 
                         if failed_cleanup {
-                            Err(AktorCleanupError::new("cleanup also failed"))
+                            Err(AktorCleanupError::new("cleanup also failed", ()))
                         } else {
                             Ok(())
                         }
@@ -419,9 +449,10 @@ mod tests {
         };
 
         assert_eq!(
-            error.to_string().contains("cleanup also failed"),
+            format!("{error:#}").contains("cleanup also failed"),
             failed_cleanup
         );
+        assert!(!error.to_string().contains("cleanup also failed"));
         assert_eq!(cleaned.load(Ordering::Relaxed), 1);
     }
 

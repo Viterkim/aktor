@@ -1,8 +1,10 @@
 use crate::preferences::{read::read, write::write};
 use aktor::message::CallError;
 use aktor::*;
+use er::*;
 use futures_util::FutureExt;
 use rusqlite::Connection;
+use sqlite_wasm_vfs::sahpool::{OpfsSAHError, OpfsSAHPoolUtil};
 use std::{
     cell::{Cell, RefCell},
     fmt::Display,
@@ -78,6 +80,20 @@ fn js_error(error: impl Display) -> JsValue {
     JsValue::from_str(&error.to_string())
 }
 
+#[derive(Er)]
+enum CloseErr {
+    Database(#[er(source, skip)] rusqlite::Error),
+    Storage(#[er(source, skip)] OpfsSAHError),
+}
+fn close_database(db: Connection, pool: &OpfsSAHPoolUtil) -> ErResult<(), CloseErr> {
+    db.close().er_val(|(db, error)| {
+        drop(db);
+        CloseErr::database(error)
+    })?;
+
+    pool.pause_vfs().er_val(CloseErr::storage)
+}
+
 #[wasm_bindgen]
 pub async fn start_worker() -> Result<(), JsValue> {
     let pool = sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
@@ -107,14 +123,8 @@ pub async fn start_worker() -> Result<(), JsValue> {
     )
     .map_err(js_error)?;
 
-    let cleanup = async move |db: Connection| {
-        db.close()
-            .map_err(|(_, error)| AktorCleanupError::new(error.to_string()))?;
-
-        pool.pause_vfs()
-            .map_err(|error| AktorCleanupError::new(error.to_string()))?;
-
-        Ok(())
+    let cleanup = async move |db: Connection| -> Result<(), AktorCleanupError> {
+        close_database(db, &pool).er_into(|report| report)
     };
 
     let options = Options {
@@ -500,7 +510,7 @@ impl Client {
 
 #[wasm_bindgen]
 pub fn startup_failed(error: String) -> Result<(), JsValue> {
-    worker::setup_failed(aktor::AktorSetupError::new(error)).map_err(js_error)
+    worker::setup_failed(aktor::AktorSetupError::new(error, ())).map_err(js_error)
 }
 
 #[wasm_bindgen]

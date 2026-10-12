@@ -1,5 +1,5 @@
 use crate::{
-    AktorError,
+    AktorError, AktorFailure,
     local::hooks::AktorHooks,
     message::{CallError, LocalFuture},
     operation::Operation,

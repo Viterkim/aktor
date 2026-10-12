@@ -34,7 +34,8 @@ impl<Clock: AktorGroupClock> Drop for Driver<Clock> {
                     kind: Some(entry.kind),
                     actor: entry.name,
                     diagnostics: alloc::vec![AktorError::new(
-                        "actor owner cancelled before cleanup finished"
+                        "actor owner cancelled before cleanup finished",
+                        ()
                     )],
                     timed_out: false,
                 });
@@ -74,7 +75,7 @@ pub fn capture<T>(action: impl FnOnce() -> T) -> Result<T, AktorError> {
                 let message = panic_message(&payload);
 
                 dispose_secondary(payload);
-                Err(AktorError::new(message))
+                Err(AktorError::new(message, ()))
             }
         }
     }

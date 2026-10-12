@@ -28,11 +28,11 @@ pub const AktorNoRole: AktorNoRole = ();
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[derive(Clone, PartialEq, Eq, er::Er)]
-#[er(no_constructors)]
+#[er(format = "actor lifecycle failed", display_alt = "{diagnostics}")]
 pub struct AktorError<T = ()> {
-    #[er(into_report_string, skip)]
+    #[er(into_report_string)]
     pub diagnostics: String,
-    #[er(skip)]
+    #[er(default)]
     pub data: T,
 }
 
@@ -40,9 +40,15 @@ pub type AktorSetupError<T = ()> = AktorError<T>;
 pub type AktorCleanupError<T = ()> = AktorError<T>;
 
 #[doc(hidden)]
-#[derive(Clone)]
+#[derive(Clone, er::Er)]
+#[er(
+    no_constructors,
+    format = "actor lifecycle failed",
+    display_alt = "{diagnostics}"
+)]
 pub struct AktorFailure {
     pub diagnostics: String,
+    #[er(skip)]
     pub primary: bool,
 }
 

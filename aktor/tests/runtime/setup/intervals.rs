@@ -13,10 +13,10 @@ async fn backup() {
             closures: AktorClosures {
                 start: async || {
                     let db = rusqlite::Connection::open_in_memory()
-                        .map_err(|error| AktorSetupError::new(error.to_string()))?;
+                        .map_err(|error| AktorSetupError::new(error.to_string(), ()))?;
 
                     db.execute_batch("CREATE TABLE saved(value); INSERT INTO saved VALUES(85)")
-                        .map_err(|error| AktorSetupError::new(error.to_string()))?;
+                        .map_err(|error| AktorSetupError::new(error.to_string(), ()))?;
                     Ok::<_, AktorSetupError>(db)
                 },
                 intervals: vec![AktorInterval {

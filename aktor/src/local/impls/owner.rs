@@ -45,7 +45,10 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                     .completion
                     .diagnostics
                     .borrow_mut()
-                    .push(crate::AktorError::new(crate::panic::panic_message(payload)));
+                    .push(crate::AktorError::new(
+                        crate::panic::panic_message(payload),
+                        (),
+                    ));
             };
 
             let primary = crate::local::panic::discard_hooks(hooks, report);
@@ -63,7 +66,7 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
         #[cfg(feature = "std")]
         {
             let report = |payload: &Box<dyn std::any::Any + Send>| {
-                let error = crate::AktorError::new(crate::panic::panic_message(payload));
+                let error = crate::AktorError::new(crate::panic::panic_message(payload), ());
                 self.inner.fail(&OwnerError::Runner(error.clone()));
                 self.inner.completion.diagnostics.borrow_mut().push(error);
             };

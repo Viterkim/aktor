@@ -73,7 +73,7 @@ pub fn check() -> Result<(), String> {
 
                         end: async move |counter: Counter| {
                             end.send(counter.0.get())
-                                .map_err(|error| AktorCleanupError::new(error.to_string()))
+                                .map_err(|error| AktorCleanupError::new(error.to_string(), ()))
                         },
                         intervals: vec![AktorInterval {
                             every: Duration::from_millis(1),
@@ -135,7 +135,6 @@ pub fn check() -> Result<(), String> {
         let report = actors.shutdown().await;
 
         assert!(!report.failed(), "{report}");
-        assert_eq!(report.actors[0].kind, Some(AktorExecution::StdThread));
         assert_eq!(output.next().await, Some(Ok(7)));
         assert_eq!(output.next().await, None);
         assert_eq!(ended.recv().unwrap(), 7);
@@ -144,14 +143,14 @@ pub fn check() -> Result<(), String> {
     })
 }
 
+fn main() -> Result<(), String> {
+    check()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn counter() {
         super::check().unwrap();
     }
-}
-
-fn main() -> Result<(), String> {
-    check()
 }

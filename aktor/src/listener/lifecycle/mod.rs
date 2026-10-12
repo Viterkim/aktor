@@ -34,22 +34,16 @@ pub enum AbandonedSetup<E> {
 
 #[derive(Er)]
 pub enum LifecycleError<E = crate::AktorSetupError> {
-    #[er(format = "actor stopped")]
     Closed,
-    #[er(format = "actor is already running")]
     AlreadyRunning,
-    #[er(format = "actor lifecycle operation failed")]
-    Failed(#[er(source)] E),
+    Failed(#[er(source, skip)] E),
 }
 
 #[derive(Er)]
 pub enum ReplaceError<E = crate::AktorSetupError, C = crate::AktorFailure> {
-    #[er(format = "actor stopped")]
     Closed,
-    #[er(format = "replacement cleanup failed")]
-    Cleanup(#[er(source)] Arc<C>),
-    #[er(format = "replacement setup failed")]
-    Setup(#[er(source)] E),
+    Cleanup(#[er(source, skip)] Arc<C>),
+    Setup(#[er(source, skip)] E),
 }
 
 #[derive(Debug)]

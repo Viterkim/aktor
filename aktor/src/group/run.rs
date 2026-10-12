@@ -42,9 +42,9 @@ impl AktorGroup {
                 let lifetime = ();
                 let _sent = hook_start.send((report, lifetime));
 
-                hook_result
-                    .await
-                    .map_err(|_| AktorError::new("group driver cancelled before cleanup finished"))
+                hook_result.await.map_err(|_| {
+                    AktorError::new("group driver cancelled before cleanup finished", ())
+                })
             }) {
                 Ok(completed) => completed,
                 Err(error) => {

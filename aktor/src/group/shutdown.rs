@@ -324,7 +324,7 @@ pub fn fail_application(kill: &KillSwitch, phase: &str, message: String) {
             .lock()
             .report
             .application
-            .push(AktorError::new(format!("{phase}: {message}")));
+            .push(AktorError::new(format!("{phase}: {message}"), ()));
     }
 }
 

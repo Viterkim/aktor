@@ -122,12 +122,13 @@ async fn failure_report() {
                         capacity: 2,
                         setup: || Ok::<_, AktorError>(0usize),
                         cleanup: |_| {
-                            Err(io::Error::new(
+                            let tree = io::Error::new(
                                 io::ErrorKind::PermissionDenied,
                                 "backup folder is read only",
-                            ))
-                            .er::<FlushErr>(())
-                            .er_into::<AktorCleanupError>(|_| ())
+                            )
+                            .er::<FlushErr>(());
+
+                            Err(tree).er_into(|report| report)
                         },
                     })
                     .await

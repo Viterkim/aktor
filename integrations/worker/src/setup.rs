@@ -265,7 +265,7 @@ async fn browser_budget() -> Result<(), JsValue> {
                 if state.get() == 4096 {
                     Ok(())
                 } else {
-                    Err(AktorCleanupError::new("busy owner lost admitted work"))
+                    Err(AktorCleanupError::new("busy owner lost admitted work", ()))
                 }
             };
 
@@ -403,7 +403,7 @@ pub async fn bevy_setup_check() -> Result<bool, JsValue> {
                 if counter.get() == 7 {
                     Ok::<_, AktorCleanupError>(())
                 } else {
-                    Err(AktorError::new("Bevy task lost admitted work"))
+                    Err(AktorError::new("Bevy task lost admitted work", ()))
                 }
             },
             intervals: vec![],

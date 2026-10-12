@@ -653,16 +653,20 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
         let completion = retained.borrow_mut().take().unwrap();
         let error = completion.wait().await.unwrap_err();
 
+        assert!(!error.to_string().contains("backup folder is read only"));
+        assert!(format!("{error:#}").contains("backup folder is read only"));
+
         error
             .data
             .is_some_and(|data| data.code == 17 && data.option == Some(None))
     } else if mode == 6 || mode == 7 {
         let completion = retained.borrow_mut().take().unwrap();
         let error = completion.wait().await.unwrap_err();
+        let diagnostic = format!("{error:#}");
 
         error.data.is_none()
-            && error.to_string().contains("backup folder is read only")
-            && error.to_string().contains("Optional lifecycle data")
+            && diagnostic.contains("backup folder is read only")
+            && diagnostic.contains("Optional lifecycle data")
     } else {
         true
     };
@@ -968,7 +972,8 @@ pub async fn typed_setup_check(url: String) -> Result<bool, JsValue> {
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let error = actor.ready().await.unwrap_err();
 
-    assert!(error.to_string().contains("could not open storage"));
+    assert!(!error.to_string().contains("could not open storage"));
+    assert!(format!("{error:#}").contains("could not open storage"));
     assert!(
         error
             .data
@@ -976,6 +981,8 @@ pub async fn typed_setup_check(url: String) -> Result<bool, JsValue> {
     );
 
     let error = actor.completion().wait().await.unwrap_err();
+    assert!(!error.to_string().contains("could not open storage"));
+    assert!(format!("{error:#}").contains("could not open storage"));
 
     Ok(error
         .data

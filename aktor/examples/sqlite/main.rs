@@ -1,4 +1,5 @@
 use aktor::*;
+use er::*;
 use rusqlite::Connection;
 
 pub mod adopt;
@@ -28,15 +29,28 @@ pub struct Owner {
     pub name: String,
 }
 
+#[derive(Er)]
+pub struct OpenErr;
+fn open_database() -> ErResult<Connection, OpenErr> {
+    Connection::open_in_memory().er(())
+}
+
+#[derive(Er)]
+pub struct CloseErr;
+fn close_database(db: Connection) -> ErResult<(), CloseErr> {
+    match db.close() {
+        Ok(()) => Ok(()),
+        Err((db, err)) => {
+            drop(db);
+            Err(err).er(())
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::result::Result<(), Box<dyn core::error::Error>> {
-    let setup = async || {
-        Connection::open_in_memory().map_err(|error| AktorSetupError::new(error.to_string()))
-    };
-    let cleanup = async |db: Connection| {
-        db.close()
-            .map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
-    };
+    let setup = async || open_database().er_into(|report| report);
+    let cleanup = async |db| close_database(db).er_into(|report| report);
 
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {

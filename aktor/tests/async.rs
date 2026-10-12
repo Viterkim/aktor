@@ -144,7 +144,7 @@ async fn panic_after_await() {
                 tokio::task::yield_now().await;
                 *observed.lock() = Some(state.values.borrow().clone());
 
-                Err(aktor::AktorCleanupError::new("cleanup failed too"))
+                Err(aktor::AktorCleanupError::new("cleanup failed too", ()))
             }
         },
     })
@@ -171,7 +171,8 @@ async fn panic_after_await() {
     );
     assert_eq!(cleanup.errors[0].diagnostics, "cleanup failed too");
 
-    let report = error.to_string();
+    assert_eq!(error.to_string(), "actor thread failed; cleanup failed");
+    let report = format!("{error:#}");
 
     assert!(report.contains("after await"));
     assert!(report.contains("cleanup failed too"));
@@ -188,6 +189,7 @@ async fn completion() {
         cleanup: |_| {
             Err(aktor::AktorCleanupError::new(
                 "database connection stayed open",
+                (),
             ))
         },
     })
@@ -227,9 +229,6 @@ async fn completion() {
         error.errors[0].diagnostics,
         "database connection stayed open"
     );
-    assert!(
-        first
-            .to_string()
-            .contains("database connection stayed open")
-    );
+    assert_eq!(first.to_string(), "actor cleanup failed 1 time(s)");
+    assert!(format!("{first:#}").contains("database connection stayed open"));
 }

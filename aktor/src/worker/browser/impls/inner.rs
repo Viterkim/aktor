@@ -68,14 +68,14 @@ impl Inner {
         let primary = self.notify(error);
         let message = match &error.cause {
             WorkerCause::Cleanup(message) => Some(message.clone()),
-            _ if !primary => Some(error.to_string()),
+            _ if !primary => Some(format!("{error:#}")),
             _ => None,
         };
 
         if let Some(message) = message {
             self.diagnostics
                 .borrow_mut()
-                .push(crate::AktorError::new(message));
+                .push(crate::AktorError::new(message, ()));
         }
     }
 
@@ -86,7 +86,7 @@ impl Inner {
         };
         let (phase, message) = match &error.cause {
             WorkerCause::Cleanup(_) => ("cleanup", "worker cleanup failed".into()),
-            _ => ("worker", error.to_string()),
+            _ => ("worker", format!("{error:#}")),
         };
         let failure = crate::group::ActorFailure {
             kind: None,

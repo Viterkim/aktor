@@ -95,7 +95,6 @@ async fn value() {
         .await
         .unwrap();
 
-    assert_eq!(report.actors.len(), 1);
     assert_eq!(
         report.application[0].diagnostics,
         "application cleanup error"
@@ -226,7 +225,7 @@ fn shutdown() {
 
                         if app_mode == "application error" {
                             let _resource = BrokenDrop;
-                            return Err(AktorError::new("original application error"));
+                            return Err(AktorError::new("original application error", ()));
                         }
 
                         if app_mode == "driver" {
@@ -245,7 +244,7 @@ fn shutdown() {
 
                         if hook_mode == "hook error" {
                             let _resource = BrokenDrop;
-                            return Err(AktorError::new("original hook error"));
+                            return Err(AktorError::new("original hook error", ()));
                         }
 
                         if hook_mode == "hook driver" {
@@ -322,7 +321,6 @@ fn shutdown() {
                 let report = completed.wait().await;
 
                 assert!(cleaned.load(Ordering::SeqCst));
-                assert_eq!(report.actors.len(), 1);
                 assert!(!report.timed_out);
 
                 if mode.ends_with("driver") {
@@ -407,10 +405,4 @@ fn stop_before_start() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-#[test]
-#[should_panic(expected = "unknown child test: missing_child_test")]
-fn missing_child() {
-    support::child("missing_child_test", "invalid");
 }

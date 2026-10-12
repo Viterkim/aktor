@@ -1,4 +1,5 @@
 use super::*;
+use crate::AktorError;
 use crate::{
     AktorClosures, local::hooks::AktorHooks, setup::closures::AktorEndCall,
     setup::kind::BrowserWebWorker,
@@ -140,7 +141,7 @@ where
         state,
         async move |state| match end.run(state).await {
             Ok(()) => Ok(()),
-            Err(error) => Err(error.report()),
+            Err(error) => Err(AktorError::new(error.diagnostics, ())),
         },
         options,
         AktorHooks {

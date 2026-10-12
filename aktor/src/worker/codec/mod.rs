@@ -44,7 +44,8 @@ const ENUM: u8 = 22;
 const END: u8 = 23;
 const UNIT_VARIANT: u8 = 24;
 
-#[derive(Debug)]
+#[derive(er::Er)]
+#[er(no_constructors)]
 struct Error(String);
 
 fn error(message: &str) -> Error {

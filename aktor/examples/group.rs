@@ -1,12 +1,31 @@
 use aktor::*;
+use er::*;
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Write},
+    io::Write,
 };
 
+#[derive(Er)]
+pub struct AppendErr;
 #[aktor]
-async fn append(file: &mut File, text: String) -> io::Result<()> {
-    writeln!(file, "{text}")
+async fn append(file: &mut File, text: String) -> ErResult<(), AppendErr> {
+    writeln!(file, "{text}").er(())
+}
+
+#[derive(Er)]
+pub struct OpenErr(pub String);
+fn open_log(path: &str) -> ErResult<File, OpenErr> {
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .er(|_| path)
+}
+
+#[derive(Er)]
+pub struct SyncErr;
+fn sync_log(file: File) -> ErResult<(), SyncErr> {
+    file.sync_all().er(())
 }
 
 #[tokio::main]
@@ -14,18 +33,8 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "aktor.log".into());
-    let setup = move || {
-        OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(path)
-            .map_err(|error| AktorSetupError::new(error.to_string()))
-    };
-
-    let cleanup = |file: File| {
-        file.sync_all()
-            .map_err(|error| AktorCleanupError::new(error.to_string()))
-    };
+    let setup = move || open_log(&path).er_into(|report| report);
+    let cleanup = |file| sync_log(file).er_into(|report| report);
     let after = async |report: ShutdownReport| {
         if report.failed() {
             eprintln!("{report}");
@@ -42,7 +51,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
 
     actors.spawn_task(async move {
         if let Err(error) = append(&log, "application started".into()).await {
-            eprintln!("{error}");
+            eprintln!("{}", error.er_report());
         }
 
         core::future::pending::<()>().await;

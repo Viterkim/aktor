@@ -1,4 +1,5 @@
 use super::*;
+use crate::AktorError;
 use crate::{cross_core, local::hooks::AktorHooks};
 use core::ops::AsyncFnOnce;
 use kind::EmbassyCrossCore;
@@ -41,6 +42,7 @@ where
                     AktorExecution::EmbassyCrossCore,
                     AktorStartError::Setup(AktorSetupError::new(
                         "interval duration must be positive",
+                        (),
                     )),
                 ));
             }
@@ -50,15 +52,15 @@ where
                     &context.group,
                     &setup.name.name,
                     AktorExecution::EmbassyCrossCore,
-                    AktorStartError::Setup(AktorSetupError::new(alloc::format!(
-                        "{}",
-                        crate::message::ActorError::InvalidCapacity
-                    ))),
+                    AktorStartError::Setup(AktorSetupError::new(
+                        alloc::format!("{}", crate::message::ActorError::InvalidCapacity),
+                        (),
+                    )),
                 ));
             }
 
             let (handle, mut owner) = cross_core::channel(options.capacity).map_err(|error| {
-                AktorStartError::Setup(AktorSetupError::new(alloc::format!("{error}")))
+                AktorStartError::Setup(AktorSetupError::new(alloc::format!("{error}"), ()))
             })?;
 
             owner.hooks = AktorHooks {
@@ -91,7 +93,7 @@ where
                     }),
                     Box::pin(async move {
                         owner
-                            .run_with(
+                            .run_prepared(
                                 async move || match start().await {
                                     Ok(state) => {
                                         ready.send(Ok(()));
@@ -103,27 +105,27 @@ where
                                             AktorExecution::EmbassyCrossCore,
                                             error,
                                         );
-                                        let report = error.report();
+                                        let report = error.clone();
 
                                         ready.send(Err(AktorStartError::Init(error)));
                                         Err(report)
                                     }
                                 },
-                                async move |state| match end.run(state).await {
-                                    Ok(()) => Ok(()),
-                                    Err(error) => Err(error.report()),
-                                },
+                                async move |state| end.run(state).await,
                             )
                             .await
                             .err()
+                            .filter(|error| !error.primary)
+                            .map(|error| AktorError::new(error.diagnostics, ()))
                     }),
                 )
                 .map_err(|error| {
-                    AktorStartError::Setup(AktorSetupError::new(alloc::format!("{error}")))
+                    AktorStartError::Setup(AktorSetupError::new(alloc::format!("{error}"), ()))
                 })?;
             initialized.await.ok_or_else(|| {
                 AktorStartError::Setup(AktorSetupError::new(
                     "cross core actor stopped during startup",
+                    (),
                 ))
             })??;
             Ok(handle.with_role::<Role>())

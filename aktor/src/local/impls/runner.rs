@@ -1,4 +1,5 @@
 use super::*;
+use crate::AktorError;
 use core::{future::poll_fn, ops::AsyncFnOnce};
 
 pub struct AktorRunner<'a, S, const N: usize = 0, E = ()> {
@@ -196,7 +197,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         {
             Ok(result) => (result, None),
             Err(payload) => {
-                let error = crate::AktorError::new(crate::panic::panic_message(&payload));
+                let error = crate::AktorError::new(crate::panic::panic_message(&payload), ());
 
                 (Err(OwnerError::SetupPanic(error)), Some(payload))
             }
@@ -211,7 +212,16 @@ impl<S, const N: usize, E> Owner<S, N, E> {
             Err(error) => {
                 let error = Rc::new(error);
 
-                self.inner.fail(&error);
+                if !self.inner.fail(&error)
+                    && self.inner.group.borrow().is_some()
+                    && let OwnerError::Setup(error) = &*error
+                {
+                    self.inner
+                        .completion
+                        .diagnostics
+                        .borrow_mut()
+                        .push(crate::AktorError::new(error.diagnostics.clone(), ()));
+                }
                 #[cfg(feature = "std")]
                 {
                     let inner = self.inner.clone();
@@ -275,7 +285,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 }
                 #[cfg(not(feature = "std"))]
                 self.inner.finish(result.clone());
-                result.map_err(|error| error.report())
+                result.map_err(|err| err.without_data())
             }
         }
     }
@@ -316,6 +326,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 if discarded.get() {
                     Poll::Ready(Err(crate::AktorError::new(
                         "custom runner discarded admitted work",
+                        (),
                     )))
                 } else {
                     result
@@ -345,6 +356,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 {
                     Err(crate::AktorError::new(
                         "custom runner stopped before draining admission",
+                        (),
                     ))
                 } else {
                     Ok(())
@@ -413,7 +425,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 .completion
                 .diagnostics
                 .borrow_mut()
-                .push(crate::AktorError::new(alloc::format!("{error:#}")));
+                .push(crate::AktorError::new(alloc::format!("{error:#}"), ()));
         }
 
         let result = result.and(cleaned);
@@ -421,6 +433,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         let result = if let Some(payload) = &primary {
             Err(Rc::new(OwnerError::Runner(crate::AktorError::new(
                 crate::panic::panic_message(payload),
+                (),
             ))))
         } else {
             result
@@ -449,7 +462,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
             std::panic::resume_unwind(payload);
         }
 
-        result.map_err(|error| error.report())
+        result.map_err(|err| err.without_data())
     }
 }
 
@@ -490,7 +503,7 @@ impl<S, C> LocalSetupOutput<S, C>
                 Ok(state)
             }
             Err(error) => {
-                let diagnostic = error.report();
+                let diagnostic = AktorError::new(error.diagnostics.clone(), ());
                 let primary = error.primary;
                 ready.send(Err(crate::AktorStartError::Init(error)));
                 Err(OwnerError::SetupDiagnostic(diagnostic, primary))

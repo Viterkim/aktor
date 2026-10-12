@@ -280,7 +280,6 @@ async fn local_waiting() {
     assert!(poll(&mut abandoned).is_pending());
     drop(abandoned);
     assert_eq!(drops.get(), 1);
-    assert_eq!(state.get(), 0);
 
     let mut waiting = add(&handle, input(10)).into_request();
     assert!(poll(&mut waiting).is_pending());

@@ -38,10 +38,10 @@ impl Failures {
                         });
                     }
                 } else if let Some(first) = &mut self.first {
-                    first.diagnostics.push(crate::AktorError::new(format!(
-                        "{kind:?}: {}",
-                        crate::panic::panic_message(&payload)
-                    )));
+                    first.diagnostics.push(crate::AktorError::new(
+                        format!("{kind:?}: {}", crate::panic::panic_message(&payload)),
+                        (),
+                    ));
                     dispose_secondary(payload);
                 }
 

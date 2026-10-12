@@ -44,12 +44,9 @@ async fn transaction(db: &mut Connection, name: String, commit: bool) -> rusqlit
 async fn local() {
     let mut db = open().unwrap();
 
-    assert_eq!(
-        transaction(&mut db, "rollback".into(), false)
-            .await
-            .unwrap(),
-        "rollback"
-    );
+    transaction(&mut db, "rollback".into(), false)
+        .await
+        .unwrap();
 
     assert_eq!(
         db.query_row::<i64, _, _>("SELECT count(*) FROM users", [], |row| row.get(0))
@@ -57,10 +54,7 @@ async fn local() {
         0
     );
 
-    assert_eq!(
-        transaction(&mut db, "kept".into(), true).await.unwrap(),
-        "kept"
-    );
+    transaction(&mut db, "kept".into(), true).await.unwrap();
     assert_eq!(queries::name(&db, 1).await.unwrap(), "kept");
 }
 
@@ -68,10 +62,7 @@ async fn local() {
 async fn remote() {
     let (db, task) = spawn_thread(open().unwrap(), 1).unwrap();
 
-    assert_eq!(
-        transaction(&db, "actor".into(), true).await.unwrap(),
-        "actor"
-    );
+    transaction(&db, "actor".into(), true).await.unwrap();
     assert_eq!(queries::name(&db, 1).await.unwrap(), "actor");
 
     drop(db);

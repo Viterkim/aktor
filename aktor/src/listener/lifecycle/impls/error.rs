@@ -21,12 +21,14 @@ impl<C: fmt::Display> fmt::Display for CleanupErrors<C> {
             self.errors.len() + self.diagnostics.len()
         )?;
 
-        for error in &self.errors {
-            write!(f, ": {error}")?;
-        }
+        if f.alternate() {
+            for error in &self.errors {
+                write!(f, ": {error:#}")?;
+            }
 
-        for diagnostic in &self.diagnostics {
-            write!(f, ": {}", diagnostic.diagnostics)?;
+            for diagnostic in &self.diagnostics {
+                write!(f, ": {}", diagnostic.diagnostics)?;
+            }
         }
 
         Ok(())

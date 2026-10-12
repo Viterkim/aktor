@@ -261,7 +261,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(format!("{error}").contains("same operation"));
+        assert!(format!("{error:#}").contains("same operation"));
         assert_eq!(state.0, 0);
 
         dispatch::<State, First>(&mut state, "same operation".into(), Vec::new())

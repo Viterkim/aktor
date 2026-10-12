@@ -91,7 +91,7 @@ async fn native() {
             ));
         }
         let completed = actor.completion().wait().await.unwrap_err();
-        if !completed.to_string().contains("secondary cleanup sentinel") {
+        if !format!("{completed:#}").contains("secondary cleanup sentinel") {
             missing.push(format!(
                 "standard={standard}: missing completion diagnostic"
             ));
@@ -111,7 +111,10 @@ async fn native() {
                                 start: async || Ok::<_, AktorSetupError>(()),
                                 end: async move |_| {
                                     count.fetch_add(1, Ordering::SeqCst);
-                                    Err(AktorCleanupError::new(format!("{}", FormatPanic(false))))
+                                    Err(AktorCleanupError::new(
+                                        format!("{}", FormatPanic(false)),
+                                        (),
+                                    ))
                                 },
                                 intervals: vec![],
                                 before_each: None,
@@ -125,10 +128,10 @@ async fn native() {
                             kind: $kind,
                             closures: AktorClosures {
                                 start: async || {
-                                    Err::<(), _>(AktorSetupError::new(format!(
-                                        "{}",
-                                        FormatPanic(false)
-                                    )))
+                                    Err::<(), _>(AktorSetupError::new(
+                                        format!("{}", FormatPanic(false)),
+                                        (),
+                                    ))
                                 },
                                 end: (),
                                 intervals: vec![],
@@ -155,7 +158,7 @@ async fn native() {
             (format!("{error:#}"), format!("{error:?}"))
         }))
         .expect("public startup formatting panicked");
-        assert_eq!(printed.0, printed.1);
+        assert_eq!(printed.1, "actor startup failed");
         assert!(printed.0.contains("failed setup"));
         assert_eq!(printed.0.matches("rollback panic sentinel").count(), 2);
 
@@ -191,7 +194,7 @@ async fn native() {
                     start: async move || {
                         let error = FormatPanic(source);
                         error.source();
-                        Err::<(), _>(AktorSetupError::new(format!("{error}")))
+                        Err::<(), _>(AktorSetupError::new(format!("{error}"), ()))
                     },
                     end: (),
                     intervals: vec![],
@@ -211,7 +214,7 @@ async fn native() {
         }))
         .expect("public startup formatting panicked");
 
-        assert_eq!(printed.0, printed.1);
+        assert_eq!(printed.1, "actor startup failed");
         assert!(printed.0.contains("hostile startup"));
         let sentinel = if source {
             "source panic sentinel"
@@ -376,7 +379,7 @@ fn closures() {
         let runner = Broken(dropped.clone(), 2, "runner capture sentinel");
         let error = owner
             .run_with_custom(
-                async || Err(AktorSetupError::new("initialization refused")),
+                async || Err(AktorSetupError::new("initialization refused", ())),
                 async move |_| {
                     std::hint::black_box(&cleanup);
                     Ok(())

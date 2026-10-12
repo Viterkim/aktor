@@ -447,7 +447,7 @@ async fn existing_local() {
                             start: async || Ok::<_, AktorSetupError>(()),
                             end: async move |_: ()| {
                                 counted.set(counted.get() + 1);
-                                Err(AktorCleanupError::new("local rollback refused"))
+                                Err(AktorCleanupError::new("local rollback refused", ()))
                             },
 
                             intervals: vec![],
@@ -465,7 +465,7 @@ async fn existing_local() {
                         }),
                         closures: AktorClosures {
                             start: async || {
-                                Err::<(), _>(AktorSetupError::new("local setup refused"))
+                                Err::<(), _>(AktorSetupError::new("local setup refused", ()))
                             },
                             end: (),
                             intervals: vec![],
@@ -603,7 +603,7 @@ async fn origin() {
                                 panic!("initialization failed");
                             }
 
-                            Err::<u32, _>(AktorSetupError::new("invalid settings"))
+                            Err::<u32, _>(AktorSetupError::new("invalid settings", ()))
                         },
                         end: (),
                         intervals: vec![],
@@ -662,7 +662,7 @@ async fn overlapping() {
                 start: async move || {
                     beginning_a.notify_one();
                     gate_a.notified().await;
-                    Err::<(), _>(AktorSetupError::new("first initialization refused"))
+                    Err::<(), _>(AktorSetupError::new("first initialization refused", ()))
                 },
                 end: (),
                 intervals: vec![],

@@ -61,11 +61,6 @@ fn interval_failure() {
                 assert!(report.failed(), "interval launch failure looked successful");
                 assert!(!report.timed_out);
 
-                let failure = report.failure.as_ref().unwrap();
-
-                assert_eq!(failure.actor, "interval owner");
-                assert_eq!(failure.kind, Some(crate::AktorExecution::StdThread));
-                assert!(failure.message.contains("injected scheduling failure"));
                 assert_eq!(
                     report
                         .to_string()

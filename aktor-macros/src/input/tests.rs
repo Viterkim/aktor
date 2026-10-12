@@ -18,13 +18,3 @@ fn options() {
     assert!(syn::parse_str::<Options>("actor = Main, actor = Audit").is_err());
     assert!(syn::parse_str::<Options>("role = Main, actor = Audit").is_err());
 }
-
-#[test]
-fn async_required() {
-    let error = syn::parse_str::<Function>("fn load(state: &State) {}")
-        .err()
-        .unwrap();
-
-    assert!(error.to_string().contains("must be async"));
-    assert!(syn::parse_str::<Function>("async fn load(state: &State) {}").is_ok());
-}

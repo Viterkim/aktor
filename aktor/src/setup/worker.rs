@@ -43,7 +43,7 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
                     &context.group,
                     &self.name.name,
                     AktorExecution::BrowserWebWorker,
-                    AktorStartError::Setup(AktorSetupError::new(error.to_string())),
+                    AktorStartError::Setup(AktorSetupError::new(alloc::format!("{error:#}"), ())),
                 )
             })?;
 
@@ -88,7 +88,8 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
 
             worker.ready().await.map_err(|error| {
                 AktorStartError::Init(crate::AktorFailure::from(AktorSetupError::new(
-                    error.to_string(),
+                    alloc::format!("{error:#}"),
+                    (),
                 )))
             })?;
             Ok(worker)

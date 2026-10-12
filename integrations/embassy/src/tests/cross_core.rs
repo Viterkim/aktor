@@ -70,7 +70,8 @@ pub async fn check(spawner: Spawner) {
         role: AktorNoRole,
         kind: AktorKind::EmbassyCrossCore(move |future| {
             spawner.spawn(
-                setup_driver(future).map_err(|_| AktorSetupError::new("no shared driver slot"))?,
+                setup_driver(future)
+                    .map_err(|_| AktorSetupError::new("no shared driver slot", ()))?,
             );
             Ok(())
         }),
@@ -827,7 +828,7 @@ async fn startup_origin() {
                 closures: AktorClosures {
                     start: async move || {
                         gate.wait().await;
-                        Err::<u32, _>(AktorSetupError::new("invalid settings"))
+                        Err::<u32, _>(AktorSetupError::new("invalid settings", ()))
                     },
                     end: (),
                     intervals: vec![],
