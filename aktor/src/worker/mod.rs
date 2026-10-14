@@ -1,5 +1,4 @@
 use crate::message::CallError;
-use er::Er;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -41,12 +40,11 @@ pub struct Options {
     pub max_outstanding_bytes: usize,
 }
 
-#[derive(Er, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[er(format = "worker call {outcome:?}: {cause:?}", no_constructors)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, er::Er)]
+#[er(no_constructors, display = Self::fmt_display, display_alt = Self::fmt_details, debug = Self::fmt_display)]
 pub struct WorkerError<T = ()> {
     pub outcome: CallError,
     pub cause: WorkerCause,
-    #[er(skip)]
     pub data: Option<T>,
 }
 

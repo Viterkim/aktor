@@ -123,7 +123,7 @@ fn teardown() {
             if mode.ends_with("setup") {
                 let result = owner
                     .run_with(
-                        async || Err(AktorSetupError::new("primary setup")),
+                        async || Err(AktorSetupError::new("primary setup", ())),
                         async |_| Ok(()),
                     )
                     .await;
@@ -201,7 +201,7 @@ fn teardown() {
             if mode.ends_with("setup") {
                 let result = owner
                     .run_with(
-                        async || Err(AktorSetupError::new("primary setup")),
+                        async || Err(AktorSetupError::new("primary setup", ())),
                         async |_| Ok(()),
                     )
                     .await;

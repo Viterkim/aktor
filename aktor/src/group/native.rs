@@ -343,7 +343,10 @@ impl AktorGroup {
                         outcome.await.unwrap_or_else(|_| ActorOutcome {
                             kind: None,
                             actor: label,
-                            diagnostics: vec![AktorCleanupError::new("startup observer stopped")],
+                            diagnostics: vec![AktorCleanupError::new(
+                                "startup observer stopped",
+                                (),
+                            )],
                             timed_out: false,
                         })
                     }),
@@ -428,7 +431,7 @@ impl AktorGroup {
                         diagnostics: if first || primary {
                             Vec::new()
                         } else {
-                            vec![AktorError::new(diagnostics)]
+                            vec![AktorError::new(diagnostics, ())]
                         },
                         timed_out: false,
                     });
@@ -521,7 +524,7 @@ impl AktorGroup {
                             errors
                                 .errors
                                 .iter()
-                                .map(|error| AktorError::new(describe_cleanup(error))),
+                                .map(|error| AktorError::new(describe_cleanup(error), ())),
                         );
                         outcome
                             .diagnostics
@@ -531,13 +534,13 @@ impl AktorGroup {
                         if !first && !actor.group_primary() {
                             outcome
                                 .diagnostics
-                                .push(AktorError::new(format!("panic: {cause}")));
+                                .push(AktorError::new(format!("panic: {cause}"), ()));
                         }
                         outcome.diagnostics.extend(
                             cleanup
                                 .errors
                                 .iter()
-                                .map(|error| AktorError::new(describe_cleanup(error))),
+                                .map(|error| AktorError::new(describe_cleanup(error), ())),
                         );
                         outcome
                             .diagnostics
@@ -547,7 +550,7 @@ impl AktorGroup {
                         if !first && !actor.group_primary() {
                             outcome
                                 .diagnostics
-                                .push(AktorError::new(format!("panic: {cause}")));
+                                .push(AktorError::new(format!("panic: {cause}"), ()));
                         }
                     }
                     OwnerError::Cancelled | OwnerError::RuntimeStopped => outcome.timed_out = true,

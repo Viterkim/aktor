@@ -115,7 +115,7 @@ where
             &context.group,
             &setup.name.name,
             Kind::EXECUTION,
-            AktorStartError::Setup(AktorError::new("interval duration must be positive")),
+            AktorStartError::Setup(AktorError::new("interval duration must be positive", ())),
         ));
     }
 
@@ -126,6 +126,7 @@ where
             Kind::EXECUTION,
             AktorStartError::Setup(AktorError::new(
                 crate::message::ActorError::InvalidCapacity.to_string(),
+                (),
             )),
         ));
     }
@@ -164,13 +165,13 @@ where
             Kind::EXECUTION,
             runner,
         )
-        .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string())))?;
+        .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string(), ())))?;
 
     match initialized.await {
         Some(result) => result?,
         None => {
             let error = handle.completion().wait().await.err().unwrap_or_else(|| {
-                local::OwnerError::Runner(AktorError::new("local actor stopped during startup"))
+                local::OwnerError::Runner(AktorError::new("local actor stopped during startup", ()))
             });
 
             return Err(AktorStartError::Local(error));

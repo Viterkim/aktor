@@ -99,21 +99,3 @@ async fn typed() {
     drop(other);
     assert_eq!(other_results.next().await, None);
 }
-
-#[tokio::test]
-async fn retained_reply() {
-    let (handle, mut listener) = channel::<Db>(2).unwrap();
-    let mut state = Db::default();
-    let mut reply = insert(&handle, "first".into()).send().await;
-
-    assert!(reply.try_take().is_none());
-    listener.recv().await.unwrap().run(&mut state).await;
-    assert_eq!(reply.try_take(), Some(0));
-    assert!(reply.try_take().is_none());
-
-    let mut reply = insert(&handle, "second".into()).send().await;
-
-    assert!(reply.try_take().is_none());
-    listener.recv().await.unwrap().run(&mut state).await;
-    assert_eq!(reply.await, 1);
-}

@@ -20,7 +20,7 @@ pub fn diagnostics(error: &(dyn core::error::Error + 'static)) -> String {
             if !output.is_empty() {
                 output.push_str("\ncaused by: ");
             }
-            output.push_str(&alloc::format!("{error}"));
+            output.push_str(&alloc::format!("{error:#}"));
             source = error.source();
         }
 
@@ -52,8 +52,9 @@ pub fn diagnostics(error: &(dyn core::error::Error + 'static)) -> String {
     }
 }
 
-impl fmt::Display for AktorStartupError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl AktorStartupError {
+    #[doc(hidden)]
+    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("actor startup failed")?;
 
         if let Some(report) = &self.report {
@@ -91,16 +92,6 @@ impl fmt::Display for AktorStartupError {
         write!(f, "\n{}", self.diagnostics)?;
 
         Ok(())
-    }
-}
-impl fmt::Debug for AktorStartupError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:#}")
-    }
-}
-impl core::error::Error for AktorStartupError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        None
     }
 }
 
@@ -343,7 +334,7 @@ mod tests {
     #[test]
     fn sources() {
         let public = |cause| {
-            let captured = crate::AktorFailure::from(AktorSetupError::new(diagnostics(&cause)));
+            let captured = crate::AktorFailure::from(AktorSetupError::new(diagnostics(&cause), ()));
             let error = AktorStartError::Init(captured);
 
             AktorStartupError {
@@ -381,14 +372,17 @@ mod tests {
 
             assert!(output.contains("actor startup failed"));
             assert!(output.contains("error formatter panicked: source panic sentinel"));
-            assert_eq!(alloc::format!("{hostile:?}"), output);
+            assert_eq!(alloc::format!("{hostile:?}"), "actor startup failed");
         }
 
-        let captured = crate::AktorFailure::from(AktorSetupError::new(diagnostics(&Cause {
-            source: None,
-            cycle: true,
-            panic: false,
-        })));
+        let captured = crate::AktorFailure::from(AktorSetupError::new(
+            diagnostics(&Cause {
+                source: None,
+                cycle: true,
+                panic: false,
+            }),
+            (),
+        ));
         let mut output = Output(String::new());
 
         output
@@ -396,7 +390,7 @@ mod tests {
             .expect("captured source walk exceeded its output budget");
         assert!(output.0.ends_with("(source chain truncated)"));
         assert!(captured.diagnostics.contains("source chain truncated"));
-        assert!(alloc::format!("{captured:?}").contains("source chain truncated"));
+        assert!(!alloc::format!("{captured:?}").contains("source chain truncated"));
 
         let cyclic = public(Cause {
             source: None,
@@ -407,6 +401,6 @@ mod tests {
 
         write!(output, "{cyclic:#}").expect("source walk exceeded its output budget");
         assert!(output.0.ends_with("(source chain truncated)"));
-        assert_eq!(alloc::format!("{cyclic:?}"), output.0);
+        assert_eq!(alloc::format!("{cyclic:?}"), "actor startup failed");
     }
 }

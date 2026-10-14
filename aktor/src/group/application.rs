@@ -27,7 +27,10 @@ impl AktorGroup {
             Ok(runtime) => runtime,
             Err(_) => {
                 contain_drop(future, &self.killswitch(), "rejected task drop");
-                return Err(AktorError::new("application tasks need a Tokio runtime"));
+                return Err(AktorError::new(
+                    "application tasks need a Tokio runtime",
+                    (),
+                ));
             }
         };
         let mut state = self.control.lock();
@@ -37,6 +40,7 @@ impl AktorGroup {
             contain_drop(future, &self.killswitch(), "rejected task drop");
             return Err(AktorError::new(
                 "actor group cannot accept application work",
+                (),
             ));
         }
 

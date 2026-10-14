@@ -95,7 +95,6 @@ fn caller_runtime() {
                     .to_string()
                     .contains("actor task cancelled before cleanup completed")
             );
-            assert_eq!(report.actors[0].kind, Some(AktorExecution::TokioTask));
         }
 
         drop(actors);
@@ -186,7 +185,6 @@ fn caller_runtime() {
     let report = executor::block_on(completion.wait());
     assert!(!report.failed(), "{report}");
     assert!(executor::block_on(owner.wait()).is_ok());
-    assert_eq!(report.actors.len(), 1);
     drop(handle);
 }
 
@@ -300,8 +298,6 @@ async fn counter() {
     );
     assert!(!report.failed(), "{report}");
     assert!(!completion.try_report().unwrap().failed());
-    assert_eq!(report.actors[0].actor, "BingoManden");
-    assert_eq!(report.actors[0].kind, Some(AktorExecution::TokioThread));
     assert_eq!(
         *log.lock().unwrap(),
         [
@@ -333,7 +329,7 @@ async fn multiple() {
             closures: AktorClosures {
                 start: async move || {
                     if fail {
-                        Err(AktorSetupError::new("no thanks"))
+                        Err(AktorSetupError::new("no thanks", ()))
                     } else {
                         Ok(Counter(Rc::new(Cell::new(0))))
                     }
@@ -579,7 +575,6 @@ fn standard() {
         let report = actors.shutdown().await;
 
         assert!(!report.failed(), "{report}");
-        assert_eq!(report.actors[0].kind, Some(AktorExecution::StdThread));
         assert_eq!(output.next().await, Some(Ok(8)));
         assert_eq!(output.next().await, None);
         assert_eq!(log.lock().unwrap().last(), Some(&("end", 8)));

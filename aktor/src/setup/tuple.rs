@@ -53,6 +53,7 @@ impl<A: AktorStart<MA>, B: AktorStart<MB, Group = A::Group>, MA, MB> Future
 
         Poll::Ready(Err(AktorStartError::Setup(AktorSetupError::new(
             "actor startup was polled after completion",
+            (),
         ))))
     }
 }

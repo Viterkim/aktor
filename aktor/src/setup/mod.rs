@@ -101,6 +101,8 @@ pub struct AktorStartup<Setup: AktorStart<Mode>, Mode = ()> {
 
 /// The startup failure and its completed rollback report.
 /// report is None if startup was rejected before adding actors to the group.
+#[derive(Er)]
+#[er(format = "actor startup failed", display_alt = Self::fmt_details)]
 pub struct AktorStartupError {
     pub error: AktorStartError,
     pub diagnostics: String,
@@ -111,19 +113,15 @@ pub struct AktorStartupError {
 
 #[derive(Er)]
 pub enum AktorStartError<E: 'static = crate::AktorFailure> {
-    #[er(format = "actor initialization failed")]
-    Init(#[er(source)] E),
-    #[er(format = "actor setup failed")]
-    Setup(#[er(source)] AktorSetupError),
+    Init(#[er(source, skip)] E),
+    Setup(#[er(source, skip)] AktorSetupError),
     #[cfg(feature = "local")]
-    #[er(format = "local actor startup failed")]
-    Local(#[er(source)] crate::local::OwnerError),
-    #[er(format = "actor thread startup failed")]
+    Local(#[er(source, skip)] crate::local::OwnerError),
     #[cfg(all(
         any(feature = "tokio", feature = "std_thread"),
         not(target_family = "wasm")
     ))]
-    Thread(#[er(source)] DedicatedStartError<core::convert::Infallible>),
+    Thread(#[er(source, skip)] DedicatedStartError<core::convert::Infallible>),
 }
 
 #[doc(hidden)]

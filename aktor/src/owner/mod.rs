@@ -34,6 +34,12 @@ pub enum OwnerError {
     Cancelled,
 }
 
+#[derive(Debug)]
+struct CompletionScheduleError {
+    cause: std::io::Error,
+    cleanup: Arc<OwnerError>,
+}
+
 pub struct Lifecycle<S> {
     inner: crate::listener::Actor<S, crate::AktorSetupError, AktorFailure>,
 }

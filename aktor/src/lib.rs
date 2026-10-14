@@ -9,7 +9,6 @@ mod impls;
 #[cfg(feature = "std")]
 mod panic;
 mod report;
-pub use impls::{aktor_err_cleanup, aktor_err_setup};
 pub mod types;
 pub use types::*;
 

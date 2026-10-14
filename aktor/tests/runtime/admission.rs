@@ -28,7 +28,7 @@ async fn stopping() {
                             release.notified().await;
 
                             if cleanup_fails {
-                                Err(AktorCleanupError::new("real cleanup failure"))
+                                Err(AktorCleanupError::new("real cleanup failure", ()))
                             } else {
                                 Ok(())
                             }
@@ -96,7 +96,7 @@ async fn local_stopping() {
                                     release.notified().await;
 
                                     if cleanup_fails {
-                                        Err(AktorCleanupError::new("real cleanup failure"))
+                                        Err(AktorCleanupError::new("real cleanup failure", ()))
                                     } else {
                                         Ok::<_, AktorCleanupError>(())
                                     }

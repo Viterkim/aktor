@@ -130,10 +130,10 @@ pub async fn start_legacy_setup_worker() -> Result<(), JsValue> {
 }
 
 #[derive(er::Er)]
-#[er(format = "counter setup failed")]
+
 struct SetupErr;
 #[derive(er::Er)]
-#[er(format = "counter cleanup failed")]
+
 struct CloseErr;
 
 #[wasm_bindgen]
@@ -150,8 +150,8 @@ pub async fn start_setup_worker(build: String) -> Result<(), JsValue> {
                 gloo_timers::future::TimeoutFuture::new(config.setup_delay).await;
 
                 if config.fail_start {
-                    return Err(er::ErTree::new(SetupErr, [] as [std::io::Error; 0]))
-                        .er_into(|_| {});
+                    let tree = er::ErTree::new(SetupErr, [] as [std::io::Error; 0]);
+                    return Err(tree).er_into(|report| report);
                 }
 
                 Ok(Counter {
@@ -167,8 +167,8 @@ pub async fn start_setup_worker(build: String) -> Result<(), JsValue> {
                     note_end();
 
                     if counter.before != counter.after || config.fail_end {
-                        return Err(er::ErTree::new(CloseErr, [] as [std::io::Error; 0]))
-                            .er_into(|_| {});
+                        let tree = er::ErTree::new(CloseErr, [] as [std::io::Error; 0]);
+                        return Err(tree).er_into(|report| report);
                     }
 
                     Ok(())
@@ -229,7 +229,14 @@ pub async fn remote_preflight_check(program: String) -> Result<bool, JsValue> {
                 worker::Worker::<u32>::with_config(&program, options, &config).map_err(error)?;
 
             if client.ready().await.is_ok() {
-                return Err(error("mismatched operations passed preflight"));
+                return Err(error(format!(
+                    "mismatched operations passed preflight: counter={:?}, u32={:?}, registrations={}",
+                    worker::Operations::for_actor::<Counter, ()>(),
+                    worker::Operations::for_actor::<u32, ()>(),
+                    worker::inventory::iter::<worker::Registration>
+                        .into_iter()
+                        .count(),
+                )));
             }
         } else {
             let client = worker::Worker::<Counter>::with_config(&program, options, &config)
@@ -410,7 +417,7 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
                 assert_eq!(report.actors[0].diagnostics.len(), usize::from(fail_end));
 
                 if fail_end {
-                    assert!(report.to_string().contains("counter cleanup failed"));
+                    assert!(report.to_string().contains("CloseErr"));
                 }
             }
         }
@@ -599,15 +606,12 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     drop(input);
 
     if !report.failed()
-        || !format!("{report}").contains("counter cleanup failed")
+        || !format!("{report}").contains("CloseErr")
         || format!("{}", completion.wait().await) != format!("{report}")
     {
         return Err(error("remote cleanup report was lost"));
     }
-    assert_eq!(
-        report.to_string().matches("counter cleanup failed").count(),
-        1
-    );
+    assert_eq!(report.to_string().matches("CloseErr").count(), 1);
 
     let failed = aktor_start(AktorSetup {
         actors: (
@@ -644,8 +648,8 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
         .ok_or_else(|| error("remote rollback report was lost"))?;
 
     if report.timed_out
-        || !report.to_string().contains("counter setup failed")
-        || !report.to_string().contains("counter cleanup failed")
+        || !report.to_string().contains("SetupErr")
+        || !report.to_string().contains("CloseErr")
     {
         return Err(error(format!("remote rollback failed: {report}")));
     }

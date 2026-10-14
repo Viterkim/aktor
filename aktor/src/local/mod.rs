@@ -90,6 +90,8 @@ pub struct Reply<O, Clock = ()> {
 pub type Channel<S, const N: usize, E = core::convert::Infallible, Clock = ()> =
     (Handle<S, N, E, (), Clock>, Owner<S, N, E>);
 
+#[derive(er::Er)]
+#[er(display = Self::fmt_display, display_alt = Self::fmt_details, debug = Self::fmt_display)]
 pub enum OwnerError<E = ()> {
     Setup(AktorSetupError<E>),
     SetupDiagnostic(crate::AktorError, bool),
@@ -101,6 +103,8 @@ pub enum OwnerError<E = ()> {
 }
 
 /// The original local lifecycle error, shared between typed observers.
+#[derive(er::Er)]
+#[er(display = Self::fmt_display, display_alt = Self::fmt_details, debug = Self::fmt_display)]
 pub struct SharedOwnerError<E> {
     pub error: Rc<OwnerError<E>>,
 }

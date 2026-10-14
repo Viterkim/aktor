@@ -45,5 +45,5 @@ fn record(kill: &KillSwitch, report: &mut ActorOutcome, message: String) {
         message: message.clone(),
     });
 
-    report.diagnostics.push(AktorError::new(message));
+    report.diagnostics.push(AktorError::new(message, ()));
 }

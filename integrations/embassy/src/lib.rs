@@ -108,8 +108,8 @@ pub fn sensor_setup(
         name: AktorName::new("sensor"),
         role: AktorNoRole,
         kind: AktorKind::EmbassyLocal(move |future| {
-            let task =
-                setup_driver(future).map_err(|_| AktorSetupError::new("no sensor driver slot"))?;
+            let task = setup_driver(future)
+                .map_err(|_| AktorSetupError::new("no sensor driver slot", ()))?;
 
             spawner.spawn(task);
             Ok(())
@@ -141,8 +141,8 @@ pub fn shared_sensor_setup(
         name: AktorName::new("shared sensor"),
         role: AktorNoRole,
         kind: AktorKind::EmbassyCrossCore(move |future| {
-            let task =
-                setup_driver(future).map_err(|_| AktorSetupError::new("no sensor driver slot"))?;
+            let task = setup_driver(future)
+                .map_err(|_| AktorSetupError::new("no sensor driver slot", ()))?;
 
             spawner.spawn(task);
             Ok(())

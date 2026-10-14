@@ -144,6 +144,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
             failure: result.as_ref().err().cloned().unwrap_or_else(|| {
                 Rc::new(OwnerError::Runner(crate::AktorError::new(
                     "actor work destruction failed",
+                    (),
                 )))
             }),
             armed: true,
@@ -156,7 +157,10 @@ impl<S, const N: usize, E> Inner<S, N, E> {
             self.completion
                 .diagnostics
                 .borrow_mut()
-                .push(crate::AktorError::new(crate::panic::panic_message(payload)));
+                .push(crate::AktorError::new(
+                    crate::panic::panic_message(payload),
+                    (),
+                ));
         });
         #[cfg(not(feature = "std"))]
         for message in queued.into_iter().chain(services) {

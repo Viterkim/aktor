@@ -38,7 +38,7 @@ impl Drop for Completion {
                 diagnostics: if primary {
                     Vec::new()
                 } else {
-                    vec![AktorError::new("local actor task cancelled")]
+                    vec![AktorError::new("local actor task cancelled", ())]
                 },
                 timed_out: false,
             });
@@ -82,7 +82,7 @@ where
             &context.group,
             &name,
             Kind::EXECUTION,
-            AktorStartError::Setup(AktorError::new("interval duration must be positive")),
+            AktorStartError::Setup(AktorError::new("interval duration must be positive", ())),
         ));
     }
 
@@ -93,6 +93,7 @@ where
             Kind::EXECUTION,
             AktorStartError::Setup(AktorError::new(
                 crate::message::ActorError::InvalidCapacity.to_string(),
+                (),
             )),
         ));
     }
@@ -102,7 +103,7 @@ where
         retained,
     } = LocalIntervals::new(intervals);
     let (handle, mut owner) = local::channel_with_clock::<S, 0, (), Clock>(options.capacity)
-        .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string())))?;
+        .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string(), ())))?;
 
     owner.hooks = AktorHooks {
         before_each: before_each.map(|hook| hook.0),
@@ -135,7 +136,7 @@ where
                 outcome.await.unwrap_or_else(|_| ActorOutcome {
                     kind: Some(Kind::EXECUTION),
                     actor: label,
-                    diagnostics: vec![AktorError::new("local actor observer stopped")],
+                    diagnostics: vec![AktorError::new("local actor observer stopped", ())],
                     timed_out: false,
                 })
             }),
@@ -202,10 +203,10 @@ where
                                 local::OwnerError::SetupDiagnostic(error, false) => report.diagnostics.push(error),
                                 local::OwnerError::CleanupFailure(error) => {
                                     if !error.primary {
-                                        report.diagnostics.push(error.report());
+                                        report.diagnostics.push(AktorError::new(error.diagnostics, ()));
                                     }
                                 },
-                                error => report.diagnostics.push(AktorError::new(format!("{error:#}"))),
+                                error => report.diagnostics.push(AktorError::new(format!("{error:#}"), ())),
                             }
                         },
                         Err(payload) => {
@@ -218,7 +219,7 @@ where
                                 message: message.clone(),
                             });
                             if !first && !retained.panic_reported() {
-                                report.diagnostics.push(AktorError::new(format!("operation: {message}")));
+                                report.diagnostics.push(AktorError::new(format!("operation: {message}"), ()));
                             }
                             contain_drop(payload, &completion.kill, "local panic drop");
                         },
@@ -250,7 +251,7 @@ where
         Some(result) => result?,
         None => {
             let error = handle.completion().wait().await.err().unwrap_or_else(|| {
-                local::OwnerError::Runner(AktorError::new("local actor stopped during startup"))
+                local::OwnerError::Runner(AktorError::new("local actor stopped during startup", ()))
             });
 
             return Err(AktorStartError::Local(error));

@@ -77,7 +77,7 @@ impl Completion {
             if !self.fail(phase, message.clone()) {
                 self.report
                     .diagnostics
-                    .push(AktorError::new(format!("{phase}: {message}")));
+                    .push(AktorError::new(format!("{phase}: {message}"), ()));
             }
             contain_drop(payload, &self.kill, "task panic payload drop");
         }
@@ -123,7 +123,7 @@ impl Drop for Completion {
             let message = "actor task cancelled before cleanup completed";
 
             if !self.fail("owner", message.into()) {
-                self.report.diagnostics.push(AktorError::new(message));
+                self.report.diagnostics.push(AktorError::new(message, ()));
             }
             self.publish();
         }
@@ -187,7 +187,7 @@ where
             group,
             &setup.name.name,
             kind,
-            AktorStartError::Setup(AktorError::new(reason)),
+            AktorStartError::Setup(AktorError::new(reason, ())),
         ));
     }
 
@@ -222,7 +222,7 @@ where
                 let mut report = outcome.await.unwrap_or_else(|_| ActorOutcome {
                     actor: label,
                     kind: Some(kind),
-                    diagnostics: vec![AktorError::new("actor task observer stopped")],
+                    diagnostics: vec![AktorError::new("actor task observer stopped", ())],
                     timed_out: false,
                 });
 
@@ -312,12 +312,14 @@ where
     started.await.unwrap_or_else(|_| {
         Err(AktorStartError::Setup(AktorError::new(
             "actor task cancelled during setup",
+            (),
         )))
     })?;
 
     if kill.is_stopping() {
         return Err(AktorStartError::Setup(AktorError::new(
             "actor task closed during startup",
+            (),
         )));
     }
 
@@ -417,6 +419,7 @@ async fn drive<S, Start, Fut>(
             let Some(start) = closures.start.take() else {
                 return Err(AktorStartError::Setup(AktorError::new(
                     "actor task setup already consumed",
+                    (),
                 )));
             };
 
@@ -448,7 +451,10 @@ async fn drive<S, Start, Fut>(
             if let AktorStartError::Init(error) = &error
                 && !error.primary
             {
-                completion.report.diagnostics.push(error.report());
+                completion
+                    .report
+                    .diagnostics
+                    .push(AktorError::new(error.diagnostics.clone(), ()));
             }
 
             let sent = ready.send(Err(error));
@@ -468,11 +474,11 @@ async fn drive<S, Start, Fut>(
                 completion
                     .report
                     .diagnostics
-                    .push(AktorError::new(message.clone()));
+                    .push(AktorError::new(message.clone(), ()));
             }
             completion.dispose(payload, "task setup panic drop");
 
-            let _sent = ready.send(Err(AktorStartError::Setup(AktorError::new(message))));
+            let _sent = ready.send(Err(AktorStartError::Setup(AktorError::new(message, ()))));
 
             completion.dispose_hooks(std::mem::take(&mut closures.hooks));
             completion.dispose_intervals(std::mem::take(&mut closures.intervals));
@@ -486,6 +492,7 @@ async fn drive<S, Start, Fut>(
 
             let _sent = ready.send(Err(AktorStartError::Setup(AktorError::new(
                 "actor task setup cancelled",
+                (),
             ))));
 
             completion.dispose_hooks(std::mem::take(&mut closures.hooks));
@@ -642,10 +649,10 @@ async fn drive<S, Start, Fut>(
             let message = panic_message(payload);
 
             if !completion.fail(operation.name, message.clone()) {
-                completion
-                    .report
-                    .diagnostics
-                    .push(AktorError::new(format!("{}: {message}", operation.name)));
+                completion.report.diagnostics.push(AktorError::new(
+                    format!("{}: {message}", operation.name),
+                    (),
+                ));
             }
         }
 
@@ -724,7 +731,10 @@ async fn drive<S, Start, Fut>(
                 error.primary = primary;
 
                 if !primary {
-                    completion.report.diagnostics.push(error.report());
+                    completion
+                        .report
+                        .diagnostics
+                        .push(AktorError::new(error.diagnostics.clone(), ()));
                 }
                 completion.cleanup.lock().push(Arc::new(error));
             }
@@ -733,7 +743,7 @@ async fn drive<S, Start, Fut>(
                     completion
                         .report
                         .diagnostics
-                        .push(AktorError::new(panic_message(&payload)));
+                        .push(AktorError::new(panic_message(&payload), ()));
                 }
                 completion.dispose(payload, "task cleanup panic drop");
             }
@@ -742,7 +752,7 @@ async fn drive<S, Start, Fut>(
                 completion
                     .report
                     .diagnostics
-                    .push(AktorError::new("actor task cleanup cancelled"));
+                    .push(AktorError::new("actor task cleanup cancelled", ()));
             }
         }
     }

@@ -73,29 +73,23 @@ pub struct CompletionObserver {
     finished: watch::Receiver<()>,
 }
 
-#[derive(Debug)]
+#[derive(Er)]
+#[er(display = Self::fmt_display)]
 pub struct DedicatedJoinError {
     pub payload: parking_lot::Mutex<Box<dyn std::any::Any + Send>>,
 }
 
 #[derive(Er)]
 pub enum DedicatedStartError<E> {
-    #[er(format = "start the actor group before spawning actors")]
     NotStarted,
-    #[er(format = "actor group is closing")]
     Closed,
-    #[er(format = "an owned actor needs a Tokio runtime")]
     NoRuntime,
-    #[er(format = "actor capacity is outside Tokio's supported range")]
     InvalidCapacity,
-    #[er(format = "could not spawn actor thread")]
-    Thread(#[er(source)] io::Error),
-    #[er(format = "could not initialize actor")]
-    Init(#[er(source)] E),
-    #[er(format = "actor {actor:?} panicked while initializing")]
+    Thread(#[er(source, skip)] io::Error),
+    Init(#[er(source, skip)] E),
     Panicked {
         actor: String,
-        #[er(source)]
+        #[er(source, skip)]
         cause: DedicatedJoinError,
     },
 }

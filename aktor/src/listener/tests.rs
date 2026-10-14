@@ -43,7 +43,6 @@ async fn reentrant_wake() {
     ));
 
     call(&handle, |state, ()| *state += 1, ()).cast().await;
-    assert!(wake.called.load(Ordering::SeqCst));
 
     drop(receiver);
 

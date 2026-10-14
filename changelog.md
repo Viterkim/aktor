@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.7
+
+Lifecycle errors uses short Display and Debug but with full diags on `{err:#}` (and fixed missing and repeated setup/cleanup diagnostics).
+
 ## 0.0.6
 
 Fixed startup and cleanup reporting, worker failures and shutdown after the caller runtime exits.

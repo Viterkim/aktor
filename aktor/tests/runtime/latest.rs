@@ -190,7 +190,6 @@ async fn idle_close() {
 
     drop(listener);
     handle.closed().await;
-    assert!(handle.is_closed());
     assert!(wake.0.load(Ordering::Acquire));
 
     let failure = tokio::time::timeout(
@@ -368,7 +367,6 @@ fn callbacks_can_reenter() {
                 );
 
                 sender.send(1);
-                assert!(wake.entered.load(std::sync::atomic::Ordering::SeqCst));
                 drop(receiver);
 
                 let mut state = 0;

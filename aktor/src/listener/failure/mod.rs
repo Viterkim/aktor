@@ -54,8 +54,6 @@ pub struct FailurePanic {
 
 #[derive(Er, PartialEq, Eq)]
 pub enum RunError<E> {
-    #[er(format = "actor serving loop failed")]
-    Failed(#[er(source)] E),
-    #[er(format = "actor serving loop panicked")]
+    Failed(#[er(source, skip)] E),
     Panicked,
 }

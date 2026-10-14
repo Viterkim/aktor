@@ -190,7 +190,7 @@ fn application_error() {
         let report = group
             .start_with(async move |_| {
                 let error = ApplicationError { kill, panic };
-                Err::<(), _>(AktorCleanupError::new(error.to_string()))
+                Err::<(), _>(AktorCleanupError::new(error.to_string(), ()))
             })
             .unwrap();
         group.killswitch().stop();

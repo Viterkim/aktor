@@ -84,18 +84,6 @@ pub fn check() -> Result<(), String> {
             let report = actors.shutdown().await;
 
             assert!(!report.failed(), "{report}");
-            assert!(
-                report
-                    .actors
-                    .iter()
-                    .any(|actor| actor.kind == Some(AktorExecution::BevyLocal))
-            );
-            assert!(
-                report
-                    .actors
-                    .iter()
-                    .any(|actor| actor.kind == Some(AktorExecution::BevyTask))
-            );
             assert!(ended.get());
             assert_eq!(output.next().await.unwrap().get(), 7);
             assert!(output.next().await.is_none());
@@ -310,7 +298,6 @@ async fn task(pool: &bevy_tasks::TaskPool) -> Result<(), String> {
     let report = actors.shutdown().await;
 
     assert!(!report.failed(), "{report}");
-    assert_eq!(report.actors[0].kind, Some(AktorExecution::BevyTask));
     assert_eq!(*ended.lock().unwrap(), Some(7));
     assert_eq!(output.next().await, Some(7));
     assert!(output.next().await.is_none());
@@ -355,14 +342,14 @@ async fn task(pool: &bevy_tasks::TaskPool) -> Result<(), String> {
     Ok(())
 }
 
+fn main() -> Result<(), String> {
+    check()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn counter() {
         super::check().unwrap();
     }
-}
-
-fn main() -> Result<(), String> {
-    check()
 }

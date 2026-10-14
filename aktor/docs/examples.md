@@ -20,16 +20,27 @@ A tuple works too, you get the handles back in the same order.
 Setup returns `Result<State, AktorSetupError>`, cleanup returns `Result<(), AktorCleanupError>`. Put the diagnostic you want kept in the report:
 
 ```rust
-start: async || {
-    Connection::open("users.sqlite")
-        .map_err(|error| AktorSetupError::new(error.to_string()))
-},
-end: async |db: Connection| {
-    db.close().map_err(|(_, error)| AktorCleanupError::new(error.to_string()))
-},
+start: async || open_database().er_into(|report| report),
+end: async |db| close_database(db).er_into(|report| report),
 ```
 
-Use any error library inside those closures, then finish into Aktor's report. With Er, .er_into(|_| {}) fills diagnostics with the full tree. Infallible cleanup can return (), and end: () leaves it out.
+Here opening and closing return `ErResult`, and Aktor saves their reports automatically. With another error library, give `AktorSetupError::new(text, ())` or `AktorCleanupError::new(text, ())` its diagnostic text. Your error library and its version are yours to choose. Infallible cleanup can return (), and end: () leaves it out.
+
+## Startup and rollback
+
+`users` starts, then opening `archive.sqlite` fails. Aktor rolls back `users`, and closing its database fails too. The returned `AktorStartupError` prints `actor startup failed` normally. Both failures are still there.
+
+Print the ordinary error first, then the Aktor details separately:
+
+```rust
+eprintln!("{err}");
+
+eprintln!("Aktor startup and rollback:\n{err:#}");
+```
+
+`{:#}` includes the startup diagnostic and any rollback failures. Display and Debug stay short on purpose. Putting the whole saved report there would stuff another giant report inside one entry of your error library's report. Keep them apart and print both.
+
+`AktorStartupError::source()` returning `None` is intentional too. For an error panel, the startup text is in `err.diagnostics` and the optional rollback report is in `err.report`. A `ShutdownReport` already prints its full contents with `{report}`.
 
 ## Calling another query
 
@@ -86,3 +97,7 @@ pause finishes queued calls and closes the resource. New calls wait for resume, 
 [SQLite example](../examples/sqlite/main.rs)
 
 [Request example](../examples/guide.rs)
+
+## Error reporting libraries (Like 'er')
+
+For an `ErResult`, use `.er_into(|report| report)` to save the report automatically. Aktor’s public errors use ordinary field conversions, so they don’t need your Er version. An explicit payload uses `.er_into(|report| (report, data))`.

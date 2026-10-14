@@ -1,8 +1,9 @@
 use super::super::*;
 use core::fmt;
 
-impl fmt::Display for DedicatedJoinError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl DedicatedJoinError {
+    #[doc(hidden)]
+    pub fn fmt_display(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let payload = self.payload.lock();
 
         if let Some(message) = payload.downcast_ref::<&str>() {
@@ -14,4 +15,3 @@ impl fmt::Display for DedicatedJoinError {
         }
     }
 }
-impl core::error::Error for DedicatedJoinError {}

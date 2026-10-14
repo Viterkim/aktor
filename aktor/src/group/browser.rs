@@ -66,7 +66,7 @@ impl AktorGroup {
                     kind: None,
                     actor: name,
                     phase: "setup".into(),
-                    message: error.to_string(),
+                    message: format!("{error:#}"),
                 });
 
                 self.completion().wait().await;

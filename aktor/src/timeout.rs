@@ -1,6 +1,5 @@
 use alloc::boxed::Box;
 use core::{
-    fmt,
     future::Future,
     pin::Pin,
     task::{Context, Poll},
@@ -8,17 +7,11 @@ use core::{
 };
 
 /// Timing out after admission stops waiting, the operation still belongs to Aktor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(er::Er, Clone, Copy, PartialEq, Eq)]
 pub struct AktorTimeoutError {
     pub duration: Duration,
     pub admitted: bool,
 }
-impl fmt::Display for AktorTimeoutError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "actor call timed out after {:?}", self.duration)
-    }
-}
-impl core::error::Error for AktorTimeoutError {}
 
 #[cfg(not(target_family = "wasm"))]
 type Timer = Pin<Box<dyn Future<Output = ()> + Send>>;

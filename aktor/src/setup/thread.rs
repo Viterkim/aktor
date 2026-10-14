@@ -108,7 +108,7 @@ where
             &context.group,
             &name,
             Kind::EXECUTION,
-            AktorStartError::Setup(AktorError::new("interval duration must be positive")),
+            AktorStartError::Setup(AktorError::new("interval duration must be positive", ())),
         ));
     }
 
@@ -185,7 +185,7 @@ where
                     &context.group,
                     &name,
                     Kind::EXECUTION,
-                    AktorStartError::Setup(AktorError::new(error.to_string())),
+                    AktorStartError::Setup(AktorError::new(error.to_string(), ())),
                 )
             })?,
         )
@@ -194,7 +194,7 @@ where
                 &context.group,
                 &name,
                 Kind::EXECUTION,
-                AktorStartError::Setup(AktorError::new(error.to_string())),
+                AktorStartError::Setup(AktorError::new(error.to_string(), ())),
             )
         })?;
     }

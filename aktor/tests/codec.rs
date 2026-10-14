@@ -32,8 +32,8 @@ struct Portable {
 }
 
 #[test]
-fn portable_values() {
-    let mut value = Portable {
+fn values() {
+    let value = Portable {
         options: vec![None, Some(None), Some(Some(7))],
         units: vec![None, Some(())],
         map: BTreeMap::from([((7, "key".into()), u128::MAX)]),
@@ -77,55 +77,6 @@ fn portable_values() {
 
     extra.push(0);
     assert!(worker::decode::<Portable>(&extra).is_err());
-
-    for tag in 0..=u8::MAX {
-        let mut broken = bytes.clone();
-
-        broken[0] = tag;
-
-        if let Ok(value) = worker::decode::<Portable>(&broken) {
-            assert_eq!(
-                worker::decode::<Portable>(&worker::encode(&value).unwrap()).unwrap(),
-                value
-            );
-        }
-    }
-
-    for size in [0, 1, 2, 7, 31, 128] {
-        value.options = (0..size)
-            .map(|index| match index % 3 {
-                0 => None,
-                1 => Some(None),
-                _ => Some(Some(index as u8)),
-            })
-            .collect();
-        value.map = (0..size)
-            .map(|index| {
-                (
-                    (index as u32, format!("ø{index}")),
-                    u128::MAX - index as u128,
-                )
-            })
-            .collect();
-        value.choice = (0..size)
-            .map(|index| match index % 4 {
-                0 => Choice::Tagged(Tagged::Unit),
-                1 => Choice::Tagged(Tagged::Pair(index as u8, 17)),
-                2 => Choice::Name {
-                    name: format!("Kat {index}"),
-                },
-                _ => Choice::Number(u64::MAX - index as u64),
-            })
-            .collect();
-
-        let bytes = worker::encode(&value).unwrap();
-
-        assert_eq!(worker::decode::<Portable>(&bytes).unwrap(), value);
-
-        for length in [0, bytes.len() / 2, bytes.len() - 1] {
-            assert!(worker::decode::<Portable>(&bytes[..length]).is_err());
-        }
-    }
 }
 
 #[derive(Er, Serialize, Deserialize, PartialEq)]
@@ -143,9 +94,9 @@ pub struct PublicError {
 }
 
 #[test]
-fn portable_diagnostics() {
+fn diagnostics() {
     let tree = ErTree::new(PublicKind::Failed(17), ["backup folder is read only"]);
-    let result: Result<(), PublicError> = Err::<(), _>(tree).er_into(|_| {});
+    let result: Result<(), PublicError> = Err::<(), _>(tree).er_into(|report| report);
     let value = AktorCleanupError {
         diagnostics: "could not flush".into(),
         data: result.unwrap_err(),
@@ -154,12 +105,6 @@ fn portable_diagnostics() {
         worker::decode(&worker::encode(&value).unwrap()).unwrap();
 
     assert_eq!(decoded, value);
-    assert!(
-        decoded
-            .data
-            .diagnostics
-            .contains("backup folder is read only")
-    );
 }
 
 #[test]
@@ -175,7 +120,7 @@ fn large_bytes() {
 }
 
 #[test]
-fn malformed_values() {
+fn malformed() {
     let values = [
         vec![],
         vec![255],

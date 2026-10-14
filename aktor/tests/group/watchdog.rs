@@ -113,7 +113,7 @@ fn shutdown() {
                     .spawn(ActorArgs::new(
                         "broken formatter",
                         || Ok::<_, AktorError>(()),
-                        |_| Err::<(), _>(AktorError::new(format!("{broken}", broken = Broken))),
+                        |_| Err::<(), _>(AktorError::new(format!("{broken}", broken = Broken), ())),
                     ))
                     .await
                     .unwrap();

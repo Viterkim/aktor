@@ -72,7 +72,7 @@ impl<S> Inner<S> {
                 .as_ref()
                 .err()
                 .cloned()
-                .unwrap_or_else(|| AktorError::new("actor work destruction failed")),
+                .unwrap_or_else(|| AktorError::new("actor work destruction failed", ())),
             armed: true,
         };
 
@@ -96,7 +96,7 @@ impl<S> Inner<S> {
                     state
                         .borrow_mut()
                         .diagnostics
-                        .push(AktorError::new(panic_message(payload)))
+                        .push(AktorError::new(panic_message(payload), ()))
                 });
             });
         #[cfg(not(feature = "std"))]
@@ -336,7 +336,7 @@ impl<S> Owner<S> {
         )>,
     ) -> Result<(), AktorError> {
         if intervals.iter().any(|(every, _)| every.is_zero()) {
-            return Err(AktorError::new("interval duration must be positive"));
+            return Err(AktorError::new("interval duration must be positive", ()));
         }
 
         for (every, callback) in intervals {
@@ -466,40 +466,45 @@ impl<S> Owner<S> {
         self.supervisor = Some((name, kill));
     }
 
-    fn fail(&self, phase: &str, error: &AktorError) {
+    fn fail(&self, phase: &str, diagnostic: &str) -> bool {
         if let Some((name, kill)) = &self.supervisor {
-            kill.fail(ActorFailure {
+            return kill.fail(ActorFailure {
                 actor: name.clone(),
                 kind: Some(AktorExecution::EmbassyCrossCore),
                 phase: phase.into(),
-                message: error.diagnostics.clone(),
+                message: diagnostic.into(),
             });
         }
+
+        false
     }
 
-    fn fail_startup(&self, error: &AktorError) {
+    fn fail_startup(&self, diagnostic: &str) -> bool {
         if let Some((name, kill)) = &self.supervisor {
-            kill.fail_startup(ActorFailure {
+            return kill.fail_startup(ActorFailure {
                 actor: name.clone(),
                 kind: Some(AktorExecution::EmbassyCrossCore),
                 phase: "setup".into(),
-                message: error.diagnostics.clone(),
+                message: diagnostic.into(),
             });
         }
+
+        false
     }
 
+    #[cfg(feature = "std")]
     fn diagnostic(&self, phase: &str, error: AktorError) {
-        self.fail(phase, &error);
+        let primary = self.fail(phase, &error.diagnostics);
         self.inner
             .status
             .state
             .lock(|state| state.borrow_mut().diagnostics.push(error.clone()));
 
-        if let Some((name, kill)) = &self.supervisor {
-            kill.record_diagnostic(AktorError::new(alloc::format!(
-                "{name}: {}",
-                error.diagnostics
-            )));
+        if !primary && let Some((name, kill)) = &self.supervisor {
+            kill.record_diagnostic(AktorError::new(
+                alloc::format!("{name}: {}", error.diagnostics),
+                (),
+            ));
         }
     }
 
@@ -508,7 +513,7 @@ impl<S> Owner<S> {
         let hooks = core::mem::take(&mut self.hooks);
         let intervals = core::mem::take(&mut self.intervals);
         let report = |payload: &Box<dyn std::any::Any + Send>| {
-            self.diagnostic("hook drop", AktorError::new(panic_message(payload)));
+            self.diagnostic("hook drop", AktorError::new(panic_message(payload), ()));
         };
 
         let mut primary = crate::local::panic::discard_hooks(hooks, report);
@@ -537,7 +542,7 @@ impl<S> Owner<S> {
     }
 
     pub async fn run_with<Start, StartFuture, End, EndFuture>(
-        mut self,
+        self,
         start: Start,
         end: End,
     ) -> Result<(), AktorError>
@@ -547,23 +552,62 @@ impl<S> Owner<S> {
         End: FnOnce(S) -> EndFuture,
         EndFuture: Future<Output = Result<(), AktorCleanupError>>,
     {
+        let supervisor = self.supervisor.clone();
+        let result = self
+            .run_prepared(
+                async move || start().await.map_err(AktorFailure::from),
+                async move |state| end(state).await.map_err(AktorFailure::from),
+            )
+            .await;
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if !error.primary
+                    && let Some((name, kill)) = supervisor
+                {
+                    kill.record_diagnostic(AktorError::new(
+                        alloc::format!("{name}: {}", error.diagnostics),
+                        (),
+                    ));
+                }
+
+                Err(AktorError::new(error.diagnostics, ()))
+            }
+        }
+    }
+
+    pub(crate) async fn run_prepared<Start, StartFuture, End, EndFuture>(
+        mut self,
+        start: Start,
+        end: End,
+    ) -> Result<(), AktorFailure>
+    where
+        Start: FnOnce() -> StartFuture,
+        StartFuture: Future<Output = Result<S, AktorFailure>>,
+        End: FnOnce(S) -> EndFuture,
+        EndFuture: Future<Output = Result<(), AktorFailure>>,
+    {
         #[cfg(feature = "std")]
         let started = crate::local::panic::catch(async { start().await }, |_, payload| {
-            self.fail_startup(&AktorError::new(panic_message(payload)));
+            self.fail_startup(&panic_message(payload));
         })
         .await;
         #[cfg(feature = "std")]
         let started = match started {
             Ok(result) => result,
             Err(payload) => {
-                let error = AktorError::new(panic_message(&payload));
+                let error = AktorError::new(panic_message(&payload), ());
 
                 if let Err(secondary) = crate::local::panic::catch(
                     async {
                         self.inner.finish(Err(error));
                     },
                     |_, secondary| {
-                        self.diagnostic("queue drop", AktorError::new(panic_message(secondary)));
+                        self.diagnostic(
+                            "queue drop",
+                            AktorError::new(panic_message(secondary), ()),
+                        );
                     },
                 )
                 .await
@@ -579,15 +623,16 @@ impl<S> Owner<S> {
 
         let mut state = match started {
             Ok(state) => state,
-            Err(error) => {
-                self.fail_startup(&error);
+            Err(mut error) => {
+                error.primary |= self.fail_startup(&error.diagnostics);
                 #[cfg(feature = "std")]
                 if let Some(payload) = self.dispose_hooks() {
                     dispose_secondary(payload);
                 }
                 #[cfg(not(feature = "std"))]
                 self.dispose_hooks();
-                self.inner.finish(Err(error.clone()));
+                self.inner
+                    .finish(Err(AktorError::new(error.diagnostics.clone(), ())));
                 return Err(error);
             }
         };
@@ -656,7 +701,7 @@ impl<S> Owner<S> {
         let mut primary = crate::local::panic::catch(serving, |_, _| {}).await.err();
         #[cfg(feature = "std")]
         if let Some(payload) = &primary {
-            self.fail("operation", &AktorError::new(panic_message(payload)));
+            self.fail("operation", &panic_message(payload));
         }
         #[cfg(not(feature = "std"))]
         serving.await;
@@ -664,14 +709,14 @@ impl<S> Owner<S> {
         self.inner.close();
         #[cfg(feature = "std")]
         let cleaned = crate::local::panic::catch(async { end(state).await }, |_, payload| {
-            self.fail("cleanup", &AktorError::new(panic_message(payload)));
+            self.fail("cleanup", &panic_message(payload));
         })
         .await;
         #[cfg(feature = "std")]
         let result = match cleaned {
             Ok(result) => result,
             Err(payload) => {
-                let error = AktorError::new(panic_message(&payload));
+                let error = AktorFailure::from(AktorError::new(panic_message(&payload), ()));
 
                 if primary.is_none() {
                     primary = Some(payload);
@@ -685,8 +730,15 @@ impl<S> Owner<S> {
         #[cfg(not(feature = "std"))]
         let result = end(state).await;
 
-        if let Err(error) = &result {
-            self.diagnostic("cleanup", error.clone());
+        let mut result = result;
+        if let Err(error) = &mut result {
+            error.primary |= self.fail("cleanup", &error.diagnostics);
+            self.inner.status.state.lock(|state| {
+                state
+                    .borrow_mut()
+                    .diagnostics
+                    .push(AktorError::new(error.diagnostics.clone(), ()));
+            });
         }
         #[cfg(feature = "std")]
         if let Some(payload) = self.dispose_hooks() {
@@ -700,20 +752,27 @@ impl<S> Owner<S> {
         self.dispose_hooks();
         #[cfg(feature = "std")]
         let result = if let Some(payload) = &primary {
-            Err(AktorError::new(panic_message(payload)))
+            Err(AktorFailure::from(AktorError::new(
+                panic_message(payload),
+                (),
+            )))
         } else {
             result
         };
         #[cfg(feature = "std")]
         if let Err(payload) = crate::local::panic::catch(
             async {
-                self.inner.finish(result.clone());
+                self.inner.finish(
+                    result
+                        .clone()
+                        .map_err(|error| AktorError::new(error.diagnostics, ())),
+                );
             },
             |_, _| {},
         )
         .await
         {
-            self.diagnostic("queue drop", AktorError::new(panic_message(&payload)));
+            self.diagnostic("queue drop", AktorError::new(panic_message(&payload), ()));
 
             if primary.is_none() {
                 primary = Some(payload);
@@ -722,7 +781,11 @@ impl<S> Owner<S> {
             }
         }
         #[cfg(not(feature = "std"))]
-        self.inner.finish(result.clone());
+        self.inner.finish(
+            result
+                .clone()
+                .map_err(|error| AktorError::new(error.diagnostics, ())),
+        );
         #[cfg(feature = "std")]
         if let Some(payload) = primary {
             std::panic::resume_unwind(payload);
@@ -744,20 +807,20 @@ impl<S> Drop for Owner<S> {
             .state
             .lock(|state| state.borrow().completed.is_none())
         {
-            let error = AktorError::new("actor owner cancelled before cleanup completed");
+            let error = AktorError::new("actor owner cancelled before cleanup completed", ());
 
             if !self
                 .supervisor
                 .as_ref()
                 .is_some_and(|(_, kill)| kill.is_stopping())
             {
-                self.fail("owner", &error);
+                self.fail("owner", &error.diagnostics);
             }
             #[cfg(feature = "std")]
             if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.inner.finish(Err(error));
             })) {
-                self.diagnostic("queue drop", AktorError::new(panic_message(&payload)));
+                self.diagnostic("queue drop", AktorError::new(panic_message(&payload), ()));
 
                 if primary.is_none() {
                     primary = Some(payload);

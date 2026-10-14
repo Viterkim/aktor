@@ -14,7 +14,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         primary: &mut Option<Box<dyn Any + Send>>,
     ) -> Result<F::Output, crate::AktorError> {
         self.capture_result(phase, future).await.map_err(|payload| {
-            let error = crate::AktorError::new(panic_message(&payload));
+            let error = crate::AktorError::new(panic_message(&payload), ());
 
             if primary.is_none() {
                 *primary = Some(payload);
@@ -70,7 +70,10 @@ impl<S, const N: usize, E> Inner<S, N, E> {
                 self.completion
                     .diagnostics
                     .borrow_mut()
-                    .push(crate::AktorError::new(alloc::format!("{phase}: {message}")));
+                    .push(crate::AktorError::new(
+                        alloc::format!("{phase}: {message}"),
+                        (),
+                    ));
             }
         }
     }

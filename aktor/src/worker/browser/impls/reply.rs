@@ -41,7 +41,7 @@ impl<O> WorkerReply<O> {
                 kind: None,
                 actor: name.clone(),
                 phase: "worker".into(),
-                message: error.to_string(),
+                message: format!("{error:#}"),
             });
             Poll::Pending
         } else {
