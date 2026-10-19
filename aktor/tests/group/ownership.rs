@@ -52,6 +52,7 @@ async fn cancellation() {
         assert!(cleaned.load(Ordering::SeqCst));
         assert!(
             result
+                .report
                 .failure
                 .unwrap()
                 .message
@@ -66,7 +67,10 @@ async fn value() {
 
     assert!(matches!(
         actors.spawn_value("early", 0usize).await,
-        Err(aktor::listener::DedicatedStartError::NotStarted)
+        Err(aktor::owner::StartError {
+            error: aktor::listener::DedicatedStartError::NotStarted,
+            ..
+        })
     ));
 
     let kill = actors.killswitch();

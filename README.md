@@ -4,7 +4,7 @@ Write normal functions, call them with a handle and .await. Go to definition tak
 
 ```toml
 [dependencies]
-aktor = { version = "0.0.7", features = ["tokio"] }
+aktor = { version = "0.0.8", features = ["tokio"] }
 ```
 
 The API can change before 0.1.
@@ -65,11 +65,9 @@ let report = actors.shutdown().await;
 result?;
 
 if report.failed() {
-    return Err(report.into());
+    return Err(AktorRunError::from(report).into());
 }
 ```
-
-So a server error also goes through shutdown before leaving main. The select drops the server future when stopping begins, releasing what it held while actor cleanup runs. Native groups keep their shutdown runtime alive until cleanup finishes.
 
 ## Multiplatform SQLite example (Tokio and web worker)
 

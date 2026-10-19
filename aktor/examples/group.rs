@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     let report = closing.await;
 
     if report.failed() {
-        return Err(report.into());
+        return Err(aktor::AktorRunError::from(report).into());
     }
 
     Ok(())

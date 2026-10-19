@@ -67,7 +67,10 @@ impl Inner {
     fn record(&self, error: &WireError) {
         let primary = self.notify(error);
         let message = match &error.cause {
-            WorkerCause::Cleanup(message) => Some(message.clone()),
+            WorkerCause::Cleanup => error
+                .diagnostics
+                .as_ref()
+                .map(|diagnostics| diagnostics.report.clone()),
             _ if !primary => Some(format!("{error:#}")),
             _ => None,
         };
@@ -85,7 +88,7 @@ impl Inner {
             return false;
         };
         let (phase, message) = match &error.cause {
-            WorkerCause::Cleanup(_) => ("cleanup", "worker cleanup failed".into()),
+            WorkerCause::Cleanup => ("cleanup", "worker cleanup failed".into()),
             _ => ("worker", format!("{error:#}")),
         };
         let failure = crate::group::ActorFailure {
@@ -107,8 +110,6 @@ impl Inner {
     }
 
     pub fn fail_error(&self, error: WireError) {
-        let cause = error.cause.clone();
-
         if self.finished.borrow().is_some() || self.failed.replace(true) {
             return;
         }
@@ -132,11 +133,17 @@ impl Inner {
             };
 
             if let Some(service) = work.service {
-                service.answer(Err(WireError::new(outcome, cause.clone())));
+                service.answer(Err(WireError {
+                    outcome,
+                    ..error.clone()
+                }));
             }
 
             if let Some(answer) = work.answer {
-                answer(Err(WireError::new(outcome, cause.clone())));
+                answer(Err(WireError {
+                    outcome,
+                    ..error.clone()
+                }));
             }
         }
 
@@ -188,7 +195,7 @@ impl Inner {
                     && !self.shutdown_sent.replace(true)
                     && let Err(error) = post(&self.worker, &self.buffers, &Incoming::Shutdown)
                 {
-                    self.fail(error.cause);
+                    self.fail_error(error);
                 }
 
                 return;
@@ -230,7 +237,7 @@ impl Inner {
                 self.outstanding.borrow_mut().insert(id, work);
 
                 if let Err(error) = post(&self.worker, &self.buffers, &input) {
-                    self.fail(error.cause);
+                    self.fail_error(error);
                 }
 
                 return;
@@ -273,7 +280,7 @@ impl Inner {
         wasm_bindgen_futures::spawn_local(async move {
             match observe(inner.ready.subscribe()).await {
                 Ok(()) => inner.pump(),
-                Err(error) => inner.fail(error.cause),
+                Err(error) => inner.fail_error(error),
             }
         });
     }

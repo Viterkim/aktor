@@ -162,16 +162,6 @@ impl Status {
         self.state
             .lock(|state| state.borrow().group_stopping.is_some())
     }
-
-    pub fn stopping(&self) -> bool {
-        self.state.lock(|state| {
-            state
-                .borrow()
-                .group_stopping
-                .as_ref()
-                .is_some_and(|stopping| stopping.load(Ordering::Acquire))
-        })
-    }
 }
 
 impl<S, Role> Handle<S, Role> {

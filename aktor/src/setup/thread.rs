@@ -30,7 +30,7 @@ where
     type Startup = AktorThreadFuture<Result<Self::Handles, AktorStartError>>;
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        group.start_threaded().map(|_| ())
+        group.start_threaded().map(|_| ()).map_err(Into::into)
     }
 
     fn start_in(self, context: AktorStartContext<crate::AktorGroup>) -> Self::Startup {
@@ -55,7 +55,7 @@ where
     type Startup = AktorThreadFuture<Result<Self::Handles, AktorStartError>>;
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        group.start_standard().map(|_| ())
+        group.start_standard().map(|_| ()).map_err(Into::into)
     }
 
     fn start_in(self, context: AktorStartContext<Self::Group>) -> Self::Startup {

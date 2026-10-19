@@ -22,7 +22,7 @@ impl<E> Completion<E> {
     pub async fn wait(&self) -> Result<(), OwnerError> {
         self.wait_with_data()
             .await
-            .map_err(|error| error.error.without_data())
+            .map_err(SharedOwnerError::without_data)
     }
 
     /// Observe the exact lifecycle error and its data on this executor.
@@ -33,7 +33,9 @@ impl<E> Completion<E> {
             changed.register(context);
 
             match self.inner.result.borrow().clone() {
-                Some(result) => Poll::Ready(result.map_err(|error| SharedOwnerError { error })),
+                Some(result) => Poll::Ready(result.map_err(|error| {
+                    SharedOwnerError::from_failure(error, &self.inner.diagnostics.borrow())
+                })),
                 None => Poll::Pending,
             }
         })

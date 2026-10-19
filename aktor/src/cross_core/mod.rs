@@ -7,7 +7,7 @@ use crate::{
 use alloc::{boxed::Box, collections::VecDeque, rc::Rc, vec::Vec};
 use core::{cell::RefCell, marker::PhantomData};
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
-use portable_atomic::{AtomicBool, Ordering};
+use portable_atomic::AtomicBool;
 use portable_atomic_util::{Arc, Weak};
 
 mod dispatch;

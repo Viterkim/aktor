@@ -162,9 +162,10 @@ async fn task_failure() {
     .unwrap_err();
 
     assert!(!after.load(Ordering::SeqCst));
-    assert_eq!(report.failure.as_ref().unwrap().phase, "task");
+    assert_eq!(report.report.failure.as_ref().unwrap().phase, "task");
     assert!(
         report
+            .report
             .failure
             .as_ref()
             .unwrap()

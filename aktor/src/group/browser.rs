@@ -37,20 +37,18 @@ impl AktorGroup {
         let name = name.into();
 
         if !self.control.lock().listening {
-            return Err(WorkerError {
-                outcome: crate::message::CallError::NotAdmitted,
-                cause: WorkerCause::Setup("start the actor group before opening workers".into()),
-                data: None,
-            });
+            return Err(WorkerError::setup(
+                crate::message::CallError::NotAdmitted,
+                "start the actor group before opening workers",
+            ));
         }
 
         if self.killswitch().is_stopping() {
             self.completion().wait().await;
-            return Err(WorkerError {
-                outcome: crate::message::CallError::NotAdmitted,
-                cause: WorkerCause::Closed,
-                data: None,
-            });
+            return Err(WorkerError::new(
+                crate::message::CallError::NotAdmitted,
+                WorkerCause::Closed,
+            ));
         }
 
         self.control

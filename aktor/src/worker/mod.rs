@@ -25,7 +25,7 @@ pub use wire::Codec;
 
 pub use crate::dispatch::{Native, Remote};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 0;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 type WireError = WorkerError<Vec<u8>>;
@@ -45,6 +45,8 @@ pub struct Options {
 pub struct WorkerError<T = ()> {
     pub outcome: CallError,
     pub cause: WorkerCause,
+    #[er(source, skip)]
+    pub diagnostics: Option<crate::AktorDiagnostic>,
     pub data: Option<T>,
 }
 
@@ -53,8 +55,8 @@ pub enum WorkerCause {
     Closed,
     Full,
     Codec(String),
-    Setup(String),
-    Cleanup(String),
+    Setup,
+    Cleanup,
     Crashed(String),
     Protocol,
     UnknownOperation(String),

@@ -7,7 +7,7 @@ impl<S: 'static> Aktor<S> {
     /// Start the actor on its own thread. Returns after setup succeeds.
     pub async fn spawn<Setup, Cleanup, Output>(
         args: SpawnArgs<Setup, Cleanup>,
-    ) -> Result<Self, DedicatedStartError<AktorFailure>>
+    ) -> Result<Self, StartError>
     where
         Output: AktorCleanupOutput,
         Setup: FnOnce() -> Result<S, crate::AktorSetupError> + Send + 'static,
@@ -34,7 +34,7 @@ impl<S: 'static> Aktor<S> {
     /// Async setup and cleanup run on the actor's thread too.
     pub async fn spawn_async<Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         args: SpawnArgs<Setup, Cleanup>,
-    ) -> Result<Self, DedicatedStartError<AktorFailure>>
+    ) -> Result<Self, StartError>
     where
         Output: AktorCleanupOutput,
         Setup: FnOnce() -> SetupFuture + Send + 'static,
@@ -48,7 +48,7 @@ impl<S: 'static> Aktor<S> {
     pub async fn spawn_async_with_hooks<Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         args: SpawnArgs<Setup, Cleanup>,
         hooks: crate::listener::hooks::AktorHooks<S>,
-    ) -> Result<Self, DedicatedStartError<AktorFailure>>
+    ) -> Result<Self, StartError>
     where
         Output: AktorCleanupOutput,
         Setup: FnOnce() -> SetupFuture + Send + 'static,
@@ -63,7 +63,7 @@ impl<S: 'static> Aktor<S> {
         args: SpawnArgs<Setup, Cleanup>,
         hooks: crate::listener::hooks::AktorHooks<S>,
         standard: bool,
-    ) -> Result<Self, DedicatedStartError<AktorFailure>>
+    ) -> Result<Self, StartError>
     where
         Output: AktorCleanupOutput,
         Setup: FnOnce() -> SetupFuture + Send + 'static,
@@ -107,7 +107,9 @@ impl<S: 'static> Aktor<S> {
             },
         };
 
-        Self::spawn_async_captured(args, hooks, standard).await
+        Self::spawn_async_captured(args, hooks, standard)
+            .await
+            .map_err(StartError::from)
     }
 }
 
@@ -192,18 +194,20 @@ impl<S: 'static> Aktor<S> {
         let observer = actor.new_controller();
         let observing = async move {
             let outcome = match runtime.join(thread).await {
-                Ok(Ok(())) if observer.is_cancelled() => Err(Arc::new(OwnerError::Cancelled)),
+                Ok(Ok(())) if observer.is_cancelled() => {
+                    Err(Arc::new(OwnerFailure::Cancelled.into()))
+                }
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(Arc::new(OwnerError::Cleanup(error))),
+                Ok(Err(error)) => Err(Arc::new(OwnerFailure::Cleanup(error).into())),
                 Err(cause) => {
                     let cleanup = observer.cleanup_errors();
                     let error = if cleanup.errors.is_empty() && cleanup.diagnostics.is_empty() {
-                        OwnerError::Panicked(cause)
+                        OwnerFailure::Panicked(cause)
                     } else {
-                        OwnerError::PanickedWithCleanup { cause, cleanup }
+                        OwnerFailure::PanickedWithCleanup { cause, cleanup }
                     };
 
-                    Err(Arc::new(error))
+                    Err(Arc::new(OwnerError::from(error)))
                 }
             };
 
@@ -267,13 +271,13 @@ impl OwnerCompletion {
             }
 
             if result.changed().await.is_err() {
-                return Err(Arc::new(OwnerError::RuntimeStopped));
+                return Err(Arc::new(OwnerFailure::RuntimeStopped.into()));
             }
         }
     }
 }
 
-impl fmt::Display for OwnerError {
+impl fmt::Display for OwnerFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cleanup(error) => {
@@ -332,7 +336,6 @@ impl fmt::Display for OwnerError {
         }
     }
 }
-impl core::error::Error for OwnerError {}
 
 impl fmt::Display for CompletionScheduleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -359,6 +362,20 @@ impl<'a> core::future::IntoFuture for &'a OwnerCompletion {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.wait())
+    }
+}
+
+impl From<OwnerFailure> for OwnerError {
+    fn from(error: OwnerFailure) -> Self {
+        let diagnostics = crate::AktorDiagnostic::new(error.to_string(), format!("{error:#}"));
+
+        Self { error, diagnostics }
+    }
+}
+impl OwnerError {
+    #[doc(hidden)]
+    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.diagnostics.report)
     }
 }
 
@@ -444,12 +461,17 @@ mod tests {
 
         crate::executor::FAIL_SPAWN.with(|setting| setting.set(None));
 
-        let Err(DedicatedStartError::Thread(error)) = result else {
+        let Err(error) = result else {
             panic!("completion scheduling failure was lost");
         };
 
         assert_eq!(
-            format!("{error:#}").contains("cleanup also failed"),
+            error
+                .diagnostics
+                .as_ref()
+                .unwrap()
+                .report
+                .contains("cleanup also failed"),
             failed_cleanup
         );
         assert!(!error.to_string().contains("cleanup also failed"));

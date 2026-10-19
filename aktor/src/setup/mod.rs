@@ -102,10 +102,11 @@ pub struct AktorStartup<Setup: AktorStart<Mode>, Mode = ()> {
 /// The startup failure and its completed rollback report.
 /// report is None if startup was rejected before adding actors to the group.
 #[derive(Er)]
-#[er(format = "actor startup failed", display_alt = Self::fmt_details)]
+#[er(no_constructors, format = "actor startup failed", display_alt = Self::fmt_details)]
 pub struct AktorStartupError {
     pub error: AktorStartError,
-    pub diagnostics: String,
+    #[er(source, skip)]
+    pub diagnostics: Box<crate::AktorDiagnostic>,
     pub report: Option<Box<crate::ShutdownReport>>,
     /// The startup diagnostic represents the group's first failure.
     pub source_is_failure: bool,

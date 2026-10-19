@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// The execution kind recorded in reports. Setup constructors live in AktorKind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +21,34 @@ pub type AktorNoRole = ();
 
 #[allow(non_upper_case_globals)]
 pub const AktorNoRole: AktorNoRole = ();
+
+#[cfg_attr(
+    feature = "wasm_browser_workers",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[derive(Clone, PartialEq, Eq, er::Er)]
+#[er(format = "{message}", display_alt = "{report}")]
+pub struct AktorDiagnostic {
+    pub message: String,
+    #[er(into_report_string)]
+    pub report: String,
+}
+
+#[derive(Clone, er::Er)]
+#[er(no_constructors, format = "actor group failed", display_alt = Self::fmt_details)]
+pub struct AktorRunError {
+    pub report: Box<ShutdownReport>,
+    #[er(source, skip)]
+    pub diagnostics: AktorDiagnostic,
+}
+
+#[derive(Clone, er::Er)]
+#[er(no_constructors, format = "{message}", display_alt = Self::fmt_details)]
+pub struct AktorGroupError {
+    pub message: String,
+    #[er(source, skip)]
+    pub diagnostics: Option<AktorDiagnostic>,
+}
 
 /// Setup and cleanup diagnostics, with optional data for low-level APIs.
 #[cfg_attr(

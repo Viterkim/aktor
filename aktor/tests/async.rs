@@ -1,7 +1,7 @@
 #![cfg(feature = "macros")]
 
 use aktor::message::call;
-use aktor::owner::OwnerError;
+use aktor::owner::OwnerFailure;
 use aktor::*;
 use std::{cell::RefCell, rc::Rc, sync::Arc, thread, time::Duration};
 use tokio::sync::oneshot;
@@ -161,7 +161,7 @@ async fn panic_after_await() {
 
     let error = database.completion.wait().await.unwrap_err();
 
-    let OwnerError::PanickedWithCleanup { cause, cleanup } = &*error else {
+    let OwnerFailure::PanickedWithCleanup { cause, cleanup } = &error.error else {
         panic!("expected operation panic and cleanup failure")
     };
 
@@ -221,7 +221,7 @@ async fn completion() {
 
     assert!(Arc::ptr_eq(&first, &second));
 
-    let OwnerError::Cleanup(error) = &*first else {
+    let OwnerFailure::Cleanup(error) = &first.error else {
         panic!("expected cleanup error")
     };
 

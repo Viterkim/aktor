@@ -74,20 +74,14 @@ fn respond_with(
 pub fn scope() -> Result<DedicatedWorkerGlobalScope, WireError> {
     JsValue::from(js_sys::global())
         .dyn_into::<DedicatedWorkerGlobalScope>()
-        .map_err(|_| {
-            WireError::new(
-                CallError::NotAdmitted,
-                WorkerCause::Setup("serve needs a Dedicated Worker".into()),
-            )
-        })
+        .map_err(|_| WireError::setup(CallError::NotAdmitted, "serve needs a Dedicated Worker"))
 }
 
 pub fn setup_failed<T: Serialize>(error: crate::AktorSetupError<T>) -> Result<(), WireError> {
     respond(
         &scope()?,
         Outgoing::SetupFailed(lifecycle_error(
-            CallError::NotAdmitted,
-            WorkerCause::Setup(error.diagnostics),
+            WireError::setup(CallError::NotAdmitted, error.diagnostics),
             &error.data,
         )),
     )
@@ -326,8 +320,7 @@ where
         let result = match cleanup(state).await {
             Ok(()) => Ok(()),
             Err(error) => Err(lifecycle_error(
-                CallError::OutcomeUnknown,
-                WorkerCause::Cleanup(error.diagnostics),
+                WireError::cleanup(CallError::OutcomeUnknown, error.diagnostics),
                 &error.data,
             )),
         };
@@ -358,9 +351,7 @@ where
     })
 }
 
-fn lifecycle_error<E: Serialize>(outcome: CallError, cause: WorkerCause, data: &E) -> WireError {
-    let mut error = WireError::new(outcome, cause);
-
+fn lifecycle_error<E: Serialize>(mut error: WireError, data: &E) -> WireError {
     match encode(data) {
         Ok(data) => error.data = Some(data),
         Err(codec) => error = error.data_error(codec),

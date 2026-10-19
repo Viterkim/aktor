@@ -117,10 +117,7 @@ where
     } = closures;
 
     if intervals.iter().any(|interval| interval.every.is_zero()) {
-        let error = WireError::new(
-            CallError::NotAdmitted,
-            WorkerCause::Setup("interval duration must be positive".into()),
-        );
+        let error = WireError::setup(CallError::NotAdmitted, "interval duration must be positive");
 
         respond(&scope()?, Outgoing::SetupFailed(error.clone()))?;
         return Err(error);
@@ -130,10 +127,7 @@ where
         Ok(state) => state,
         Err(error) => {
             setup_failed(error.clone())?;
-            return Err(WireError::new(
-                CallError::NotAdmitted,
-                WorkerCause::Setup(error.diagnostics),
-            ));
+            return Err(WireError::setup(CallError::NotAdmitted, error.diagnostics));
         }
     };
 

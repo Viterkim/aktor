@@ -21,7 +21,6 @@ type Timer = Pin<Box<dyn Future<Output = ()>>>;
 #[doc(hidden)]
 pub struct WaitStatus {
     pub admitted: bool,
-    pub stopping: bool,
 }
 
 /// The duration starts when you begin awaiting it.
@@ -147,13 +146,9 @@ impl<F: Future> Future for Timeout<F> {
             return Poll::Ready(Ok(value));
         }
 
-        let status = (this.status)(this.future.as_ref().get_ref());
-
-        if status.stopping {
-            return Poll::Pending;
-        }
-
         if timer.as_mut().poll(cx).is_ready() {
+            let status = (this.status)(this.future.as_ref().get_ref());
+
             return Poll::Ready(Err(AktorTimeoutError {
                 duration: this.duration,
                 admitted: status.admitted,

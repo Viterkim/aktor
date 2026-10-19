@@ -197,7 +197,7 @@ async fn exercise(spawner: Spawner) {
 
     assert!(matches!(
         &*first_error.error,
-        embassy::OwnerError::Setup(AktorSetupError { data: "setup", .. })
+        embassy::OwnerFailure::Setup(AktorSetupError { data: "setup", .. })
     ));
     assert!(Rc::ptr_eq(
         &first_error.error,
@@ -226,7 +226,7 @@ async fn exercise(spawner: Spawner) {
 
     assert!(matches!(
         &*completion.wait_with_data().await.unwrap_err().error,
-        embassy::OwnerError::Cleanup(AktorCleanupError {
+        embassy::OwnerFailure::Cleanup(AktorCleanupError {
             data: "cleanup",
             ..
         })
@@ -268,8 +268,8 @@ async fn exercise(spawner: Spawner) {
             .is_err()
     );
     assert!(matches!(
-        sensor.completion().wait().await.unwrap_err(),
-        embassy::OwnerError::Cancelled
+        sensor.completion().wait().await.unwrap_err().error,
+        embassy::OwnerFailure::Cancelled
     ));
     assert!(!cleaned.get());
 
@@ -403,6 +403,7 @@ async fn grouped() {
 
     assert!(
         report
+            .report
             .failure
             .unwrap()
             .message
@@ -723,7 +724,7 @@ fn completion_callbacks() {
             panic!("owner cancellation did not reach its observer")
         };
 
-        assert!(matches!(error, embassy::OwnerError::Cancelled));
+        assert!(matches!(error.error, embassy::OwnerFailure::Cancelled));
     }
 
     struct Input;

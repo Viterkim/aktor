@@ -52,9 +52,13 @@ pub fn diagnostics(error: &(dyn core::error::Error + 'static)) -> String {
     }
 }
 
-impl AktorStartupError {
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+struct StartupDetails<'a> {
+    primary: &'a str,
+    report: Option<&'a crate::ShutdownReport>,
+    source_is_failure: bool,
+}
+impl fmt::Display for StartupDetails<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("actor startup failed")?;
 
         if let Some(report) = &self.report {
@@ -89,9 +93,42 @@ impl AktorStartupError {
             }
         }
 
-        write!(f, "\n{}", self.diagnostics)?;
+        write!(f, "\n{}", self.primary)?;
 
         Ok(())
+    }
+}
+
+impl AktorStartupError {
+    #[doc(hidden)]
+    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.diagnostics.report)
+    }
+
+    pub fn from_failure(
+        error: AktorStartError,
+        primary: String,
+        report: Option<Box<crate::ShutdownReport>>,
+        source_is_failure: bool,
+    ) -> Self {
+        let details = alloc::format!(
+            "{}",
+            StartupDetails {
+                primary: &primary,
+                report: report.as_deref(),
+                source_is_failure,
+            }
+        );
+
+        Self {
+            error,
+            diagnostics: Box::new(crate::AktorDiagnostic::new(
+                "actor initialization failed",
+                details,
+            )),
+            report,
+            source_is_failure,
+        }
     }
 }
 
@@ -201,12 +238,12 @@ pub async fn aktor_start_in<Setup: AktorStart<Mode>, Mode>(
         let error = AktorStartError::from(error);
         let diagnostics = Setup::diagnostics(&error);
 
-        return Err(AktorStartupError {
-            diagnostics,
+        return Err(AktorStartupError::from_failure(
             error,
-            report: None,
-            source_is_failure: false,
-        });
+            diagnostics,
+            None,
+            false,
+        ));
     }
 
     let mut group = group.registration();
@@ -242,9 +279,11 @@ impl<E: 'static> AktorStartError<E> {
                 | crate::listener::DedicatedStartError::InvalidCapacity,
             ) => true,
             #[cfg(feature = "local")]
-            Self::Local(
-                crate::local::OwnerError::Setup(_) | crate::local::OwnerError::SetupPanic(_),
-            ) => true,
+            Self::Local(crate::local::OwnerError {
+                error:
+                    crate::local::OwnerFailure::Setup(_) | crate::local::OwnerFailure::SetupPanic(_),
+                ..
+            }) => true,
             _ => false,
         }
     }
@@ -337,12 +376,9 @@ mod tests {
             let captured = crate::AktorFailure::from(AktorSetupError::new(diagnostics(&cause), ()));
             let error = AktorStartError::Init(captured);
 
-            AktorStartupError {
-                diagnostics: start_diagnostics(&error),
-                error,
-                report: None,
-                source_is_failure: false,
-            }
+            let diagnostics = start_diagnostics(&error);
+
+            AktorStartupError::from_failure(error, diagnostics, None, false)
         };
         let finite = public(Cause {
             source: Some(Box::new(Cause {

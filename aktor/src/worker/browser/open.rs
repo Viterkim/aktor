@@ -28,12 +28,8 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
 
         js_options.set_type(WorkerType::Module);
 
-        let worker = web_sys::Worker::new_with_options(url, &js_options).map_err(|error| {
-            WorkerError::new(
-                CallError::NotAdmitted,
-                WorkerCause::Setup(format!("{error:?}")),
-            )
-        })?;
+        let worker = web_sys::Worker::new_with_options(url, &js_options)
+            .map_err(|error| WorkerError::setup(CallError::NotAdmitted, format!("{error:?}")))?;
 
         let (ready, _) = watch::channel(None);
         let (finished, _) = watch::channel(None);
@@ -116,7 +112,10 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
                             inner.fail_error(error);
                         }
                     } else {
-                        inner.fail(WorkerCause::Setup("worker requires configuration".into()));
+                        inner.fail_error(WireError::setup(
+                            CallError::OutcomeUnknown,
+                            "worker requires configuration",
+                        ));
                     }
                 }
                 Ok(Outgoing::Ready {
@@ -191,7 +190,7 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
                         inner.finish(result);
                     }
                 }
-                Err(error) => inner.fail(error.cause),
+                Err(error) => inner.fail_error(error),
             }
         });
 
@@ -203,13 +202,16 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
         let weak = Rc::downgrade(&inner);
         let error = Closure::new(move |event: ErrorEvent| {
             if let Some(inner) = weak.upgrade() {
-                let cause = if matches!(*inner.ready.borrow(), Some(Ok(()))) {
-                    WorkerCause::Crashed(event.message())
+                let error = if matches!(*inner.ready.borrow(), Some(Ok(()))) {
+                    WireError::new(
+                        CallError::OutcomeUnknown,
+                        WorkerCause::Crashed(event.message()),
+                    )
                 } else {
-                    WorkerCause::Setup(event.message())
+                    WireError::setup(CallError::OutcomeUnknown, event.message())
                 };
 
-                inner.fail(cause);
+                inner.fail_error(error);
             }
         });
 

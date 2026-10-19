@@ -177,8 +177,8 @@ async fn data() {
 
     let error = handle.shutdown().wait().await.unwrap_err();
 
-    match &*error {
-        owner::OwnerError::Cleanup(errors) => {
+    match &error.error {
+        owner::OwnerFailure::Cleanup(errors) => {
             assert_eq!(errors.errors[0].diagnostics, "cleanup data");
         }
         error => panic!("unexpected completion: {error:?}"),
@@ -186,7 +186,7 @@ async fn data() {
 
     let error = tree.shutdown().wait().await.unwrap_err();
 
-    let owner::OwnerError::Cleanup(errors) = &*error else {
+    let owner::OwnerFailure::Cleanup(errors) = &error.error else {
         panic!("cleanup tree was lost: {error}");
     };
     let diagnostic = &errors.errors[0].diagnostics;
@@ -240,10 +240,14 @@ async fn data() {
 
     let failure = result.as_ref().err().unwrap();
     assert_eq!(failure.to_string(), "actor startup failed");
-    let printed = format!("{failure:#}");
+    let printed = &failure.diagnostics.report;
     assert_eq!(printed.matches("setup data").count(), 1);
     assert_eq!(printed.matches("rollback cleanup refused").count(), 1);
-    assert_eq!(failure.er_report_string(), "actor startup failed");
+    assert!(
+        !failure
+            .er_report_string()
+            .contains("rollback cleanup refused")
+    );
     let tree = er::ErTree::from(result.err().unwrap());
     match tree.top {
         AktorStartupError {
@@ -441,12 +445,7 @@ async fn local_data() {
         };
 
         let error: Box<dyn Error + Send + Sync> = result.unwrap_err().into();
-        let context = if setup_failure {
-            "actor setup failed"
-        } else {
-            "actor cleanup failed"
-        };
-        assert_eq!(error.er_report_string(), context.to_string());
+        assert!(!error.er_report_string().contains("local data"));
         assert!(completion(&completed).await.is_err());
         assert!(owned_completion(completed.new_observer()).await.is_err());
 
@@ -454,9 +453,9 @@ async fn local_data() {
         let observed = completed.new_observer().wait_with_data().await.unwrap_err();
         assert!(Rc::ptr_eq(&typed.error, &observed.error));
         let local_report: Box<dyn Error> = typed.clone().into();
-        assert_eq!(local_report.er_report_string(), context.to_string());
+        assert!(!local_report.er_report_string().contains("local data"));
         let data = match &*typed.error {
-            local::OwnerError::Setup(error) | local::OwnerError::Cleanup(error) => &error.data,
+            local::OwnerFailure::Setup(error) | local::OwnerFailure::Cleanup(error) => &error.data,
             error => panic!("unexpected lifecycle error: {error}"),
         };
         assert!(Rc::ptr_eq(&data.0, &value));
@@ -492,7 +491,7 @@ async fn local_data() {
     assert!(ready(&handle).await.is_err());
     let typed = completed.wait_with_data().await.unwrap_err();
     match &*typed.error {
-        local::OwnerError::Setup(error) => assert!(std::ptr::eq(error.data, &data)),
+        local::OwnerFailure::Setup(error) => assert!(std::ptr::eq(error.data, &data)),
         error => panic!("unexpected lifecycle error: {error}"),
     }
 
@@ -614,8 +613,10 @@ async fn initialization() {
 
     assert_eq!(disposed.get(), 2);
     assert!(Rc::ptr_eq(&ready.error, &completed.error));
-    assert!(matches!(&*ready.error, local::OwnerError::SetupPanic(error)
-        if error.diagnostics == "retained initialization sentinel"));
+    assert!(
+        matches!(&*ready.error, local::OwnerFailure::SetupPanic(error)
+        if error.diagnostics == "retained initialization sentinel")
+    );
 
     let (handle, owner) = local::channel::<(), 1, String>().unwrap();
     let completion = owner.completion();
@@ -623,10 +624,16 @@ async fn initialization() {
     drop(owner);
     assert!(matches!(
         handle.ready().await,
-        Err(local::OwnerError::Cancelled)
+        Err(local::OwnerError {
+            error: local::OwnerFailure::Cancelled,
+            ..
+        })
     ));
     assert!(matches!(
         completion.wait().await,
-        Err(local::OwnerError::Cancelled)
+        Err(local::OwnerError {
+            error: local::OwnerFailure::Cancelled,
+            ..
+        })
     ));
 }

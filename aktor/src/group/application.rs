@@ -1,5 +1,7 @@
 use super::*;
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
+use crate::AktorGroupError;
+#[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 use {
     super::shutdown::{contain_drop, fail_application, panic_message},
     futures_util::FutureExt,
@@ -22,14 +24,13 @@ impl AktorGroup {
     pub fn spawn_task(
         &self,
         future: impl Future<Output = ()> + Send + 'static,
-    ) -> Result<(), AktorError> {
+    ) -> Result<(), AktorGroupError> {
         let runtime = match tokio::runtime::Handle::try_current() {
             Ok(runtime) => runtime,
             Err(_) => {
                 contain_drop(future, &self.killswitch(), "rejected task drop");
-                return Err(AktorError::new(
+                return Err(AktorGroupError::new(
                     "application tasks need a Tokio runtime",
-                    (),
                 ));
             }
         };
@@ -38,9 +39,8 @@ impl AktorGroup {
         if !state.listening || state.deadline.is_some() || state.finished {
             drop(state);
             contain_drop(future, &self.killswitch(), "rejected task drop");
-            return Err(AktorError::new(
+            return Err(AktorGroupError::new(
                 "actor group cannot accept application work",
-                (),
             ));
         }
 

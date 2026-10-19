@@ -4,7 +4,7 @@ mod ownership;
 mod startup;
 mod watchdog;
 use aktor::{
-    ActorArgs, AktorCleanupError, AktorError, AktorFailure, AktorGroup,
+    ActorArgs, AktorCleanupError, AktorError, AktorGroup,
     message::{call, call_async},
 };
 use er::*;
@@ -86,7 +86,7 @@ async fn cleanup_timeout() {
                 assert!(call(&actor.handle, |_, ()| (), ()).now_or_never().is_none());
 
                 let error = (&completion).await.unwrap_err();
-                let aktor::owner::OwnerError::Cleanup(errors) = &*error else {
+                let aktor::owner::OwnerFailure::Cleanup(errors) = &error.error else {
                     panic!("cleanup error was lost");
                 };
 
@@ -100,7 +100,7 @@ async fn cleanup_timeout() {
         .unwrap_err();
 
     assert_eq!(
-        result.actors[0].diagnostics[0].diagnostics,
+        result.report.actors[0].diagnostics[0].diagnostics,
         "could not flush"
     );
 }
@@ -155,15 +155,15 @@ async fn failure_report() {
         .await
         .unwrap_err();
 
-    assert_eq!(result.failure.as_ref().unwrap().actor, "settings");
+    assert_eq!(result.report.failure.as_ref().unwrap().actor, "settings");
 
-    let report = result.actors[0].diagnostics[0].diagnostics.clone();
+    let report = result.report.actors[0].diagnostics[0].diagnostics.clone();
 
     assert!(report.contains("Flush the settings"));
     assert!(report.contains("backup folder is read only"));
     assert!(!after.load(Ordering::SeqCst));
     assert_eq!(hooks.load(Ordering::SeqCst), 1);
-    assert_eq!(finished.wait().await.to_string(), result.to_string());
+    assert_eq!(finished.wait().await.to_string(), result.diagnostics.report);
 }
 
 #[tokio::test]
@@ -217,6 +217,7 @@ async fn stop_failure() {
     trigger.await.unwrap();
     assert!(
         result
+            .report
             .failure
             .unwrap()
             .message
@@ -287,8 +288,8 @@ async fn deadline() {
         .unwrap()
         .unwrap_err();
 
-        assert!(result.timed_out);
-        assert!(result.actors[0].timed_out);
+        assert!(result.report.timed_out);
+        assert!(result.report.actors[0].timed_out);
         assert_eq!(cleaned.load(Ordering::SeqCst), !operation);
     }
 }
@@ -328,7 +329,7 @@ async fn early_failure() {
     .unwrap()
     .unwrap_err();
 
-    assert_eq!(result.failure.unwrap().actor, "early failure");
+    assert_eq!(result.report.failure.unwrap().actor, "early failure");
 }
 
 #[tokio::test]
@@ -494,6 +495,7 @@ async fn latest_failure() {
 
     assert!(
         result
+            .report
             .failure
             .unwrap()
             .message
@@ -577,7 +579,7 @@ async fn cleanup_failure() {
     assert!(sibling.completion().wait().await.is_ok());
 
     let error = actor.completion().wait().await.unwrap_err();
-    let aktor::owner::OwnerError::Cleanup(errors) = &*error else {
+    let aktor::owner::OwnerFailure::Cleanup(errors) = &error.error else {
         panic!("typed cleanup error was lost");
     };
 

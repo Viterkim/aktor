@@ -214,12 +214,6 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
     pub fn timeout(self, duration: core::time::Duration) -> crate::Timeout<Self> {
         crate::Timeout::browser(self, duration, |request| crate::timeout::WaitStatus {
             admitted: request.reply.is_some(),
-            stopping: request
-                .inner
-                .group
-                .borrow()
-                .as_ref()
-                .is_some_and(|(_, group)| group.is_stopping()),
         })
     }
 

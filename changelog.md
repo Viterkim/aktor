@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.8
+
+Timeouts keep their deadline during shutdown.
+
+Worker registrations survive optimized builds across dependency archives.
+
+Saved reports use AktorDiagnostic, with startup rollback included (Display just a small msg, Lifecycle and completion outcomes moved to .error, and worker setup/cleanup text moved to .diagnostics).
+
+Group control methods return AktorGroupError with the rejection reason in ordinary Display. Group run() returns AktorRunError. ShutdownReport no longer implements Error.
+
 ## 0.0.7
 
 Lifecycle errors uses short Display and Debug but with full diags on `{err:#}` (and fixed missing and repeated setup/cleanup diagnostics).

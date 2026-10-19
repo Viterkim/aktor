@@ -40,7 +40,7 @@ impl<S, const N: usize, E, Role, Clock> Handle<S, N, E, Role, Clock> {
     pub async fn ready(&self) -> Result<(), OwnerError> {
         self.ready_with_data()
             .await
-            .map_err(|error| error.error.without_data())
+            .map_err(SharedOwnerError::without_data)
     }
 
     /// Observe the original setup error and its data on this executor.
@@ -51,7 +51,12 @@ impl<S, const N: usize, E, Role, Clock> Handle<S, N, E, Role, Clock> {
             changed.register(context);
 
             match self.inner.completion.ready.borrow().clone() {
-                Some(result) => Poll::Ready(result.map_err(|error| SharedOwnerError { error })),
+                Some(result) => Poll::Ready(result.map_err(|error| {
+                    SharedOwnerError::from_failure(
+                        error,
+                        &self.inner.completion.diagnostics.borrow(),
+                    )
+                })),
                 None => Poll::Pending,
             }
         })

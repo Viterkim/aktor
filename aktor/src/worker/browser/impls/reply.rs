@@ -68,12 +68,8 @@ impl<O> WorkerReply<O> {
     }
 
     pub fn timeout(&mut self, duration: core::time::Duration) -> crate::Timeout<&mut Self> {
-        crate::Timeout::browser(self, duration, |reply| crate::timeout::WaitStatus {
+        crate::Timeout::browser(self, duration, |_| crate::timeout::WaitStatus {
             admitted: true,
-            stopping: reply
-                .group
-                .as_ref()
-                .is_some_and(|(_, group)| group.is_stopping()),
         })
     }
 }

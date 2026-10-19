@@ -1,7 +1,7 @@
 use super::impls::stopped;
 use super::shutdown::{contain_drop, fail_application, finish_hook, panic_message};
 use super::*;
-use crate::AktorShutdownOutput;
+use crate::{AktorRunError, AktorShutdownOutput};
 use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
 
@@ -12,7 +12,7 @@ impl AktorGroup {
         self,
         application: Application,
         cleanup: Cleanup,
-    ) -> impl Future<Output = Result<Option<O>, Box<ShutdownReport>>>
+    ) -> impl Future<Output = Result<Option<O>, AktorRunError>>
     where
         Application: AsyncFnOnce(&mut AktorGroup) -> Result<O, AktorError>,
         Cleanup: FnOnce(ShutdownReport) -> Output,
@@ -48,8 +48,8 @@ impl AktorGroup {
             }) {
                 Ok(completed) => completed,
                 Err(error) => {
-                    return Err(Box::new(ShutdownReport {
-                        application: vec![error],
+                    return Err(AktorRunError::from(ShutdownReport {
+                        application: vec![error.into()],
                         ..ShutdownReport::default()
                     }));
                 }
@@ -125,7 +125,7 @@ impl AktorGroup {
             let report = completed.wait().await;
 
             if report.failed() {
-                Err(Box::new(report))
+                Err(AktorRunError::from(report))
             } else {
                 Ok(output)
             }

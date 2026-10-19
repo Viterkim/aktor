@@ -287,19 +287,25 @@ async fn panic_cleanup() {
 
         assert!(notified.get());
         assert_eq!(hook_calls.get(), 1);
-        assert!(!report.timed_out, "{report}");
+        assert!(!report.report.timed_out, "{report}");
         assert!(completion.try_report().unwrap().failed());
 
         if mode == 0 {
             assert_eq!(
                 report
-                    .to_string()
+                    .diagnostics
+                    .report
                     .matches("application poll failed")
                     .count(),
                 1
             );
         } else {
-            assert!(report.to_string().contains("application destructor failed"));
+            assert!(
+                report
+                    .diagnostics
+                    .report
+                    .contains("application destructor failed")
+            );
         }
     }
 }

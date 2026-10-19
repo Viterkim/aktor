@@ -66,6 +66,7 @@ pub fn typed<E: DeserializeOwned>(error: WireError) -> WorkerError<E> {
     let mut report: WorkerError<E> = WorkerError {
         outcome: error.outcome,
         cause: error.cause,
+        diagnostics: error.diagnostics,
         data: None,
     };
 

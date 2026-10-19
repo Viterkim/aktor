@@ -17,30 +17,33 @@ let id = insert_user(&actors.handles.users, "Katten".into()).await?;
 
 A tuple works too, you get the handles back in the same order.
 
-Setup returns `Result<State, AktorSetupError>`, cleanup returns `Result<(), AktorCleanupError>`. Put the diagnostic you want kept in the report:
+## Saved diagnostics (examples use 'er' for errors)
+
+Setup and cleanup supply the diagnostic text Aktor keeps. Here connect returns an ErResult:
 
 ```rust
-start: async || open_database().er_into(|report| report),
-end: async |db| close_database(db).er_into(|report| report),
+async fn open_database() -> Result<Connection, AktorSetupError> {
+    connect().await.er_into(|report| report)
+}
 ```
 
-Here opening and closing return `ErResult`, and Aktor saves their reports automatically. With another error library, give `AktorSetupError::new(text, ())` or `AktorCleanupError::new(text, ())` its diagnostic text. Your error library and its version are yours to choose. Infallible cleanup can return (), and end: () leaves it out.
+With another error library, pass its report text to AktorSetupError::new(text, ()).
 
-## Startup and rollback
-
-`users` starts, then opening `archive.sqlite` fails. Aktor rolls back `users`, and closing its database fails too. The returned `AktorStartupError` prints `actor startup failed` normally. Both failures are still there.
-
-Print the ordinary error first, then the Aktor details separately:
+A startup error carries the complete report in diagnostics.report, including rollback. Er contexts keep that error available:
 
 ```rust
-eprintln!("{err}");
-
-eprintln!("Aktor startup and rollback:\n{err:#}");
+let database = aktor_start(setup).await.er::<OpenErr>(|_| path)?;
 ```
 
-`{:#}` includes the startup diagnostic and any rollback failures. Display and Debug stay short on purpose. Putting the whole saved report there would stuff another giant report inside one entry of your error library's report. Keep them apart and print both.
+Further up, collect the saved reports when presenting the failure:
 
-`AktorStartupError::source()` returning `None` is intentional too. For an error panel, the startup text is in `err.diagnostics` and the optional rollback report is in `err.report`. A `ShutdownReport` already prints its full contents with `{report}`.
+```rust
+eprintln!("{}", error.er_report());
+
+for diagnostic in error.er_find_all::<AktorDiagnostic>() {
+    eprintln!("\n{}", diagnostic.report);
+}
+```
 
 ## Calling another query
 
@@ -97,7 +100,3 @@ pause finishes queued calls and closes the resource. New calls wait for resume, 
 [SQLite example](../examples/sqlite/main.rs)
 
 [Request example](../examples/guide.rs)
-
-## Error reporting libraries (Like 'er')
-
-For an `ErResult`, use `.er_into(|report| report)` to save the report automatically. Aktor’s public errors use ordinary field conversions, so they don’t need your Er version. An explicit payload uses `.er_into(|report| (report, data))`.

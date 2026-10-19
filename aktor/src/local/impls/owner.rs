@@ -67,7 +67,7 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
         {
             let report = |payload: &Box<dyn std::any::Any + Send>| {
                 let error = crate::AktorError::new(crate::panic::panic_message(payload), ());
-                self.inner.fail(&OwnerError::Runner(error.clone()));
+                self.inner.fail(&OwnerFailure::Runner(error.clone()));
                 self.inner.completion.diagnostics.borrow_mut().push(error);
             };
 
@@ -82,7 +82,7 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
 
             if unfinished
                 && let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.inner.finish(Err(Rc::new(OwnerError::Cancelled)));
+                    self.inner.finish(Err(Rc::new(OwnerFailure::Cancelled)));
                 }))
             {
                 report(&payload);
@@ -104,7 +104,7 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
         }
         #[cfg(not(feature = "std"))]
         if self.inner.completion.result.borrow().is_none() {
-            self.inner.finish(Err(Rc::new(OwnerError::Cancelled)));
+            self.inner.finish(Err(Rc::new(OwnerFailure::Cancelled)));
         }
     }
 }

@@ -199,7 +199,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
             Err(payload) => {
                 let error = crate::AktorError::new(crate::panic::panic_message(&payload), ());
 
-                (Err(OwnerError::SetupPanic(error)), Some(payload))
+                (Err(OwnerFailure::SetupPanic(error)), Some(payload))
             }
         };
         #[cfg(not(feature = "std"))]
@@ -214,7 +214,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
 
                 if !self.inner.fail(&error)
                     && self.inner.group.borrow().is_some()
-                    && let OwnerError::Setup(error) = &*error
+                    && let OwnerFailure::Setup(error) = &*error
                 {
                     self.inner
                         .completion
@@ -285,7 +285,10 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 }
                 #[cfg(not(feature = "std"))]
                 self.inner.finish(result.clone());
-                result.map_err(|err| err.without_data())
+                result.map_err(|err| {
+                    SharedOwnerError::from_failure(err, &self.inner.completion.diagnostics.borrow())
+                        .without_data()
+                })
             }
         }
     }
@@ -362,7 +365,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                     Ok(())
                 }
             })
-            .map_err(|error| Rc::new(OwnerError::Runner(error)));
+            .map_err(|error| Rc::new(OwnerFailure::Runner(error)));
 
         if let Err(error) = &result {
             self.inner.fail(error);
@@ -387,7 +390,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 &mut primary,
             )
             .await
-            .map_err(|error| Rc::new(OwnerError::Runner(error)))
+            .map_err(|error| Rc::new(OwnerFailure::Runner(error)))
             .and_then(|result| result.map_err(Rc::new));
         #[cfg(not(feature = "std"))]
         let mut cleaned = cleanup(state).await.into_owner_cleanup().map_err(Rc::new);
@@ -395,7 +398,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         if let Err(error) = &mut cleaned {
             let primary = self.inner.fail(error);
 
-            if let Some(OwnerError::CleanupFailure(failure)) = Rc::get_mut(error) {
+            if let Some(OwnerFailure::CleanupFailure(failure)) = Rc::get_mut(error) {
                 failure.primary = primary;
             }
         }
@@ -419,7 +422,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
 
         if retain_cleanup
             && let Err(error) = &cleaned
-            && !matches!(&**error, OwnerError::CleanupFailure(failure) if failure.primary)
+            && !matches!(&**error, OwnerFailure::CleanupFailure(failure) if failure.primary)
         {
             self.inner
                 .completion
@@ -431,7 +434,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         let result = result.and(cleaned);
         #[cfg(feature = "std")]
         let result = if let Some(payload) = &primary {
-            Err(Rc::new(OwnerError::Runner(crate::AktorError::new(
+            Err(Rc::new(OwnerFailure::Runner(crate::AktorError::new(
                 crate::panic::panic_message(payload),
                 (),
             ))))
@@ -462,30 +465,33 @@ impl<S, const N: usize, E> Owner<S, N, E> {
             std::panic::resume_unwind(payload);
         }
 
-        result.map_err(|err| err.without_data())
+        result.map_err(|err| {
+            SharedOwnerError::from_failure(err, &self.inner.completion.diagnostics.borrow())
+                .without_data()
+        })
     }
 }
 
 pub trait LocalCleanupOutput<E> {
-    fn into_owner_cleanup(self) -> Result<(), OwnerError<E>>;
+    fn into_owner_cleanup(self) -> Result<(), OwnerFailure<E>>;
 }
 impl<E> LocalCleanupOutput<E> for Result<(), AktorCleanupError<E>> {
-    fn into_owner_cleanup(self) -> Result<(), OwnerError<E>> {
-        self.map_err(OwnerError::Cleanup)
+    fn into_owner_cleanup(self) -> Result<(), OwnerFailure<E>> {
+        self.map_err(OwnerFailure::Cleanup)
     }
 }
 impl LocalCleanupOutput<()> for Result<(), crate::AktorFailure> {
-    fn into_owner_cleanup(self) -> Result<(), OwnerError<()>> {
-        self.map_err(OwnerError::CleanupFailure)
+    fn into_owner_cleanup(self) -> Result<(), OwnerFailure<()>> {
+        self.map_err(OwnerFailure::CleanupFailure)
     }
 }
 
 pub trait LocalSetupOutput<S, C> {
-    fn into_owner_setup(self) -> Result<S, OwnerError<C>>;
+    fn into_owner_setup(self) -> Result<S, OwnerFailure<C>>;
 }
 impl<S, C> LocalSetupOutput<S, C> for Result<S, AktorSetupError<C>> {
-    fn into_owner_setup(self) -> Result<S, OwnerError<C>> {
-        self.map_err(OwnerError::Setup)
+    fn into_owner_setup(self) -> Result<S, OwnerFailure<C>> {
+        self.map_err(OwnerFailure::Setup)
     }
 }
 impl<S, C> LocalSetupOutput<S, C>
@@ -494,7 +500,7 @@ impl<S, C> LocalSetupOutput<S, C>
         crate::setup::ready::Sender<Result<(), crate::AktorStartError<crate::AktorFailure>>>,
     )
 {
-    fn into_owner_setup(self) -> Result<S, OwnerError<C>> {
+    fn into_owner_setup(self) -> Result<S, OwnerFailure<C>> {
         let (result, ready) = self;
 
         match result {
@@ -506,7 +512,7 @@ impl<S, C> LocalSetupOutput<S, C>
                 let diagnostic = AktorError::new(error.diagnostics.clone(), ());
                 let primary = error.primary;
                 ready.send(Err(crate::AktorStartError::Init(error)));
-                Err(OwnerError::SetupDiagnostic(diagnostic, primary))
+                Err(OwnerFailure::SetupDiagnostic(diagnostic, primary))
             }
         }
     }

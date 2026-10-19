@@ -1,11 +1,16 @@
 use super::shutdown::bounded;
 use super::*;
-use crate::AktorShutdownOutput;
+#[cfg(not(target_family = "wasm"))]
+use crate::AktorDiagnostic;
+use crate::{AktorGroupError, AktorShutdownOutput};
 
 impl AktorGroup {
     #[cfg(not(target_family = "wasm"))]
     /// Run once after actor cleanup, before publishing the group's final report.
-    pub fn on_shutdown<Cleanup, Output, Mode>(&self, cleanup: Cleanup) -> Result<(), AktorError>
+    pub fn on_shutdown<Cleanup, Output, Mode>(
+        &self,
+        cleanup: Cleanup,
+    ) -> Result<(), AktorGroupError>
     where
         Cleanup: FnOnce(ShutdownReport) -> Output + Send + 'static,
         Output: AktorShutdownOutput<Mode>,
@@ -18,7 +23,10 @@ impl AktorGroup {
 
     #[cfg(target_family = "wasm")]
     /// Run once after actor cleanup, before publishing the group's final report.
-    pub fn on_shutdown<Cleanup, Output, Mode>(&self, cleanup: Cleanup) -> Result<(), AktorError>
+    pub fn on_shutdown<Cleanup, Output, Mode>(
+        &self,
+        cleanup: Cleanup,
+    ) -> Result<(), AktorGroupError>
     where
         Cleanup: FnOnce(ShutdownReport) -> Output + 'static,
         Output: AktorShutdownOutput<Mode>,
@@ -29,7 +37,7 @@ impl AktorGroup {
         }))
     }
 
-    fn register_shutdown(&self, hook: ShutdownHook) -> Result<(), AktorError> {
+    fn register_shutdown(&self, hook: ShutdownHook) -> Result<(), AktorGroupError> {
         let state = self.control.lock();
         #[cfg(not(target_family = "wasm"))]
         let mut state = state;
@@ -38,9 +46,11 @@ impl AktorGroup {
         #[cfg(target_family = "wasm")]
         let registered = self.shutdown_hook.borrow().is_some();
         let error = if registered {
-            Some("this group already has a shutdown closure")
+            Some(AktorGroupError::new(
+                "this group already has a shutdown closure",
+            ))
         } else if state.deadline.is_some() || state.finished {
-            Some("actor group is closing")
+            Some(AktorGroupError::new("actor group is closing"))
         } else {
             None
         };
@@ -52,7 +62,7 @@ impl AktorGroup {
                 &self.killswitch(),
                 "rejected shutdown closure drop",
             );
-            return Err(AktorError::new(error, ()));
+            return Err(error);
         }
 
         #[cfg(not(target_family = "wasm"))]
@@ -148,7 +158,7 @@ impl AktorGroup {
 
     #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
     #[doc(hidden)]
-    pub fn start_threaded(&mut self) -> Result<GroupCompletion, AktorError> {
+    pub fn start_threaded(&mut self) -> Result<GroupCompletion, AktorGroupError> {
         self.start()
     }
 
@@ -174,7 +184,7 @@ impl AktorGroup {
 
     #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
     #[doc(hidden)]
-    pub fn start_standard(&mut self) -> Result<GroupCompletion, AktorError> {
+    pub fn start_standard(&mut self) -> Result<GroupCompletion, AktorGroupError> {
         let completed = self.completion();
         let closing = self.listen(async |_| Ok::<_, AktorCleanupError>(()))?;
 
@@ -198,9 +208,15 @@ impl AktorGroup {
 
             self.killswitch().dispose_shutdown_hook();
             let report = self.control.lock().report.clone();
-            self.control.completed.send_replace(Some(report));
+            self.control.completed.send_replace(Some(report.clone()));
             self.control.wake.notify_all();
-            return Err(AktorError::new(error.to_string(), ()));
+            return Err(AktorGroupError {
+                message: "could not start actor group".into(),
+                diagnostics: Some(AktorDiagnostic::new(
+                    "actor group startup failed",
+                    report.to_string(),
+                )),
+            });
         }
 
         self.stop_on_drop = true;
@@ -255,7 +271,7 @@ impl AktorGroup {
         )
     ))]
     /// Start shutdown handling with defaults.
-    pub fn start(&mut self) -> Result<GroupCompletion, AktorError> {
+    pub fn start(&mut self) -> Result<GroupCompletion, AktorGroupError> {
         #[cfg(any(
             any(feature = "tokio", feature = "wasm_browser_workers"),
             target_family = "wasm"
@@ -268,9 +284,8 @@ impl AktorGroup {
             not(target_family = "wasm")
         ))]
         {
-            Err(AktorError::new(
+            Err(AktorGroupError::new(
                 "use AktorKind::StdThread or enable the tokio feature",
-                (),
             ))
         }
     }
@@ -289,14 +304,14 @@ impl AktorGroup {
     pub fn start_with<Cleanup, Output, Mode>(
         &mut self,
         cleanup: Cleanup,
-    ) -> Result<GroupCompletion, AktorError>
+    ) -> Result<GroupCompletion, AktorGroupError>
     where
         Cleanup: FnOnce(ShutdownReport) -> Output + Send + 'static,
         Output: AktorShutdownOutput<Mode>,
         Output::Future: Send + 'static,
     {
         tokio::runtime::Handle::try_current()
-            .map_err(|_| AktorError::new("starting an actor group needs a Tokio runtime", ()))?;
+            .map_err(|_| AktorGroupError::new("starting an actor group needs a Tokio runtime"))?;
 
         let completed = self.completion();
         let closing = self.listen(move |report| cleanup(report).into_shutdown())?;
@@ -363,9 +378,15 @@ impl AktorGroup {
 
                 self.killswitch().dispose_shutdown_hook();
                 let report = self.control.lock().report.clone();
-                self.control.completed.send_replace(Some(report));
+                self.control.completed.send_replace(Some(report.clone()));
                 self.control.wake.notify_all();
-                Err(AktorError::new(error.to_string(), ()))
+                Err(AktorGroupError {
+                    message: "could not start actor group".into(),
+                    diagnostics: Some(AktorDiagnostic::new(
+                        "actor group startup failed",
+                        report.to_string(),
+                    )),
+                })
             }
         }
     }
@@ -379,7 +400,7 @@ impl AktorGroup {
     pub fn start_with<Cleanup, Output, Mode>(
         &mut self,
         cleanup: Cleanup,
-    ) -> Result<GroupCompletion, AktorError>
+    ) -> Result<GroupCompletion, AktorGroupError>
     where
         Cleanup: FnOnce(ShutdownReport) -> Output + 'static,
         Output: AktorShutdownOutput<Mode>,
@@ -407,7 +428,7 @@ impl AktorGroup {
     fn listen<Cleanup, CleanupFuture>(
         &mut self,
         cleanup: Cleanup,
-    ) -> Result<impl Future<Output = ShutdownReport> + use<Cleanup, CleanupFuture>, AktorError>
+    ) -> Result<impl Future<Output = ShutdownReport> + use<Cleanup, CleanupFuture>, AktorGroupError>
     where
         Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
         CleanupFuture: Future<Output = Result<(), AktorError>>,
@@ -435,17 +456,16 @@ impl AktorGroup {
         Ok(closing)
     }
 
-    pub(super) fn claim_listener(&self) -> Result<(), AktorError> {
+    pub(super) fn claim_listener(&self) -> Result<(), AktorGroupError> {
         let mut state = self.control.lock();
 
         if state.finished {
-            return Err(AktorError::new("this group has already stopped", ()));
+            return Err(AktorGroupError::new("this group has already stopped"));
         }
 
         if state.listening {
-            return Err(AktorError::new(
+            return Err(AktorGroupError::new(
                 "this group already has a shutdown listener",
-                (),
             ));
         }
 
@@ -772,7 +792,7 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn thread_failure() {
-        type StartGroup = fn(&mut AktorGroup) -> Result<GroupCompletion, AktorError>;
+        type StartGroup = fn(&mut AktorGroup) -> Result<GroupCompletion, AktorGroupError>;
 
         let starters: &[StartGroup] = &[
             AktorGroup::start_threaded,
@@ -788,9 +808,16 @@ mod tests {
             let result = start(&mut group);
             crate::executor::FAIL_SPAWN.with(|setting| setting.set(None));
 
-            assert!(result.err().unwrap().diagnostics.contains("injected"));
+            let error = er::ErTree::from(result.err().unwrap());
+
+            assert!(
+                error
+                    .er_find::<AktorDiagnostic>()
+                    .unwrap()
+                    .report
+                    .contains("injected")
+            );
             assert!(completed.wait().await.failed());
-            assert!(group.check_started().is_err());
         }
     }
 

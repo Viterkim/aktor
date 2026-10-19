@@ -272,22 +272,15 @@ pub async fn check(spawner: Spawner) {
 }
 
 async fn shutdown_timeout() {
-    fn expired(future: impl Future<Output = Result<usize, AktorTimeoutError>>) -> bool {
+    fn expired(future: impl Future<Output = Result<usize, AktorTimeoutError>>) {
         let mut timeout = Box::pin(future);
 
         assert!(support::poll(&mut timeout).is_pending());
 
-        match support::poll(&mut timeout) {
-            Poll::Ready(Err(error)) => {
-                assert!(error.admitted);
-                true
-            }
-            Poll::Pending => false,
-            Poll::Ready(Ok(_)) => panic!("held operation completed before release"),
-        }
+        let Poll::Ready(Err(_)) = support::poll(&mut timeout) else {
+            panic!("held call did not time out during shutdown");
+        };
     }
-
-    let mut timeouts = Vec::new();
 
     for (managed, stop_group) in [(false, false), (true, false), (true, true)] {
         for reply_only in [false, true] {
@@ -321,11 +314,11 @@ async fn shutdown_timeout() {
                 handle.shutdown();
             }
 
-            let timeout = if reply_only {
+            if reply_only {
                 expired(request.send().await.timeout(Duration::ZERO))
             } else {
                 expired(request.timeout(Duration::ZERO))
-            };
+            }
 
             let completed = handle.shutdown();
 
@@ -345,12 +338,9 @@ async fn shutdown_timeout() {
                 );
             }
 
-            timeouts.push(timeout);
             assert_eq!(*readings.borrow(), [1]);
         }
     }
-
-    assert_eq!(timeouts, [true, true, true, true, false, false]);
 }
 
 async fn interval_delay() {
@@ -478,7 +468,9 @@ async fn cancellation() {
     let mut timeout = Box::pin(reply.timeout(Duration::ZERO));
 
     assert!(support::poll(&mut timeout).is_pending());
-    assert!(support::poll(&mut timeout).is_pending());
+    let Poll::Ready(Err(_)) = support::poll(&mut timeout) else {
+        panic!("reply did not time out after its driver stopped");
+    };
     drop(timeout);
     assert!(output.next().now_or_never().is_none());
     drop(input);

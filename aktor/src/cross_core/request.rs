@@ -200,7 +200,6 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Request<'a, S, 
     pub fn timeout(self, duration: Duration) -> Timeout<Self> {
         Timeout::local(self, duration, |request| crate::timeout::WaitStatus {
             admitted: request.submitted,
-            stopping: request.reply.status.stopping(),
         })
     }
 }
@@ -257,9 +256,8 @@ impl<O> Reply<O> {
     }
 
     pub fn timeout(&mut self, duration: Duration) -> Timeout<&mut Self> {
-        Timeout::local(self, duration, |reply| crate::timeout::WaitStatus {
+        Timeout::local(self, duration, |_| crate::timeout::WaitStatus {
             admitted: true,
-            stopping: reply.status.stopping(),
         })
     }
 }

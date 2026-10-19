@@ -100,7 +100,7 @@ async fn main() -> std::result::Result<(), Box<dyn core::error::Error>> {
     let report = actors.shutdown().await;
 
     if report.failed() {
-        return Err(report.into());
+        return Err(aktor::AktorRunError::from(report).into());
     }
 
     Ok(())

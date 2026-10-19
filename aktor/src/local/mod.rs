@@ -92,7 +92,7 @@ pub type Channel<S, const N: usize, E = core::convert::Infallible, Clock = ()> =
 
 #[derive(er::Er)]
 #[er(display = Self::fmt_display, display_alt = Self::fmt_details, debug = Self::fmt_display)]
-pub enum OwnerError<E = ()> {
+pub enum OwnerFailure<E = ()> {
     Setup(AktorSetupError<E>),
     SetupDiagnostic(crate::AktorError, bool),
     SetupPanic(crate::AktorError),
@@ -106,7 +106,17 @@ pub enum OwnerError<E = ()> {
 #[derive(er::Er)]
 #[er(display = Self::fmt_display, display_alt = Self::fmt_details, debug = Self::fmt_display)]
 pub struct SharedOwnerError<E> {
-    pub error: Rc<OwnerError<E>>,
+    pub error: Rc<OwnerFailure<E>>,
+    #[er(source, skip)]
+    pub diagnostics: crate::AktorDiagnostic,
+}
+
+#[derive(er::Er)]
+#[er(no_constructors, format = "{error}", display_alt = Self::fmt_details)]
+pub struct OwnerError<E = ()> {
+    pub error: OwnerFailure<E>,
+    #[er(source, skip)]
+    pub diagnostics: crate::AktorDiagnostic,
 }
 
 struct Inner<S, const N: usize, E> {
@@ -124,8 +134,8 @@ struct Inner<S, const N: usize, E> {
 }
 
 struct Completed<E> {
-    ready: RefCell<Option<Result<(), Rc<OwnerError<E>>>>>,
-    result: RefCell<Option<Result<(), Rc<OwnerError<E>>>>>,
+    ready: RefCell<Option<Result<(), Rc<OwnerFailure<E>>>>>,
+    result: RefCell<Option<Result<(), Rc<OwnerFailure<E>>>>>,
     diagnostics: Rc<RefCell<alloc::vec::Vec<crate::AktorError>>>,
     panic_reported: Cell<bool>,
     changed: Event,
@@ -133,7 +143,7 @@ struct Completed<E> {
 
 struct CompletionGuard<'a, S, const N: usize, E> {
     inner: &'a Inner<S, N, E>,
-    failure: Rc<OwnerError<E>>,
+    failure: Rc<OwnerFailure<E>>,
     armed: bool,
 }
 

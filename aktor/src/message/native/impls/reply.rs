@@ -37,13 +37,7 @@ impl<O> Reply<O> {
         crate::Timeout::queued(
             self,
             duration,
-            |reply| crate::timeout::WaitStatus {
-                admitted: true,
-                stopping: reply
-                    .group
-                    .as_ref()
-                    .is_some_and(|group| group.is_stopping()),
-            },
+            |_| crate::timeout::WaitStatus { admitted: true },
             standard,
         )
     }

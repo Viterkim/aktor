@@ -78,9 +78,9 @@ impl Registry {
 
         for pair in operations.windows(2) {
             if pair[0].name == pair[1].name {
-                return Err(WorkerError::new(
+                return Err(WorkerError::setup(
                     CallError::NotAdmitted,
-                    WorkerCause::Setup(format!("duplicate worker operation {:?}", pair[0].name)),
+                    format!("duplicate worker operation {:?}", pair[0].name),
                 ));
             }
         }
@@ -191,8 +191,8 @@ pub async fn dispatch<S: 'static, Role: 'static>(
 #[macro_export]
 macro_rules! __aktor_register {
     ($export:ty, $name:expr, $codec:ty) => {
-        $crate::worker::inventory::submit! {
-            $crate::worker::Registration(|| {
+        const _: () = {
+            fn registration() -> ::core::option::Option<$crate::worker::Registered> {
                 use $crate::worker::Register as _;
 
                 // The fallback keeps local Rust calls free of Serde requirements.
@@ -200,8 +200,36 @@ macro_rules! __aktor_register {
                     name: $name,
                     export: ::core::marker::PhantomData,
                 }).register()
-            })
-        }
+            }
+
+            #[cfg(not(target_family = "wasm"))]
+            $crate::worker::inventory::submit! {
+                $crate::worker::Registration(registration)
+            }
+
+            #[cfg(target_family = "wasm")]
+            const _: () = {
+                static NODE: $crate::worker::inventory::Node = $crate::worker::inventory::Node {
+                    value: &$crate::worker::Registration(registration),
+                    next: ::core::cell::UnsafeCell::new(::core::option::Option::None),
+                    initialized: ::core::sync::atomic::AtomicBool::new(false),
+                };
+
+                // Exporting the constructor also pulls its object out of dependency archives.
+                #[unsafe(export_name = ::core::concat!(
+                    "__aktor_register_", ::core::module_path!(), "@", ::core::env!("CARGO_PKG_VERSION"),
+                    ":", ::core::line!(), ":", ::core::column!()
+                ))]
+                pub extern "C" fn initialize() {
+                    // NODE.value is the Registration stored in NODE. Inventory guards repeat calls.
+                    unsafe { $crate::worker::inventory::ErasedNode::submit(NODE.value, &NODE) }
+                }
+
+                #[used]
+                #[unsafe(link_section = ".init_array")]
+                static CTOR: extern "C" fn() = initialize;
+            };
+        };
     };
 }
 

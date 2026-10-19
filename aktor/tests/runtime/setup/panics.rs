@@ -392,7 +392,7 @@ fn closures() {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, local::OwnerError::Setup(_)));
+        assert!(matches!(error.error, local::OwnerFailure::Setup(_)));
         assert_eq!(dropped.get(), 3);
         let diagnostics = completion
             .diagnostics()

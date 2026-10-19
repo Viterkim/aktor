@@ -1,8 +1,9 @@
 use super::*;
 #[cfg(any(feature = "tokio", feature = "std_thread"))]
 use crate::{
-    Aktor, AktorSetupError, FailurePolicy, SpawnArgs, listener::DedicatedJoinError,
-    listener::DedicatedStartError, owner::OwnerError,
+    Aktor, AktorDiagnostic, AktorSetupError, FailurePolicy, SpawnArgs,
+    listener::{DedicatedJoinError, DedicatedStartError},
+    owner::{OwnerFailure, StartError},
 };
 #[cfg(any(feature = "tokio", feature = "std_thread"))]
 use crate::{AktorCleanupOutput, AktorExecution, AktorFailure};
@@ -121,7 +122,7 @@ impl AktorGroup {
         &mut self,
         name: impl Into<String>,
         value: S,
-    ) -> Result<Aktor<S>, DedicatedStartError<AktorFailure>> {
+    ) -> Result<Aktor<S>, StartError> {
         let setup = move || Ok::<_, AktorSetupError>(value);
         let cleanup = |_| Ok::<_, AktorCleanupError>(());
         self.spawn(ActorArgs::new(name, setup, cleanup)).await
@@ -131,7 +132,7 @@ impl AktorGroup {
     pub async fn spawn<S, Setup, Cleanup, Output>(
         &mut self,
         args: ActorArgs<Setup, Cleanup>,
-    ) -> Result<Aktor<S>, DedicatedStartError<AktorFailure>>
+    ) -> Result<Aktor<S>, StartError>
     where
         S: 'static,
         Output: AktorCleanupOutput,
@@ -157,7 +158,7 @@ impl AktorGroup {
     pub async fn spawn_async<S, Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         &mut self,
         args: ActorArgs<Setup, Cleanup>,
-    ) -> Result<Aktor<S>, DedicatedStartError<AktorFailure>>
+    ) -> Result<Aktor<S>, StartError>
     where
         S: 'static,
         Output: AktorCleanupOutput,
@@ -174,7 +175,7 @@ impl AktorGroup {
         &mut self,
         args: ActorArgs<Setup, Cleanup>,
         hooks: crate::listener::hooks::AktorHooks<S>,
-    ) -> Result<Aktor<S>, DedicatedStartError<AktorFailure>>
+    ) -> Result<Aktor<S>, StartError>
     where
         S: 'static,
         Output: AktorCleanupOutput,
@@ -200,7 +201,7 @@ impl AktorGroup {
         args: ActorArgs<Setup, Cleanup>,
         hooks: crate::listener::hooks::AktorHooks<S>,
         standard: bool,
-    ) -> Result<Aktor<S>, DedicatedStartError<AktorFailure>>
+    ) -> Result<Aktor<S>, StartError>
     where
         S: 'static,
         Output: AktorCleanupOutput,
@@ -246,6 +247,20 @@ impl AktorGroup {
             |error| (error.diagnostics.clone(), error.primary),
         )
         .await
+        .map_err(|error| {
+            let mut error = StartError::from(error);
+
+            if let Some(report) = self.completion().try_report()
+                && report.failed()
+            {
+                error.diagnostics = Some(AktorDiagnostic::new(
+                    "actor startup failed",
+                    report.to_string(),
+                ));
+            }
+
+            error
+        })
     }
 
     #[doc(hidden)]
@@ -488,24 +503,24 @@ impl AktorGroup {
             };
 
             if let Err(error) = result {
-                let forced = matches!(&*error, OwnerError::Cancelled) && kill.is_stopping();
+                let forced = matches!(&error.error, OwnerFailure::Cancelled) && kill.is_stopping();
 
                 let mut first = false;
 
                 if !forced {
-                    let (phase, message) = match &*error {
-                        OwnerError::Cleanup(errors) => (
+                    let (phase, message) = match &error.error {
+                        OwnerFailure::Cleanup(errors) => (
                             "cleanup",
                             format!(
                                 "actor cleanup failed {} time(s)",
                                 errors.errors.len() + errors.diagnostics.len()
                             ),
                         ),
-                        OwnerError::Panicked(cause)
-                        | OwnerError::PanickedWithCleanup { cause, .. } => {
+                        OwnerFailure::Panicked(cause)
+                        | OwnerFailure::PanickedWithCleanup { cause, .. } => {
                             ("completion", format!("actor thread failed: {cause}"))
                         }
-                        OwnerError::Cancelled | OwnerError::RuntimeStopped => {
+                        OwnerFailure::Cancelled | OwnerFailure::RuntimeStopped => {
                             ("completion", error.to_string())
                         }
                     };
@@ -518,8 +533,8 @@ impl AktorGroup {
                     });
                 }
 
-                match &*error {
-                    OwnerError::Cleanup(errors) => {
+                match &error.error {
+                    OwnerFailure::Cleanup(errors) => {
                         outcome.diagnostics.extend(
                             errors
                                 .errors
@@ -530,7 +545,7 @@ impl AktorGroup {
                             .diagnostics
                             .extend(errors.diagnostics.iter().cloned());
                     }
-                    OwnerError::PanickedWithCleanup { cause, cleanup } => {
+                    OwnerFailure::PanickedWithCleanup { cause, cleanup } => {
                         if !first && !actor.group_primary() {
                             outcome
                                 .diagnostics
@@ -546,14 +561,16 @@ impl AktorGroup {
                             .diagnostics
                             .extend(cleanup.diagnostics.iter().cloned());
                     }
-                    OwnerError::Panicked(cause) => {
+                    OwnerFailure::Panicked(cause) => {
                         if !first && !actor.group_primary() {
                             outcome
                                 .diagnostics
                                 .push(AktorError::new(format!("panic: {cause}"), ()));
                         }
                     }
-                    OwnerError::Cancelled | OwnerError::RuntimeStopped => outcome.timed_out = true,
+                    OwnerFailure::Cancelled | OwnerFailure::RuntimeStopped => {
+                        outcome.timed_out = true
+                    }
                 }
             }
 

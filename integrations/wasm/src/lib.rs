@@ -179,7 +179,7 @@ async fn grouped() -> Result<(), &'static str> {
         .err()
         .ok_or("group timeout")?;
 
-    if !timed.timed_out {
+    if !timed.report.timed_out {
         return Err("group timeout outcome");
     }
 
@@ -490,7 +490,7 @@ async fn exercise() -> Result<(), &'static str> {
         .await
         .err()
         .ok_or("typed cleanup observation")?;
-    let embassy::OwnerError::Cleanup(cleanup) = &*typed.error else {
+    let embassy::OwnerFailure::Cleanup(cleanup) = &*typed.error else {
         return Err("cleanup kind");
     };
 

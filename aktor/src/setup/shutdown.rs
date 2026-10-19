@@ -28,7 +28,7 @@ where
     Output::Future: Send + 'static,
 {
     fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorError> {
-        AktorGroup::on_shutdown(self, cleanup)
+        AktorGroup::on_shutdown(self, cleanup).map_err(Into::into)
     }
 }
 #[cfg(all(
@@ -43,7 +43,7 @@ where
     Output::Future: 'static,
 {
     fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorError> {
-        AktorGroup::on_shutdown(self, cleanup)
+        AktorGroup::on_shutdown(self, cleanup).map_err(Into::into)
     }
 }
 
@@ -57,6 +57,6 @@ where
     Output::Future: 'static,
 {
     fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorError> {
-        crate::local::AktorGroup::on_shutdown(self, cleanup)
+        crate::local::AktorGroup::on_shutdown(self, cleanup).map_err(Into::into)
     }
 }

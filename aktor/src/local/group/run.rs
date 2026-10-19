@@ -1,6 +1,6 @@
 use super::driver::{capture, contain, poll_owners};
 use super::*;
-use crate::AktorShutdownOutput;
+use crate::{AktorRunError, AktorShutdownOutput};
 use core::{pin::Pin, task::Context};
 
 impl<Clock: AktorGroupClock> AktorGroup<Clock> {
@@ -8,15 +8,15 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         mut self,
         application: Application,
         cleanup: Cleanup,
-    ) -> Result<Option<O>, Box<ShutdownReport>>
+    ) -> Result<Option<O>, AktorRunError>
     where
         Application: AsyncFnOnce(&mut AktorGroup<Clock>) -> Result<O, AktorError>,
         Cleanup: FnOnce(ShutdownReport) -> Output,
         Output: AktorShutdownOutput<Mode>,
     {
         if let Err(error) = self.claim_listener() {
-            return Err(Box::new(ShutdownReport {
-                application: alloc::vec![error],
+            return Err(AktorRunError::from(ShutdownReport {
+                application: alloc::vec![error.into()],
                 ..ShutdownReport::default()
             }));
         }
@@ -73,7 +73,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         drop(driver);
 
         if report.failed() {
-            Err(Box::new(report))
+            Err(AktorRunError::from(report))
         } else {
             Ok(output)
         }
@@ -216,10 +216,10 @@ mod tests {
             }
 
             let report = report.expect("local cleanup did not finish");
-            assert!(!report.startup);
+            assert!(!report.report.startup);
             assert_eq!(notified.get(), 1, "{report}");
             assert_eq!(
-                report.failure.unwrap().message,
+                report.report.failure.unwrap().message,
                 if actor_panic {
                     "custom clock actor failed"
                 } else {

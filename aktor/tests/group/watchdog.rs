@@ -227,7 +227,10 @@ fn shutdown() {
                 assert!(report.failure.is_none());
                 assert!(matches!(
                     startup.await.unwrap(),
-                    Err(aktor::listener::DedicatedStartError::Closed)
+                    Err(aktor::owner::StartError {
+                        error: aktor::listener::DedicatedStartError::Closed,
+                        ..
+                    })
                 ));
                 tokio::time::sleep(Duration::from_millis(250)).await;
             });

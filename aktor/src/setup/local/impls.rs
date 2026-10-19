@@ -198,10 +198,10 @@ where
                     match result {
                         Ok(Ok(())) => {},
                         Ok(Err(error)) => {
-                            match error {
-                                local::OwnerError::SetupDiagnostic(_, true) => {},
-                                local::OwnerError::SetupDiagnostic(error, false) => report.diagnostics.push(error),
-                                local::OwnerError::CleanupFailure(error) => {
+                            match error.error {
+                                local::OwnerFailure::SetupDiagnostic(_, true) => {},
+                                local::OwnerFailure::SetupDiagnostic(error, false) => report.diagnostics.push(error),
+                                local::OwnerFailure::CleanupFailure(error) => {
                                     if !error.primary {
                                         report.diagnostics.push(AktorError::new(error.diagnostics, ()));
                                     }
@@ -251,7 +251,11 @@ where
         Some(result) => result?,
         None => {
             let error = handle.completion().wait().await.err().unwrap_or_else(|| {
-                local::OwnerError::Runner(AktorError::new("local actor stopped during startup", ()))
+                local::OwnerFailure::Runner(AktorError::new(
+                    "local actor stopped during startup",
+                    (),
+                ))
+                .into()
             });
 
             return Err(AktorStartError::Local(error));

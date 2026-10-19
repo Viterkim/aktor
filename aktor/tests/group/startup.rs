@@ -48,12 +48,19 @@ async fn startup_failure() {
         .await
         .unwrap_err();
 
-    assert!(result.startup);
+    assert!(result.report.startup);
     assert!(cleaned.load(Ordering::SeqCst));
-    let failure = result.failure.as_ref().unwrap();
+    let failure = result.report.failure.as_ref().unwrap();
 
     assert_eq!(failure.phase, "setup");
-    assert_eq!(result.to_string().matches("setup went wrong").count(), 1);
+    assert_eq!(
+        result
+            .diagnostics
+            .report
+            .matches("setup went wrong")
+            .count(),
+        1
+    );
 }
 
 struct ReleaseOnDrop(Arc<Notify>);
@@ -110,7 +117,7 @@ async fn cancelled_startup() {
 
         trigger.await.unwrap();
 
-        assert!(!result.timed_out);
+        assert!(!result.report.timed_out);
 
         let expected = if setup_fails {
             "late setup error"
@@ -118,17 +125,17 @@ async fn cancelled_startup() {
             "late cleanup error"
         };
 
-        let failure = result.failure.as_ref().unwrap();
+        let failure = result.report.failure.as_ref().unwrap();
 
         assert_eq!(failure.phase, if setup_fails { "setup" } else { "cleanup" });
-        assert_eq!(result.to_string().matches(expected).count(), 1);
+        assert_eq!(result.diagnostics.report.matches(expected).count(), 1);
 
         if setup_fails {
-            assert!(result.actors[0].diagnostics.is_empty());
+            assert!(result.report.actors[0].diagnostics.is_empty());
             assert!(failure.message.contains(expected));
         } else {
             assert!(
-                result.actors[0]
+                result.report.actors[0]
                     .diagnostics
                     .iter()
                     .any(|error| error.diagnostics.contains(expected))
@@ -230,7 +237,10 @@ async fn startup() {
                     |_| Ok::<_, AktorError>(())
                 ))
                 .await,
-            Err(aktor::listener::DedicatedStartError::Closed)
+            Err(aktor::owner::StartError {
+                error: aktor::listener::DedicatedStartError::Closed,
+                ..
+            })
         ));
     }
 }
@@ -304,13 +314,13 @@ async fn startup_rollback() {
 
     let cleaned = Arc::new(AtomicBool::new(false));
     let cleanup = cleaned.clone();
-    let sibling = actors
+    let _sibling = actors
         .spawn(ActorArgs::new(
             "audio",
             || Ok::<_, AktorError>(()),
             move |_| {
                 cleanup.store(true, Ordering::SeqCst);
-                Ok::<_, AktorError>(())
+                Err(AktorError::new("audio cleanup failed", ()))
             },
         ))
         .await
@@ -329,7 +339,7 @@ async fn startup_rollback() {
                 |_| Ok::<_, AktorError>(()),
             ))
             .await?;
-        Ok::<_, aktor::listener::DedicatedStartError<AktorFailure>>(())
+        Ok::<_, aktor::owner::StartError>(())
     });
 
     let failed = tokio::time::timeout(Duration::from_secs(2), startup)
@@ -338,18 +348,25 @@ async fn startup_rollback() {
         .unwrap()
         .unwrap_err();
 
-    let aktor::listener::DedicatedStartError::Init(error) = failed else {
+    let aktor::listener::DedicatedStartError::Init(error) = &failed.error else {
         panic!("typed setup error was lost");
     };
 
     assert_eq!(error.diagnostics, "could not open");
+
+    let tree = ErTree::from(failed);
+    let diagnostic = tree.er_find::<aktor::AktorDiagnostic>().unwrap();
+
+    for message in ["could not open", "audio cleanup failed"] {
+        assert_eq!(diagnostic.report.matches(message).count(), 1);
+    }
+
     assert!(cleaned.load(Ordering::SeqCst));
     assert!(hooks.load(Ordering::SeqCst));
 
     let report = closing.wait().await;
 
     assert_eq!(report.failure.unwrap().actor, "storage");
-    assert!(sibling.completion().wait().await.is_ok());
 }
 
 #[tokio::test]

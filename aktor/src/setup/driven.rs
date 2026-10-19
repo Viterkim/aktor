@@ -171,7 +171,11 @@ where
         Some(result) => result?,
         None => {
             let error = handle.completion().wait().await.err().unwrap_or_else(|| {
-                local::OwnerError::Runner(AktorError::new("local actor stopped during startup", ()))
+                local::OwnerFailure::Runner(AktorError::new(
+                    "local actor stopped during startup",
+                    (),
+                ))
+                .into()
             });
 
             return Err(AktorStartError::Local(error));

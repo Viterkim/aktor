@@ -118,7 +118,6 @@ impl fmt::Display for ShutdownReport {
         Ok(())
     }
 }
-impl core::error::Error for ShutdownReport {}
 
 fn write_kind(f: &mut fmt::Formatter<'_>, kind: Option<AktorExecution>) -> fmt::Result {
     if let Some(kind) = kind {

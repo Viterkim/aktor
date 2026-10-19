@@ -1,7 +1,7 @@
 use super::driver::poll_owners;
 use super::*;
 use crate::AktorError;
-use crate::AktorShutdownOutput;
+use crate::{AktorGroupError, AktorShutdownOutput};
 
 impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     #[doc(hidden)]
@@ -101,18 +101,17 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     }
 
     /// Your hook gets the report after actor cleanup, before completion is published.
-    pub fn on_shutdown<Hook, Output, Mode>(&self, hook: Hook) -> Result<(), AktorError>
+    pub fn on_shutdown<Hook, Output, Mode>(&self, hook: Hook) -> Result<(), AktorGroupError>
     where
         Hook: FnOnce(ShutdownReport) -> Output + 'static,
         Output: AktorShutdownOutput<Mode>,
         Output::Future: 'static,
     {
         let error = if self.killswitch().is_stopping() {
-            Some(AktorError::new("actor group is already stopping", ()))
+            Some(AktorGroupError::new("actor group is already stopping"))
         } else if self.control.shutdown_hook.borrow().is_some() {
-            Some(AktorError::new(
+            Some(AktorGroupError::new(
                 "actor group already has a shutdown hook",
-                (),
             ))
         } else {
             None
@@ -159,7 +158,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         self.completion()
     }
 
-    pub fn listen(&mut self) -> Result<LocalFuture<'static, ShutdownReport>, AktorError> {
+    pub fn listen(&mut self) -> Result<LocalFuture<'static, ShutdownReport>, AktorGroupError> {
         self.listen_with(async |_| Ok::<_, AktorCleanupError>(()))
     }
 
@@ -279,27 +278,29 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
                     .await
                 {
                     Ok(()) => None,
-                    Err(error) => match &error {
-                        OwnerError::Setup(_) | OwnerError::SetupPanic(_) => None,
-                        OwnerError::SetupDiagnostic(error, primary) => {
+                    Err(error) => match &error.error {
+                        OwnerFailure::Setup(_) | OwnerFailure::SetupPanic(_) => None,
+                        OwnerFailure::SetupDiagnostic(error, primary) => {
                             if *primary {
                                 None
                             } else {
                                 Some(error.clone())
                             }
                         }
-                        OwnerError::Cleanup(error) => {
+                        OwnerFailure::Cleanup(error) => {
                             Some(AktorError::new(error.diagnostics.clone(), ()))
                         }
-                        OwnerError::Runner(error) => Some(error.clone()),
-                        OwnerError::CleanupFailure(error) => {
+                        OwnerFailure::Runner(error) => Some(error.clone()),
+                        OwnerFailure::CleanupFailure(error) => {
                             if error.primary {
                                 None
                             } else {
                                 Some(AktorError::new(error.diagnostics.clone(), ()))
                             }
                         }
-                        OwnerError::Cancelled => Some(AktorError::new("actor owner cancelled", ())),
+                        OwnerFailure::Cancelled => {
+                            Some(AktorError::new("actor owner cancelled", ()))
+                        }
                     },
                 }
             }),
@@ -315,7 +316,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     pub fn listen_with<'a, Cleanup, Output, Mode>(
         &mut self,
         cleanup: Cleanup,
-    ) -> Result<LocalFuture<'a, ShutdownReport>, AktorError>
+    ) -> Result<LocalFuture<'a, ShutdownReport>, AktorGroupError>
     where
         Cleanup: FnOnce(ShutdownReport) -> Output + 'a,
         Output: AktorShutdownOutput<Mode>,
@@ -361,15 +362,14 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         }))
     }
 
-    pub(super) fn claim_listener(&self) -> Result<(), AktorError> {
+    pub(super) fn claim_listener(&self) -> Result<(), AktorGroupError> {
         if self.control.stopping.get() {
-            return Err(AktorError::new("this group has already stopped", ()));
+            return Err(AktorGroupError::new("this group has already stopped"));
         }
 
         if self.control.listening.replace(true) {
-            Err(AktorError::new(
+            Err(AktorGroupError::new(
                 "this group already has a shutdown listener",
-                (),
             ))
         } else {
             Ok(())

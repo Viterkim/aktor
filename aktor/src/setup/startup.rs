@@ -91,21 +91,24 @@ impl<Setup: AktorStart<Mode>, Mode> Future for AktorStartup<Setup, Mode> {
             this.shutdown = None;
 
             if let Some(error) = this.failure.take() {
-                return Poll::Ready(Err(AktorStartupError {
-                    source_is_failure: Setup::source_is_setup(&error)
-                        && Setup::Group::source_is_failure(&this.killswitch),
-                    diagnostics: Setup::diagnostics(&error),
-                    error: *error,
-                    report: Some(Box::new(report)),
-                }));
+                let diagnostics = Setup::diagnostics(&error);
+                let source_is_failure = Setup::source_is_setup(&error)
+                    && Setup::Group::source_is_failure(&this.killswitch);
+
+                return Poll::Ready(Err(AktorStartupError::from_failure(
+                    *error,
+                    diagnostics,
+                    Some(Box::new(report)),
+                    source_is_failure,
+                )));
             }
         }
 
-        Poll::Ready(Err(AktorStartupError {
-            diagnostics: "actor startup was polled after completion".into(),
-            error: AktorSetupError::new("actor startup was polled after completion", ()).into(),
-            report: None,
-            source_is_failure: false,
-        }))
+        Poll::Ready(Err(AktorStartupError::from_failure(
+            AktorSetupError::new("actor startup was polled after completion", ()).into(),
+            "actor startup was polled after completion".into(),
+            None,
+            false,
+        )))
     }
 }

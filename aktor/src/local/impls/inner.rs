@@ -86,9 +86,9 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         Ok(())
     }
 
-    pub fn fail(&self, error: &OwnerError<E>) -> bool {
-        if matches!(error, OwnerError::SetupDiagnostic(_, true))
-            || matches!(error, OwnerError::CleanupFailure(failure) if failure.primary)
+    pub fn fail(&self, error: &OwnerFailure<E>) -> bool {
+        if matches!(error, OwnerFailure::SetupDiagnostic(_, true))
+            || matches!(error, OwnerFailure::CleanupFailure(failure) if failure.primary)
         {
             return true;
         }
@@ -96,18 +96,18 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         let supervisor = self.group.borrow().clone();
 
         if let Some((name, group)) = supervisor
-            && !(matches!(error, OwnerError::Cancelled) && group.is_stopping())
+            && !(matches!(error, OwnerFailure::Cancelled) && group.is_stopping())
         {
             let failure = crate::ActorFailure {
                 kind: None,
                 actor: name,
                 phase: match error {
-                    OwnerError::Setup(_)
-                    | OwnerError::SetupDiagnostic(_, _)
-                    | OwnerError::SetupPanic(_) => "setup",
-                    OwnerError::Cleanup(_) | OwnerError::CleanupFailure(_) => "cleanup",
-                    OwnerError::Runner(_) => "runner",
-                    OwnerError::Cancelled => "owner",
+                    OwnerFailure::Setup(_)
+                    | OwnerFailure::SetupDiagnostic(_, _)
+                    | OwnerFailure::SetupPanic(_) => "setup",
+                    OwnerFailure::Cleanup(_) | OwnerFailure::CleanupFailure(_) => "cleanup",
+                    OwnerFailure::Runner(_) => "runner",
+                    OwnerFailure::Cancelled => "owner",
                 }
                 .into(),
                 message: alloc::format!("{error:#}"),
@@ -115,9 +115,9 @@ impl<S, const N: usize, E> Inner<S, N, E> {
 
             if matches!(
                 error,
-                OwnerError::Setup(_)
-                    | OwnerError::SetupDiagnostic(_, _)
-                    | OwnerError::SetupPanic(_)
+                OwnerFailure::Setup(_)
+                    | OwnerFailure::SetupDiagnostic(_, _)
+                    | OwnerFailure::SetupPanic(_)
             ) {
                 return group.fail_startup(failure);
             } else {
@@ -128,7 +128,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         false
     }
 
-    pub fn finish(&self, result: Result<(), Rc<OwnerError<E>>>) {
+    pub fn finish(&self, result: Result<(), Rc<OwnerFailure<E>>>) {
         if let Err(error) = &result {
             self.fail(error);
         }
@@ -142,7 +142,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         let mut completion = CompletionGuard {
             inner: self,
             failure: result.as_ref().err().cloned().unwrap_or_else(|| {
-                Rc::new(OwnerError::Runner(crate::AktorError::new(
+                Rc::new(OwnerFailure::Runner(crate::AktorError::new(
                     "actor work destruction failed",
                     (),
                 )))
@@ -181,7 +181,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         }
     }
 
-    fn complete(&self, result: Result<(), Rc<OwnerError<E>>>) {
+    fn complete(&self, result: Result<(), Rc<OwnerFailure<E>>>) {
         if self.completion.result.borrow().is_some() {
             return;
         }

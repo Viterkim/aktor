@@ -52,7 +52,6 @@ impl<'a, S, I, O, Fut, Role> AktorTaskRequest<'a, S, I, O, Fut, Role> {
             .clock
             .timeout(self, duration, |request| WaitStatus {
                 admitted: request.reply.admitted,
-                stopping: request.reply.kill.is_stopping(),
             })
     }
 }
@@ -186,7 +185,6 @@ impl<O> AktorTaskReply<O> {
     pub fn timeout(&mut self, duration: Duration) -> Timeout<&mut Self> {
         self.clock.timeout(self, duration, |reply| WaitStatus {
             admitted: reply.admitted,
-            stopping: reply.kill.is_stopping(),
         })
     }
 }

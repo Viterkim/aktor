@@ -13,10 +13,6 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
                     request.submission,
                     Submission::Submitted | Submission::Consumed
                 ),
-                stopping: request
-                    .admission
-                    .group()
-                    .is_some_and(|group| group.is_stopping()),
             },
             standard,
         )

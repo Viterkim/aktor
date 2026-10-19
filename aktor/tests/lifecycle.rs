@@ -163,7 +163,7 @@ async fn direct() {
     assert_eq!(report.to_string().matches("journal sentinel").count(), 1);
 
     let error = actors.handles.0.completion().wait().await.unwrap_err();
-    let owner::OwnerError::Cleanup(errors) = &*error else {
+    let owner::OwnerFailure::Cleanup(errors) = &error.error else {
         panic!("cleanup error lost");
     };
     let diagnostic = &errors.errors[0].diagnostics;
@@ -301,7 +301,7 @@ async fn recovery() {
     let controller = actors.handles.actor.new_controller();
     let actor = controller.clone();
     let error = controller.replace(|| Ok(41)).await.unwrap_err();
-    let listener::ReplaceError::Cleanup(error) = error else {
+    let listener::ReplaceError::Cleanup(error) = error.error else {
         panic!("replacement lost cleanup classification");
     };
 
@@ -310,7 +310,7 @@ async fn recovery() {
         .resume(|| Err(AktorSetupError::new("resume sentinel", ())))
         .await
         .unwrap_err();
-    let listener::LifecycleError::Failed(error) = error else {
+    let listener::LifecycleError::Failed(error) = error.error else {
         panic!("resume lost setup classification");
     };
 
@@ -325,7 +325,7 @@ async fn recovery() {
         })
         .await
         .unwrap_err();
-    let listener::ReplaceError::Setup(error) = error else {
+    let listener::ReplaceError::Setup(error) = error.error else {
         panic!("replacement lost setup classification");
     };
 
@@ -425,8 +425,14 @@ async fn reports() {
         .await
         .unwrap_err();
 
-    assert_eq!(report.application[0].diagnostics, "application sentinel");
-    assert_eq!(report.application[1].diagnostics, "shutdown sentinel");
+    assert_eq!(
+        report.report.application[0].diagnostics,
+        "application sentinel"
+    );
+    assert_eq!(
+        report.report.application[1].diagnostics,
+        "shutdown sentinel"
+    );
 
     let report = AktorGroup::new()
         .run(
@@ -435,7 +441,7 @@ async fn reports() {
         )
         .await
         .unwrap_err();
-    let text = report.to_string();
+    let text = &report.diagnostics.report;
 
     assert_eq!(
         text.matches("application panic sentinel").count(),
@@ -443,7 +449,7 @@ async fn reports() {
         "{text}"
     );
     assert_eq!(text.matches("shutdown panic sentinel").count(), 1, "{text}");
-    assert_eq!(report.failure.as_ref().unwrap().phase, "run");
+    assert_eq!(report.report.failure.as_ref().unwrap().phase, "run");
 
     let standalone = Aktor::spawn(SpawnArgs {
         name: "standalone".into(),
@@ -455,7 +461,7 @@ async fn reports() {
     .await
     .unwrap();
     let error = standalone.shutdown().await.unwrap_err();
-    let owner::OwnerError::Cleanup(errors) = &*error else {
+    let owner::OwnerFailure::Cleanup(errors) = &error.error else {
         panic!("standalone cleanup lost");
     };
     assert!(errors.errors[0].diagnostics.contains("journal sentinel"));
@@ -545,7 +551,7 @@ async fn local() {
             let report = actors.shutdown().await;
             assert_eq!(report.to_string().matches("local error 47").count(), 1);
             let error = completed.wait_with_data().await.unwrap_err();
-            let local::OwnerError::CleanupFailure(error) = &*error.error else {
+            let local::OwnerFailure::CleanupFailure(error) = &*error.error else {
                 panic!("local cleanup value lost");
             };
 

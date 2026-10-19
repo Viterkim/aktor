@@ -62,11 +62,6 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock>
     {
         Clock::timeout(self, duration, |request| crate::timeout::WaitStatus {
             admitted: request.submitted,
-            stopping: request
-                .reply
-                .group
-                .as_ref()
-                .is_some_and(StopSignal::is_stopping),
         })
     }
 
@@ -286,9 +281,8 @@ impl<O, Clock> Reply<O, Clock> {
     where
         Clock: clock::AktorClock,
     {
-        Clock::timeout(self, duration, |reply| crate::timeout::WaitStatus {
+        Clock::timeout(self, duration, |_| crate::timeout::WaitStatus {
             admitted: true,
-            stopping: reply.group.as_ref().is_some_and(StopSignal::is_stopping),
         })
     }
 }

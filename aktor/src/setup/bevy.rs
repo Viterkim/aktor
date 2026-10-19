@@ -20,11 +20,11 @@ where
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         #[cfg(not(target_family = "wasm"))]
         {
-            group.start_standard().map(|_| ())
+            group.start_standard().map(|_| ()).map_err(Into::into)
         }
         #[cfg(target_family = "wasm")]
         {
-            group.start().map(|_| ())
+            group.start().map(|_| ()).map_err(Into::into)
         }
     }
 
@@ -66,11 +66,11 @@ where
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         #[cfg(not(target_family = "wasm"))]
         {
-            group.start_standard().map(|_| ())
+            group.start_standard().map(|_| ()).map_err(Into::into)
         }
         #[cfg(target_family = "wasm")]
         {
-            group.start().map(|_| ())
+            group.start().map(|_| ()).map_err(Into::into)
         }
     }
 

@@ -973,7 +973,14 @@ pub async fn typed_setup_check(url: String) -> Result<bool, JsValue> {
     let error = actor.ready().await.unwrap_err();
 
     assert!(!error.to_string().contains("could not open storage"));
-    assert!(format!("{error:#}").contains("could not open storage"));
+    assert!(
+        error
+            .diagnostics
+            .as_ref()
+            .unwrap()
+            .report
+            .contains("could not open storage")
+    );
     assert!(
         error
             .data
@@ -982,7 +989,14 @@ pub async fn typed_setup_check(url: String) -> Result<bool, JsValue> {
 
     let error = actor.completion().wait().await.unwrap_err();
     assert!(!error.to_string().contains("could not open storage"));
-    assert!(format!("{error:#}").contains("could not open storage"));
+    assert!(
+        error
+            .diagnostics
+            .as_ref()
+            .unwrap()
+            .report
+            .contains("could not open storage")
+    );
 
     Ok(error
         .data

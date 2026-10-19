@@ -51,7 +51,12 @@ fn interval_failure() {
         executor::block_on(async {
             let error = startup.await.err().unwrap();
 
-            assert!(error.diagnostics.contains("injected scheduling failure"));
+            assert!(
+                error
+                    .diagnostics
+                    .report
+                    .contains("injected scheduling failure")
+            );
             assert_eq!(cleaned.load(Ordering::SeqCst), 1);
 
             let completed = completion.wait().await;

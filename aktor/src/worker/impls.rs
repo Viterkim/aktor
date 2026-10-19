@@ -4,9 +4,9 @@ use core::fmt;
 impl Options {
     pub fn validate(&self) -> Result<(), WorkerError> {
         if self.capacity == 0 || self.capacity > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(WorkerError::new(
+            return Err(WorkerError::setup(
                 CallError::NotAdmitted,
-                WorkerCause::Setup("worker queue capacity is outside the supported range".into()),
+                "worker queue capacity is outside the supported range",
             ));
         }
 
@@ -14,9 +14,9 @@ impl Options {
             || self.max_outstanding_bytes > u32::MAX as usize
             || self.max_outstanding_bytes > tokio::sync::Semaphore::MAX_PERMITS
         {
-            return Err(WorkerError::new(
+            return Err(WorkerError::setup(
                 CallError::NotAdmitted,
-                WorkerCause::Setup("worker byte budget is outside the supported range".into()),
+                "worker byte budget is outside the supported range",
             ));
         }
 
@@ -37,40 +37,68 @@ impl<T> WorkerError<T> {
     #[doc(hidden)]
     pub fn fmt_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match &self.cause {
-            WorkerCause::Setup(_) => Some("worker setup failed"),
-            WorkerCause::Cleanup(_) => Some("worker cleanup failed"),
+            WorkerCause::Setup => Some("worker setup failed"),
+            WorkerCause::Cleanup => Some("worker cleanup failed"),
+            WorkerCause::Operations { .. } => Some("worker operations do not match"),
             _ => None,
         };
 
         if let Some(message) = message {
             write!(f, "worker call {:?}: {message}", self.outcome)
         } else {
-            self.fmt_details(f)
+            write!(f, "worker call {:?}: {:?}", self.outcome, self.cause)
         }
     }
 
     #[doc(hidden)]
     pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "worker call {:?}: {:?}", self.outcome, self.cause)
+        match &self.diagnostics {
+            Some(diagnostics) => f.write_str(&diagnostics.report),
+            None => write!(f, "worker call {:?}: {:?}", self.outcome, self.cause),
+        }
     }
 
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     #[doc(hidden)]
     pub fn data_error(mut self, error: WorkerError) -> Self {
-        let message = match &mut self.cause {
-            WorkerCause::Setup(message) | WorkerCause::Cleanup(message) => message,
-            _ => return self,
-        };
-
-        message.push_str("\nOptional lifecycle data: ");
-        message.push_str(&alloc::format!("{error:#}"));
+        if let Some(diagnostics) = &mut self.diagnostics {
+            diagnostics.report.push_str("\nOptional lifecycle data: ");
+            diagnostics.report.push_str(&alloc::format!("{error:#}"));
+        }
         self
     }
 
+    pub fn setup(outcome: CallError, report: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            cause: WorkerCause::Setup,
+            diagnostics: Some(crate::AktorDiagnostic::new("worker setup failed", report)),
+            data: None,
+        }
+    }
+
+    pub fn cleanup(outcome: CallError, report: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            cause: WorkerCause::Cleanup,
+            diagnostics: Some(crate::AktorDiagnostic::new("worker cleanup failed", report)),
+            data: None,
+        }
+    }
+
     pub fn new(outcome: CallError, cause: WorkerCause) -> Self {
+        let diagnostics = match &cause {
+            WorkerCause::Operations { .. } => Some(crate::AktorDiagnostic::new(
+                "worker operations do not match",
+                alloc::format!("worker call {outcome:?}: {cause:?}"),
+            )),
+            _ => None,
+        };
+
         Self {
             outcome,
             cause,
+            diagnostics,
             data: None,
         }
     }
@@ -80,6 +108,7 @@ impl<T> WorkerError<T> {
         WorkerError {
             outcome: self.outcome,
             cause: self.cause,
+            diagnostics: self.diagnostics,
             data: None,
         }
     }
