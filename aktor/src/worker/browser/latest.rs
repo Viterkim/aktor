@@ -80,7 +80,7 @@ struct Slot<I, O> {
     pending: Option<I>,
     output: Option<O>,
     running: Option<u64>,
-    scheduled: bool,
+    scheduled: Option<u64>,
     senders: usize,
     receiver: bool,
     failed: Option<WireError>,
@@ -90,9 +90,9 @@ struct Slot<I, O> {
 impl<I: 'static, O: 'static> Shared<I, O> {
     fn schedule(&self) {
         {
-            let mut slot = self.slot.borrow_mut();
+            let slot = self.slot.borrow();
 
-            if slot.scheduled
+            if slot.scheduled.is_some()
                 || slot.running.is_some()
                 || !slot.receiver
                 || slot.pending.is_none()
@@ -100,8 +100,6 @@ impl<I: 'static, O: 'static> Shared<I, O> {
             {
                 return;
             }
-
-            slot.scheduled = true;
         }
 
         let id = self.inner.next.get();
@@ -116,6 +114,7 @@ impl<I: 'static, O: 'static> Shared<I, O> {
             return;
         };
 
+        self.slot.borrow_mut().scheduled = Some(id);
         self.inner.outstanding.borrow_mut().insert(
             id,
             Work {
@@ -150,7 +149,7 @@ impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
         let input = {
             let mut slot = self.0.slot.borrow_mut();
 
-            slot.scheduled = false;
+            slot.scheduled = None;
 
             if !slot.receiver {
                 return Ok(None);
@@ -183,7 +182,7 @@ impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
                 Ok(output) => (Some(output), None),
                 Err(error) => {
                     slot.failed = Some(error);
-                    slot.scheduled = false;
+                    slot.scheduled = None;
                     (None, slot.pending.take())
                 }
             }
@@ -258,7 +257,7 @@ impl<I, O> Output<O> for Shared<I, O> {
         }
 
         if (slot.senders == 0 || self.inner.closed.get())
-            && !slot.scheduled
+            && slot.scheduled.is_none()
             && slot.running.is_none()
             && slot.pending.is_none()
         {
@@ -280,8 +279,12 @@ impl<I, O> Output<O> for Shared<I, O> {
         let pending = slot.pending.take();
         let output = slot.output.take();
         let wake = slot.wake.take();
+        let scheduled = slot.scheduled.take();
 
         drop(slot);
+        if let Some(id) = scheduled {
+            self.inner.cancel_queued(id);
+        }
         drop(pending);
         drop(output);
         drop(wake);
@@ -321,7 +324,7 @@ where
                 pending: None,
                 output: None,
                 running: None,
-                scheduled: false,
+                scheduled: None,
                 senders: 1,
                 receiver: true,
                 failed: None,

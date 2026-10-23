@@ -47,7 +47,7 @@ async fn native() {
         let cleaned = Arc::new(AtomicUsize::new(0));
         let count = cleaned.clone();
         let actor = group
-            .spawn(ActorArgs::new(
+            .spawn(AktorArgs::new(
                 "failed operation",
                 || Ok::<_, AktorSetupError>(0u32),
                 move |_| -> Result<(), AktorCleanupError> {

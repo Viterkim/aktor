@@ -28,10 +28,11 @@ struct Shared<S, I, O, Fut> {
     _alive: mpsc::Sender<Message<S>>,
 }
 
-struct SlotOutput<I, O> {
+struct SlotOutput<S, I, O> {
     slot: Arc<SlotMutex<Slot<I, O>>>,
+    services: std::sync::Weak<service::Services<S>>,
 }
-impl<I, O> SlotOutput<I, O> {
+impl<S, I, O> SlotOutput<S, I, O> {
     fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>> {
         let replacement = cx.waker().clone();
         let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
@@ -52,11 +53,20 @@ impl<I, O> SlotOutput<I, O> {
     }
 
     fn close(&self) {
-        let (input, output, wake) = {
+        let (input, output, wake, scheduled) = {
             let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
             slot.receiver = false;
-            (slot.input.take(), slot.output.take(), slot.wake.take())
+            (
+                slot.input.take(),
+                slot.output.take(),
+                slot.wake.take(),
+                slot.scheduled,
+            )
         };
+
+        if scheduled && let Some(services) = self.services.upgrade() {
+            services.cancel(Arc::as_ptr(&self.slot).cast());
+        }
 
         drop((input, output, wake));
     }
@@ -176,7 +186,7 @@ trait Output<O>: Send + Sync {
     fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>>;
     fn close(&self);
 }
-impl<I: Send, O: Send> Output<O> for SlotOutput<I, O> {
+impl<S, I: Send, O: Send> Output<O> for SlotOutput<S, I, O> {
     fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>> {
         self.poll(cx)
     }
@@ -273,6 +283,10 @@ where
     O: Send + 'static,
     Fut: Future<Output = (AktorTaskState<S>, O)> + Send + 'static,
 {
+    fn service_id(&self) -> Option<*const ()> {
+        Some(Arc::as_ptr(&self.shared.slot).cast())
+    }
+
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -418,6 +432,7 @@ impl<S: Send + 'static, I: Send + 'static, O: Send + 'static, Role, Wire>
             AktorTaskResults {
                 output: Arc::new(SlotOutput {
                     slot: shared.slot.clone(),
+                    services: Arc::downgrade(&self.services),
                 }),
                 terminal,
                 ended: None,
@@ -430,8 +445,44 @@ impl<S: Send + 'static, I: Send + 'static, O: Send + 'static, Role, Wire>
 mod tests {
     use super::*;
 
+    #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
+    #[test]
+    fn cancelled() {
+        async fn identity(state: AktorTaskState<()>, input: u32) -> (AktorTaskState<()>, u32) {
+            (state, input)
+        }
+
+        let (sender, _receiver) = mpsc::channel(1);
+        let task = AktorTask::<()> {
+            cleanup: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            name: Arc::new("cancelled".into()),
+            sender,
+            services: Arc::new(service::Services::new()),
+            kill: crate::AktorGroup::new().killswitch(),
+            finished: watch::channel(AktorTaskStatus::Running).1,
+            role: PhantomData,
+            clock: TaskClock::Tokio,
+        };
+
+        for _ in 0..1000 {
+            let (sender, results) = TypedSession::<_, _, _, _, ()>::session(
+                &task,
+                Operation {
+                    name: "cancelled",
+                    caller: core::panic::Location::caller(),
+                },
+                async |_, input: u32| input,
+                identity,
+            );
+            sender.send(9);
+            drop((sender, results));
+        }
+
+        assert!(task.services.discard().is_empty());
+    }
+
     struct Publish {
-        slot: SlotOutput<(), u32>,
+        slot: SlotOutput<(), (), u32>,
         finished: watch::Sender<AktorTaskStatus>,
         first: std::sync::atomic::AtomicBool,
     }
@@ -459,6 +510,7 @@ mod tests {
         let mut results = AktorTaskResults {
             output: Arc::new(Publish {
                 slot: SlotOutput {
+                    services: std::sync::Weak::new(),
                     slot: Arc::new(SlotMutex::new(Slot {
                         input: None,
                         output: None,

@@ -59,7 +59,7 @@ impl AktorGroup {
         }
     }
 
-    pub(super) async fn finish<Cleanup, CleanupFuture>(self, cleanup: Cleanup) -> ShutdownReport
+    pub async fn finish<Cleanup, CleanupFuture>(self, cleanup: Cleanup) -> ShutdownReport
     where
         Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
         CleanupFuture: Future<Output = Result<(), AktorError>>,

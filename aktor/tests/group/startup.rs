@@ -8,7 +8,7 @@ async fn startup_failure() {
         .run(
             async |app| -> Result<(), AktorError> {
                 let _first = app
-                    .spawn(ActorArgs {
+                    .spawn(AktorArgs {
                         name: "opened resource".into(),
                         capacity: 1,
                         setup: || Ok::<_, AktorError>(()),
@@ -24,7 +24,7 @@ async fn startup_failure() {
                     })?;
 
                 let _second = app
-                    .spawn(ActorArgs {
+                    .spawn(AktorArgs {
                         name: "failed setup".into(),
                         capacity: 1,
                         setup: || {
@@ -90,7 +90,7 @@ async fn cancelled_startup() {
                 async move |app| -> Result<(), AktorError> {
                     let _release = ReleaseOnDrop(release);
                     let _owner = app
-                        .spawn_async(ActorArgs {
+                        .spawn_async(AktorArgs {
                             name: "cancelled startup".into(),
                             capacity: 1,
                             setup: async move || {
@@ -173,7 +173,7 @@ async fn startup() {
             Ok::<_, AktorError>(())
         };
         let database = actors
-            .spawn(ActorArgs::new("database", setup, cleanup))
+            .spawn(AktorArgs::new("database", setup, cleanup))
             .await
             .unwrap();
         let caller_kill = kill.clone();
@@ -231,7 +231,7 @@ async fn startup() {
 
         assert!(matches!(
             actors
-                .spawn(ActorArgs::new(
+                .spawn(AktorArgs::new(
                     "late",
                     || Ok::<_, AktorError>(()),
                     |_| Ok::<_, AktorError>(())
@@ -315,7 +315,7 @@ async fn startup_rollback() {
     let cleaned = Arc::new(AtomicBool::new(false));
     let cleanup = cleaned.clone();
     let _sibling = actors
-        .spawn(ActorArgs::new(
+        .spawn(AktorArgs::new(
             "audio",
             || Ok::<_, AktorError>(()),
             move |_| {
@@ -328,7 +328,7 @@ async fn startup_rollback() {
 
     let startup = tokio::spawn(async move {
         actors
-            .spawn(ActorArgs::new(
+            .spawn(AktorArgs::new(
                 "storage",
                 || {
                     Err::<(), _>(AktorError {
@@ -383,7 +383,7 @@ async fn listener_cancel() {
         let setup_release = release.clone();
         let startup = tokio::spawn(async move {
             actors
-                .spawn_async(ActorArgs::new(
+                .spawn_async(AktorArgs::new(
                     "storage",
                     move || async move {
                         setup_entered.notify_one();

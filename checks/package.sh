@@ -8,8 +8,8 @@ version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)
 
 cargo package --workspace --no-verify --all-features --target-dir "$package_dir/target" "$@"
 
-mkdir -p "$package_dir/aktor" "$package_dir/aktor-macros" "$package_dir/.cargo"
-for package in aktor aktor-macros; do
+mkdir -p "$package_dir/aktor" "$package_dir/aktor-macros" "$package_dir/aktor-remote" "$package_dir/.cargo"
+for package in aktor aktor-macros aktor-remote; do
     tar -xzf "$package_dir/target/package/$package-$version.crate" \
         --strip-components=1 -C "$package_dir/$package"
 done
@@ -22,12 +22,14 @@ cp rust-toolchain.toml "$package_dir/"
 cat > "$package_dir/.cargo/config.toml" <<EOF
 [patch.crates-io]
 aktor-macros = { path = "$package_dir/aktor-macros" }
+aktor = { path = "$package_dir/aktor" }
 EOF
 
 cd -- "$package_dir"
 export CARGO_TARGET_DIR="$package_dir/target"
 
 cargo +1.89.0 test --manifest-path aktor/Cargo.toml --features tokio --all-targets
+cargo +1.89.0 test --manifest-path aktor-remote/Cargo.toml --all-features
 RUSTDOCFLAGS="-D warnings" cargo +1.89.0 doc --manifest-path aktor/Cargo.toml --features tokio --no-deps
 cargo +1.89.0 test --manifest-path aktor/Cargo.toml --no-default-features --features tokio --all-targets
 cargo +1.89.0 check --manifest-path aktor/Cargo.toml --no-default-features \

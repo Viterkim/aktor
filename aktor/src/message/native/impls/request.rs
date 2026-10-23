@@ -47,6 +47,15 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
         self.reply
     }
 
+    #[doc(hidden)]
+    pub async fn admit(mut self) -> Result<Reply<O>, CallError> {
+        if poll_fn(|cx| self.poll_submit(cx)).await {
+            Ok(self.reply)
+        } else {
+            Err(CallError::NotAdmitted)
+        }
+    }
+
     fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
         loop {
             if let Some(available) = &mut self.available {

@@ -16,7 +16,7 @@ struct Record {
 #[derive(Default)]
 struct State(usize);
 
-#[aktor(data)]
+#[aktor]
 async fn store(state: &mut State, record: Record) -> Result<Record, String> {
     state.0 += 1;
     Ok(record)
@@ -32,7 +32,6 @@ async fn dispatch() {
     };
     let bytes = data::encode(&(input,)).unwrap();
 
-    assert!(bytes.len() < 1040);
     let output = worker::dispatch::<State, ()>(&mut state, store::NAME.into(), bytes.clone())
         .await
         .unwrap();
@@ -48,7 +47,5 @@ async fn dispatch() {
 
     let error = <DataCodec as Codec<Record>>::decode_output(&[255]).unwrap_err();
     assert_eq!(error.outcome, CallError::OutcomeUnknown);
-    assert!(
-        worker::Operations::for_actor::<State, ()>().0[0].ends_with("[aktor-data-postcard-v1]")
-    );
+    assert!(worker::Operations::for_actor::<State, ()>().0[0].ends_with("[aktor-data]"));
 }

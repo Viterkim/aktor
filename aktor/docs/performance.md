@@ -1,10 +1,8 @@
 # Performance
 
-An empty counter makes the messaging do almost all the work, so that's where Aktor's overhead sticks out. These numbers include sending the call and getting its result back. Startup and shutdown stay outside the timer.
-
 ## Native tasks
 
-One caller, an empty counter and a Tokio runtime on one thread:
+Empty counter, call and reply:
 
 ```text
 Handwritten task       181 ns     1 allocation
@@ -16,37 +14,64 @@ Kameo explicit send    375 ns     4 allocations
 
 ## Dedicated threads
 
-An empty call with the caller and owner sharing one CPU:
-
 ```text
-Handwritten thread    1.517 microseconds
-Aktor StdThread       2.001 microseconds
-Aktor TokioThread     2.361 microseconds
+Handwritten thread    1.517 us
+Aktor StdThread       2.001 us
+Aktor TokioThread     2.361 us
 ```
-
-TokioTask is the cheaper choice for lots of small actors. Dedicated threads let resources own their execution and finish cleanup after the caller's runtime exits.
 
 ## Browser workers
 
-One caller sends owned Rust values to a real worker and gets them back. A 1 MiB byte round trip:
+### 8 bytes
 
 ```text
-AktorData             0.452 ms
-Aktor Serde           0.507 ms
-Gloo                  2.835 ms
-Yew                   2.932 ms
-Leptos                2.761 ms
-Leptos transferable   1.241 ms
+Shared Wasm thread      37 us
+AktorData               41 us
+Gloo                    13 us
+Yew                     13 us
+Leptos                  17 us
 ```
 
-With 10,485 records, each containing an id and two strings:
+### 1 MiB bytes
 
 ```text
-AktorData             2.131 ms
-Aktor Serde           3.591 ms
-Gloo                  4.062 ms
-Yew                   3.471 ms
-Leptos               24.061 ms
+Shared Wasm thread    0.039 ms
+AktorData             0.422 ms
+Aktor Serde           0.502 ms
+Gloo                  3.251 ms
+Yew                   3.385 ms
+Leptos                3.237 ms
+Leptos transferable   1.460 ms
 ```
 
-Large payloads are where AktorData does well. Calls with eight bytes took 156 microseconds through AktorData, 23 through Gloo, 18 through Yew and 26 through Leptos. Yew was quickest there.
+### 10,485 records
+
+An id and two strings each:
+
+```text
+Shared Wasm thread    0.035 ms
+AktorData             1.969 ms
+Aktor Serde           3.481 ms
+Gloo                  4.451 ms
+Yew                   3.553 ms
+Leptos               20.748 ms
+```
+
+## AktorData
+
+CPU time per encode / decode:
+
+```text
+                     Bytes       Encode       Decode
+4,096 booleans          515      1.06 us       0.43 us
+4,096 f64s           32,771      0.46 us       0.46 us
+```
+
+## TCP
+
+2 MiB echo:
+
+```text
+Round trip    3.76 ms
+CPU time      3.62 ms
+```

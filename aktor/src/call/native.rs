@@ -7,14 +7,6 @@ use crate::{
 use core::time::Duration;
 
 impl<'a, T, I, S: 'static, O, L> Call<T, I, Request<'a, S, O>, L> {
-    pub async fn send(self) -> Reply<O> {
-        self.into_request().send().await
-    }
-
-    pub fn timeout(self, duration: Duration) -> Timeout<Request<'a, S, O>> {
-        self.into_request().timeout(duration)
-    }
-
     pub fn operation(mut self, operation: Operation) -> Self {
         self.operation = operation;
 
@@ -23,11 +15,6 @@ impl<'a, T, I, S: 'static, O, L> Call<T, I, Request<'a, S, O>, L> {
         }
 
         self
-    }
-}
-impl<'a, T, I, S: 'static, L> Call<T, I, Request<'a, S, ()>, L> {
-    pub async fn cast(self) {
-        self.into_request().cast().await;
     }
 }
 impl<'a, T, I, S: 'static, O: Send + 'static, Role, L> Call<T, I, Queued<'a, S, I, O, Role>, L>
@@ -43,12 +30,45 @@ where
 
         self
     }
+}
 
-    pub async fn send(self) -> Reply<O> {
-        self.into_request().send().await
+impl<'a, S: 'static, O> SendRequest for Request<'a, S, O> {
+    type Reply = Reply<O>;
+
+    async fn send(self) -> Self::Reply {
+        self.send().await
     }
+}
+impl<'a, S: 'static, O> TimeoutRequest for Request<'a, S, O> {
+    type Timed = crate::Timeout<Self>;
 
-    pub fn timeout(self, duration: Duration) -> Timeout<Request<'a, S, O>> {
-        self.into_request().timeout(duration)
+    fn timeout(self, duration: Duration) -> Self::Timed {
+        self.timeout(duration)
+    }
+}
+impl<'a, S: 'static> CastRequest for Request<'a, S, ()> {
+    type Output = ();
+
+    async fn cast(self) {
+        self.cast().await;
+    }
+}
+
+impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> SendRequest
+    for Queued<'a, S, I, O, Role>
+{
+    type Reply = Reply<O>;
+
+    async fn send(self) -> Self::Reply {
+        self.send().await
+    }
+}
+impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> TimeoutRequest
+    for Queued<'a, S, I, O, Role>
+{
+    type Timed = Timeout<Request<'a, S, O>>;
+
+    fn timeout(self, duration: Duration) -> Self::Timed {
+        self.timeout(duration)
     }
 }

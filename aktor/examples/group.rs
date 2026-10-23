@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
     let mut actors = AktorGroup::new();
     let kill = actors.killswitch();
     let closing = actors.start_with(after)?;
-    let log = actors.spawn(ActorArgs::new("log", setup, cleanup)).await?;
+    let log = actors.spawn(AktorArgs::new("log", setup, cleanup)).await?;
 
     actors.spawn_task(async move {
         if let Err(error) = append(&log, "application started".into()).await {

@@ -151,7 +151,7 @@ mod tests {
             let mut run = Box::pin(group.run(
                 async move |group| -> Result<(), AktorError> {
                     let handle = group
-                        .spawn::<(), 1, ()>(ActorArgs {
+                        .spawn::<(), 1, ()>(AktorArgs {
                             name: "custom clock actor".into(),
                             capacity: 1,
                             setup: async || Ok(()),

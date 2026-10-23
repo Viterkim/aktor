@@ -1,21 +1,25 @@
 use super::*;
-use crate::{
-    Timeout,
-    worker::{WorkerReply, WorkerRequest},
-};
+use crate::worker::{WorkerReply, WorkerRequest};
 use core::time::Duration;
 
-impl<'a, T, I, S, O: 'static, Role, L> Call<T, I, WorkerRequest<'a, S, O, Role>, L> {
-    pub async fn send(self) -> WorkerReply<O> {
-        self.into_request().send().await
-    }
+impl<'a, S, O: 'static, Role> SendRequest for WorkerRequest<'a, S, O, Role> {
+    type Reply = WorkerReply<O>;
 
-    pub fn timeout(self, duration: Duration) -> Timeout<WorkerRequest<'a, S, O, Role>> {
-        self.into_request().timeout(duration)
+    async fn send(self) -> Self::Reply {
+        self.send().await
     }
 }
-impl<'a, T, I, S, Role, L> Call<T, I, WorkerRequest<'a, S, (), Role>, L> {
-    pub async fn cast(self) {
-        self.into_request().cast().await;
+impl<'a, S, O: 'static, Role> TimeoutRequest for WorkerRequest<'a, S, O, Role> {
+    type Timed = crate::Timeout<Self>;
+
+    fn timeout(self, duration: Duration) -> Self::Timed {
+        self.timeout(duration)
+    }
+}
+impl<'a, S, Role> CastRequest for WorkerRequest<'a, S, (), Role> {
+    type Output = ();
+
+    async fn cast(self) {
+        self.cast().await;
     }
 }

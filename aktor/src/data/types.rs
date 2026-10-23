@@ -21,6 +21,21 @@ pub trait AktorData: Sized {
     fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Self>, D::Error> {
         super::impls::deserialize_vec(deserializer)
     }
+
+    #[doc(hidden)]
+    fn serialize_array<S: Serializer, const N: usize>(
+        values: &[Self; N],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        super::impls::serialize_array(values, serializer)
+    }
+
+    #[doc(hidden)]
+    fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
+        deserializer: D,
+    ) -> Result<[Self; N], D::Error> {
+        super::impls::deserialize_array(deserializer)
+    }
 }
 
 #[doc(hidden)]

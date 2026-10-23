@@ -6,7 +6,10 @@ extern crate alloc;
 extern crate self as aktor;
 
 mod impls;
-#[cfg(feature = "std")]
+#[cfg(all(
+    feature = "std",
+    any(feature = "tokio", feature = "std_thread", feature = "local")
+))]
 mod panic;
 mod report;
 pub mod types;
@@ -45,9 +48,16 @@ pub mod group;
 pub use group::{AktorGroup, GroupCompletion, KillSwitch};
 
 pub mod call;
-#[cfg(feature = "embassy_cross_core")]
+#[cfg(any(
+    feature = "embassy_cross_core",
+    all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    )
+))]
 pub mod cross_core;
-#[cfg(feature = "wasm_browser_workers")]
+#[cfg(feature = "transport")]
 pub mod data;
 #[cfg(feature = "embassy")]
 pub mod embassy;
@@ -57,6 +67,14 @@ pub mod embassy;
 ))]
 #[doc(hidden)]
 pub mod executor;
+#[cfg(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_os = "unknown",
+    target_feature = "atomics"
+))]
+pub mod threads;
+
 pub mod latest;
 #[cfg(any(
     feature = "tokio",
@@ -95,6 +113,8 @@ mod queue;
 pub mod setup;
 #[cfg(any(all(feature = "tokio", not(target_family = "wasm")), feature = "bevy"))]
 pub mod task;
+#[cfg(feature = "testing")]
+pub mod testing;
 #[cfg(all(
     any(feature = "tokio", feature = "std_thread"),
     not(target_family = "wasm")
@@ -115,10 +135,24 @@ pub use setup::AktorDefinition;
 pub use setup::{aktor_start, aktor_start_in};
 #[cfg(any(all(feature = "tokio", not(target_family = "wasm")), feature = "bevy"))]
 pub use task::{AktorTask, AktorTaskState};
-#[cfg(feature = "wasm_browser_workers")]
+#[cfg(feature = "transport")]
 pub mod worker;
 
-#[cfg(not(feature = "wasm_browser_workers"))]
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __aktor_testing {
+    ($($item:item)*) => { $($item)* };
+}
+
+#[cfg(not(feature = "testing"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __aktor_testing {
+    ($($item:tt)*) => {};
+}
+
+#[cfg(not(feature = "transport"))]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __aktor_register {

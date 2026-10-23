@@ -1,7 +1,11 @@
 use crate::message::CallError;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
 mod browser;
 pub mod bytes;
 mod codec;
@@ -9,7 +13,11 @@ mod impls;
 mod registry;
 mod wire;
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
 pub use browser::{
     Completion, LatestResults, LatestSender, Server, Worker, WorkerReply, WorkerRequest, serve,
     serve_for, serve_setup, serve_with, setup_failed,
@@ -19,7 +27,7 @@ pub use codec::{decode, encode};
 pub use inventory;
 pub use registry::Operations;
 #[doc(hidden)]
-pub use registry::{Exporter, Register, Registered, Registration, dispatch};
+pub use registry::{Exporter, Register, Registered, Registration, Registry, dispatch};
 #[doc(hidden)]
 pub use wire::Codec;
 
@@ -27,7 +35,11 @@ pub use crate::dispatch::{Native, Remote};
 
 pub const VERSION: u32 = 0;
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
 type WireError = WorkerError<Vec<u8>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +78,11 @@ pub enum WorkerCause {
     },
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
 #[derive(Serialize, Deserialize)]
 enum Incoming {
     Call {
@@ -82,7 +98,11 @@ enum Incoming {
     },
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
 #[derive(Serialize, Deserialize)]
 enum Outgoing {
     Configure {

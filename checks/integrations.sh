@@ -22,3 +22,5 @@ for backend in standard bevy; do
         exit 1
     fi
 done
+
+python3 integrations/remote/check.py

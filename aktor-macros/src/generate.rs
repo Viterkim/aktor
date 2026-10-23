@@ -9,10 +9,14 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         return crate::worker::expand(options, function);
     }
 
-    if options.data {
+    if options.data || options.serde || options.remote {
         return Err(syn::Error::new_spanned(
             &function.signature,
-            "#[aktor(data)] needs concrete owned arguments and an owned result",
+            if options.remote {
+                "#[aktor(remote)] needs concrete owned arguments and an owned result"
+            } else {
+                "explicit transport options need concrete owned arguments and an owned result"
+            },
         ));
     }
 
@@ -487,13 +491,11 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #state_type, #input_type, #session_output, #latest_lease, #role
                 >>::Results;
 
-                fn start(
+                fn create(
                     self,
                     #parameter: #target,
-                    #input_name: #input_type,
                     #operation_name: #aktor::operation::Operation
                 ) -> (Self::Sender, Self::Results) {
-                    let (#(#bindings,)*) = #input_name;
 
                     let (#inner_name, #results_name) = #aktor::latest::TypedSession::session(
                         #parameter, #operation_name,
@@ -505,7 +507,6 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     );
                     let #sender_name = self::LatestSender { inner: #inner_name, marker: ::core::marker::PhantomData };
 
-                    #sender_name.send(#(#bindings),*);
 
                     (#sender_name, #results_name)
                 }
@@ -518,6 +519,11 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             impl #send_impl self::LatestSender #sender_type #send_where {
                 pub fn send(&self, #(#bindings: #input_types),*) {
                     #aktor::latest::SendLatest::send(&self.inner, (#(#bindings,)*));
+                }
+            }
+            impl #send_impl #aktor::latest::SendLatest<#input_type> for self::LatestSender #sender_type #send_where {
+                fn send(&self, #input_name: #input_type) {
+                    #aktor::latest::SendLatest::send(&self.inner, #input_name);
                 }
             }
             impl #clone_impl ::core::clone::Clone for self::LatestSender #sender_type #clone_where {

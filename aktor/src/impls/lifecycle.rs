@@ -1,5 +1,5 @@
 use crate::{
-    ActorArgs, AktorCleanupError, AktorCleanupOutput, AktorExecution, AktorShutdownAsync,
+    AktorArgs, AktorCleanupError, AktorCleanupOutput, AktorExecution, AktorShutdownAsync,
     AktorShutdownFuture, AktorShutdownOutput, AktorShutdownSync, ShutdownReport,
 };
 use alloc::string::String;
@@ -62,7 +62,7 @@ where
     }
 }
 
-impl<Setup, Cleanup> ActorArgs<Setup, Cleanup> {
+impl<Setup, Cleanup> AktorArgs<Setup, Cleanup> {
     /// Queue capacity starts at 32, change capacity if you need another size.
     pub fn new(name: impl Into<String>, setup: Setup, cleanup: Cleanup) -> Self {
         Self {

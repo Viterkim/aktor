@@ -1,7 +1,7 @@
 use super::closures::AktorEndCall;
 use super::*;
 use crate::{
-    ActorArgs, Aktor, AktorError, AktorFailure,
+    Aktor, AktorArgs, AktorError, AktorFailure,
     listener::{Handle, hooks::AktorHooks},
     message::call_async,
     operation::Operation,
@@ -145,7 +145,7 @@ where
     let actor = context
         .group
         .spawn_async_initial_on_reported::<S, _, _, _, _, _>(
-            ActorArgs {
+            AktorArgs {
                 name: name.clone(),
                 capacity: options.capacity,
                 setup: async move || match start().await {

@@ -28,7 +28,7 @@ mod opaque_dispatch;
 pub mod panic;
 mod request;
 mod signal;
-pub use group::{ActorArgs, AktorGroup, GroupCompletion, KillSwitch, ShutdownReport};
+pub use group::{AktorArgs, AktorGroup, GroupCompletion, KillSwitch, ShutdownReport};
 #[doc(hidden)]
 pub use impls::runner::serve;
 #[cfg(all(
@@ -153,6 +153,10 @@ struct Message<S> {
 }
 
 trait Job<S> {
+    fn service_id(&self) -> Option<*const ()> {
+        None
+    }
+
     fn run<'s>(
         &'s mut self,
         state: &'s mut S,

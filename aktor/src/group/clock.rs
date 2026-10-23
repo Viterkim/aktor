@@ -1,17 +1,24 @@
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 
-#[wasm_bindgen]
+#[wasm_bindgen(
+    inline_js = "export function now() { return performance.now(); }\nexport function timeOrigin() { return performance.timeOrigin; }"
+)]
 extern "C" {
-    #[wasm_bindgen(js_namespace = performance, js_name = now)]
     fn now() -> f64;
+
+    #[wasm_bindgen(js_name = timeOrigin)]
+    fn time_origin() -> f64;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(Duration);
 impl Instant {
     pub fn now() -> Self {
-        Self(Duration::from_secs_f64(now() / 1000.0))
+        Self(
+            Duration::from_secs_f64(time_origin() / 1000.0)
+                + Duration::from_secs_f64(now() / 1000.0),
+        )
     }
 
     pub fn checked_add(self, duration: Duration) -> Option<Self> {

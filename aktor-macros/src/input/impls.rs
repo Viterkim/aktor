@@ -10,15 +10,35 @@ impl Parse for Options {
         let mut crate_path = None;
         let mut role = None;
         let mut data = false;
+        let mut serde = false;
+        let mut remote = false;
 
         while !input.is_empty() {
             let option = input.call(Ident::parse_any)?;
-            if option == "data" {
-                if data {
-                    return Err(syn::Error::new(option.span(), "duplicate `data` option"));
+            if option == "data" || option == "serde" || option == "remote" {
+                if (option == "data" && serde) || (option == "serde" && data) {
+                    return Err(syn::Error::new(
+                        option.span(),
+                        "choose either `data` or `serde`",
+                    ));
                 }
 
-                data = true;
+                let flag = if option == "data" {
+                    &mut data
+                } else if option == "serde" {
+                    &mut serde
+                } else {
+                    &mut remote
+                };
+
+                if *flag {
+                    return Err(syn::Error::new(
+                        option.span(),
+                        format!("duplicate `{option}` option"),
+                    ));
+                }
+
+                *flag = true;
 
                 if input.is_empty() {
                     break;
@@ -60,6 +80,8 @@ impl Parse for Options {
             crate_path,
             role,
             data,
+            serde,
+            remote,
         })
     }
 }

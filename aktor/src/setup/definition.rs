@@ -4,8 +4,7 @@ use super::{
 use crate::{AktorGroup, AktorSetupError};
 use core::marker::PhantomData;
 
-/// A native actor definition with its callback types hidden.
-/// Boxes the configuration once. Lifecycle failures use Aktor reports.
+/// Return an actor setup from a helper without naming its closure types.
 pub struct AktorDefinition<Actor> {
     setup: Box<dyn DefinitionStart<Actor> + Send>,
 }

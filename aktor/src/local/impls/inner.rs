@@ -1,6 +1,18 @@
 use super::super::*;
 
 impl<S, const N: usize, E> Inner<S, N, E> {
+    pub fn cancel_service(&self, id: *const ()) {
+        let message = {
+            let mut services = self.services.borrow_mut();
+            let index = services
+                .iter()
+                .position(|message| message.job.service_id() == Some(id));
+            index.and_then(|index| services.remove(index))
+        };
+
+        drop(message);
+    }
+
     pub fn close(&self) {
         if self.open.replace(false) {
             self.closed.notify();

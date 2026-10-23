@@ -1,4 +1,4 @@
-#![cfg(all(feature = "macros", feature = "wasm_browser_workers"))]
+#![cfg(all(feature = "macros", feature = "transport"))]
 use aktor::{AktorData, data, worker};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -195,6 +195,33 @@ fn values() {
     roundtrip(HashSet::from(["key".to_owned()]));
     roundtrip(vec![1u8, 2, 3].into_boxed_slice());
 
+    for count in [0, 1, 7, 8, 9, 32, 4096] {
+        roundtrip(
+            (0..count)
+                .map(|index| index % 3 == 0)
+                .collect::<Vec<bool>>(),
+        );
+    }
+    roundtrip([false; 0]);
+    roundtrip([true, false, true, false, true, false, true, false, true]);
+    roundtrip(VecDeque::from([true, false, true]));
+    roundtrip(BTreeSet::from([true, false]));
+    roundtrip(HashSet::from([true, false]));
+    roundtrip(VecDeque::from([1.25f32, -2.5]));
+    roundtrip(vec![0.0f32, -0.0, f32::INFINITY]);
+    let values = vec![f64::NAN, -0.0, f64::NEG_INFINITY];
+    let decoded: Vec<f64> = data::decode(&data::encode(&values).unwrap()).unwrap();
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        decoded
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+
     roundtrip((
         i128::MIN,
         u128::MAX,
@@ -361,4 +388,8 @@ fn bounds() {
     assert!(data::decode::<char>(&[255]).is_err());
     assert!(data::decode::<String>(&[1, 255]).is_err());
     assert!(data::decode::<Choice>(&[255]).is_err());
+    assert!(data::decode::<Vec<bool>>(&encoded_count).is_err());
+    assert!(data::decode::<Vec<bool>>(&[1, 0]).is_err());
+    assert!(data::decode::<[bool; 1]>(&[2]).is_err());
+    assert!(data::decode::<Vec<f64>>(&[1, 0]).is_err());
 }

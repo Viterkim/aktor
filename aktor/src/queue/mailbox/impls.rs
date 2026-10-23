@@ -21,6 +21,19 @@ impl<'a, S> Permit<'a, S> {
 }
 
 impl<S> Sender<S> {
+    pub fn cancel_service(&self, id: *const ()) {
+        let message = {
+            let mut entries = self.0.entries.lock();
+            let index = entries
+                .messages
+                .iter()
+                .position(|message| message.service_id() == Some(id));
+            index.and_then(|index| entries.messages.remove(index))
+        };
+
+        drop(message);
+    }
+
     pub fn commit_service(&self, message: Message<S>) -> Result<&Notify, Message<S>> {
         let mut entries = self.0.entries.lock();
 

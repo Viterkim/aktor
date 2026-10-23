@@ -226,35 +226,44 @@ async fn close_interval(waiting: bool) {
     let actors = aktor_start(AktorSetup {
         actors: aktor_setups! {
             timed: AktorNew {
-
                 name: AktorName::new("interval owner"),
                 role: AktorNoRole,
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
-start: async || Ok::<_, AktorSetupError>(0_u32),
+                    start: async || Ok::<_, AktorSetupError>(0_u32),
                     end: async move |_: u32| {
                         end.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     },
                     intervals: vec![AktorInterval {
                         every: Duration::from_secs(1),
-                        run: (async |value: &mut u32| { *value += 1; }).into(),
+                        run: (async |value: &mut u32| {
+                            *value += 1;
+                        })
+                        .into(),
                     }],
-                     before_each: None, after_each: None,
+                    before_each: None,
+                    after_each: None,
                 },
                 options: AktorNewOptions { capacity: 1 },
             },
             sibling: AktorNew {
-
                 name: AktorName::new("sibling"),
                 role: AktorNoRole,
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
-start: async || Ok::<_, AktorSetupError>(0_u32),  end: (), intervals: vec![], before_each: None, after_each: None },
+                    start: async || Ok::<_, AktorSetupError>(0_u32),
+                    end: (),
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
                 options: AktorNewOptions { capacity: 32 },
             },
         },
         shutdown: |_| {},
-        options: AktorOptions { shutdown_grace: Duration::from_secs(5) },
+        options: AktorOptions {
+            shutdown_grace: Duration::from_secs(5),
+        },
     })
     .await
     .unwrap();

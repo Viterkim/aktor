@@ -36,7 +36,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         self.run_custom(state, cleanup, runner::serve).await
     }
 
-    pub(super) async fn dispose_hooks(&mut self) {
+    pub async fn dispose_hooks(&mut self) {
         let hooks = core::mem::take(&mut self.hooks);
         #[cfg(feature = "std")]
         {

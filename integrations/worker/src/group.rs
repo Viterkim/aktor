@@ -1,5 +1,6 @@
 use aktor::{
     AktorCleanupError, AktorClosures, AktorError, AktorGroup, AktorSetupError,
+    dispatch::SerdeCodec,
     worker::{self, Options, Server, WorkerCause},
 };
 use serde::{Deserialize, Serialize};
@@ -96,15 +97,20 @@ pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> 
     assert_eq!(worker.outstanding(), (0, 0));
     CLOSING.with(|stored| *stored.borrow_mut() = Some(worker.new_handle()));
 
-    let request =
-        <&worker::Worker<u32> as Transport<u32, ClosingInput, Result<u32, String>>>::request(
-            &worker,
-            Operation {
-                name: operation::NAME,
-                caller: std::panic::Location::caller(),
-            },
-            ClosingInput,
-        );
+    let request = <&worker::Worker<u32> as Transport<
+        u32,
+        ClosingInput,
+        Result<u32, String>,
+        (),
+        SerdeCodec,
+    >>::request(
+        &worker,
+        Operation {
+            name: operation::NAME,
+            caller: std::panic::Location::caller(),
+        },
+        ClosingInput,
+    );
 
     let closed = request.send().now_or_never().is_none();
 
@@ -155,7 +161,7 @@ pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> 
     Ok(closed)
 }
 
-#[aktor::aktor]
+#[aktor::aktor(serde)]
 async fn operation(_: &u32, mode: u32) -> Result<u32, String> {
     match mode {
         0 => Err("ordinary operation error".into()),
@@ -218,7 +224,7 @@ impl<'de> Deserialize<'de> for RejectedOutput {
     }
 }
 
-#[aktor::aktor]
+#[aktor::aktor(serde)]
 async fn bad_output(_: &u32) -> RejectedOutput {
     RejectedOutput
 }
@@ -230,7 +236,7 @@ impl Serialize for BrokenData {
     }
 }
 
-#[aktor::aktor]
+#[aktor::aktor(serde)]
 async fn roundtrip(_: &u32, value: Portable) -> Portable {
     value
 }

@@ -1,5 +1,5 @@
 pub use crate::local::{
-    ActorArgs, Completion, LatestResults, LatestSender, Owner, OwnerError, OwnerFailure,
+    AktorArgs, Completion, LatestResults, LatestSender, Owner, OwnerError, OwnerFailure,
     ShutdownReport,
 };
 use crate::{local, message::ActorError};

@@ -1,3 +1,4 @@
 /target/
 /integrations/target/
 /integrations/worker/web/pkg/
+/integrations/threads/web/pkg/

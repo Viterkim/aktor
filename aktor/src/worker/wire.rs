@@ -1,9 +1,14 @@
-use super::{WorkerError, decode, encode};
+use super::WorkerError;
+#[cfg(feature = "serde")]
+use super::{decode, encode};
+#[cfg(feature = "serde")]
+use crate::dispatch::SerdeCodec;
 use crate::{
     data::{self, AktorData},
-    dispatch::{DataCodec, SerdeCodec},
+    dispatch::DataCodec,
     message::CallError,
 };
+#[cfg(feature = "serde")]
 use serde::{Serialize, de::DeserializeOwned};
 
 pub trait Codec<T> {
@@ -19,6 +24,7 @@ pub trait Codec<T> {
         })
     }
 }
+#[cfg(feature = "serde")]
 impl<T: Serialize + DeserializeOwned> Codec<T> for SerdeCodec {
     const NAME: &'static str = "";
 
@@ -32,7 +38,7 @@ impl<T: Serialize + DeserializeOwned> Codec<T> for SerdeCodec {
 }
 
 impl<T: AktorData> Codec<T> for DataCodec {
-    const NAME: &'static str = " [aktor-data-postcard-v1]";
+    const NAME: &'static str = " [aktor-data]";
 
     fn encode(value: &T) -> Result<Vec<u8>, WorkerError> {
         data::encode(value)

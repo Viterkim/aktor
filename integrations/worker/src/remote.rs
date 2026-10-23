@@ -1,4 +1,5 @@
 use aktor::{
+    dispatch::SerdeCodec,
     latest::{SendLatest, Session},
     operation::Operation,
     *,
@@ -76,7 +77,7 @@ struct Buffer {
     data: Vec<u8>,
 }
 
-#[aktor]
+#[aktor(serde)]
 async fn echo(_: &Counter, buffer: Buffer) -> Buffer {
     buffer
 }
@@ -86,6 +87,19 @@ struct DataBuffer {
     data: Vec<u8>,
     #[aktor(skip)]
     cache: String,
+}
+
+#[derive(AktorData, Clone, PartialEq)]
+struct Packed {
+    flags: Vec<bool>,
+    values: Vec<f64>,
+    bytes: [u8; 16],
+    switches: [bool; 9],
+}
+
+#[aktor]
+async fn packed(_: &Counter, value: Packed) -> Packed {
+    value
 }
 
 #[aktor(data)]
@@ -285,18 +299,24 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     let handles = aktor_start_in(
         &group,
         aktor_setups! {
-            first: setup(&program, Config {
-                initial: 17,
-                fail_start: false,
-                fail_end: false,
-                setup_delay: 0,
-            }),
-            second: setup(&program, Config {
-                initial: 23,
-                fail_start: false,
-                fail_end: false,
-                setup_delay: 0,
-            }),
+            first: setup(
+                &program,
+                Config {
+                    initial: 17,
+                    fail_start: false,
+                    fail_end: false,
+                    setup_delay: 0,
+                },
+            ),
+            second: setup(
+                &program,
+                Config {
+                    initial: 23,
+                    fail_start: false,
+                    fail_end: false,
+                    setup_delay: 0,
+                },
+            ),
         },
     )
     .await
@@ -375,6 +395,8 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
                             Counter,
                             RejectedInput,
                             u32,
+                            (),
+                            SerdeCodec,
                         >>::session(
                             &rejected.handles,
                             Operation {
@@ -479,6 +501,17 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     };
 
     assert_eq!(echo(&actors.handles, buffer.clone()).await, buffer);
+
+    let input = Packed {
+        flags: (0..19).map(|value| value % 3 == 0).collect(),
+        values: vec![0.0, -0.0, 0.75, f64::INFINITY],
+        bytes: core::array::from_fn(|index| index as u8),
+        switches: [true, false, true, false, true, false, true, false, true],
+    };
+
+    if packed(&actors.handles, input.clone()).await != input {
+        return Err(error("packed data changed during the worker call"));
+    }
 
     let input = DataBuffer {
         data: buffer.data.clone(),

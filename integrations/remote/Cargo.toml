@@ -1,0 +1,19 @@
+[package]
+name = "aktor-remote-proof"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "power_api"
+
+[dependencies]
+aktor = { workspace = true, features = ["macros", "tokio", "transport"] }
+aktor-remote = { path = "../../aktor-remote" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+
+[lints]
+workspace = true
+

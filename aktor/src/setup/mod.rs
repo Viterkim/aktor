@@ -162,3 +162,11 @@ type AktorClosingFuture = AktorThreadFuture<crate::ShutdownReport>;
     target_family = "wasm"
 ))]
 type AktorClosingFuture = crate::message::LocalFuture<'static, crate::ShutdownReport>;
+
+#[cfg(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_os = "unknown",
+    target_feature = "atomics"
+))]
+mod shared;

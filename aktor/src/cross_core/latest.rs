@@ -250,12 +250,15 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Arc<Shared<S, I, O, F, Ro
     }
 
     fn close_receiver(&self) {
-        let discarded = self.slot.lock(|slot| {
+        let (discarded, scheduled) = self.slot.lock(|slot| {
             let mut slot = slot.borrow_mut();
             slot.receiver = false;
-            (slot.pending.take(), slot.output.take())
+            ((slot.pending.take(), slot.output.take()), slot.scheduled)
         });
 
+        if scheduled {
+            self.handle.inner.cancel_service(self.this.as_ptr().cast());
+        }
         drop(discarded);
     }
 }
@@ -265,6 +268,10 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, F, Role: 'static> Job<S>
 where
     F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
 {
+    fn service_id(&self) -> Option<*const ()> {
+        Some(Arc::as_ptr(&self.shared).cast())
+    }
+
     fn run<'a>(
         &'a mut self,
         state: &'a mut S,

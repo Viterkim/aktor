@@ -25,6 +25,7 @@ release_url="https://github.com/Viterkim/aktor/blob/$(git rev-parse HEAD)"
 # Only the published copy gets full links.
 sed -i -E \
     -e "s@\]\((\./)?aktor/@](${release_url}/aktor/@g" \
+    -e "s@\]\((\./)?aktor-remote/@](${release_url}/aktor-remote/@g" \
     -e "s@\]\((\./)?integrations/@](${release_url}/integrations/@g" \
     "$release_dir/README.md"
 sed -i -E \
@@ -39,9 +40,9 @@ cd -- "$release_dir"
 bash checks/package.sh
 
 printf '\nDry run bingo! You are in %s\n' "$release_dir"
-printf 'Bash:'
-printf 'cargo publish -p aktor-macros && cargo publish -p aktor\n'
-printf 'Nushell:'
-printf 'cargo publish -p aktor-macros; cargo publish -p aktor\n'
+printf 'Bash:\n'
+printf 'cargo publish -p aktor-macros && cargo publish -p aktor && cargo publish -p aktor-remote\n'
+printf 'Nushell:\n'
+printf 'cargo publish -p aktor-macros; cargo publish -p aktor; cargo publish -p aktor-remote\n'
 printf 'exit this shell when you are done.\n\n'
 exec "${SHELL:-bash}" -i

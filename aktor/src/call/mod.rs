@@ -8,9 +8,21 @@ use pin_project_lite::pin_project;
     target_os = "unknown"
 ))]
 mod browser;
-#[cfg(feature = "embassy_cross_core")]
+#[cfg(any(
+    feature = "embassy_cross_core",
+    all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    )
+))]
 mod cross_core;
 mod impls;
+mod request;
+mod retry;
+#[doc(hidden)]
+pub use request::{CastRequest, RetryRequest, SendRequest, TimeoutRequest};
+pub use retry::Retried;
 #[cfg(feature = "local")]
 mod local;
 #[cfg(any(

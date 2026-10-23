@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["renamed", "worker", "embassy", "wasm", "native"]
+members = ["renamed", "worker", "embassy", "wasm", "native", "remote", "threads"]
 
 [workspace.package]
 license = "MIT-0"

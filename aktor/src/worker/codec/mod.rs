@@ -8,7 +8,14 @@ mod impls;
 pub use decode::decode;
 pub use encode::encode;
 
-#[cfg(any(test, all(target_family = "wasm", target_os = "unknown")))]
+#[cfg(any(
+    test,
+    all(
+        feature = "wasm_browser_workers",
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
 pub fn decode_output<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WorkerError> {
     decode(bytes).map_err(|mut error| {
         error.outcome = CallError::OutcomeUnknown;

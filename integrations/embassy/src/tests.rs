@@ -325,7 +325,7 @@ async fn grouped() {
         .run(
             async move |app| {
                 let sensor = app
-                    .spawn::<Sensor, 2, ()>(embassy::ActorArgs {
+                    .spawn::<Sensor, 2, ()>(embassy::AktorArgs {
                         name: "sensor".into(),
                         capacity: 2,
                         setup: async move || Ok(Sensor { readings: values }),
@@ -368,7 +368,7 @@ async fn grouped() {
         .run(
             async |app| {
                 let sensor = app
-                    .spawn::<Sensor, 2, ()>(embassy::ActorArgs {
+                    .spawn::<Sensor, 2, ()>(embassy::AktorArgs {
                         name: "failed sensor".into(),
                         capacity: 2,
                         setup: async || Err(AktorSetupError::new("could not open sensor", ())),
@@ -447,7 +447,7 @@ async fn listening(spawner: Spawner) {
             cleanup.set(true);
             Ok::<_, AktorError>(())
         };
-        let mut args = ActorArgs::new("sensor", setup, cleanup);
+        let mut args = AktorArgs::new("sensor", setup, cleanup);
 
         args.capacity = 2;
 
@@ -866,7 +866,7 @@ async fn driver_cancellation() {
             .unwrap();
 
         let handle = group
-            .spawn::<Sensor, 2, ()>(ActorArgs {
+            .spawn::<Sensor, 2, ()>(AktorArgs {
                 name: "sensor".into(),
                 capacity: 2,
                 setup: async move || {
@@ -978,7 +978,7 @@ fn registration_from_actor() {
     let weak = Rc::downgrade(&group);
     let handle = group
         .borrow_mut()
-        .spawn::<u32, 1, ()>(ActorArgs {
+        .spawn::<u32, 1, ()>(AktorArgs {
             name: "first".into(),
             capacity: 1,
             setup: async move || {

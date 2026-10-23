@@ -1,3 +1,9 @@
+#[cfg(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_feature = "atomics"
+))]
+use crate::threads::lock::Mutex;
 use crate::{
     AktorError, AktorFailure,
     local::hooks::AktorHooks,
@@ -6,12 +12,17 @@ use crate::{
 };
 use alloc::{boxed::Box, collections::VecDeque, rc::Rc, vec::Vec};
 use core::{cell::RefCell, marker::PhantomData};
+#[cfg(not(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_feature = "atomics"
+)))]
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
-use portable_atomic::AtomicBool;
 use portable_atomic_util::{Arc, Weak};
 
 mod dispatch;
-mod event;
+#[doc(hidden)]
+pub mod event;
 mod impls;
 mod latest;
 mod request;
@@ -19,7 +30,18 @@ use event::{Event, Listener};
 pub use impls::channel;
 pub use latest::{LatestResults, LatestSender};
 
+#[cfg(not(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_feature = "atomics"
+)))]
 type Lock<T> = Mutex<CriticalSectionRawMutex, RefCell<T>>;
+#[cfg(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_feature = "atomics"
+))]
+type Lock<T> = Mutex<RefCell<T>>;
 
 /// Callers can transfer this handle. State and operation futures stay on the owner.
 pub struct Handle<S, Role = ()> {
@@ -35,6 +57,7 @@ pub struct WeakHandle<S, Role = ()> {
 pub struct Owner<S> {
     pub hooks: AktorHooks<S>,
     inner: Arc<Inner<S>>,
+    #[cfg(feature = "embassy_cross_core")]
     supervisor: Option<(alloc::string::String, crate::embassy::KillSwitch)>,
     local: PhantomData<Rc<()>>,
     intervals: Vec<Interval>,
@@ -88,7 +111,7 @@ struct Status {
 
 #[derive(Default)]
 struct State {
-    group_stopping: Option<Arc<AtomicBool>>,
+    managed: bool,
     closing: bool,
     finishing: bool,
     ready: Option<Result<(), AktorError>>,
@@ -102,6 +125,10 @@ struct Message<S> {
 }
 
 trait Job<S>: Send {
+    fn service_id(&self) -> Option<*const ()> {
+        None
+    }
+
     fn run<'a>(
         &'a mut self,
         state: &'a mut S,

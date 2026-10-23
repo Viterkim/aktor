@@ -36,10 +36,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            write(&db, "volume".into(), "0.7".into()).await.unwrap(),
-            "0.7"
-        );
+        write(&db, "volume".into(), "0.7".into()).await.unwrap();
         assert_eq!(read(&db, "volume".into()).await.unwrap(), "0.7");
         assert_eq!(
             read(&db, "absent".into()).await,

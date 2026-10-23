@@ -1,7 +1,7 @@
 #![cfg(all(feature = "tokio", feature = "local"))]
 
 use aktor::{
-    ActorArgs, AktorCleanupError, AktorClosures, AktorError, AktorKind, AktorName, AktorNew,
+    AktorArgs, AktorCleanupError, AktorClosures, AktorError, AktorKind, AktorName, AktorNew,
     AktorNewOptions, AktorNoRole, AktorOptions, AktorSetup, AktorSetupError, aktor_start, local,
     operation::Operation,
 };
@@ -242,7 +242,7 @@ async fn panic_cleanup() {
         let run = group.run(
             async move |group| {
                 let handle = group
-                    .spawn::<(), 1, ()>(ActorArgs {
+                    .spawn::<(), 1, ()>(AktorArgs {
                         name: "application actor".into(),
                         capacity: 1,
                         setup: async || Ok(()),

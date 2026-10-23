@@ -8,30 +8,38 @@ use crate::local::{Reply, Request};
 ))]
 use core::time::Duration;
 
-impl<'a, T, I, S: 'static, const N: usize, E, O: 'static, Role, Clock, L>
-    Call<T, I, Request<'a, S, N, E, O, Role, Clock>, L>
+impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock> SendRequest
+    for Request<'a, S, N, E, O, Role, Clock>
 {
-    pub async fn send(self) -> Reply<O, Clock> {
-        self.into_request().send().await
-    }
+    type Reply = Reply<O, Clock>;
 
-    #[cfg(any(
-        feature = "tokio",
-        all(feature = "std_thread", not(target_family = "wasm")),
-        feature = "embassy",
-        feature = "browser_local"
-    ))]
-    pub fn timeout(self, duration: Duration) -> crate::Timeout<Request<'a, S, N, E, O, Role, Clock>>
-    where
-        Clock: crate::local::clock::AktorClock,
-    {
-        self.into_request().timeout(duration)
+    async fn send(self) -> Self::Reply {
+        self.send().await
     }
 }
-impl<'a, T, I, S: 'static, const N: usize, E, Role, Clock, L>
-    Call<T, I, Request<'a, S, N, E, (), Role, Clock>, L>
+#[cfg(any(
+    feature = "tokio",
+    all(feature = "std_thread", not(target_family = "wasm")),
+    feature = "embassy",
+    feature = "browser_local"
+))]
+impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock> TimeoutRequest
+    for Request<'a, S, N, E, O, Role, Clock>
+where
+    Clock: crate::local::clock::AktorClock,
 {
-    pub async fn cast(self) {
-        self.into_request().cast().await;
+    type Timed = crate::Timeout<Self>;
+
+    fn timeout(self, duration: Duration) -> Self::Timed {
+        self.timeout(duration)
+    }
+}
+impl<'a, S: 'static, const N: usize, E, Role, Clock> CastRequest
+    for Request<'a, S, N, E, (), Role, Clock>
+{
+    type Output = ();
+
+    async fn cast(self) {
+        self.cast().await;
     }
 }

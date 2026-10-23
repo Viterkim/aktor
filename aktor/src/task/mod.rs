@@ -63,6 +63,10 @@ pub struct Message<S> {
 }
 
 trait Job<S> {
+    fn service_id(&self) -> Option<*const ()> {
+        None
+    }
+
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

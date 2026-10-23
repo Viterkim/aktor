@@ -70,6 +70,10 @@ pub struct Message<S> {
 }
 
 trait Job<S>: Send + Sync {
+    fn service_id(&self) -> Option<*const ()> {
+        None
+    }
+
     fn run<'a>(
         &'a self,
         state: &'a mut S,

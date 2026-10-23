@@ -125,13 +125,13 @@ impl AktorGroup {
     ) -> Result<Aktor<S>, StartError> {
         let setup = move || Ok::<_, AktorSetupError>(value);
         let cleanup = |_| Ok::<_, AktorCleanupError>(());
-        self.spawn(ActorArgs::new(name, setup, cleanup)).await
+        self.spawn(AktorArgs::new(name, setup, cleanup)).await
     }
 
     /// Start an actor in this group.
     pub async fn spawn<S, Setup, Cleanup, Output>(
         &mut self,
-        args: ActorArgs<Setup, Cleanup>,
+        args: AktorArgs<Setup, Cleanup>,
     ) -> Result<Aktor<S>, StartError>
     where
         S: 'static,
@@ -139,14 +139,14 @@ impl AktorGroup {
         Setup: FnOnce() -> Result<S, crate::AktorSetupError> + Send + 'static,
         Cleanup: FnMut(S) -> Output + Send + 'static,
     {
-        let ActorArgs {
+        let AktorArgs {
             name,
             capacity,
             setup,
             mut cleanup,
         } = args;
 
-        self.spawn_async(ActorArgs {
+        self.spawn_async(AktorArgs {
             name,
             capacity,
             setup: move || core::future::ready(setup()),
@@ -157,7 +157,7 @@ impl AktorGroup {
 
     pub async fn spawn_async<S, Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         &mut self,
-        args: ActorArgs<Setup, Cleanup>,
+        args: AktorArgs<Setup, Cleanup>,
     ) -> Result<Aktor<S>, StartError>
     where
         S: 'static,
@@ -173,7 +173,7 @@ impl AktorGroup {
 
     pub async fn spawn_async_with_hooks<S, Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         &mut self,
-        args: ActorArgs<Setup, Cleanup>,
+        args: AktorArgs<Setup, Cleanup>,
         hooks: crate::listener::hooks::AktorHooks<S>,
     ) -> Result<Aktor<S>, StartError>
     where
@@ -198,7 +198,7 @@ impl AktorGroup {
     #[doc(hidden)]
     pub async fn spawn_async_on<S, Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         &mut self,
-        args: ActorArgs<Setup, Cleanup>,
+        args: AktorArgs<Setup, Cleanup>,
         hooks: crate::listener::hooks::AktorHooks<S>,
         standard: bool,
     ) -> Result<Aktor<S>, StartError>
@@ -210,7 +210,7 @@ impl AktorGroup {
         Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
         CleanupFuture: Future<Output = Output>,
     {
-        let ActorArgs {
+        let AktorArgs {
             name,
             capacity,
             setup,
@@ -225,7 +225,7 @@ impl AktorGroup {
         };
 
         self.spawn_async_initial_on_reported::<S, _, _, _, _, _>(
-            ActorArgs {
+            AktorArgs {
                 name,
                 capacity,
                 setup: move || async move {
@@ -273,7 +273,7 @@ impl AktorGroup {
         CleanupFuture,
     >(
         &mut self,
-        args: ActorArgs<Setup, Cleanup>,
+        args: AktorArgs<Setup, Cleanup>,
         hooks: crate::listener::hooks::AktorHooks<S>,
         standard: bool,
         describe_cleanup: fn(&AktorFailure) -> String,
@@ -293,7 +293,7 @@ impl AktorGroup {
             AktorExecution::TokioThread
         };
 
-        let ActorArgs {
+        let AktorArgs {
             name,
             capacity,
             setup,

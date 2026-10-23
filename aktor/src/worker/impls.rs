@@ -58,7 +58,11 @@ impl<T> WorkerError<T> {
         }
     }
 
-    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    #[cfg(all(
+        feature = "wasm_browser_workers",
+        target_family = "wasm",
+        target_os = "unknown"
+    ))]
     #[doc(hidden)]
     pub fn data_error(mut self, error: WorkerError) -> Self {
         if let Some(diagnostics) = &mut self.diagnostics {
@@ -103,7 +107,11 @@ impl<T> WorkerError<T> {
         }
     }
 
-    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    #[cfg(all(
+        feature = "wasm_browser_workers",
+        target_family = "wasm",
+        target_os = "unknown"
+    ))]
     pub fn without_data<U>(self) -> WorkerError<U> {
         WorkerError {
             outcome: self.outcome,

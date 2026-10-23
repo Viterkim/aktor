@@ -9,6 +9,11 @@ pub struct Registration(pub fn() -> Option<Registered>);
 inventory::collect!(Registration);
 
 type Run = for<'a> fn(&'a mut dyn Any, &'a [u8]) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>;
+#[cfg(feature = "testing")]
+type MockRun = for<'a> fn(
+    &'a mut crate::testing::Handlers,
+    &'a [u8],
+) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>;
 
 pub struct Registered {
     name: &'static str,
@@ -17,15 +22,24 @@ pub struct Registered {
     input: &'static str,
     output: &'static str,
     codec: &'static str,
+    remote: bool,
     run: Run,
+    #[cfg(feature = "testing")]
+    mock: MockRun,
 }
 impl Registered {
-    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-    pub(super) fn name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         self.name
     }
 
-    pub(super) fn execute<'a>(
+    fn signature(&self) -> String {
+        format!(
+            "{}: {} -> {}{}",
+            self.name, self.input, self.output, self.codec,
+        )
+    }
+
+    pub fn execute<'a>(
         &self,
         state: &'a mut dyn Any,
         input: &'a [u8],
@@ -37,14 +51,25 @@ impl Registered {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Operations(pub Vec<String>);
 impl Operations {
+    pub fn for_remote<S: 'static, Role: 'static>() -> Self {
+        let mut operations: Vec<_> = registered::<S, Role>()
+            .filter(|operation| operation.remote)
+            .map(|operation| operation.signature())
+            .collect();
+        operations.sort_unstable();
+        Self(operations)
+    }
+
+    pub fn supports(&self, required: &Self) -> bool {
+        required
+            .0
+            .iter()
+            .all(|operation| self.0.binary_search(operation).is_ok())
+    }
+
     pub fn for_actor<S: 'static, Role: 'static>() -> Self {
         let mut operations: Vec<_> = registered::<S, Role>()
-            .map(|operation| {
-                format!(
-                    "{}: {} -> {}{}",
-                    operation.name, operation.input, operation.output, operation.codec
-                )
-            })
+            .map(|operation| operation.signature())
             .collect();
 
         operations.sort_unstable();
@@ -54,7 +79,24 @@ impl Operations {
 
 pub struct Registry(Vec<Registered>);
 impl Registry {
-    pub(super) fn resolve(&self, name: &str) -> Option<&Registered> {
+    #[cfg(feature = "testing")]
+    pub async fn dispatch_mock(
+        &self,
+        handlers: &mut crate::testing::Handlers,
+        name: String,
+        input: Vec<u8>,
+    ) -> Result<Vec<u8>, WorkerError> {
+        let operation = self.resolve(&name).ok_or_else(|| {
+            WorkerError::new(CallError::NotAdmitted, WorkerCause::UnknownOperation(name))
+        })?;
+        (operation.mock)(handlers, &input).await
+    }
+
+    pub fn for_remote<S: 'static, Role: 'static>() -> Result<Self, WorkerError> {
+        Self::collect(registered::<S, Role>().filter(|operation| operation.remote))
+    }
+
+    pub fn resolve(&self, name: &str) -> Option<&Registered> {
         if self.0.len() <= 16 {
             return self.0.iter().find(|operation| operation.name == name);
         }
@@ -72,7 +114,11 @@ impl Registry {
     }
 
     pub fn for_actor<S: 'static, Role: 'static>() -> Result<Self, WorkerError> {
-        let mut operations: Vec<_> = registered::<S, Role>().collect();
+        Self::collect(registered::<S, Role>())
+    }
+
+    fn collect(operations: impl Iterator<Item = Registered>) -> Result<Self, WorkerError> {
+        let mut operations: Vec<_> = operations.collect();
 
         operations.sort_unstable_by_key(|operation| operation.name);
 
@@ -88,18 +134,8 @@ impl Registry {
         Ok(Self(operations))
     }
 
-    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     pub fn operations(&self) -> Operations {
-        let mut operations: Vec<_> = self
-            .0
-            .iter()
-            .map(|operation| {
-                format!(
-                    "{}: {} -> {}{}",
-                    operation.name, operation.input, operation.output, operation.codec
-                )
-            })
-            .collect();
+        let mut operations: Vec<_> = self.0.iter().map(Registered::signature).collect();
 
         operations.sort_unstable();
         Operations(operations)
@@ -119,7 +155,7 @@ impl Registry {
     }
 }
 
-pub struct Exporter<E, C = crate::dispatch::SerdeCodec> {
+pub struct Exporter<E, C = crate::dispatch::DataCodec> {
     pub name: &'static str,
     pub export: PhantomData<(E, C)>,
 }
@@ -137,6 +173,7 @@ where
     E: Export<C> + Default,
     C: Codec<E::Input> + Codec<E::Output>,
     E::Role: 'static,
+    E::Input: 'static,
 {
     fn register(self) -> Option<Registered> {
         Some(Registered {
@@ -146,9 +183,46 @@ where
             input: type_name::<E::Input>(),
             output: type_name::<E::Output>(),
             codec: <C as Codec<E::Input>>::NAME,
+            remote: E::REMOTE,
             run: run::<E, C>,
+            #[cfg(feature = "testing")]
+            mock: run_mock::<E, C>,
         })
     }
+}
+
+#[cfg(feature = "testing")]
+fn run_mock<'a, E, C>(
+    handlers: &'a mut crate::testing::Handlers,
+    input: &'a [u8],
+) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>
+where
+    E: Export<C>,
+    E::Input: 'static,
+    C: Codec<E::Input> + Codec<E::Output>,
+{
+    Box::pin(async move {
+        let input = <C as Codec<E::Input>>::decode(input).map_err(|mut error| {
+            error.outcome = CallError::Discarded;
+            error
+        })?;
+        let output = handlers
+            .run(E::NAME, Box::new(input))
+            .await
+            .map_err(|error| {
+                WorkerError::new(
+                    CallError::Discarded,
+                    WorkerCause::UnknownOperation(error.operation),
+                )
+            })?;
+        let output = output
+            .downcast::<E::Output>()
+            .map_err(|_| WorkerError::new(CallError::OutcomeUnknown, WorkerCause::Protocol))?;
+        <C as Codec<E::Output>>::encode(&output).map_err(|mut error| {
+            error.outcome = CallError::OutcomeUnknown;
+            error
+        })
+    })
 }
 
 fn run<'a, E, C>(
@@ -190,12 +264,27 @@ pub async fn dispatch<S: 'static, Role: 'static>(
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __aktor_register {
+    ($export:ty, $name:expr, $codec:ty, true) => {
+        const _: () = {
+            fn require_codec<E, C>()
+            where
+                E: $crate::dispatch::Export<C>,
+                C: $crate::worker::Codec<E::Input> + $crate::worker::Codec<E::Output>,
+            {}
+
+            let _ = require_codec::<$export, $codec>;
+        };
+        $crate::__aktor_register!($export, $name, $codec);
+    };
+    ($export:ty, $name:expr, $codec:ty, false) => {
+        $crate::__aktor_register!($export, $name, $codec);
+    };
     ($export:ty, $name:expr, $codec:ty) => {
         const _: () = {
             fn registration() -> ::core::option::Option<$crate::worker::Registered> {
                 use $crate::worker::Register as _;
 
-                // The fallback keeps local Rust calls free of Serde requirements.
+                // Local calls don't need a transport codec.
                 (&&$crate::worker::Exporter::<$export, $codec> {
                     name: $name,
                     export: ::core::marker::PhantomData,
@@ -270,7 +359,17 @@ mod tests {
             input: "()",
             output: "()",
             codec: "",
+            remote: false,
             run,
+            #[cfg(feature = "testing")]
+            mock: |_, _| {
+                Box::pin(async {
+                    Err(WorkerError::new(
+                        CallError::NotAdmitted,
+                        WorkerCause::Protocol,
+                    ))
+                })
+            },
         })
     }
 
@@ -336,46 +435,6 @@ mod tests {
                 "catalogue::operation_missing",
             ] {
                 assert!(registry.resolve(unknown).is_none());
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "run in release mode for catalogue lookup measurements"]
-    fn lookup_cost() {
-        use std::{hint::black_box, time::Instant};
-
-        println!("catalogue,position,lookups,ns_per_lookup");
-
-        for count in [1, 16, 85, 256] {
-            let registry = Registry(
-                (0..count)
-                    .map(|index| {
-                        let mut operation = operation::<First>(first).unwrap();
-
-                        operation.name =
-                            Box::leak(format!("catalogue::operation_{index:03}").into_boxed_str());
-                        operation
-                    })
-                    .collect(),
-            );
-
-            for (position, name) in [
-                ("first", registry.0[0].name),
-                ("last", registry.0[count - 1].name),
-                ("unknown", "catalogue::operation_missing"),
-            ] {
-                let calls = 1_000_000;
-                let start = Instant::now();
-
-                for _ in 0..calls {
-                    black_box(registry.resolve(black_box(name)));
-                }
-
-                println!(
-                    "{count},{position},{calls},{:.2}",
-                    start.elapsed().as_nanos() as f64 / calls as f64
-                );
             }
         }
     }

@@ -2,6 +2,10 @@ use super::super::*;
 use futures_util::FutureExt;
 
 impl<S> Message<S> {
+    pub fn service_id(&self) -> Option<*const ()> {
+        self.job.service_id()
+    }
+
     pub fn counted(&self) -> bool {
         self.counted
     }

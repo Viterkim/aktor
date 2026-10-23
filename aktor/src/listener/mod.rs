@@ -42,8 +42,7 @@ pub struct SpawnArgs<Setup, Cleanup> {
 }
 
 pub struct Handle<S, Role = ()> {
-    // Submission needs this across modules; callers must go through requests.
-    pub(crate) inner: Arc<HandleInner<S>>,
+    pub inner: Arc<HandleInner<S>>,
     role: PhantomData<fn() -> Role>,
 }
 

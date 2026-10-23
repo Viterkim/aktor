@@ -84,7 +84,7 @@ async fn listening() -> Result<(), &'static str> {
     };
 
     let cleanup = async |_| Ok::<_, AktorError>(());
-    let mut args = ActorArgs::new("lines", setup, cleanup);
+    let mut args = AktorArgs::new("lines", setup, cleanup);
 
     args.capacity = 1;
 
@@ -118,7 +118,7 @@ async fn grouped() -> Result<(), &'static str> {
         .run(
             async move |group| {
                 let actor = group
-                    .spawn::<State, 1, ()>(ActorArgs {
+                    .spawn::<State, 1, ()>(AktorArgs {
                         name: "lines".into(),
                         capacity: 1,
                         setup: async || {
@@ -155,7 +155,7 @@ async fn grouped() -> Result<(), &'static str> {
         .run(
             async |group| {
                 let actor = group
-                    .spawn::<State, 1, ()>(ActorArgs {
+                    .spawn::<State, 1, ()>(AktorArgs {
                         name: "stuck cleanup".into(),
                         capacity: 1,
                         setup: async || {

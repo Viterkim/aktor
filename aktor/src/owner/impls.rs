@@ -382,7 +382,7 @@ impl OwnerError {
 #[cfg(all(test, feature = "std_thread", feature = "tokio"))]
 mod tests {
     use super::*;
-    use crate::{ActorArgs, AktorCleanupError, AktorGroup, AktorSetupError, FailurePolicy};
+    use crate::{AktorArgs, AktorCleanupError, AktorGroup, AktorSetupError, FailurePolicy};
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
@@ -621,7 +621,7 @@ mod tests {
             group.start_standard().unwrap();
             group
                 .spawn_async_on(
-                    ActorArgs::new(args.name, args.setup, args.cleanup),
+                    AktorArgs::new(args.name, args.setup, args.cleanup),
                     Default::default(),
                     true,
                 )

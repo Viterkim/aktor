@@ -1,5 +1,4 @@
-//! The concrete types behind AktorKind::TokioThread and the other setup choices.
-//! Constructors and backend bounds live in impls.rs, AktorExecution lists the report variants.
+//! Where the actor runs. Use AktorExecution to read the kind from a report.
 
 #[cfg(feature = "local")]
 use crate::{AktorSetupError, local::clock::AktorGroupClock, message::LocalFuture};
@@ -95,4 +94,14 @@ pub trait AktorMode {
     type Interval<S: 'static>: ?Sized;
 
     const EXECUTION: AktorExecution;
+}
+
+#[cfg(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_os = "unknown",
+    target_feature = "atomics"
+))]
+pub struct BrowserThread {
+    pub program: alloc::string::String,
 }

@@ -1,19 +1,19 @@
 [workspace]
 resolver = "3"
-members = ["aktor", "aktor-macros"]
+members = ["aktor", "aktor-macros", "aktor-remote"]
 exclude = ["integrations"]
 
 [workspace.package]
 license = "MIT-0"
 readme = "README.md"
 repository = "https://github.com/Viterkim/aktor"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 rust-version = "1.89"
 publish = true
 
 [workspace.dependencies]
-aktor-macros = { version = "=0.0.8", path = "aktor-macros" }
+aktor-macros = { version = "=0.0.9", path = "aktor-macros" }
 er = { version = "0.8", default-features = false, features = ["macros"] }
 proc-macro-crate = "3.5"
 proc-macro2 = "1.0"
@@ -36,6 +36,8 @@ serde = { version = "1", features = ["derive"] }
 # Wasm constructor rooting uses inventory's node layout.
 inventory = "=0.3.25"
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+bytemuck = { version = "1", default-features = false }
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 gloo-timers = { version = ">=0.3, <0.5", features = ["futures"] }
@@ -43,6 +45,10 @@ web-sys = { version = "0.3", features = ["Worker", "WorkerOptions", "WorkerType"
 js-sys = "0.3"
 rustix = { version = "1.1", default-features = false, features = ["process"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+tempfile = "3"
+getrandom = "0.4"
+utp = { package = "librqbit-utp", version = "0.7" }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

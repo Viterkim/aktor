@@ -25,6 +25,7 @@ pub fn supports(function: &input::Function) -> syn::Result<bool> {
 }
 
 pub fn expand(options: input::Options, mut function: input::Function) -> syn::Result<TokenStream> {
+    let remote = options.remote;
     let output = match &function.signature.output {
         ReturnType::Default => parse_quote!(()),
         ReturnType::Type(_, ty) => (**ty).clone(),
@@ -197,6 +198,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             "NAME",
             "request",
             "export",
+            "handler",
             "latest",
             "LatestSender",
             "Latest",
@@ -230,15 +232,15 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     scope.visit_path_mut(&mut aktor);
 
-    let (wire, transport_note) = if options.data {
+    let (wire, transport_note) = if options.serde {
         (
-            quote!(#aktor::dispatch::DataCodec),
-            "Check the actor's state type and actor marker. #[aktor(data)] worker arguments and results must implement AktorData.",
+            quote!(#aktor::dispatch::SerdeCodec),
+            "Check the actor's state type and actor marker. #[aktor(serde)] transport arguments and results must implement Serialize and DeserializeOwned.",
         )
     } else {
         (
-            quote!(#aktor::dispatch::SerdeCodec),
-            "Check the actor's state type and actor marker. Browser worker arguments and results must implement Serialize and DeserializeOwned.",
+            quote!(#aktor::dispatch::DataCodec),
+            "Check the actor's state type and actor marker. Transport arguments and results must implement AktorData.",
         )
     };
 
@@ -302,6 +304,19 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 }
             }
 
+            impl<#latest_inner: #aktor::latest::SendLatest<#input_type>> #aktor::latest::SendLatest<#input_type> for LatestSender<#latest_inner> {
+                fn send(&self, #input_name: #input_type) {
+                    #aktor::latest::SendLatest::send(&self.inner, #input_name);
+                }
+            }
+            impl<#latest_inner: #aktor::call::RetryRequest> #aktor::call::RetryRequest for LatestSender<#latest_inner> {
+                type Options = #latest_inner::Options;
+
+                fn retry(self, options: Self::Options) -> Self {
+                    Self { inner: #aktor::call::RetryRequest::retry(self.inner, options) }
+                }
+            }
+
             #[doc(hidden)]
             pub struct #latest_factory<#latest_state, #latest_input, #latest_output, #latest_role, #latest_lease, #latest_future> {
                 pub factory: fn(#latest_lease, #latest_input) -> #latest_future,
@@ -327,13 +342,11 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #state_type, #input_type, #output, #latest_lease, #role, #wire
                 >>::Results;
 
-                fn start(
+                fn create(
                     self,
                     #parameter: #target,
-                    #input_name: #input_type,
                     #operation_name: #aktor::operation::Operation
                 ) -> (Self::Sender, Self::Results) {
-                    let (#(#bindings,)*) = #input_name;
                     let (#inner_name, #results_name) = <#target as #aktor::latest::TypedSession<
                         #state_type, #input_type, #output, #latest_lease, #role, #wire
                     >>::session(
@@ -345,7 +358,6 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                         self.factory,
                     );
                     let #sender_name = LatestSender { inner: #inner_name };
-                    #sender_name.send(#(#bindings),*);
                     (#sender_name, #results_name)
                 }
             }
@@ -567,6 +579,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             #[derive(Default)]
             struct #adapter;
             impl #aktor::dispatch::Export<#wire> for #adapter {
+                const REMOTE: bool = #remote;
+                const NAME: &'static str = NAME;
+
                 type State = #state_type;
                 type Input = #input_type;
                 type Output = #output;
@@ -593,7 +608,23 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 #adapter
             }
 
-            #aktor::__aktor_register!(#adapter, NAME, #wire);
+            #aktor::__aktor_testing! {
+                pub fn handler<#function_parameter>(mut #function_name: #function_parameter) -> #aktor::testing::Handler<
+                    impl #aktor::dispatch::Export<#wire, State = #state_type, Input = #input_type, Output = #output, Role = #role>,
+                    impl ::core::ops::AsyncFnMut(#input_type) -> #output + ::core::marker::Send + 'static,
+                    #wire,
+                >
+                where
+                    #function_parameter: ::core::ops::AsyncFnMut(#(#input_types),*) -> #output + ::core::marker::Send + 'static,
+                {
+                    #aktor::testing::handler(export(), async move |#input_name: #input_type| {
+                        let (#(#bindings,)*) = #input_name;
+                        #function_name(#(#bindings),*).await
+                    })
+                }
+            }
+
+            #aktor::__aktor_register!(#adapter, NAME, #wire, #remote);
         }
     })
 }

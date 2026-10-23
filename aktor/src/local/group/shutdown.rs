@@ -2,7 +2,7 @@ use super::driver::{cancel_callers, capture, contain, poll_owners};
 use super::*;
 
 impl<Clock: AktorGroupClock> AktorGroup<Clock> {
-    pub(super) async fn finish<Cleanup, CleanupFuture>(self, cleanup: Cleanup) -> ShutdownReport
+    pub async fn finish<Cleanup, CleanupFuture>(self, cleanup: Cleanup) -> ShutdownReport
     where
         Cleanup: FnOnce(ShutdownReport) -> CleanupFuture,
         CleanupFuture: Future<Output = Result<(), AktorError>>,

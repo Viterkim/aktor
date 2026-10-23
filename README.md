@@ -1,10 +1,10 @@
 # Aktor, not an actor framework
 
-Write normal functions, call them with a handle and .await. Go to definition takes you to the actual SQL or whatever you wrote. One owner runs the calls one after the other, and the same functions work on a native thread or a browser worker.
+Write normal functions, call them with a handle and .await. Go to definition takes you to the actual SQL or whatever you wrote. The actor runs one call at a time, on a native thread or a browser worker.
 
 ```toml
 [dependencies]
-aktor = { version = "0.0.8", features = ["tokio"] }
+aktor = { version = "0.0.9", features = ["tokio"] }
 ```
 
 The API can change before 0.1.
@@ -45,36 +45,14 @@ let actors = aktor_start(AktorSetup {
 let count = add(&actors.handles, 5).await;
 ```
 
-TokioThread owns the counter on its own thread. Calls wait for queue space. Keep actors alive while using its handles, dropping it starts shutdown.
+Keep actors alive, dropping it starts shutdown. Await actors.shutdown() to finish cleanup and get the report.
 
-## A Tokio app
+An actor failure shuts down the group and runs cleanup. A query returning Err just gives you the error. A native actor stuck past the shutdown deadline takes the process down with it.
 
-Aktor does the channel plumbing. Open your resources in start and close them in end. If an actor fails, the group shuts down and runs cleanup, then your shutdown closure can tell the app to close. A query returning Err still returns it to the caller.
-
-With Tokio's signal feature enabled, your main can do this around a server returning io::Result<()>:
+## SQLite, including the browser
 
 ```rust
-let kill = actors.killswitch();
-let result = tokio::select! {
-    result = serve_http(&actors.handles) => result,
-    result = tokio::signal::ctrl_c() => result,
-    _ = kill.wait_stopping() => Ok(()),
-};
-
-let report = actors.shutdown().await;
-result?;
-
-if report.failed() {
-    return Err(AktorRunError::from(report).into());
-}
-```
-
-## Multiplatform SQLite example (Tokio and web worker)
-
-Write the query once and call it the same way on either platform.
-
-```rust
-#[aktor(data)]
+#[aktor]
 pub async fn insert_user(db: &Connection, name: String) -> Result<i64, String> {
     db.execute("INSERT INTO user (name) VALUES (?)", [name])
         .map_err(|error| error.to_string())?;
@@ -82,47 +60,20 @@ pub async fn insert_user(db: &Connection, name: String) -> Result<i64, String> {
     Ok(db.last_insert_rowid())
 }
 
-#[cfg(not(target_family = "wasm"))]
-let database_actor = AktorNew {
-    name: AktorName::new("sqlite"),
-    role: AktorNoRole,
-    kind: AktorKind::TokioThread,
-    closures: sqlite_closures(),
-    options: Default::default(),
-};
-
-#[cfg(target_family = "wasm")]
-let database_actor = AktorWorkerNew::<Connection, _> {
-    name: AktorName::new("sqlite"),
-    role: AktorNoRole,
-    kind: AktorKind::BrowserWebWorker("/database-worker.js"),
-    config: (),
-    options: Default::default(),
-};
-
-let actors = aktor_start(AktorSetup {
-    actors: database_actor,
-    shutdown: |_report| { /* tell your app to close */ },
-    options: Default::default(),
-}).await?;
-
 let id = insert_user(&actors.handles, "Katten".into()).await?;
 ```
 
-sqlite_closures opens the connection in start and closes it in end. The worker entry point serves those closures:
+Open the connection in start and close it in end. Use TokioThread on native, or [BrowserWebWorker](integrations/worker/README.md) to open it in a browser worker. Same query, same call.
 
-```rust
-worker::serve_setup(AktorNoRole, Default::default(), |()| sqlite_closures())
-    .await?.wait().await?;
-```
-
-#[aktor(data)] uses AktorData for worker arguments and results, including the query's error. Derive AktorData on your own transported types. The connection stays with its owner. Inside another query, pass that connection directly, passing its handle queues behind yourself.
+Inside another query, pass the connection directly, passing its handle queues behind yourself.
 
 ## More
 
 [Examples](aktor/docs/examples.md)
 
-[Browser workers](integrations/worker/README.md)
+[Shared memory browser threads](integrations/threads/README.md)
+
+[Remote services](aktor-remote/README.md)
 
 [Embassy](integrations/embassy/README.md)
 

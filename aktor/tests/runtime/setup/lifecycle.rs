@@ -203,34 +203,41 @@ async fn data() {
     let counted = cleaned.clone();
     let result = aktor_start(AktorSetup {
         actors: aktor_setups! {
-                    ready: AktorNew {
-
-                        name: AktorName::new("ready"),
-                        role: AktorNoRole,
-                        kind: AktorKind::TokioThread,
-                        closures: AktorClosures {
-        start: async || Ok::<_, AktorSetupError>(0_u32),
-                            end: async move |_: u32| {
-                                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                Err(AktorCleanupError::new("rollback cleanup refused", ()))
-                            },
-                             intervals: vec![], before_each: None, after_each: None,
-                        },
-                        options: AktorNewOptions { capacity: 32 },
+            ready: AktorNew {
+                name: AktorName::new("ready"),
+                role: AktorNoRole,
+                kind: AktorKind::TokioThread,
+                closures: AktorClosures {
+                    start: async || Ok::<_, AktorSetupError>(0_u32),
+                    end: async move |_: u32| {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(AktorCleanupError::new("rollback cleanup refused", ()))
                     },
-                    failed: AktorNew {
-
-                        name: AktorName::new("failed"),
-                        role: AktorNoRole,
-                        kind: AktorKind::StdThread,
-                        closures: AktorClosures {
-        start: async || Err::<u32, _>(AktorSetupError {
-                        diagnostics: "setup data".into(),
-                        data: (),
-                    }),  end: (), intervals: vec![], before_each: None, after_each: None },
-                        options: AktorNewOptions { capacity: 32 },
-                    },
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
                 },
+                options: AktorNewOptions { capacity: 32 },
+            },
+            failed: AktorNew {
+                name: AktorName::new("failed"),
+                role: AktorNoRole,
+                kind: AktorKind::StdThread,
+                closures: AktorClosures {
+                    start: async || {
+                        Err::<u32, _>(AktorSetupError {
+                            diagnostics: "setup data".into(),
+                            data: (),
+                        })
+                    },
+                    end: (),
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
+                options: AktorNewOptions { capacity: 32 },
+            },
+        },
         shutdown: |_| {},
         options: AktorOptions {
             shutdown_grace: Duration::from_secs(5),
@@ -369,7 +376,7 @@ async fn diagnostic() {
     let mut group = local::AktorGroup::<local::clock::Tokio>::new();
     let mut driver = group.listen().unwrap();
     let _handle = group
-        .spawn::<(), 1, ()>(ActorArgs {
+        .spawn::<(), 1, ()>(AktorArgs {
             name: "driven cleanup only".into(),
             capacity: 1,
             setup: async || Ok(()),

@@ -614,7 +614,7 @@ async fn local_deadline() {
         .unwrap();
 
     let _handle = group
-        .spawn::<u32, 1, ()>(ActorArgs {
+        .spawn::<u32, 1, ()>(AktorArgs {
             name: "pending setup".into(),
             capacity: 1,
             setup: async || {
@@ -699,7 +699,7 @@ async fn local_driver_loss() {
         let hook = UnpolledHook;
         let _handle = group
             .spawn_with_hooks(
-                ActorArgs::new(
+                AktorArgs::new(
                     "unpolled local owner",
                     async || core::future::pending::<Result<u32, AktorSetupError>>().await,
                     async |_| Ok(()),

@@ -168,7 +168,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         name: impl Into<String>,
         value: S,
     ) -> Result<Handle<S, N, (), (), Clock>, ActorError> {
-        self.spawn(ActorArgs {
+        self.spawn(AktorArgs {
             name: name.into(),
             capacity: N,
             setup: async move || Ok(value),
@@ -178,7 +178,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
 
     pub fn spawn<S: 'static, const N: usize, E: 'static>(
         &mut self,
-        args: ActorArgs<
+        args: AktorArgs<
             impl AsyncFnOnce() -> Result<S, AktorSetupError<E>> + 'static,
             impl AsyncFnOnce(S) -> Result<(), AktorCleanupError<E>> + 'static,
         >,
@@ -198,7 +198,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     #[doc(hidden)]
     pub fn spawn_with_hooks<S: 'static, E: 'static>(
         &mut self,
-        args: ActorArgs<
+        args: AktorArgs<
             impl AsyncFnOnce() -> Result<S, AktorSetupError<E>> + 'static,
             impl AsyncFnOnce(S) -> Result<(), AktorCleanupError<E>> + 'static,
         >,
@@ -211,7 +211,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     #[doc(hidden)]
     pub fn spawn_with_custom<S: 'static, E: 'static, Runner, SetupOutput, CleanupOutput>(
         &mut self,
-        args: ActorArgs<
+        args: AktorArgs<
             impl AsyncFnOnce() -> SetupOutput + 'static,
             impl AsyncFnOnce(S) -> CleanupOutput + 'static,
         >,
@@ -229,7 +229,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
 
     fn spawn_in<S: 'static, const N: usize, E: 'static, Runner, SetupOutput, CleanupOutput>(
         &mut self,
-        args: ActorArgs<
+        args: AktorArgs<
             impl AsyncFnOnce() -> SetupOutput + 'static,
             impl AsyncFnOnce(S) -> CleanupOutput + 'static,
         >,
@@ -362,7 +362,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         }))
     }
 
-    pub(super) fn claim_listener(&self) -> Result<(), AktorGroupError> {
+    pub fn claim_listener(&self) -> Result<(), AktorGroupError> {
         if self.control.stopping.get() {
             return Err(AktorGroupError::new("this group has already stopped"));
         }

@@ -10,16 +10,17 @@ fi
 version=$1
 sed -i -E "s/^version = \"[^\"]+\"$/version = \"$version\"/" Cargo.toml
 sed -i -E "s/^(aktor-macros = \{ version = \"=)[^\"]+/\1$version/" Cargo.toml
+sed -i -E "s/^(aktor = \{ version = \"=)[^\"]+/\1$version/" aktor-remote/Cargo.toml
 
 shopt -s globstar nullglob
-for doc in README.md aktor-macros/README.md aktor/docs/**/*.md; do
+for doc in README.md aktor-macros/README.md aktor-remote/README.md aktor/docs/**/*.md; do
     sed -i -E \
-        -e "s/^((aktor|aktor-macros) = \")[^\"]+/\1$version/" \
-        -e "s/^((aktor|aktor-macros) = \{ version = \")[^\"]+/\1$version/" \
+        -e "s/^((aktor|aktor-macros|aktor-remote) = \")[^\"]+/\1$version/" \
+        -e "s/^((aktor|aktor-macros|aktor-remote) = \{ version = \")[^\"]+/\1$version/" \
         "$doc"
 done
 
-cargo update --offline -p aktor -p aktor-macros
-cargo update --offline --manifest-path integrations/Cargo.toml -p aktor -p aktor-macros
+cargo update --offline -p aktor -p aktor-macros -p aktor-remote
+cargo update --offline --manifest-path integrations/Cargo.toml -p aktor -p aktor-macros -p aktor-remote
 
-printf 'aktor + aktor-macros are now %s\n' "$version"
+printf 'aktor + aktor-macros + aktor-remote are now %s\n' "$version"

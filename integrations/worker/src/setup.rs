@@ -414,7 +414,10 @@ pub async fn bevy_setup_check() -> Result<bool, JsValue> {
     };
 
     let actors = aktor_start(AktorSetup {
-        actors: aktor_setups! { local: local_setup, task: task_setup },
+        actors: aktor_setups! {
+            local: local_setup,
+            task: task_setup,
+        },
         shutdown: |_| {},
         options: AktorOptions {
             shutdown_grace: Duration::from_secs(5),

@@ -1,9 +1,10 @@
+use aktor::AktorData;
 use serde::{Deserialize, Serialize};
 
 pub mod read;
 pub mod write;
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(AktorData, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageError {
     Sql(String),
     Missing(String),

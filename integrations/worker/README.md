@@ -1,10 +1,6 @@
 # Browser SQLite
 
-With wasm_browser_workers, SQLite runs in a worker and the page calls its functions as usual.
-
-Start it with AktorWorkerNew. The worker opens the database in worker::serve_setup. Both sides use the same build identity, change it when your wire types change.
-
-## Typed data
+Enable wasm_browser_workers. The page starts an AktorWorkerNew with BrowserWebWorker("/database-worker.js") and calls its functions:
 
 ```rust
 #[derive(aktor::AktorData)]
@@ -13,7 +9,7 @@ struct Record {
     bytes: Vec<u8>,
 }
 
-#[aktor::aktor(data)]
+#[aktor::aktor]
 async fn save(db: &mut Database, record: Record) -> Result<(), String> {
     db.save(record).await
 }
@@ -21,15 +17,16 @@ async fn save(db: &mut Database, record: Record) -> Result<(), String> {
 save(&worker, record).await?;
 ```
 
-Worker arguments and results have to be owned. #[aktor] uses Serde, #[aktor(data)] uses AktorData as above.
+Open SQLite in the worker's worker::serve_setup. Arguments and results must be owned. For Serde types, enable serde and use #[aktor(serde)].
 
-Install wasm32-unknown-unknown and wasm-bindgen-cli matching Cargo.lock, then from the repo root:
+Change worker::Options.build on both sides when you change transported types.
+
+With wasm32-unknown-unknown and wasm-bindgen-cli matching Cargo.lock:
 
 ```sh
 bash integrations/worker/build.sh
-cargo run --manifest-path ../aktor-extras/checks/Cargo.toml --bin browser -- "$PWD" serve
 ```
 
-Open the printed address. Enter stops the server. The browser runner lives in ../aktor-extras, AKTOR_EXTRAS can point to another copy.
+Serve integrations/worker/web from your app.
 
 [Example](src/browser.rs)

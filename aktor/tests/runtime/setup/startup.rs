@@ -9,42 +9,40 @@ async fn cancel() {
 
     let startup = aktor_start(AktorSetup {
         actors: aktor_setups! {
-                    ready: AktorNew {
+            ready: AktorNew {
+                name: AktorName::new("ready counter"),
+                role: AktorNoRole,
+                kind: AktorKind::TokioThread,
+                closures: AktorClosures {
+                    start: async || Ok::<_, AktorSetupError>(0_u32),
 
-                        name: AktorName::new("ready counter"),
-                        role: AktorNoRole,
-                        kind: AktorKind::TokioThread,
-                        closures: AktorClosures {
-        start: async || Ok::<_, AktorSetupError>(0_u32),
-
-                            end: async move |_: u32| {
-                                    end.notify_one();
-                                },
-                            intervals: vec![],
-                            before_each: None,
-                            after_each: None,
-                        },
-                        options: AktorNewOptions { capacity: 32 },
+                    end: async move |_: u32| {
+                        end.notify_one();
                     },
-                    waiting: AktorNew {
-
-                        name: AktorName::new("waiting counter"),
-                        role: AktorNoRole,
-                        kind: AktorKind::TokioThread,
-                        closures: AktorClosures {
-        start: async move || {
-                            beginning.notify_one();
-                            std::future::pending::<Result<u32, AktorSetupError>>().await
-                        },
-
-                            end: (),
-                            intervals: vec![],
-                            before_each: None,
-                            after_each: None,
-                        },
-                        options: AktorNewOptions { capacity: 32 },
-                    },
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
                 },
+                options: AktorNewOptions { capacity: 32 },
+            },
+            waiting: AktorNew {
+                name: AktorName::new("waiting counter"),
+                role: AktorNoRole,
+                kind: AktorKind::TokioThread,
+                closures: AktorClosures {
+                    start: async move || {
+                        beginning.notify_one();
+                        std::future::pending::<Result<u32, AktorSetupError>>().await
+                    },
+
+                    end: (),
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
+                options: AktorNewOptions { capacity: 32 },
+            },
+        },
         shutdown: |_| {},
         options: AktorOptions {
             shutdown_grace: Duration::from_secs(1),
@@ -279,21 +277,29 @@ async fn existing() {
         &group,
         aktor_setups! {
             first: AktorNew {
-
                 name: AktorName::new("first"),
                 role: aktors::Users,
                 kind: AktorKind::TokioThread,
                 closures: AktorClosures {
-start: async || Ok::<_, AktorSetupError>(17_u32),  end: (), intervals: vec![], before_each: None, after_each: None },
+                    start: async || Ok::<_, AktorSetupError>(17_u32),
+                    end: (),
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
                 options: AktorNewOptions { capacity: 32 },
             },
             second: AktorNew {
-
                 name: AktorName::new("second"),
                 role: aktors::Users,
                 kind: AktorKind::TokioTask,
                 closures: AktorClosures {
-start: async || Ok::<_, AktorSetupError>(23_u32),  end: (), intervals: vec![], before_each: None, after_each: None },
+                    start: async || Ok::<_, AktorSetupError>(23_u32),
+                    end: (),
+                    intervals: vec![],
+                    before_each: None,
+                    after_each: None,
+                },
                 options: AktorNewOptions { capacity: 32 },
             },
         },

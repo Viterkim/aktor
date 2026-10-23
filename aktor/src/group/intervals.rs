@@ -3,9 +3,9 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::io;
 use tokio::sync::mpsc;
 
-pub(super) type Pending = Pin<Box<dyn Future<Output = ()> + Send>>;
+pub type Pending = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-pub(super) fn drive<F: Future<Output = ShutdownReport>>(
+pub fn drive<F: Future<Output = ShutdownReport>>(
     control: Arc<Control>,
     closing: F,
 ) -> impl Future<Output = ShutdownReport> {
@@ -35,7 +35,7 @@ pub(super) fn drive<F: Future<Output = ShutdownReport>>(
 }
 
 impl AktorGroup {
-    pub(crate) fn spawn_interval(
+    pub fn spawn_interval(
         &self,
         future: impl Future<Output = ()> + Send + 'static,
     ) -> io::Result<()> {

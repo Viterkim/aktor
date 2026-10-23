@@ -1,7 +1,7 @@
 use super::*;
 use crate::setup::intervals::{LocalInterval, LocalIntervals};
 use crate::{
-    ActorArgs, AktorError,
+    AktorArgs, AktorError,
     local::{self, Request, clock::AktorGroupClock, hooks::AktorHooks},
     message::LocalFuture,
     operation::Operation,
@@ -142,7 +142,7 @@ where
     let handle = context
         .group
         .spawn_with_custom(
-            ActorArgs {
+            AktorArgs {
                 name: setup.name.name,
                 capacity: options.capacity,
                 setup: async move || {

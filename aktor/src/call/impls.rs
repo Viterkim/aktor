@@ -28,18 +28,11 @@ impl<T, I, R, L> Call<T, I, R, L> {
             crate::message::consumed();
         };
 
-        self.latest.start(target, input, self.operation)
+        let (sender, results) = self.latest.create(target, self.operation);
+        crate::latest::SendLatest::send(&sender, input);
+        (sender, results)
     }
 
-    #[cfg(any(
-        any(feature = "tokio", feature = "std_thread"),
-        feature = "local",
-        all(
-            feature = "wasm_browser_workers",
-            target_family = "wasm",
-            target_os = "unknown"
-        )
-    ))]
     pub fn into_request(mut self) -> R
     where
         R: Unpin,
@@ -53,6 +46,35 @@ impl<T, I, R, L> Call<T, I, R, L> {
         };
 
         (self.request)(target, input, self.operation)
+    }
+
+    /// Wait for queue admission and keep the reply for later.
+    pub async fn send(self) -> R::Reply
+    where
+        R: SendRequest + Unpin,
+    {
+        self.into_request().send().await
+    }
+
+    pub async fn cast(self) -> R::Output
+    where
+        R: CastRequest + Unpin,
+    {
+        self.into_request().cast().await
+    }
+
+    pub fn timeout(self, duration: core::time::Duration) -> R::Timed
+    where
+        R: TimeoutRequest + Unpin,
+    {
+        self.into_request().timeout(duration)
+    }
+
+    pub fn retry(self, options: R::Options) -> Retried<T, I, R, L>
+    where
+        R: RetryRequest + Unpin,
+    {
+        Retried::new(self, options)
     }
 }
 impl<T, I, R: Future, L> Future for Call<T, I, R, L> {

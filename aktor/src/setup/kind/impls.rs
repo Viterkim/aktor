@@ -225,3 +225,29 @@ mod worker {
     target_os = "unknown"
 ))]
 pub use worker::*;
+
+#[cfg(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_os = "unknown",
+    target_feature = "atomics"
+))]
+#[allow(non_snake_case)]
+pub fn BrowserThread(program: impl Into<alloc::string::String>) -> BrowserThread {
+    BrowserThread {
+        program: program.into(),
+    }
+}
+
+#[cfg(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_os = "unknown",
+    target_feature = "atomics"
+))]
+impl AktorMode for BrowserThread {
+    type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
+    type Interval<S: 'static> = dyn AktorIntervalLogic<S> + Send;
+
+    const EXECUTION: AktorExecution = AktorExecution::BrowserThread;
+}

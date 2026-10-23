@@ -1,6 +1,6 @@
 use crate::preferences::{read::read, write::write};
-use aktor::message::CallError;
 use aktor::*;
+use aktor::{dispatch::SerdeCodec, message::CallError};
 use er::*;
 use futures_util::FutureExt;
 use rusqlite::Connection;
@@ -27,7 +27,7 @@ async fn occupy(_: &Connection, millis: u32) -> u32 {
     millis
 }
 
-#[aktor]
+#[aktor(serde)]
 async fn pause(db: &Connection, millis: u32) -> u32 {
     timer(db, Rc::new(millis)).await
 }
@@ -250,7 +250,7 @@ impl Client {
 
     pub async fn latest_sequence(&self) -> Result<String, JsValue> {
         let running = pause(&self.worker, 150).send().await;
-        let write = write(&self.worker, "volume".into(), "0.9".into())
+        let writing = write(&self.worker, "volume".into(), "0.9".into())
             .send()
             .await;
         let (panel, mut results) = read(&self.worker, "absent".into()).latest();
@@ -264,7 +264,7 @@ impl Client {
 
         other.send("absent".into());
 
-        let bounded = self.worker.outstanding().0;
+        let before = self.worker.outstanding().0;
 
         for _ in 0..20_000 {
             let (sender, results) = read(&self.worker, "absent".into()).latest();
@@ -272,13 +272,35 @@ impl Client {
             drop(sender);
         }
 
+        let bounded = self.worker.outstanding().0;
+        if bounded != before {
+            return Err(js_error(format!(
+                "cancelled latest sessions grew outstanding work from {before} to {bounded}"
+            )));
+        }
+
         running.await;
-        write
+        writing
             .await
             .map_err(|error| js_error(format!("{error:?}")))?;
 
         let current = results.next().await;
         let independent = other_results.next().await;
+
+        let (cancelled, cancelled_results) =
+            write(&self.worker, "latest-cancelled".into(), "first".into()).latest();
+        cancelled.send("latest-cancelled".into(), "pending".into());
+        drop(cancelled_results);
+        cancelled.send("latest-cancelled".into(), "closed".into());
+
+        let saved = read(&self.worker, "latest-cancelled".into())
+            .await
+            .map_err(|error| js_error(format!("{error:?}")))?;
+        if saved != "first" {
+            return Err(js_error(format!(
+                "latest cancellation left {saved:?}, expected first"
+            )));
+        }
 
         LATEST.with(|sender| *sender.borrow_mut() = Some(panel.inner.clone()));
 
@@ -390,7 +412,13 @@ impl Client {
         use aktor::{dispatch::Transport, operation::Operation};
         let encoded = Rc::new(Cell::new(0));
         let dropped = Rc::new(Cell::new(0));
-        let mut waiting = <&Worker<Connection> as Transport<Connection, CountInput, u32>>::request(
+        let mut waiting = <&Worker<Connection> as Transport<
+            Connection,
+            CountInput,
+            u32,
+            (),
+            SerdeCodec,
+        >>::request(
             &self.worker,
             Operation {
                 name: pause::NAME,

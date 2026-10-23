@@ -19,7 +19,7 @@ async fn cancellation() {
             .run(
                 async move |app| -> Result<(), AktorError> {
                     let _owner = app
-                        .spawn(ActorArgs {
+                        .spawn(AktorArgs {
                             name: "sibling".into(),
                             capacity: 1,
                             setup: || Ok::<_, AktorError>(()),
@@ -116,7 +116,7 @@ async fn drop_group() {
             .start_with(async |_| Ok::<_, AktorError>(()))
             .unwrap();
         let actor = actors
-            .spawn(ActorArgs::new(
+            .spawn(AktorArgs::new(
                 "owned actor",
                 || Ok::<_, AktorError>(()),
                 move |_| {
@@ -198,7 +198,7 @@ fn shutdown() {
                 let task = tokio::spawn(group.run(
                     async move |app| -> Result<(), AktorError> {
                         let _actor = app
-                            .spawn_async(ActorArgs::new(
+                            .spawn_async(AktorArgs::new(
                                 "resource",
                                 async || Ok::<_, AktorError>(()),
                                 move |_| {

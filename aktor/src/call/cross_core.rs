@@ -2,21 +2,28 @@ use super::*;
 use crate::cross_core::{Reply, Request};
 use core::time::Duration;
 
-impl<'a, T, I, S: 'static, Args: Send + 'static, O: Send + 'static, Role, L>
-    Call<T, I, Request<'a, S, Args, O, Role>, L>
+impl<'a, S: 'static, Args: Send + 'static, O: Send + 'static, Role> SendRequest
+    for Request<'a, S, Args, O, Role>
 {
-    pub async fn send(self) -> Reply<O> {
-        self.into_request().send().await
-    }
+    type Reply = Reply<O>;
 
-    pub fn timeout(self, duration: Duration) -> crate::Timeout<Request<'a, S, Args, O, Role>> {
-        self.into_request().timeout(duration)
+    async fn send(self) -> Self::Reply {
+        self.send().await
     }
 }
-impl<'a, T, I, S: 'static, Args: Send + 'static, Role, L>
-    Call<T, I, Request<'a, S, Args, (), Role>, L>
+impl<'a, S: 'static, Args: Send + 'static, O: Send + 'static, Role> TimeoutRequest
+    for Request<'a, S, Args, O, Role>
 {
-    pub async fn cast(self) {
-        self.into_request().cast().await;
+    type Timed = crate::Timeout<Self>;
+
+    fn timeout(self, duration: Duration) -> Self::Timed {
+        self.timeout(duration)
+    }
+}
+impl<'a, S: 'static, Args: Send + 'static, Role> CastRequest for Request<'a, S, Args, (), Role> {
+    type Output = ();
+
+    async fn cast(self) {
+        self.cast().await;
     }
 }

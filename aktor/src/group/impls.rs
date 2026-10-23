@@ -456,7 +456,7 @@ impl AktorGroup {
         Ok(closing)
     }
 
-    pub(super) fn claim_listener(&self) -> Result<(), AktorGroupError> {
+    pub fn claim_listener(&self) -> Result<(), AktorGroupError> {
         let mut state = self.control.lock();
 
         if state.finished {
@@ -690,6 +690,18 @@ impl State {
 
 impl Control {
     pub fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        #[cfg(all(
+            feature = "wasm_threads",
+            target_family = "wasm",
+            target_feature = "atomics"
+        ))]
+        return self.state.guard();
+
+        #[cfg(not(all(
+            feature = "wasm_threads",
+            target_family = "wasm",
+            target_feature = "atomics"
+        )))]
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 }

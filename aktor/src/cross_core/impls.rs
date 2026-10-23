@@ -1,9 +1,9 @@
 use super::*;
 #[cfg(feature = "std")]
 use crate::panic::{dispose_secondary, panic_message};
-use crate::{
-    ActorFailure, AktorCleanupError, AktorExecution, AktorSetupError, message::ActorError,
-};
+#[cfg(feature = "embassy_cross_core")]
+use crate::{ActorFailure, AktorExecution};
+use crate::{AktorCleanupError, AktorSetupError, message::ActorError};
 use core::{
     future::{Future, poll_fn},
     task::Poll,
@@ -38,6 +38,7 @@ pub fn channel<S>(capacity: usize) -> Result<(Handle<S>, Owner<S>), ActorError> 
         Owner {
             inner,
             hooks: AktorHooks::default(),
+            #[cfg(feature = "embassy_cross_core")]
             supervisor: None,
             local: PhantomData,
             intervals: Vec::new(),
@@ -48,6 +49,19 @@ pub fn channel<S>(capacity: usize) -> Result<(Handle<S>, Owner<S>), ActorError> 
 }
 
 impl<S> Inner<S> {
+    pub fn cancel_service(&self, id: *const ()) {
+        let message = self.queue.lock(|queue| {
+            let mut queue = queue.borrow_mut();
+            let index = queue
+                .services
+                .iter()
+                .position(|message| message.job.service_id() == Some(id));
+            index.and_then(|index| queue.services.remove(index))
+        });
+
+        drop(message);
+    }
+
     pub fn close(&self) {
         self.queue.lock(|queue| {
             self.close_queue(&mut queue.borrow_mut());
@@ -159,12 +173,40 @@ impl Status {
     }
 
     pub fn managed(&self) -> bool {
-        self.state
-            .lock(|state| state.borrow().group_stopping.is_some())
+        self.state.lock(|state| state.borrow().managed)
     }
 }
 
 impl<S, Role> Handle<S, Role> {
+    #[cfg(all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    ))]
+    #[doc(hidden)]
+    pub fn managed(&self) {
+        self.inner.status.state.lock(|state| {
+            state.borrow_mut().managed = true;
+        });
+    }
+
+    #[cfg(all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    ))]
+    #[doc(hidden)]
+    pub fn finish_failed(&self, error: AktorError) {
+        if self
+            .inner
+            .status
+            .state
+            .lock(|state| state.borrow().completed.is_none())
+        {
+            self.inner.finish(Err(error));
+        }
+    }
+
     pub fn new_handle(&self) -> Self {
         self.inner
             .queue
@@ -310,9 +352,22 @@ impl Completion {
 
 impl Interval {
     fn arm(&mut self) {
-        let deadline = crate::timeout::embassy_deadline(embassy_time::Instant::now(), self.every);
+        use crate::local::clock::AktorGroupClock;
+        #[cfg(all(
+            feature = "wasm_threads",
+            target_family = "wasm",
+            target_feature = "atomics"
+        ))]
+        use crate::local::clock::Browser as Clock;
+        #[cfg(not(all(
+            feature = "wasm_threads",
+            target_family = "wasm",
+            target_feature = "atomics"
+        )))]
+        use crate::local::clock::Embassy as Clock;
+
         self.ready = false;
-        self.timer = Some(Box::pin(embassy_time::Timer::at(deadline)));
+        self.timer = Some(Clock::wait(Clock::deadline(self.every)));
     }
 }
 
@@ -448,15 +503,18 @@ impl<S> Owner<S> {
         }
     }
 
+    #[cfg(feature = "embassy_cross_core")]
     pub fn manage(&mut self, name: alloc::string::String, kill: crate::embassy::KillSwitch) {
         self.inner.status.state.lock(|state| {
             let mut state = state.borrow_mut();
-            state.group_stopping = Some(kill.shared_stopping());
+            state.managed = true;
         });
         self.supervisor = Some((name, kill));
     }
 
     fn fail(&self, phase: &str, diagnostic: &str) -> bool {
+        let _ = (phase, diagnostic);
+        #[cfg(feature = "embassy_cross_core")]
         if let Some((name, kill)) = &self.supervisor {
             return kill.fail(ActorFailure {
                 actor: name.clone(),
@@ -470,6 +528,8 @@ impl<S> Owner<S> {
     }
 
     fn fail_startup(&self, diagnostic: &str) -> bool {
+        let _ = diagnostic;
+        #[cfg(feature = "embassy_cross_core")]
         if let Some((name, kill)) = &self.supervisor {
             return kill.fail_startup(ActorFailure {
                 actor: name.clone(),
@@ -484,13 +544,14 @@ impl<S> Owner<S> {
 
     #[cfg(feature = "std")]
     fn diagnostic(&self, phase: &str, error: AktorError) {
-        let primary = self.fail(phase, &error.diagnostics);
+        let _primary = self.fail(phase, &error.diagnostics);
         self.inner
             .status
             .state
             .lock(|state| state.borrow_mut().diagnostics.push(error.clone()));
 
-        if !primary && let Some((name, kill)) = &self.supervisor {
+        #[cfg(feature = "embassy_cross_core")]
+        if !_primary && let Some((name, kill)) = &self.supervisor {
             kill.record_diagnostic(AktorError::new(
                 alloc::format!("{name}: {}", error.diagnostics),
                 (),
@@ -542,6 +603,7 @@ impl<S> Owner<S> {
         End: FnOnce(S) -> EndFuture,
         EndFuture: Future<Output = Result<(), AktorCleanupError>>,
     {
+        #[cfg(feature = "embassy_cross_core")]
         let supervisor = self.supervisor.clone();
         let result = self
             .run_prepared(
@@ -553,6 +615,7 @@ impl<S> Owner<S> {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
+                #[cfg(feature = "embassy_cross_core")]
                 if !error.primary
                     && let Some((name, kill)) = supervisor
                 {
@@ -567,7 +630,7 @@ impl<S> Owner<S> {
         }
     }
 
-    pub(crate) async fn run_prepared<Start, StartFuture, End, EndFuture>(
+    pub async fn run_prepared<Start, StartFuture, End, EndFuture>(
         mut self,
         start: Start,
         end: End,
@@ -799,6 +862,7 @@ impl<S> Drop for Owner<S> {
         {
             let error = AktorError::new("actor owner cancelled before cleanup completed", ());
 
+            #[cfg(feature = "embassy_cross_core")]
             if !self
                 .supervisor
                 .as_ref()
@@ -858,6 +922,32 @@ mod tests {
     use super::*;
     use core::task::{Context, Waker};
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn cancelled() {
+        use crate::latest::Session;
+
+        let (handle, _owner) = channel::<()>(1).unwrap();
+
+        for _ in 0..1000 {
+            let (sender, results) = (&handle).session(
+                Operation {
+                    name: "cancelled",
+                    caller: core::panic::Location::caller(),
+                },
+                async |_, input: u32| input,
+            );
+            sender.send(9);
+            drop((sender, results));
+        }
+
+        assert!(
+            handle
+                .inner
+                .queue
+                .lock(|queue| queue.borrow().services.is_empty())
+        );
+    }
 
     std::thread_local! {
         pub static LAST_HANDLE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);

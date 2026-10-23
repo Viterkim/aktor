@@ -2,6 +2,13 @@ use super::super::*;
 use core::task::ready;
 
 impl<O> Reply<O> {
+    #[doc(hidden)]
+    pub async fn receive(mut self) -> Result<O, CallError> {
+        let output = core::future::poll_fn(|cx| self.poll_result(cx)).await;
+        self.taken = true;
+        output
+    }
+
     /// Take a ready output once. A pending reply can still be awaited.
     pub fn try_take(&mut self) -> Option<O> {
         if self.taken || self.parked {

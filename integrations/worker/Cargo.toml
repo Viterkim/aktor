@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 er = { workspace = true, features = ["macros"] }
-aktor = { workspace = true, features = ["macros", "wasm_browser_workers", "tokio", "browser_local", "bevy"] }
+aktor = { workspace = true, features = ["macros", "wasm_browser_workers", "tokio", "browser_local", "bevy", "serde"] }
 serde.workspace = true
 serde_json.workspace = true
 futures-util = { workspace = true, default-features = true }

@@ -33,20 +33,24 @@ pub struct Native;
 pub struct Remote;
 
 #[doc(hidden)]
+#[cfg(feature = "serde")]
 pub struct SerdeCodec;
 
 #[doc(hidden)]
 pub struct DataCodec;
 
 /// A data transport used by generated operations with concrete signatures.
-pub trait Transport<S, I, O, Role = (), Codec = SerdeCodec> {
-    type Request: Future<Output = O>;
+pub trait Transport<S, I, O, Role = (), Codec = DataCodec> {
+    type Request: Future;
 
     fn request(self, operation: Operation, input: I) -> Self::Request;
 }
 
 /// The local body and types needed when registering a concrete operation for transport.
-pub trait Export<Codec = SerdeCodec> {
+pub trait Export<Codec = DataCodec> {
+    const REMOTE: bool = false;
+    const NAME: &'static str = "";
+
     type State: 'static;
     type Input;
     type Output: 'static;

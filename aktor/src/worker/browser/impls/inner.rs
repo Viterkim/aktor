@@ -1,6 +1,20 @@
 use super::super::*;
 
 impl Inner {
+    pub fn cancel_queued(&self, id: u64) {
+        let work = {
+            let mut queue = self.queue.borrow_mut();
+            let Some(index) = queue.iter().position(|queued| *queued == id) else {
+                return;
+            };
+
+            queue.remove(index);
+            self.outstanding.borrow_mut().remove(&id)
+        };
+
+        drop(work);
+    }
+
     fn wake_sessions(&self) {
         let callbacks: Vec<_> = {
             let mut sessions = self.sessions.borrow_mut();

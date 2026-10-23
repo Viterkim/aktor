@@ -49,7 +49,7 @@ async fn main() -> Result<(), ErReport<MainError>> {
         operations
             .0
             .iter()
-            .any(|name| name.contains("aktor-data-postcard-v1"))
+            .any(|name| name.contains("[aktor-data]"))
     );
 
     let bytes = actor::data::encode(&Update {
@@ -78,22 +78,21 @@ async fn main() -> Result<(), ErReport<MainError>> {
 
             let actors = actor::aktor_start(AktorSetup {
                 actors: aktor_setups! {
-                                counter: AktorNew {
+                    counter: AktorNew {
+                        name: AktorName::new("named counter"),
+                        role: AktorNoRole,
+                        kind: AktorKind::TokioTask,
+                        closures: AktorClosures {
+                            start: async || Ok::<_, AktorSetupError>(State::default()),
 
-                                    name: AktorName::new("named counter"),
-                                    role: AktorNoRole,
-                                    kind: AktorKind::TokioTask,
-                                    closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(State::default()),
-
-                                        end: (),
-                                        intervals: vec![],
-                                        before_each: None,
-                                        after_each: None,
-                                    },
-                                    options: AktorNewOptions { capacity: 32 },
-                                },
-                                },
+                            end: (),
+                            intervals: vec![],
+                            before_each: None,
+                            after_each: None,
+                        },
+                        options: AktorNewOptions { capacity: 32 },
+                    },
+                },
                 shutdown: |_| {},
                 options: AktorOptions {
                     shutdown_grace: Duration::from_secs(5),

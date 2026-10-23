@@ -3,10 +3,10 @@ use core::ops::AsyncFnOnce;
 
 #[doc(hidden)]
 pub trait Factory<T, I> {
-    type Sender;
+    type Sender: SendLatest<I>;
     type Results;
 
-    fn start(self, target: T, input: I, operation: Operation) -> (Self::Sender, Self::Results);
+    fn create(self, target: T, operation: Operation) -> (Self::Sender, Self::Results);
 }
 
 /// Update one ongoing operation.
@@ -15,7 +15,7 @@ pub trait SendLatest<I> {
 }
 
 #[doc(hidden)]
-pub trait Session<S, I, O, Role = (), Codec = crate::dispatch::SerdeCodec> {
+pub trait Session<S, I, O, Role = (), Codec = crate::dispatch::DataCodec> {
     type Sender: SendLatest<I>;
     type Results;
 
@@ -31,7 +31,7 @@ pub trait Session<S, I, O, Role = (), Codec = crate::dispatch::SerdeCodec> {
 pub use crate::message::{LatestResults as Results, LatestSender as Sender};
 
 #[doc(hidden)]
-pub trait TypedSession<S, I, O, Lease, Role = (), Codec = crate::dispatch::SerdeCodec> {
+pub trait TypedSession<S, I, O, Lease, Role = (), Codec = crate::dispatch::DataCodec> {
     type Sender<Fut>;
     type Results;
 

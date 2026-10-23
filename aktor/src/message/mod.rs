@@ -34,10 +34,7 @@ pub enum ActorError {
 
 pub type ActorResult<T> = Result<T, ActorError>;
 
-#[cfg_attr(
-    feature = "wasm_browser_workers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(feature = "transport", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Er, PartialEq, Eq)]
 pub enum CallError {
     NotAdmitted,

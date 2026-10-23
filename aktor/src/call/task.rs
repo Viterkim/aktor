@@ -1,32 +1,42 @@
 use super::*;
-use crate::{
-    Timeout,
-    task::{AktorTaskReply, AktorTaskRequest, AktorTaskState},
-};
+use crate::task::{AktorTaskReply, AktorTaskRequest, AktorTaskState};
 use core::time::Duration;
 
-impl<'a, T, I, S, O, Fut, Role, L> Call<T, I, AktorTaskRequest<'a, S, I, O, Fut, Role>, L>
+impl<'a, S, I, O, Fut, Role> SendRequest for AktorTaskRequest<'a, S, I, O, Fut, Role>
 where
     S: Send + 'static,
     I: Send + 'static,
     O: Send + 'static,
     Fut: Future<Output = (AktorTaskState<S>, O)> + Send + 'static,
 {
-    pub async fn send(self) -> AktorTaskReply<O> {
-        self.into_request().send().await
-    }
+    type Reply = AktorTaskReply<O>;
 
-    pub fn timeout(self, duration: Duration) -> Timeout<AktorTaskRequest<'a, S, I, O, Fut, Role>> {
-        self.into_request().timeout(duration)
+    async fn send(self) -> Self::Reply {
+        self.send().await
     }
 }
-impl<'a, T, I, S, Fut, Role, L> Call<T, I, AktorTaskRequest<'a, S, I, (), Fut, Role>, L>
+impl<'a, S, I, O, Fut, Role> TimeoutRequest for AktorTaskRequest<'a, S, I, O, Fut, Role>
+where
+    S: Send + 'static,
+    I: Send + 'static,
+    O: Send + 'static,
+    Fut: Future<Output = (AktorTaskState<S>, O)> + Send + 'static,
+{
+    type Timed = crate::Timeout<Self>;
+
+    fn timeout(self, duration: Duration) -> Self::Timed {
+        self.timeout(duration)
+    }
+}
+impl<'a, S, I, Fut, Role> CastRequest for AktorTaskRequest<'a, S, I, (), Fut, Role>
 where
     S: Send + 'static,
     I: Send + 'static,
     Fut: Future<Output = (AktorTaskState<S>, ())> + Send + 'static,
 {
-    pub async fn cast(self) {
+    type Output = ();
+
+    async fn cast(self) {
         drop(self.send().await);
     }
 }

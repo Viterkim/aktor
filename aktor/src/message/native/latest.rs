@@ -287,8 +287,15 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> 
         let pending = slot.pending.take();
         let output = slot.output.take();
         let wake = slot.wake.take();
+        let scheduled = slot.scheduled;
 
         drop(slot);
+        if scheduled {
+            self.handle
+                .inner
+                .sender
+                .cancel_service(self.this.as_ptr().cast());
+        }
         drop(pending);
         drop(output);
         drop(wake);
@@ -300,6 +307,10 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static, F> Job<S>
 where
     F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
 {
+    fn service_id(&self) -> Option<*const ()> {
+        Some(Arc::as_ptr(&self.0).cast())
+    }
+
     fn run<'a>(
         &'a self,
         state: &'a mut S,

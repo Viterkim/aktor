@@ -426,30 +426,29 @@ async fn named() {
     };
 
     let setups = aktor_setups! {
-            first: task("first"),
-            second: task("second"),
-            third: task("third"),
-            fourth: task("fourth"),
-            fifth: task("fifth"),
-            sixth: task("sixth"),
-            seventh: task("seventh"),
-            eighth: task("eighth"),
-            r#type: AktorNew {
+        first: task("first"),
+        second: task("second"),
+        third: task("third"),
+        fourth: task("fourth"),
+        fifth: task("fifth"),
+        sixth: task("sixth"),
+        seventh: task("seventh"),
+        eighth: task("eighth"),
+        r#type: AktorNew {
+            name: AktorName::new("archive"),
+            role: aktors::Archive,
+            kind: AktorKind::TokioThread,
+            closures: AktorClosures {
+                start: async || Ok::<_, AktorSetupError>(7_u32),
 
-                name: AktorName::new("archive"),
-                role: aktors::Archive,
-                kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-    start: async || Ok::<_, AktorSetupError>(7_u32),
-
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: AktorNewOptions { capacity: 32 },
+                end: (),
+                intervals: vec![],
+                before_each: None,
+                after_each: None,
             },
-        };
+            options: AktorNewOptions { capacity: 32 },
+        },
+    };
 
     let actors = aktor_start(AktorSetup {
         actors: setups,

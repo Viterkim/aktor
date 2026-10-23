@@ -1,4 +1,4 @@
-pub use crate::{ActorArgs, ActorFailure, ActorOutcome, ShutdownReport};
+pub use crate::{ActorFailure, ActorOutcome, AktorArgs, ShutdownReport};
 use crate::{AktorCleanupError, AktorError, AktorExecution};
 use core::{future::Future, pin::Pin};
 #[cfg(not(target_family = "wasm"))]
@@ -7,12 +7,30 @@ use std::time::Instant;
 use std::{cell::RefCell, rc::Rc};
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
-use tokio::sync::watch;
+#[cfg(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_feature = "atomics"
+))]
+use {crate::threads::lock::Mutex, signal as watch};
+#[cfg(not(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_feature = "atomics"
+)))]
+use {std::sync::Mutex, tokio::sync::watch};
+
+#[cfg(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_feature = "atomics"
+))]
+mod signal;
 
 #[cfg(any(
     feature = "tokio",

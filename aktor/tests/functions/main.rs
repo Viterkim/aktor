@@ -10,4 +10,6 @@ mod composition;
 mod data;
 mod location;
 mod outputs;
+#[cfg(feature = "testing")]
+mod presets;
 mod signatures;

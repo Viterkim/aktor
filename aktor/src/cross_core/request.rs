@@ -198,7 +198,7 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Request<'a, S, 
     }
 
     pub fn timeout(self, duration: Duration) -> Timeout<Self> {
-        Timeout::local(self, duration, |request| crate::timeout::WaitStatus {
+        clock_timeout(self, duration, |request| crate::timeout::WaitStatus {
             admitted: request.submitted,
         })
     }
@@ -256,7 +256,7 @@ impl<O> Reply<O> {
     }
 
     pub fn timeout(&mut self, duration: Duration) -> Timeout<&mut Self> {
-        Timeout::local(self, duration, |_| crate::timeout::WaitStatus {
+        clock_timeout(self, duration, |_| crate::timeout::WaitStatus {
             admitted: true,
         })
     }
@@ -287,5 +287,28 @@ impl<O> Drop for Reply<O> {
             .lock(|result| core::mem::replace(&mut *result.borrow_mut(), AnswerState::Abandoned));
 
         drop(previous);
+    }
+}
+
+fn clock_timeout<F>(
+    future: F,
+    duration: Duration,
+    status: fn(&F) -> crate::timeout::WaitStatus,
+) -> Timeout<F> {
+    #[cfg(all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    ))]
+    {
+        Timeout::browser(future, duration, status)
+    }
+    #[cfg(not(all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    )))]
+    {
+        Timeout::local(future, duration, status)
     }
 }

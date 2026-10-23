@@ -1,6 +1,6 @@
 use super::*;
-pub use crate::{ActorArgs, ShutdownReport};
 use crate::{ActorFailure, ActorOutcome, AktorError};
+pub use crate::{AktorArgs, ShutdownReport};
 use alloc::{string::String, vec::Vec};
 use clock::AktorGroupClock;
 use core::{future::poll_fn, ops::AsyncFnOnce, time::Duration};

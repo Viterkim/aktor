@@ -3,8 +3,10 @@
 //! Derive [`AktorData`] on transported structs and enums. `#[aktor(skip)]` leaves
 //! a field local and restores its default when receiving the value.
 
+mod bits;
 mod decode;
 mod encode;
+mod floats;
 mod impls;
 mod types;
 

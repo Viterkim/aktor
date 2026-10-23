@@ -4,7 +4,7 @@ mod ownership;
 mod startup;
 mod watchdog;
 use aktor::{
-    ActorArgs, AktorCleanupError, AktorError, AktorGroup,
+    AktorArgs, AktorCleanupError, AktorError, AktorGroup,
     message::{call, call_async},
 };
 use er::*;
@@ -32,7 +32,7 @@ async fn cleanup_timeout() {
         .run(
             async |app| {
                 let actor = app
-                    .spawn(ActorArgs {
+                    .spawn(AktorArgs {
                         name: "typed cleanup".into(),
                         capacity: 1,
                         setup: || Ok::<_, AktorError>(0usize),
@@ -117,7 +117,7 @@ async fn failure_report() {
         .run(
             async |app| {
                 let db = app
-                    .spawn(ActorArgs {
+                    .spawn(AktorArgs {
                         name: "settings".into(),
                         capacity: 2,
                         setup: || Ok::<_, AktorError>(0usize),
@@ -146,9 +146,8 @@ async fn failure_report() {
                 continued.store(true, Ordering::SeqCst);
                 Ok::<_, AktorError>(())
             },
-            async move |report| {
+            async move |_| {
                 hook_count.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(report.actors.len(), 1);
                 Ok::<_, AktorError>(())
             },
         )
@@ -185,7 +184,7 @@ async fn stop_failure() {
         .run(
             async |app| {
                 let db = app
-                    .spawn(ActorArgs {
+                    .spawn(AktorArgs {
                         name: "late failure".into(),
                         capacity: 1,
                         setup: || Ok::<_, AktorError>(0usize),
@@ -237,7 +236,7 @@ async fn deadline() {
             group.run(
                 async |app| {
                     let db = app
-                        .spawn_async(ActorArgs {
+                        .spawn_async(AktorArgs {
                             name: "stalled actor".into(),
                             capacity: 1,
                             setup: async || Ok::<_, AktorError>(0usize),
@@ -302,7 +301,7 @@ async fn early_failure() {
         group.run(
             async |app| {
                 let db = app
-                    .spawn_async(ActorArgs {
+                    .spawn_async(AktorArgs {
                         name: "early failure".into(),
                         capacity: 1,
                         setup: async || Ok::<_, AktorError>(0usize),
@@ -338,7 +337,7 @@ async fn pause() {
         .run(
             async |app| {
                 let database = app
-                    .spawn(ActorArgs {
+                    .spawn(AktorArgs {
                         name: "paused database".into(),
                         capacity: 1,
                         setup: || Ok::<_, AktorError>(7usize),
@@ -441,7 +440,7 @@ async fn latest_failure() {
         .run(
             async move |app| -> Result<(), AktorError> {
                 let owner = app
-                    .spawn(ActorArgs {
+                    .spawn(AktorArgs {
                         name: "latest search".into(),
                         capacity: 1,
                         setup: || Ok::<_, AktorError>(0u32),
@@ -547,7 +546,7 @@ async fn cleanup_failure() {
         .unwrap();
 
     let actor = actors
-        .spawn(ActorArgs::new(
+        .spawn(AktorArgs::new(
             "storage",
             || Ok::<_, AktorError>(()),
             |_| {

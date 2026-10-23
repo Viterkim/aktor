@@ -13,6 +13,19 @@ pub struct Services<S> {
     pub wake: Notify,
 }
 impl<S> Services<S> {
+    pub fn cancel(&self, id: *const ()) {
+        let message = {
+            let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+            let index = queue
+                .pending
+                .iter()
+                .position(|message| message.job.service_id() == Some(id));
+            index.and_then(|index| queue.pending.remove(index))
+        };
+
+        drop(message);
+    }
+
     pub fn new() -> Self {
         Self {
             queue: SlotMutex::new(Queue {

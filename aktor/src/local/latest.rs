@@ -6,6 +6,9 @@ use core::task::Context;
 use crate::latest::{SendLatest, Session};
 use core::{future::poll_fn, ops::AsyncFnOnce};
 
+#[cfg(test)]
+mod tests;
+
 pub struct LatestSender<I> {
     input: Rc<dyn Input<I>>,
 }
@@ -249,8 +252,12 @@ impl<S, I, O, F, Role, const N: usize, E, Clock> Output<O>
         let pending = slot.pending.take();
         let output = slot.output.take();
         let wake = slot.wake.take();
+        let scheduled = slot.scheduled;
 
         drop(slot);
+        if scheduled {
+            self.handle.inner.cancel_service(self.this.as_ptr().cast());
+        }
         drop(pending);
         drop(output);
         drop(wake);
@@ -270,6 +277,10 @@ impl<
 where
     F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + 'static,
 {
+    fn service_id(&self) -> Option<*const ()> {
+        Some(Rc::as_ptr(&self.shared).cast())
+    }
+
     fn run<'a>(
         &'a mut self,
         state: &'a mut S,

@@ -16,7 +16,7 @@ async fn stopping() {
             group.start().unwrap();
 
             let owner = group
-                .spawn_async(ActorArgs::new(
+                .spawn_async(AktorArgs::new(
                     "closing admission",
                     async || Ok::<_, AktorSetupError>(()),
                     move |_| {

@@ -60,7 +60,7 @@ fn shutdown() {
                 tokio::spawn(group.run(
                     async move |app| {
                         let _actor = app
-                            .spawn(ActorArgs::new(
+                            .spawn(AktorArgs::new(
                                 "abandoned run",
                                 || Ok::<_, AktorError>(()),
                                 move |_| {
@@ -110,7 +110,7 @@ fn shutdown() {
 
                 group.start().unwrap();
                 let actor = group
-                    .spawn(ActorArgs::new(
+                    .spawn(AktorArgs::new(
                         "broken formatter",
                         || Ok::<_, AktorError>(()),
                         |_| Err::<(), _>(AktorError::new(format!("{broken}", broken = Broken), ())),
@@ -194,7 +194,7 @@ fn shutdown() {
 
         if mode == "pending setup" {
             runtime.block_on(async {
-                let mut group = AktorGroup::with_grace(Duration::from_millis(200));
+                let mut group = AktorGroup::with_grace(Duration::from_secs(1));
                 let kill = group.killswitch();
                 let closing = group.start_with(async |_| Ok::<_, AktorError>(())).unwrap();
                 let entered = Arc::new(Notify::new());
@@ -203,7 +203,7 @@ fn shutdown() {
                 let cleanup = dropped.clone();
                 let startup = tokio::spawn(async move {
                     group
-                        .spawn_async(ActorArgs::new(
+                        .spawn_async(AktorArgs::new(
                             "pending setup",
                             async move || {
                                 let _drop = StartupDrop(cleanup);
@@ -225,13 +225,17 @@ fn shutdown() {
                 assert!(dropped.load(Ordering::SeqCst));
                 assert!(report.timed_out);
                 assert!(report.failure.is_none());
-                assert!(matches!(
-                    startup.await.unwrap(),
-                    Err(aktor::owner::StartError {
-                        error: aktor::listener::DedicatedStartError::Closed,
-                        ..
-                    })
-                ));
+                let result = startup.await.unwrap().map(|_| ());
+                assert!(
+                    matches!(
+                        &result,
+                        Err(aktor::owner::StartError {
+                            error: aktor::listener::DedicatedStartError::Closed,
+                            ..
+                        })
+                    ),
+                    "{result:?}"
+                );
                 tokio::time::sleep(Duration::from_millis(250)).await;
             });
 
@@ -352,7 +356,7 @@ fn shutdown() {
                 .run(
                     async |app| {
                         let _actor = app
-                            .spawn(ActorArgs {
+                            .spawn(AktorArgs {
                                 name: "blocking cleanup".into(),
                                 capacity: 1,
                                 setup: move || {

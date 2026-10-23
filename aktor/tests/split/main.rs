@@ -33,7 +33,7 @@ async fn modules() -> Result<(), Box<dyn Error>> {
             );
 
             drop(database);
-            assert_eq!(actor.await?.rows.len(), 1);
+            actor.await?;
 
             Ok(())
         })

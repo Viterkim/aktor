@@ -9,6 +9,7 @@ pub enum AktorExecution {
     StdThread,
     Local,
     BrowserLocal,
+    BrowserThread,
     BrowserWebWorker,
     EmbassyLocal,
     EmbassyCrossCore,
@@ -22,10 +23,7 @@ pub type AktorNoRole = ();
 #[allow(non_upper_case_globals)]
 pub const AktorNoRole: AktorNoRole = ();
 
-#[cfg_attr(
-    feature = "wasm_browser_workers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(feature = "transport", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, PartialEq, Eq, er::Er)]
 #[er(format = "{message}", display_alt = "{report}")]
 pub struct AktorDiagnostic {
@@ -51,10 +49,7 @@ pub struct AktorGroupError {
 }
 
 /// Setup and cleanup diagnostics, with optional data for low-level APIs.
-#[cfg_attr(
-    feature = "wasm_browser_workers",
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(feature = "transport", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, PartialEq, Eq, er::Er)]
 #[er(format = "actor lifecycle failed", display_alt = "{diagnostics}")]
 pub struct AktorError<T = ()> {
@@ -103,7 +98,7 @@ pub struct AktorShutdownFuture<F> {
 }
 
 /// Setup and cleanup for an actor owned by the application.
-pub struct ActorArgs<Setup, Cleanup> {
+pub struct AktorArgs<Setup, Cleanup> {
     pub name: String,
     pub capacity: usize,
     pub setup: Setup,
@@ -234,5 +229,5 @@ mod prepared {
 ))]
 pub use prepared::*;
 
-#[cfg(feature = "wasm_browser_workers")]
+#[cfg(feature = "transport")]
 pub use crate::data::AktorData;
