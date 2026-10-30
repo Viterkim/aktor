@@ -10,7 +10,12 @@ globalThis.aktorGate = new Promise(resolve => {
     });
 });
 
-if (parameters.has('startup_gate')) {
+if (parameters.has('raw_startup_gate')) {
+    const { default: init, start_raw_unready_worker } = await import('./pkg/aktor_worker_proof.js');
+
+    await init();
+    await start_raw_unready_worker();
+} else if (parameters.has('startup_gate')) {
     const { default: init, start_unready_worker } = await import('./pkg/aktor_worker_proof.js');
 
     await init();

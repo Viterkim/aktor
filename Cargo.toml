@@ -7,19 +7,19 @@ exclude = ["integrations"]
 license = "MIT-0"
 readme = "README.md"
 repository = "https://github.com/Viterkim/aktor"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 publish = true
 
 [workspace.dependencies]
-aktor-macros = { version = "=0.0.9", path = "aktor-macros" }
+aktor-macros = { version = "=0.0.10", path = "aktor-macros" }
 er = { version = "0.8", default-features = false, features = ["macros"] }
 proc-macro-crate = "3.5"
 proc-macro2 = "1.0"
 quote = "1.0"
 syn = { version = "3.0", features = ["full", "visit", "visit-mut"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 pin-project-lite = "0.2"
 tokio = { version = "1.53.1", features = ["macros", "sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -44,7 +44,7 @@ gloo-timers = { version = ">=0.3, <0.5", features = ["futures"] }
 web-sys = { version = "0.3", features = ["Worker", "WorkerOptions", "WorkerType", "MessageEvent", "ErrorEvent", "DedicatedWorkerGlobalScope"] }
 js-sys = "0.3"
 rustix = { version = "1.1", default-features = false, features = ["process"] }
-rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 tempfile = "3"
 getrandom = "0.4"
 utp = { package = "librqbit-utp", version = "0.7" }

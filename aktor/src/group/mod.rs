@@ -1,4 +1,4 @@
-pub use crate::{ActorFailure, ActorOutcome, AktorArgs, ShutdownReport};
+pub use crate::{AktorArgs, AktorFailureReport, AktorOutcome, ShutdownReport};
 use crate::{AktorCleanupError, AktorError, AktorExecution};
 use core::{future::Future, pin::Pin};
 #[cfg(not(target_family = "wasm"))]
@@ -64,7 +64,7 @@ pub use clock::Instant;
 #[doc(hidden)]
 pub use impls::shutdown_deadline;
 
-/// Actors sharing one shutdown. Dropping a started group begins closing it.
+/// Aktors sharing one shutdown. Dropping a started group begins closing it.
 pub struct AktorGroup {
     stop_on_drop: bool,
     control: Arc<Control>,
@@ -168,9 +168,9 @@ pub struct ThreadLife {
 }
 
 #[cfg(not(target_family = "wasm"))]
-type CloseFuture = Pin<Box<dyn Future<Output = ActorOutcome> + Send>>;
+type CloseFuture = Pin<Box<dyn Future<Output = AktorOutcome> + Send>>;
 #[cfg(target_family = "wasm")]
-type CloseFuture = Pin<Box<dyn Future<Output = ActorOutcome>>>;
+type CloseFuture = Pin<Box<dyn Future<Output = AktorOutcome>>>;
 
 #[cfg(not(target_family = "wasm"))]
 type Action = Box<dyn FnOnce() + Send>;

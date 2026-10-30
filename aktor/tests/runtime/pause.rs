@@ -16,7 +16,7 @@ fn add(handle: &Handle<usize>, by: usize) -> Request<'_, usize, usize> {
 
 #[tokio::test]
 async fn running_observation() {
-    use aktor::listener::{Actor, spawn_async};
+    use aktor::listener::{AktorControl, spawn_async};
     use std::{cell::Cell, error::Error, fmt};
 
     #[derive(Debug)]
@@ -29,13 +29,13 @@ async fn running_observation() {
     impl Error for SetupFailure {}
 
     async fn portable(
-        actor: &Actor<(), SetupFailure, std::io::Error>,
+        actor: &AktorControl<(), SetupFailure, std::io::Error>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         actor.wait_running().await?;
         Ok(())
     }
 
-    async fn reporting(actor: &Actor<(), SetupFailure, std::io::Error>) -> er::ErTest {
+    async fn reporting(actor: &AktorControl<(), SetupFailure, std::io::Error>) -> er::ErTest {
         actor.wait_running().await?;
         Ok(())
     }

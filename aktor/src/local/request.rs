@@ -257,7 +257,7 @@ impl<O, Clock> Reply<O, Clock> {
 
     fn lost(&mut self) -> Option<O> {
         if let Some(group) = &self.group {
-            group.fail(crate::ActorFailure {
+            group.fail(crate::AktorFailureReport {
                 kind: None,
                 actor: "actor".into(),
                 phase: "call".into(),

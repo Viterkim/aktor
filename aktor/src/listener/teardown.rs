@@ -1,14 +1,19 @@
 use super::*;
 
 impl<S> Listener<S> {
-    /// Discard queued work, catching each payload's destructor separately.
-    pub fn discard(mut self, failures: &mut Failures) -> watch::Sender<()> {
+    /// Settle queued calls while state and the completion signal stay owned.
+    pub fn discard_queued(&mut self, failures: &mut Failures) {
         failures.capture(FailureKind::Teardown, || self.admission.shutdown());
         failures.capture(FailureKind::Teardown, || self.receiver.close());
 
         while let Ok(message) = self.receiver.try_recv() {
             failures.capture(FailureKind::Teardown, || drop(message));
         }
+    }
+
+    /// Discard queued work, catching each payload's destructor separately.
+    pub fn discard(mut self, failures: &mut Failures) -> watch::Sender<()> {
+        self.discard_queued(failures);
 
         let Self {
             receiver,

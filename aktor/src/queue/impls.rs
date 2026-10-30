@@ -91,7 +91,7 @@ impl Admission {
         let group = self.state.lock().borrow().group.clone();
 
         if let Some((name, group)) = group {
-            group.fail(crate::group::ActorFailure {
+            group.fail(crate::group::AktorFailureReport {
                 kind: None,
                 actor: name,
                 phase: "call".into(),

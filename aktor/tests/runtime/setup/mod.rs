@@ -275,10 +275,10 @@ async fn counter() {
     input.send(3);
     assert_eq!(output.next().await, Some(Ok(8)));
 
-    actors.handles.actor.pause().await.unwrap();
+    actors.handles.control.pause().await.unwrap();
     actors
         .handles
-        .actor
+        .control
         .resume(|| Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(10)))))
         .await
         .unwrap();

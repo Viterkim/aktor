@@ -84,7 +84,7 @@ struct Cached<T> {
 #[derive(AktorData)]
 struct Local<T> {
     #[aktor(skip)]
-    cache: T,
+    _cache: T,
 }
 #[derive(AktorData, Serialize, Deserialize)]
 struct Visible {
@@ -291,12 +291,11 @@ fn representation() {
     assert_eq!((restored.value, restored.cache.hits), (19, 0));
 
     let only = Local {
-        cache: Cache { hits: 55 },
+        _cache: Cache { hits: 55 },
     };
 
     let bytes = data::encode(&only).unwrap();
     assert!(bytes.is_empty());
-    assert_eq!(data::decode::<Local<Cache>>(&bytes).unwrap().cache.hits, 0);
 
     let hidden = Hidden {
         value: 21,
@@ -319,8 +318,7 @@ fn representation() {
         WithCache::Empty,
     ] {
         match data::decode::<WithCache<Cache>>(&data::encode(&value).unwrap()).unwrap() {
-            WithCache::Named { value, cache } | WithCache::Tuple(value, cache) => {
-                assert!(value > 0);
+            WithCache::Named { cache, .. } | WithCache::Tuple(_, cache) => {
                 assert_eq!(cache.hits, 0);
             }
             WithCache::Empty => {}

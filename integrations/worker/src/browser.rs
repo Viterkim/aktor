@@ -245,7 +245,7 @@ impl Client {
     }
 
     pub async fn finished(&self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.worker.completion().wait().await).map_err(js_error)
+        serde_json::to_string(&self.worker.completion().report().await).map_err(js_error)
     }
 
     pub async fn latest_sequence(&self) -> Result<String, JsValue> {
@@ -394,7 +394,7 @@ impl Client {
         };
         assert!(!continued.get());
         assert!(notified.get());
-        let codec = completed.wait().await.unwrap_err();
+        let codec = completed.report().await.unwrap_err();
         assert!(report.failed());
         assert!(
             report
@@ -507,7 +507,7 @@ impl Client {
                 let reply = request.send().await;
                 let output = reply.await;
 
-                self.worker.completion().wait().await.map_err(js_error)?;
+                self.worker.completion().report().await.map_err(js_error)?;
                 Ok::<_, JsValue>(output)
             })
             .await;
@@ -548,6 +548,6 @@ pub struct Observer {
 #[wasm_bindgen]
 impl Observer {
     pub async fn finished(&mut self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.completion.wait().await).map_err(js_error)
+        serde_json::to_string(&self.completion.report().await).map_err(js_error)
     }
 }

@@ -97,6 +97,10 @@ impl Inner {
     }
 
     fn notify(&self, error: &WireError) -> bool {
+        if self.optional {
+            return false;
+        }
+
         let group = self.group.borrow();
         let Some((name, group)) = &*group else {
             return false;
@@ -105,7 +109,7 @@ impl Inner {
             WorkerCause::Cleanup => ("cleanup", "worker cleanup failed".into()),
             _ => ("worker", format!("{error:#}")),
         };
-        let failure = crate::group::ActorFailure {
+        let failure = crate::group::AktorFailureReport {
             kind: None,
             actor: name.clone(),
             phase: phase.into(),
@@ -119,11 +123,11 @@ impl Inner {
         }
     }
 
-    pub fn fail(&self, cause: WorkerCause) {
+    pub fn fail(self: &Rc<Self>, cause: WorkerCause) {
         self.fail_error(WireError::new(CallError::OutcomeUnknown, cause));
     }
 
-    pub fn fail_error(&self, error: WireError) {
+    pub fn fail_error(self: &Rc<Self>, error: WireError) {
         if self.finished.borrow().is_some() || self.failed.replace(true) {
             return;
         }
@@ -139,36 +143,52 @@ impl Inner {
             self.ready.send_replace(Some(Err(startup)));
         }
 
-        for (_, work) in self.outstanding.replace(HashMap::new()) {
-            let outcome = if work.input.is_some() {
-                CallError::Discarded
-            } else {
+        let active = self.active.get();
+
+        for (id, mut work) in self.outstanding.replace(HashMap::new()) {
+            let uncertain = active == Some(id);
+            let outcome = if uncertain {
                 CallError::OutcomeUnknown
+            } else {
+                CallError::Discarded
             };
 
-            if let Some(service) = work.service {
+            if let Some(service) = work.service.take() {
                 service.answer(Err(WireError {
                     outcome,
                     ..error.clone()
                 }));
             }
 
-            if let Some(answer) = work.answer {
+            if let Some(answer) = work.answer.take() {
                 answer(Err(WireError {
                     outcome,
                     ..error.clone()
                 }));
+            }
+
+            if uncertain {
+                self.uncertain.borrow_mut().push(work);
             }
         }
 
         self.queue.borrow_mut().clear();
         self.active.set(None);
         self.executing.set(false);
-        self.failure.borrow_mut().take();
-        self.complete(Err(error));
+        *self.failure.borrow_mut() = Some(error.clone());
+        self.finished.send_replace(Some(Err(error)));
+        self.wake_sessions();
+
+        self.continue_shutdown(false);
     }
 
-    pub fn finish(&self, result: Result<(), WireError>) {
+    pub fn finish(self: &Rc<Self>, result: Result<(), WireError>) {
+        if !self.join_ready() {
+            *self.pending_finish.borrow_mut() = Some(result);
+            self.continue_shutdown(false);
+            return;
+        }
+
         if let Err(error) = &result {
             self.record(error);
         }
@@ -179,14 +199,13 @@ impl Inner {
             None => Ok(()),
         });
 
+        self.retired.set(true);
         self.complete(result);
     }
 
     fn complete(&self, result: Result<(), WireError>) {
-        if self.finished.borrow().is_none() {
-            self.finished.send_replace(Some(result));
-        }
-
+        self.finished.send_replace(Some(result));
+        self.uncertain.borrow_mut().clear();
         self.wake_sessions();
         self.buffers.clear();
         self.worker.terminate();
@@ -194,7 +213,8 @@ impl Inner {
     }
 
     pub fn pump(self: &Rc<Self>) {
-        if self.pump_scheduled.get()
+        if self.failed.get()
+            || self.pump_scheduled.get()
             || self.active.get().is_some()
             || !matches!(*self.ready.borrow(), Some(Ok(())))
             || self.finished.borrow().is_some()
@@ -206,6 +226,7 @@ impl Inner {
             let next = self.queue.borrow_mut().pop_front();
             let Some(id) = next else {
                 if self.closed.get()
+                    && self.join_ready()
                     && !self.shutdown_sent.replace(true)
                     && let Err(error) = post(&self.worker, &self.buffers, &Incoming::Shutdown)
                 {
@@ -288,6 +309,87 @@ impl Inner {
 
         // Keep the worker around until accepted work and cleanup finish.
         *self.retained.borrow_mut() = Some(self.clone());
+
+        self.continue_shutdown(false);
+    }
+
+    fn join_ready(&self) -> bool {
+        match &*self.shutdown_join.borrow() {
+            ShutdownJoin::Ready => true,
+            ShutdownJoin::Waiting(_) | ShutdownJoin::Joining { .. } => false,
+        }
+    }
+
+    pub fn continue_shutdown(self: &Rc<Self>, force: bool) {
+        let gate = self.shutdown_join.replace(ShutdownJoin::Ready);
+
+        match gate {
+            ShutdownJoin::Ready => self.finish_shutdown(force),
+            ShutdownJoin::Joining { force: requested } => {
+                *self.shutdown_join.borrow_mut() = ShutdownJoin::Joining {
+                    force: requested || force,
+                };
+            }
+            ShutdownJoin::Waiting(joining) => {
+                *self.shutdown_join.borrow_mut() = ShutdownJoin::Joining { force };
+                let inner = self.clone();
+
+                wasm_bindgen_futures::spawn_local(async move {
+                    let result = joining.await;
+                    let gate = inner.shutdown_join.replace(ShutdownJoin::Ready);
+                    let force = match gate {
+                        ShutdownJoin::Joining { force } => force,
+                        ShutdownJoin::Ready | ShutdownJoin::Waiting(_) => false,
+                    };
+
+                    if let Err(error) = result {
+                        let error =
+                            WireError::cleanup(CallError::OutcomeUnknown, error.diagnostics);
+                        inner.record(&error);
+                        inner.failure.borrow_mut().get_or_insert(error);
+                    }
+
+                    inner.finish_shutdown(force);
+                });
+            }
+        }
+    }
+
+    fn finish_shutdown(self: &Rc<Self>, force: bool) {
+        let finished = self.pending_finish.borrow_mut().take();
+
+        if let Some(result) = finished {
+            self.finish(result);
+            return;
+        }
+
+        if self.retired.get() {
+            return;
+        }
+
+        if force {
+            self.worker.terminate();
+
+            if !self.accepted.get() {
+                self.buffers.clear();
+                self.retained.borrow_mut().take();
+            }
+
+            return;
+        }
+
+        if self.failed.get() {
+            if !self.accepted.get() {
+                self.worker.terminate();
+                self.buffers.clear();
+                self.retained.borrow_mut().take();
+            } else {
+                self.shutdown_sent.set(true);
+                let _result = post(&self.worker, &self.buffers, &Incoming::Shutdown);
+            }
+
+            return;
+        }
 
         let inner = self.clone();
 

@@ -27,7 +27,7 @@ impl<S> Running<S> {
             }
         }
 
-        failures.capture(FailureKind::Teardown, || listener.receiver.close());
+        listener.discard_queued(&mut failures);
 
         if failures.first.is_some() {
             failures.capture(FailureKind::Cleanup, || drop(self.state.take()));
@@ -63,7 +63,7 @@ impl<S> Drop for Running<S> {
             group_primary: false,
         });
 
-        failures.capture(FailureKind::Teardown, || listener.receiver.close());
+        listener.discard_queued(&mut failures);
         failures.capture(FailureKind::Cleanup, || drop(self.state.take()));
 
         let finished = listener.discard(&mut failures);

@@ -149,7 +149,8 @@ impl AktorGroup {
 
                 for (index, name, kind) in names {
                     if !done[index] {
-                        state.report.actors.push(ActorOutcome {
+                        state.report.actors.push(AktorOutcome {
+                            retirement: crate::RetirementStatus::Unconfirmed,
                             kind: Some(kind),
                             actor: name,
                             diagnostics: Vec::new(),
@@ -186,7 +187,8 @@ impl AktorGroup {
                     if !state.report.actors.iter().any(|actor| actor.actor == *name) {
                         let kind = state.kind(&name);
 
-                        state.report.actors.push(ActorOutcome {
+                        state.report.actors.push(AktorOutcome {
+                            retirement: crate::RetirementStatus::Unconfirmed,
                             kind,
                             actor: (*name).clone(),
                             diagnostics: Vec::new(),
@@ -312,7 +314,7 @@ pub async fn finish_hook<Cleanup, CleanupFuture>(
 }
 
 pub fn fail_application(kill: &KillSwitch, phase: &str, message: String) {
-    let primary = kill.fail(ActorFailure {
+    let primary = kill.fail(AktorFailureReport {
         kind: None,
         actor: "application".into(),
         phase: phase.into(),

@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::message::ActorError;
+use crate::message::AktorStateError;
 
 impl<S, Role> Handle<S, Role> {
     pub fn is_closed(&self) -> bool {
@@ -68,11 +68,11 @@ impl<S, Role> Handle<S, Role> {
 }
 
 impl<S, Role> WeakHandle<S, Role> {
-    pub fn upgrade(&self) -> Result<Handle<S, Role>, ActorError> {
-        let inner = self.inner.upgrade().ok_or(ActorError::Closed)?;
+    pub fn upgrade(&self) -> Result<Handle<S, Role>, AktorStateError> {
+        let inner = self.inner.upgrade().ok_or(AktorStateError::Closed)?;
 
         if inner.sender.is_closed() {
-            return Err(ActorError::Closed);
+            return Err(AktorStateError::Closed);
         }
 
         Ok(Handle {

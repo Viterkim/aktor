@@ -1,6 +1,8 @@
 #[cfg(feature = "bevy")]
 use crate::group::shutdown::panic_message;
-use crate::{ActorFailure, ActorOutcome, AktorError, KillSwitch, group::shutdown::contain_drop};
+use crate::{
+    AktorError, AktorFailureReport, AktorOutcome, KillSwitch, group::shutdown::contain_drop,
+};
 #[cfg(feature = "bevy")]
 use futures_util::FutureExt;
 
@@ -11,7 +13,7 @@ pub enum TaskJoin {
     Bevy(bevy_tasks::Task<()>),
 }
 impl TaskJoin {
-    pub async fn wait(self, kill: &KillSwitch, report: &mut ActorOutcome) {
+    pub async fn wait(self, kill: &KillSwitch, report: &mut AktorOutcome) {
         match self {
             #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
             Self::Tokio(join) => match join.await {
@@ -37,8 +39,8 @@ impl TaskJoin {
     }
 }
 
-fn record(kill: &KillSwitch, report: &mut ActorOutcome, message: String) {
-    kill.fail(ActorFailure {
+fn record(kill: &KillSwitch, report: &mut AktorOutcome, message: String) {
+    kill.fail(AktorFailureReport {
         actor: report.actor.clone(),
         kind: report.kind,
         phase: "owner".into(),

@@ -53,7 +53,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
             }
 
             let message = panic_message(payload);
-            let failure = crate::ActorFailure {
+            let failure = crate::AktorFailureReport {
                 kind: None,
                 actor: name,
                 phase: phase.into(),

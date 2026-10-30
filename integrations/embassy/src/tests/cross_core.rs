@@ -835,7 +835,7 @@ async fn startup_origin() {
         assert!(support::poll(&mut driver).is_pending());
 
         if runtime_failure {
-            group.killswitch().fail(aktor::ActorFailure {
+            group.killswitch().fail(aktor::AktorFailureReport {
                 actor: "existing actor".into(),
                 kind: Some(AktorExecution::EmbassyCrossCore),
                 phase: "operation".into(),

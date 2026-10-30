@@ -1,18 +1,18 @@
 use super::*;
 #[cfg(feature = "std")]
 use crate::panic::{dispose_secondary, panic_message};
+use crate::{AktorCleanupError, AktorSetupError, message::AktorStateError};
 #[cfg(feature = "embassy_cross_core")]
-use crate::{ActorFailure, AktorExecution};
-use crate::{AktorCleanupError, AktorSetupError, message::ActorError};
+use crate::{AktorExecution, AktorFailureReport};
 use core::{
     future::{Future, poll_fn},
     task::Poll,
 };
 
 /// The target's critical-section implementation must synchronize every calling core.
-pub fn channel<S>(capacity: usize) -> Result<(Handle<S>, Owner<S>), ActorError> {
+pub fn channel<S>(capacity: usize) -> Result<(Handle<S>, Owner<S>), AktorStateError> {
     if capacity == 0 {
-        return Err(ActorError::InvalidCapacity);
+        return Err(AktorStateError::InvalidCapacity);
     }
 
     let inner = Arc::new(Inner {
@@ -77,19 +77,8 @@ impl<S> Inner<S> {
             .lock(|state| state.borrow_mut().closing = true);
     }
 
-    pub fn finish(&self, result: Result<(), AktorError>) {
+    fn discard_queued(&self) {
         self.close();
-
-        let mut completion = CompletionGuard {
-            status: self.status.clone(),
-            fallback: result
-                .as_ref()
-                .err()
-                .cloned()
-                .unwrap_or_else(|| AktorError::new("actor work destruction failed", ())),
-            armed: true,
-        };
-
         let discarded = self.queue.lock(|queue| {
             let mut queue = queue.borrow_mut();
 
@@ -117,6 +106,31 @@ impl<S> Inner<S> {
         for message in ordinary.into_iter().chain(services) {
             drop(message);
         }
+        #[cfg(feature = "std")]
+        if let Some(payload) = primary {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    pub fn finish(&self, result: Result<(), AktorError>) {
+        self.close();
+
+        let mut completion = CompletionGuard {
+            status: self.status.clone(),
+            fallback: result
+                .as_ref()
+                .err()
+                .cloned()
+                .unwrap_or_else(|| AktorError::new("actor work destruction failed", ())),
+            armed: true,
+        };
+
+        #[cfg(feature = "std")]
+        let primary =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.discard_queued())).err();
+        #[cfg(not(feature = "std"))]
+        self.discard_queued();
+
         #[cfg(feature = "std")]
         let result = if result.is_ok() && primary.is_some() {
             Err(completion.fallback.clone())
@@ -329,6 +343,17 @@ impl<S, Role> Clone for WeakHandle<S, Role> {
 }
 
 impl Completion {
+    #[cfg(all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    ))]
+    pub(crate) fn cleanup_completed(&self) -> bool {
+        self.status
+            .state
+            .lock(|status| status.borrow().cleanup_completed)
+    }
+
     #[doc(hidden)]
     pub fn diagnostics(&self) -> Vec<AktorError> {
         self.status
@@ -516,7 +541,7 @@ impl<S> Owner<S> {
         let _ = (phase, diagnostic);
         #[cfg(feature = "embassy_cross_core")]
         if let Some((name, kill)) = &self.supervisor {
-            return kill.fail(ActorFailure {
+            return kill.fail(AktorFailureReport {
                 actor: name.clone(),
                 kind: Some(AktorExecution::EmbassyCrossCore),
                 phase: phase.into(),
@@ -531,7 +556,7 @@ impl<S> Owner<S> {
         let _ = diagnostic;
         #[cfg(feature = "embassy_cross_core")]
         if let Some((name, kill)) = &self.supervisor {
-            return kill.fail_startup(ActorFailure {
+            return kill.fail_startup(AktorFailureReport {
                 actor: name.clone(),
                 kind: Some(AktorExecution::EmbassyCrossCore),
                 phase: "setup".into(),
@@ -677,6 +702,10 @@ impl<S> Owner<S> {
         let mut state = match started {
             Ok(state) => state,
             Err(mut error) => {
+                self.inner
+                    .status
+                    .state
+                    .lock(|status| status.borrow_mut().cleanup_completed = true);
                 error.primary |= self.fail_startup(&error.diagnostics);
                 #[cfg(feature = "std")]
                 if let Some(payload) = self.dispose_hooks() {
@@ -761,9 +790,38 @@ impl<S> Owner<S> {
 
         self.inner.close();
         #[cfg(feature = "std")]
-        let cleaned = crate::local::panic::catch(async { end(state).await }, |_, payload| {
-            self.fail("cleanup", &panic_message(payload));
-        })
+        if let Err(payload) = crate::local::panic::catch(
+            async {
+                self.inner.discard_queued();
+            },
+            |_, _| {},
+        )
+        .await
+        {
+            self.diagnostic("queue drop", AktorError::new(panic_message(&payload), ()));
+            if primary.is_none() {
+                primary = Some(payload);
+            } else {
+                dispose_secondary(payload);
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        self.inner.discard_queued();
+
+        #[cfg(feature = "std")]
+        let cleaned = crate::local::panic::catch(
+            async {
+                let result = end(state).await;
+                self.inner
+                    .status
+                    .state
+                    .lock(|status| status.borrow_mut().cleanup_completed = true);
+                result
+            },
+            |_, payload| {
+                self.fail("cleanup", &panic_message(payload));
+            },
+        )
         .await;
         #[cfg(feature = "std")]
         let result = match cleaned {
@@ -781,7 +839,14 @@ impl<S> Owner<S> {
             }
         };
         #[cfg(not(feature = "std"))]
-        let result = end(state).await;
+        let result = {
+            let result = end(state).await;
+            self.inner
+                .status
+                .state
+                .lock(|status| status.borrow_mut().cleanup_completed = true);
+            result
+        };
 
         let mut result = result;
         if let Err(error) = &mut result {

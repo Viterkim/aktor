@@ -53,7 +53,7 @@ where
                     &setup.name.name,
                     AktorExecution::EmbassyCrossCore,
                     AktorStartError::Setup(AktorSetupError::new(
-                        alloc::format!("{}", crate::message::ActorError::InvalidCapacity),
+                        alloc::format!("{}", crate::message::AktorStateError::InvalidCapacity),
                         (),
                     )),
                 ));

@@ -5,29 +5,29 @@ use crate::{AktorGroup, AktorSetupError};
 use core::marker::PhantomData;
 
 /// Return an actor setup from a helper without naming its closure types.
-pub struct AktorDefinition<Actor> {
-    setup: Box<dyn DefinitionStart<Actor> + Send>,
+pub struct AktorDefinition<Handles> {
+    setup: Box<dyn DefinitionStart<Handles> + Send>,
 }
 
-trait DefinitionStart<Actor> {
+trait DefinitionStart<Handles> {
     fn begin(&self, group: &mut AktorGroup) -> Result<(), AktorSetupError>;
     fn start(
         self: Box<Self>,
         context: AktorStartContext<AktorGroup>,
-    ) -> AktorThreadFuture<Result<Actor, AktorStartError>>;
+    ) -> AktorThreadFuture<Result<Handles, AktorStartError>>;
 }
 
 struct DefinitionSetup<Setup, Mode> {
     setup: Setup,
     mode: PhantomData<fn() -> Mode>,
 }
-impl<Setup, Mode, Actor> DefinitionStart<Actor> for DefinitionSetup<Setup, Mode>
+impl<Setup, Mode, Handles> DefinitionStart<Handles> for DefinitionSetup<Setup, Mode>
 where
     Setup: AktorStart<
             Mode,
             Group = AktorGroup,
-            Handles = Actor,
-            Startup = AktorThreadFuture<Result<Actor, AktorStartError>>,
+            Handles = Handles,
+            Startup = AktorThreadFuture<Result<Handles, AktorStartError>>,
         >,
 {
     fn begin(&self, group: &mut AktorGroup) -> Result<(), AktorSetupError> {
@@ -37,20 +37,20 @@ where
     fn start(
         self: Box<Self>,
         context: AktorStartContext<AktorGroup>,
-    ) -> AktorThreadFuture<Result<Actor, AktorStartError>> {
+    ) -> AktorThreadFuture<Result<Handles, AktorStartError>> {
         self.setup.start_in(context)
     }
 }
 
 impl<S: 'static, Start, Kind: AktorMode, Role, End> AktorNew<S, Start, Kind, Role, End> {
     /// Hide the callback types when returning a native actor definition from a helper.
-    pub fn definition<Mode, Actor>(self) -> AktorDefinition<Actor>
+    pub fn definition<Mode, Handles>(self) -> AktorDefinition<Handles>
     where
         Self: AktorStart<
                 Mode,
                 Group = AktorGroup,
-                Handles = Actor,
-                Startup = AktorThreadFuture<Result<Actor, AktorStartError>>,
+                Handles = Handles,
+                Startup = AktorThreadFuture<Result<Handles, AktorStartError>>,
             > + Send
             + 'static,
         Mode: 'static,
@@ -63,10 +63,10 @@ impl<S: 'static, Start, Kind: AktorMode, Role, End> AktorNew<S, Start, Kind, Rol
         }
     }
 }
-impl<Actor> AktorStart for AktorDefinition<Actor> {
+impl<Handles> AktorStart for AktorDefinition<Handles> {
     type Group = AktorGroup;
-    type Handles = Actor;
-    type Startup = AktorThreadFuture<Result<Actor, AktorStartError>>;
+    type Handles = Handles;
+    type Startup = AktorThreadFuture<Result<Handles, AktorStartError>>;
 
     fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
         self.setup.begin(group)

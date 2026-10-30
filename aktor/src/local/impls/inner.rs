@@ -54,7 +54,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         let supervisor = self.group.borrow().clone();
 
         if let Some((name, group)) = supervisor {
-            group.fail(crate::ActorFailure {
+            group.fail(crate::AktorFailureReport {
                 kind: None,
                 actor: name,
                 phase: "call".into(),
@@ -110,7 +110,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         if let Some((name, group)) = supervisor
             && !(matches!(error, OwnerFailure::Cancelled) && group.is_stopping())
         {
-            let failure = crate::ActorFailure {
+            let failure = crate::AktorFailureReport {
                 kind: None,
                 actor: name,
                 phase: match error {
@@ -140,6 +140,30 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         false
     }
 
+    pub fn discard_queued(&self) {
+        self.close();
+        let queued = core::mem::take(&mut *self.queue.borrow_mut());
+        let services = core::mem::take(&mut *self.services.borrow_mut());
+        #[cfg(feature = "std")]
+        let primary = crate::local::panic::discard(queued.into_iter().chain(services), |payload| {
+            self.completion
+                .diagnostics
+                .borrow_mut()
+                .push(crate::AktorError::new(
+                    crate::panic::panic_message(payload),
+                    (),
+                ));
+        });
+        #[cfg(not(feature = "std"))]
+        for message in queued.into_iter().chain(services) {
+            drop(message);
+        }
+        #[cfg(feature = "std")]
+        if let Some(payload) = primary {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     pub fn finish(&self, result: Result<(), Rc<OwnerFailure<E>>>) {
         if let Err(error) = &result {
             self.fail(error);
@@ -162,22 +186,12 @@ impl<S, const N: usize, E> Inner<S, N, E> {
             armed: true,
         };
 
-        let queued = core::mem::take(&mut *self.queue.borrow_mut());
-        let services = core::mem::take(&mut *self.services.borrow_mut());
         #[cfg(feature = "std")]
-        let primary = crate::local::panic::discard(queued.into_iter().chain(services), |payload| {
-            self.completion
-                .diagnostics
-                .borrow_mut()
-                .push(crate::AktorError::new(
-                    crate::panic::panic_message(payload),
-                    (),
-                ));
-        });
+        let primary =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.discard_queued())).err();
         #[cfg(not(feature = "std"))]
-        for message in queued.into_iter().chain(services) {
-            drop(message);
-        }
+        self.discard_queued();
+
         #[cfg(feature = "std")]
         let result = if result.is_ok() && primary.is_some() {
             Err(completion.failure.clone())

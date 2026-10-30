@@ -569,12 +569,12 @@ impl KillSwitch {
     }
 
     #[doc(hidden)]
-    pub fn fail_startup(&self, failure: ActorFailure) -> bool {
+    pub fn fail_startup(&self, failure: AktorFailureReport) -> bool {
         self.record_failure(failure, true)
     }
 
     #[doc(hidden)]
-    pub fn fail(&self, failure: ActorFailure) -> bool {
+    pub fn fail(&self, failure: AktorFailureReport) -> bool {
         self.record_failure(failure, false)
     }
 
@@ -585,7 +585,7 @@ impl KillSwitch {
         kind: crate::AktorExecution,
         error: crate::AktorSetupError,
     ) -> crate::AktorFailure {
-        let primary = self.fail_startup(ActorFailure {
+        let primary = self.fail_startup(AktorFailureReport {
             actor,
             kind: Some(kind),
             phase: "setup".into(),
@@ -598,7 +598,7 @@ impl KillSwitch {
         }
     }
 
-    fn record_failure(&self, mut failure: ActorFailure, startup: bool) -> bool {
+    fn record_failure(&self, mut failure: AktorFailureReport, startup: bool) -> bool {
         let first = {
             let mut state = self.control.lock();
 

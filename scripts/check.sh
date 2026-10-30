@@ -20,5 +20,5 @@ bash checks/integrations.sh
 cargo run -p aktor --features tokio --example tokio_connection
 cargo run -p aktor --features tokio --example sqlite
 
-cargo +1.89.0 run -p aktor --features tokio --example guide
+cargo +1.95.0 run -p aktor --features tokio --example guide
 cargo run -p aktor --features tokio --example guide

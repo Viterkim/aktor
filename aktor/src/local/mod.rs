@@ -1,6 +1,6 @@
 use crate::{AktorCleanupError, AktorSetupError};
 use crate::{
-    message::{ActorError, CallError, LocalFuture},
+    message::{AktorStateError, CallError, LocalFuture},
     operation::Operation,
 };
 use alloc::{
@@ -134,6 +134,7 @@ struct Inner<S, const N: usize, E> {
 }
 
 struct Completed<E> {
+    cleanup_completed: Rc<Cell<bool>>,
     ready: RefCell<Option<Result<(), Rc<OwnerFailure<E>>>>>,
     result: RefCell<Option<Result<(), Rc<OwnerFailure<E>>>>>,
     diagnostics: Rc<RefCell<alloc::vec::Vec<crate::AktorError>>>,

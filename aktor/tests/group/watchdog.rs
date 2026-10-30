@@ -269,7 +269,8 @@ fn shutdown() {
                         Box::pin(async move {
                             cancelled.notified().await;
                             release.send(()).unwrap();
-                            aktor::ActorOutcome {
+                            aktor::AktorOutcome {
+                                retirement: aktor::RetirementStatus::Unconfirmed,
                                 actor: "settling".into(),
                                 kind: None,
                                 diagnostics: vec![],

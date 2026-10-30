@@ -125,7 +125,7 @@ where
             &setup.name.name,
             Kind::EXECUTION,
             AktorStartError::Setup(AktorError::new(
-                crate::message::ActorError::InvalidCapacity.to_string(),
+                crate::message::AktorStateError::InvalidCapacity.to_string(),
                 (),
             )),
         ));

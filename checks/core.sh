@@ -4,24 +4,24 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 cargo fmt --all --check
 
-bash checks/macros.sh 1.89.0
+bash checks/macros.sh 1.95.0
 bash checks/macros.sh
 
-cargo +1.89.0 check --workspace --all-features --all-targets
-cargo +1.89.0 check -p aktor --no-default-features --lib
-cargo +1.89.0 check -p aktor --no-default-features --features macros,local --lib
-cargo +1.89.0 check -p aktor --no-default-features --features macros,embassy_cross_core --lib
-cargo +1.89.0 check -p aktor --no-default-features --features macros,std_thread --lib
-cargo +1.89.0 check -p aktor --no-default-features --features macros,bevy --lib
-cargo +1.89.0 check -p aktor --no-default-features --features macros,browser_local --lib
-cargo +1.89.0 check -p aktor --no-default-features --features wasm_browser_workers --lib
-cargo +1.89.0 check -p aktor --no-default-features --features transport --lib
+cargo +1.95.0 check --workspace --all-features --all-targets
+cargo +1.95.0 check -p aktor --no-default-features --lib
+cargo +1.95.0 check -p aktor --no-default-features --features macros,local --lib
+cargo +1.95.0 check -p aktor --no-default-features --features macros,embassy_cross_core --lib
+cargo +1.95.0 check -p aktor --no-default-features --features macros,std_thread --lib
+cargo +1.95.0 check -p aktor --no-default-features --features macros,bevy --lib
+cargo +1.95.0 check -p aktor --no-default-features --features macros,browser_local --lib
+cargo +1.95.0 check -p aktor --no-default-features --features wasm_browser_workers --lib
+cargo +1.95.0 check -p aktor --no-default-features --features transport --lib
 
-cargo +1.89.0 test --workspace --all-features --all-targets
-cargo +1.89.0 test -p aktor --no-default-features
-cargo +1.89.0 test -p aktor --no-default-features --features local,std --lib
-cargo +1.89.0 test -p aktor --no-default-features --features std,embassy_cross_core --lib
-cargo +1.89.0 test -p aktor --no-default-features --features tokio --all-targets
+cargo +1.95.0 test --workspace --all-features --all-targets
+cargo +1.95.0 test -p aktor --no-default-features
+cargo +1.95.0 test -p aktor --no-default-features --features local,std --lib
+cargo +1.95.0 test -p aktor --no-default-features --features std,embassy_cross_core --lib
+cargo +1.95.0 test -p aktor --no-default-features --features tokio --all-targets
 cargo test --workspace --all-features --all-targets
 cargo test -p aktor --no-default-features
 cargo test -p aktor --no-default-features --features local,std --lib

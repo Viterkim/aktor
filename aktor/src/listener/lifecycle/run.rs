@@ -28,6 +28,7 @@ where
 
     let mut errors = Vec::new();
     let mut state = Some(state);
+    let mut shutdown_reply = None;
 
     failures.capture(FailureKind::Runtime, || {
         status.send_replace(true);
@@ -75,7 +76,7 @@ where
 
                     status.send_replace(false);
 
-                    let result = clean(runtime, &force, &mut state, &mut cleanup, &mut errors).map_err(LifecycleError::Failed);
+                    let result = clean(runtime, &force, &mut state, &mut cleanup, &mut errors, &failed_cleanup);
                     let _sent = reply.send(result);
                 }
 
@@ -83,6 +84,7 @@ where
                     let result = if state.is_some() {
                         Err(LifecycleError::AlreadyRunning)
                     } else {
+                        failed_cleanup.lock().completed = false;
                         match execute(runtime, &force, async { setup().await }) {
                             Some(Ok(next)) => {
                                 state = Some(next);
@@ -90,7 +92,10 @@ where
                                 status.send_replace(true);
                                 Ok(())
                             }
-                            Some(Err(error)) => Err(LifecycleError::Failed(error)),
+                            Some(Err(error)) => {
+                                failed_cleanup.lock().completed = true;
+                                Err(LifecycleError::Failed(error))
+                            },
                             None => Err(LifecycleError::Closed),
                         }
                     };
@@ -114,18 +119,25 @@ where
 
                     status.send_replace(false);
 
-                    let result = match clean(runtime, &force, &mut state, &mut cleanup, &mut errors) {
-                        Err(error) => Err(ReplaceError::Cleanup(error)),
-                        Ok(()) => match execute(runtime, &force, async { setup().await }) {
-                            Some(Ok(next)) => {
-                                state = Some(next);
-                                listener.admission.open();
-                                status.send_replace(true);
-                                Ok(())
+                    let result = match clean(runtime, &force, &mut state, &mut cleanup, &mut errors, &failed_cleanup) {
+                        Err(LifecycleError::Failed(error)) => Err(ReplaceError::Cleanup(error)),
+                        Err(LifecycleError::Closed | LifecycleError::AlreadyRunning) => Err(ReplaceError::Closed),
+                        Ok(()) => {
+                            failed_cleanup.lock().completed = false;
+                            match execute(runtime, &force, async { setup().await }) {
+                                Some(Ok(next)) => {
+                                    state = Some(next);
+                                    listener.admission.open();
+                                    status.send_replace(true);
+                                    Ok(())
+                                }
+                                Some(Err(error)) => {
+                                    failed_cleanup.lock().completed = true;
+                                    Err(ReplaceError::Setup(error))
+                                }
+                                None => Err(ReplaceError::Closed),
                             }
-                            Some(Err(error)) => Err(ReplaceError::Setup(error)),
-                            None => Err(ReplaceError::Closed),
-                        },
+                        }
                     };
 
                     let answer = SetupAnswer::new(result, abandoned_setup.clone(), |result| {
@@ -139,11 +151,12 @@ where
                 }
 
                 Event::Shutdown | Event::Command(Some(Command::Shutdown(_))) => {
-                    let reply = match event {
+                    shutdown_reply = match event {
                         Event::Command(Some(Command::Shutdown(reply))) => Some(reply),
                         _ => None,
                     };
 
+                    commands.close();
                     listener.close();
 
                     if let Some(state) = &mut state {
@@ -151,12 +164,6 @@ where
                     }
 
                     status.send_replace(false);
-
-                    let result = clean(runtime, &force, &mut state, &mut cleanup, &mut errors).map_err(LifecycleError::Failed);
-
-                    if let Some(reply) = reply {
-                        let _sent = reply.send(result);
-                    }
 
                     break;
                 }
@@ -186,9 +193,7 @@ where
         status.send_replace(false);
     });
 
-    failures.capture(FailureKind::Cleanup, || {
-        let _result = clean(runtime, &force, &mut state, &mut cleanup, &mut errors);
-    });
+    listener.discard_queued(&mut failures);
 
     // Queued setup closures can panic on drop too.
     commands.close();
@@ -198,6 +203,25 @@ where
     }
 
     failures.capture(FailureKind::Teardown, || drop(commands));
+
+    let cleaned = failures.capture(FailureKind::Cleanup, || {
+        clean(
+            runtime,
+            &force,
+            &mut state,
+            &mut cleanup,
+            &mut errors,
+            &failed_cleanup,
+        )
+    });
+
+    if let Some(reply) = shutdown_reply {
+        failures.capture(FailureKind::Teardown, || {
+            if let Some(result) = cleaned {
+                let _sent = reply.send(result);
+            }
+        });
+    }
 
     let finished = listener.discard(&mut failures);
 
@@ -231,20 +255,31 @@ pub fn clean<S, C, CleanupFuture>(
     state: &mut Option<S>,
     cleanup: &mut impl FnMut(S) -> CleanupFuture,
     errors: &mut Vec<Arc<C>>,
-) -> Result<(), Arc<C>>
+    receipt: &Arc<parking_lot::Mutex<FailedCleanup<C>>>,
+) -> Result<(), LifecycleError<Arc<C>>>
 where
     CleanupFuture: core::future::Future<Output = Result<(), C>>,
 {
-    if let Some(state) = state.take()
-        && let Some(Err(error)) =
-            FailureKind::Cleanup.during(|| execute(runtime, force, async { cleanup(state).await }))
-    {
-        let error = Arc::new(error);
-        errors.push(error.clone());
-        return Err(error);
-    }
+    let Some(state) = state.take() else {
+        return Ok(());
+    };
+    let result = FailureKind::Cleanup.during(|| {
+        execute(runtime, force, async {
+            let result = cleanup(state).await;
+            receipt.lock().completed = true;
+            result
+        })
+    });
 
-    Ok(())
+    match result {
+        Some(Ok(())) => Ok(()),
+        Some(Err(error)) => {
+            let error = Arc::new(error);
+            errors.push(error.clone());
+            Err(LifecycleError::Failed(error))
+        }
+        None => Err(LifecycleError::Closed),
+    }
 }
 
 pub fn drain<S>(

@@ -2,6 +2,18 @@ use super::super::*;
 use core::future::{IntoFuture, poll_fn};
 
 impl<E> Completion<E> {
+    #[cfg(any(
+        all(any(feature = "tokio", feature = "bevy"), not(target_family = "wasm")),
+        all(
+            feature = "browser_local",
+            target_family = "wasm",
+            target_os = "unknown"
+        )
+    ))]
+    pub(crate) fn cleanup_completed(&self) -> bool {
+        self.inner.cleanup_completed.get()
+    }
+
     #[doc(hidden)]
     pub fn panic_reported(&self) -> bool {
         self.inner.panic_reported.get()

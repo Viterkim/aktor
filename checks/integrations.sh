@@ -2,7 +2,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
-cargo +1.89.0 test --manifest-path integrations/Cargo.toml
+cargo +1.95.0 test --manifest-path integrations/Cargo.toml
 cargo test --manifest-path integrations/Cargo.toml
 
 for backend in standard bevy; do
@@ -10,7 +10,7 @@ for backend in standard bevy; do
     if [[ $backend == standard ]]; then
         feature=std_thread
     fi
-    cargo +1.89.0 run --manifest-path integrations/Cargo.toml -p aktor-native-proof \
+    cargo +1.95.0 run --manifest-path integrations/Cargo.toml -p aktor-native-proof \
         --no-default-features --features "$feature" --bin "$backend"
     cargo run --manifest-path integrations/Cargo.toml -p aktor-native-proof \
         --no-default-features --features "$feature" --bin "$backend"

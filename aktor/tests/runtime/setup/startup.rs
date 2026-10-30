@@ -2,70 +2,85 @@ use super::*;
 
 #[tokio::test]
 async fn cancel() {
-    let entered = Arc::new(Notify::new());
-    let beginning = entered.clone();
-    let cleaned = Arc::new(Notify::new());
-    let end = cleaned.clone();
+    macro_rules! cancelling {
+        ($kind:expr) => {{
+            let entered = Arc::new(Notify::new());
+            let beginning = entered.clone();
+            let cleaned = Arc::new(Notify::new());
+            let end = cleaned.clone();
 
-    let startup = aktor_start(AktorSetup {
-        actors: aktor_setups! {
-            ready: AktorNew {
-                name: AktorName::new("ready counter"),
-                role: AktorNoRole,
-                kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(0_u32),
+            let startup = aktor_start(AktorSetup {
+                actors: aktor_setups! {
+                    ready: AktorNew {
+                        name: AktorName::new("ready counter"),
+                        role: AktorNoRole,
+                        kind: AktorKind::TokioThread,
+                        closures: AktorClosures {
+                            start: async || Ok::<_, AktorSetupError>(0_u32),
 
-                    end: async move |_: u32| {
-                        end.notify_one();
+                            end: async move |_: u32| {
+                                end.notify_one();
+                            },
+                            intervals: vec![],
+                            before_each: None,
+                            after_each: None,
+                        },
+                        options: AktorNewOptions { capacity: 32 },
                     },
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: AktorNewOptions { capacity: 32 },
-            },
-            waiting: AktorNew {
-                name: AktorName::new("waiting counter"),
-                role: AktorNoRole,
-                kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async move || {
-                        beginning.notify_one();
-                        std::future::pending::<Result<u32, AktorSetupError>>().await
+                    waiting: AktorNew {
+                        name: AktorName::new("waiting counter"),
+                        role: AktorNoRole,
+                        kind: $kind,
+                        closures: AktorClosures {
+                            start: async move || {
+                                beginning.notify_one();
+                                std::future::pending::<Result<u32, AktorSetupError>>().await
+                            },
+
+                            end: (),
+                            intervals: vec![],
+                            before_each: None,
+                            after_each: None,
+                        },
+                        options: AktorNewOptions { capacity: 32 },
                     },
-
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
                 },
-                options: AktorNewOptions { capacity: 32 },
-            },
-        },
-        shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(1),
-        },
-    });
+                shutdown: |_| {},
+                options: AktorOptions {
+                    shutdown_grace: Duration::from_secs(1),
+                },
+            });
 
-    let completion = startup.completion();
-    let running = tokio::spawn(startup);
+            let completion = startup.completion();
+            let running = tokio::spawn(startup);
 
-    entered.notified().await;
-    running.abort();
-    assert!(matches!(running.await, Err(error) if error.is_cancelled()));
-    tokio::time::timeout(Duration::from_secs(2), cleaned.notified())
-        .await
-        .unwrap();
+            entered.notified().await;
+            running.abort();
+            assert!(matches!(running.await, Err(error) if error.is_cancelled()));
+            tokio::time::timeout(Duration::from_secs(2), cleaned.notified())
+                .await
+                .unwrap();
 
-    let report = tokio::time::timeout(Duration::from_secs(2), completion)
-        .await
-        .unwrap();
+            let report = tokio::time::timeout(Duration::from_secs(2), completion)
+                .await
+                .unwrap();
 
-    assert!(report.startup);
-    assert!(report.timed_out);
-    assert_eq!(report.actors.len(), 2);
+            assert!(report.startup);
+            assert!(report.timed_out);
+            assert_eq!(
+                report
+                    .actors
+                    .iter()
+                    .find(|actor| actor.actor == "waiting counter")
+                    .unwrap()
+                    .retirement,
+                RetirementStatus::Unconfirmed
+            );
+        }};
+    }
+
+    cancelling!(AktorKind::TokioThread);
+    cancelling!(AktorKind::TokioTask);
 
     let startup = aktor_start(AktorSetup {
         actors: AktorNew {

@@ -16,7 +16,7 @@ serde = ["aktor/serde"]
 udp = ["dep:utp", "dep:tokio-util"]
 
 [target.'cfg(unix)'.dependencies]
-aktor = { version = "=0.0.9", path = "../aktor", default-features = false, features = ["macros", "tokio", "transport"] }
+aktor = { version = "=0.0.10", path = "../aktor", default-features = false, features = ["macros", "tokio", "transport"] }
 tokio = { workspace = true, features = ["net", "io-util", "rt", "time"] }
 serde.workspace = true
 postcard.workspace = true
@@ -27,7 +27,7 @@ utp = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 
 [dev-dependencies]
-aktor = { version = "=0.0.9", path = "../aktor", default-features = false, features = ["serde"] }
+aktor = { version = "=0.0.10", path = "../aktor", default-features = false, features = ["serde"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "test-util"] }
 tempfile.workspace = true
 

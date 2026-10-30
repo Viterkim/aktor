@@ -1,6 +1,6 @@
 use super::super::*;
 
-impl<S, E, C> Actor<S, E, C> {
+impl<S, E, C> AktorControl<S, E, C> {
     pub fn close_admission(&self) {
         self.admission.shutdown();
     }
@@ -166,6 +166,11 @@ impl<S, E, C> Actor<S, E, C> {
     }
 
     /// Cleanup errors retained after a panic.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn cleanup_completed(&self) -> bool {
+        self.failed_cleanup.lock().completed
+    }
+
     pub fn cleanup_errors(&self) -> CleanupErrors<C> {
         let saved = self.failed_cleanup.lock();
 
@@ -180,15 +185,15 @@ impl<S, E, C> Actor<S, E, C> {
         self.failed_cleanup.lock().group_primary
     }
 }
-impl<S, E, C> Clone for Actor<S, E, C> {
+impl<S, E, C> Clone for AktorControl<S, E, C> {
     fn clone(&self) -> Self {
         self.new_controller()
     }
 }
-impl<S, E, C> core::fmt::Debug for Actor<S, E, C> {
+impl<S, E, C> core::fmt::Debug for AktorControl<S, E, C> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
-            .debug_struct("Actor")
+            .debug_struct("AktorControl")
             .field("running", &self.is_running())
             .finish()
     }

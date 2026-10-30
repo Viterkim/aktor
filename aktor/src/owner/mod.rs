@@ -14,7 +14,7 @@ mod start;
 /// The resource on its own thread, with a handle for calling your functions.
 pub struct Aktor<S, Role = ()> {
     pub handle: Handle<S, Role>,
-    pub actor: Lifecycle<S>,
+    pub control: Lifecycle<S>,
     pub completion: OwnerCompletion,
 }
 
@@ -74,5 +74,5 @@ struct CompletionScheduleError {
 }
 
 pub struct Lifecycle<S> {
-    inner: crate::listener::Actor<S, crate::AktorSetupError, AktorFailure>,
+    inner: crate::listener::AktorControl<S, crate::AktorSetupError, AktorFailure>,
 }

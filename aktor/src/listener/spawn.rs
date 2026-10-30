@@ -1,5 +1,5 @@
 use super::*;
-use crate::message::{ActorError, ActorResult};
+use crate::message::{AktorStateError, AktorStateResult};
 #[cfg(feature = "tokio")]
 use core::convert::Infallible;
 use tokio::sync::watch;
@@ -9,9 +9,9 @@ use tokio::{
     task::{self, JoinHandle},
 };
 
-pub fn channel<S>(capacity: usize) -> ActorResult<(Handle<S>, Listener<S>)> {
+pub fn channel<S>(capacity: usize) -> AktorStateResult<(Handle<S>, Listener<S>)> {
     if capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS {
-        return Err(ActorError::InvalidCapacity);
+        return Err(AktorStateError::InvalidCapacity);
     }
 
     let (sender, receiver) = mailbox::channel(capacity);
@@ -46,6 +46,7 @@ pub fn channel<S>(capacity: usize) -> ActorResult<(Handle<S>, Listener<S>)> {
 pub fn startup_cause<T>(
     joined: Result<std::thread::Result<Option<T>>, tokio::task::JoinError>,
 ) -> DedicatedJoinError {
+    let physically_joined = joined.is_ok();
     let payload: Box<dyn std::any::Any + Send> = match joined {
         Ok(Err(payload)) => payload,
         Ok(Ok(_)) => Box::new("actor startup ended before ready"),
@@ -54,6 +55,7 @@ pub fn startup_cause<T>(
     };
 
     DedicatedJoinError {
+        physically_joined,
         payload: parking_lot::Mutex::new(payload),
     }
 }
@@ -63,7 +65,7 @@ pub fn spawn_local<S: 'static>(
     executor: &task::LocalSet,
     state: S,
     capacity: usize,
-) -> ActorResult<(Handle<S>, JoinHandle<S>)> {
+) -> AktorStateResult<(Handle<S>, JoinHandle<S>)> {
     spawn_local_with_policy(executor, state, capacity, FailurePolicy::default())
 }
 
@@ -73,7 +75,7 @@ pub fn spawn_local_with_policy<S: 'static>(
     state: S,
     capacity: usize,
     failure: FailurePolicy,
-) -> ActorResult<(Handle<S>, JoinHandle<S>)> {
+) -> AktorStateResult<(Handle<S>, JoinHandle<S>)> {
     let (handle, mut listener) = channel(capacity)?;
 
     listener.failure = failure;
@@ -158,7 +160,7 @@ where
                     }
                 });
 
-                failures.capture(FailureKind::Teardown, || listener.receiver.close());
+                listener.discard_queued(&mut failures);
 
                 let outcome = match outcome {
                     Some(outcome) => outcome.map_err(RunError::Failed),

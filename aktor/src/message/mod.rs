@@ -26,13 +26,13 @@ pub use error::stopped;
 pub use native::*;
 
 #[derive(Clone, Copy, Er, PartialEq, Eq)]
-pub enum ActorError {
+pub enum AktorStateError {
     NotStarted,
     InvalidCapacity,
     Closed,
 }
 
-pub type ActorResult<T> = Result<T, ActorError>;
+pub type AktorStateResult<T> = Result<T, AktorStateError>;
 
 #[cfg_attr(feature = "transport", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Er, PartialEq, Eq)]

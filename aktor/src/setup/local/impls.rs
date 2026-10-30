@@ -2,7 +2,7 @@ use super::super::*;
 use super::Completion;
 use crate::setup::intervals::{LocalInterval, LocalIntervals};
 use crate::{
-    ActorFailure, ActorOutcome, AktorError, KillSwitch,
+    AktorError, AktorFailureReport, AktorOutcome, KillSwitch,
     group::shutdown::{contain_drop, panic_message},
     local::{self, Handle, hooks::AktorHooks},
     message::LocalFuture,
@@ -16,7 +16,7 @@ use std::panic::AssertUnwindSafe;
 use tokio::sync::{oneshot, watch};
 
 impl Completion {
-    fn publish(&mut self, outcome: ActorOutcome) {
+    fn publish(&mut self, outcome: AktorOutcome) {
         if let Some(completed) = self.completed.take() {
             let _sent = completed.send(outcome);
         }
@@ -25,14 +25,15 @@ impl Completion {
 impl Drop for Completion {
     fn drop(&mut self) {
         if self.completed.is_some() {
-            let primary = self.kill.fail(ActorFailure {
+            let primary = self.kill.fail(AktorFailureReport {
                 kind: Some(self.kind),
                 actor: self.name.clone(),
                 phase: "owner".into(),
                 message: "local actor task cancelled".into(),
             });
 
-            self.publish(ActorOutcome {
+            self.publish(AktorOutcome {
+                retirement: crate::RetirementStatus::Unconfirmed,
                 kind: Some(self.kind),
                 actor: self.name.clone(),
                 diagnostics: if primary {
@@ -92,7 +93,7 @@ where
             &name,
             Kind::EXECUTION,
             AktorStartError::Setup(AktorError::new(
-                crate::message::ActorError::InvalidCapacity.to_string(),
+                crate::message::AktorStateError::InvalidCapacity.to_string(),
                 (),
             )),
         ));
@@ -133,7 +134,8 @@ where
                 forcing.send_replace(true);
             }),
             Box::pin(async move {
-                outcome.await.unwrap_or_else(|_| ActorOutcome {
+                outcome.await.unwrap_or_else(|_| AktorOutcome {
+                    retirement: crate::RetirementStatus::Unconfirmed,
                     kind: Some(Kind::EXECUTION),
                     actor: label,
                     diagnostics: vec![AktorError::new("local actor observer stopped", ())],
@@ -184,7 +186,8 @@ where
         );
 
         let mut stopping = false;
-        let mut report = ActorOutcome {
+        let mut report = AktorOutcome {
+            retirement: crate::RetirementStatus::Unconfirmed,
             kind: Some(Kind::EXECUTION),
             actor: completion.name.clone(),
             diagnostics: Vec::new(),
@@ -212,7 +215,7 @@ where
                         Err(payload) => {
                             let message = panic_message(&payload);
 
-                            let first = completion.kill.fail(ActorFailure {
+                            let first = completion.kill.fail(AktorFailureReport {
                                 kind: Some(Kind::EXECUTION),
                                 actor: report.actor.clone(),
                                 phase: "operation".into(),
@@ -235,12 +238,18 @@ where
                 changed = forced.changed() => {
                     if changed.is_err() || *forced.borrow_and_update() {
                         report.timed_out = true;
+                        report.retirement = crate::RetirementStatus::Unconfirmed;
                         break;
                     }
                 },
             }
         }
 
+        report.retirement = if retained.cleanup_completed() {
+            crate::RetirementStatus::Confirmed
+        } else {
+            crate::RetirementStatus::Unconfirmed
+        };
         report.diagnostics.extend(retained.diagnostics());
         contain_drop(driver, &completion.kill, "local owner drop");
         contain_drop(alive, &completion.kill, "local handle drop");

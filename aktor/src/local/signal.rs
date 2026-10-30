@@ -1,4 +1,4 @@
-use crate::ActorFailure;
+use crate::AktorFailureReport;
 
 #[derive(Clone)]
 pub enum StopSignal {
@@ -25,7 +25,7 @@ impl StopSignal {
         }
     }
 
-    pub fn fail(&self, failure: ActorFailure) -> bool {
+    pub fn fail(&self, failure: AktorFailureReport) -> bool {
         match self {
             Self::Local(kill) => kill.fail(failure),
             #[cfg(any(
@@ -38,7 +38,7 @@ impl StopSignal {
         }
     }
 
-    pub fn fail_startup(&self, failure: ActorFailure) -> bool {
+    pub fn fail_startup(&self, failure: AktorFailureReport) -> bool {
         match self {
             Self::Local(kill) => kill.fail_startup(failure),
             #[cfg(any(
@@ -53,19 +53,19 @@ impl StopSignal {
 }
 pub trait LocalStop {
     fn is_stopping(&self) -> bool;
-    fn fail(&self, failure: ActorFailure) -> bool;
-    fn fail_startup(&self, failure: ActorFailure) -> bool;
+    fn fail(&self, failure: AktorFailureReport) -> bool;
+    fn fail_startup(&self, failure: AktorFailureReport) -> bool;
 }
 impl<Clock: super::clock::AktorGroupClock> LocalStop for super::group::KillSwitch<Clock> {
     fn is_stopping(&self) -> bool {
         self.is_stopping()
     }
 
-    fn fail(&self, failure: ActorFailure) -> bool {
+    fn fail(&self, failure: AktorFailureReport) -> bool {
         self.fail(failure)
     }
 
-    fn fail_startup(&self, failure: ActorFailure) -> bool {
+    fn fail_startup(&self, failure: AktorFailureReport) -> bool {
         self.fail_startup(failure)
     }
 }

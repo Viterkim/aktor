@@ -11,6 +11,7 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
         let config = encode(config)?;
         let worker = Self::with_options(url, options)?;
 
+        worker.inner.accepted.set(false);
         *worker.inner.initialize.borrow_mut() = Some(config);
         Ok(worker)
     }
@@ -20,6 +21,14 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
     }
 
     pub fn with_options(url: &str, options: Options) -> Result<Self, WorkerError> {
+        Self::with_policy(url, options, false)
+    }
+
+    pub(super) fn with_policy(
+        url: &str,
+        options: Options,
+        optional: bool,
+    ) -> Result<Self, WorkerError> {
         options.validate()?;
 
         let expected = registry::Registry::for_actor::<S, Role>()?.operations();
@@ -41,10 +50,16 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
             executing: Cell::new(false),
             pump_scheduled: Cell::new(false),
             shutdown_sent: Cell::new(false),
+            shutdown_join: RefCell::new(ShutdownJoin::Ready),
+            pending_finish: RefCell::new(None),
             next: Cell::new(0),
             handles: Cell::new(1),
             closed: Cell::new(false),
             failed: Cell::new(false),
+            optional,
+            accepted: Cell::new(true),
+            retired: Rc::new(Cell::new(false)),
+            uncertain: RefCell::new(Vec::new()),
             failure: RefCell::new(None),
             diagnostics: Rc::new(RefCell::new(Vec::new())),
             count: Arc::new(Semaphore::new(options.capacity)),
@@ -110,6 +125,8 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
                             &Incoming::Initialize { config },
                         ) {
                             inner.fail_error(error);
+                        } else {
+                            inner.accepted.set(true);
                         }
                     } else {
                         inner.fail_error(WireError::setup(
@@ -123,7 +140,11 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
                     options,
                     operations,
                 }) => {
-                    if let Err(cause) =
+                    inner.accepted.set(true);
+
+                    if inner.failed.get() {
+                        inner.continue_shutdown(false);
+                    } else if let Err(cause) =
                         compatible(&inner.options, &expected, version, &options, &operations)
                     {
                         inner.fail(cause);
@@ -133,6 +154,17 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
                     } else {
                         inner.ready.send_replace(Some(Ok(())));
                         inner.pump();
+                    }
+                }
+
+                Ok(Outgoing::SetupRetired) => {
+                    if inner.failed.get()
+                        && inner.outstanding.borrow().is_empty()
+                        && inner.initialize.borrow().is_none()
+                    {
+                        inner.finish(Ok(()));
+                    } else {
+                        inner.fail(WorkerCause::Protocol);
                     }
                 }
 
@@ -150,6 +182,10 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
                 }
 
                 Ok(Outgoing::Answer { id, output }) => {
+                    if inner.failed.get() {
+                        return;
+                    }
+
                     if inner.active.get() != Some(id) {
                         inner.fail(WorkerCause::Protocol);
                         return;
@@ -202,13 +238,15 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
         let weak = Rc::downgrade(&inner);
         let error = Closure::new(move |event: ErrorEvent| {
             if let Some(inner) = weak.upgrade() {
+                // Script loading failures can arrive without ErrorEvent.message.
+                let message = js_sys::Reflect::get(event.as_ref(), &"message".into())
+                    .ok()
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_else(|| "worker failed to load or execute".into());
                 let error = if matches!(*inner.ready.borrow(), Some(Ok(()))) {
-                    WireError::new(
-                        CallError::OutcomeUnknown,
-                        WorkerCause::Crashed(event.message()),
-                    )
+                    WireError::new(CallError::OutcomeUnknown, WorkerCause::Crashed(message))
                 } else {
-                    WireError::setup(CallError::OutcomeUnknown, event.message())
+                    WireError::setup(CallError::OutcomeUnknown, message)
                 };
 
                 inner.fail_error(error);
@@ -219,6 +257,8 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
             .worker
             .set_onerror(Some(error.as_ref().unchecked_ref()));
         *inner.error.borrow_mut() = Some(error);
+
+        *inner.retained.borrow_mut() = Some(inner.clone());
 
         Ok(Self {
             inner,

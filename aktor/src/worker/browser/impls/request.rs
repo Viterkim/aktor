@@ -115,12 +115,16 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
             id,
             parked: false,
             taken: false,
+            error: None,
         });
 
         Ok(())
     }
 
-    fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WireError>> {
+    pub(in crate::worker::browser) fn poll_submit(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), WireError>> {
         if let Some(reply) = &self.reply {
             if reply.taken {
                 crate::message::consumed();
@@ -166,12 +170,10 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
             Poll::Ready(Err(error)) => {
                 self.admission = None;
 
-                if self.inner.failed.get() {
-                    self.parked = true;
-                    self.inner.park(error)
-                } else {
-                    Poll::Ready(Err(error))
-                }
+                Poll::Ready(Err(WireError {
+                    outcome: CallError::NotAdmitted,
+                    ..error
+                }))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -186,6 +188,10 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
             Poll::Ready(Err(error)) => {
                 self.parked = true;
                 self.admission = None;
+
+                if self.inner.failed.get() {
+                    return self.inner.park(error);
+                }
 
                 if error.outcome == CallError::NotAdmitted
                     && error.cause == WorkerCause::Closed
@@ -215,6 +221,17 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
         crate::Timeout::browser(self, duration, |request| crate::timeout::WaitStatus {
             admitted: request.reply.is_some(),
         })
+    }
+
+    /// Wait for admission and return a refusal without waiting for cleanup.
+    pub async fn admit(mut self) -> Result<WorkerReply<O>, WorkerError> {
+        poll_fn(|cx| self.poll_submit(cx))
+            .await
+            .map_err(WireError::without_data)?;
+
+        self.reply
+            .take()
+            .ok_or_else(|| WorkerError::new(CallError::NotAdmitted, WorkerCause::Closed))
     }
 
     pub async fn send(mut self) -> WorkerReply<O> {

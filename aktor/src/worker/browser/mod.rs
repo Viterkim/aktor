@@ -13,15 +13,18 @@ use web_sys::{ErrorEvent, MessageEvent};
 
 mod buffer;
 mod completion;
+mod dependency;
 mod impls;
 mod latest;
 mod open;
+mod optional;
 mod server;
 mod setup;
 use buffer::Buffers;
 use completion::observe;
 use impls::fatal;
 pub use latest::{LatestResults, LatestSender};
+pub use optional::{OptionalReply, OptionalRequest, OptionalWorker};
 pub use server::{Server, serve, serve_for, serve_with, setup_failed};
 pub use setup::serve_setup;
 
@@ -38,6 +41,7 @@ pub struct Completion<E = ()> {
     data: PhantomData<fn() -> E>,
     result: watch::Receiver<Option<Result<(), WireError>>>,
     diagnostics: Rc<RefCell<Vec<crate::AktorError>>>,
+    retired: Rc<Cell<bool>>,
 }
 
 #[must_use = "await the request, or explicitly send or cast it"]
@@ -62,6 +66,7 @@ pub struct WorkerReply<O> {
     id: u64,
     parked: bool,
     taken: bool,
+    error: Option<WireError>,
 }
 
 type Callback<Event> = RefCell<Option<Closure<dyn FnMut(Event)>>>;
@@ -74,6 +79,17 @@ struct Work {
     _bytes: Option<OwnedSemaphorePermit>,
 }
 
+pub(crate) struct ShutdownDependency {
+    joining: Option<LocalFuture<'static, Result<(), crate::AktorError>>>,
+    finished: watch::Sender<Option<Result<(), crate::AktorError>>>,
+}
+
+enum ShutdownJoin {
+    Ready,
+    Waiting(LocalFuture<'static, Result<(), crate::AktorError>>),
+    Joining { force: bool },
+}
+
 struct Inner {
     worker: web_sys::Worker,
     outstanding: RefCell<HashMap<u64, Work>>,
@@ -82,10 +98,16 @@ struct Inner {
     executing: Cell<bool>,
     pump_scheduled: Cell<bool>,
     shutdown_sent: Cell<bool>,
+    shutdown_join: RefCell<ShutdownJoin>,
+    pending_finish: RefCell<Option<Result<(), WireError>>>,
     next: Cell<u64>,
     handles: Cell<usize>,
     closed: Cell<bool>,
     failed: Cell<bool>,
+    optional: bool,
+    accepted: Cell<bool>,
+    retired: Rc<Cell<bool>>,
+    uncertain: RefCell<Vec<Work>>,
     failure: RefCell<Option<WireError>>,
     diagnostics: Rc<RefCell<Vec<crate::AktorError>>>,
     options: Options,

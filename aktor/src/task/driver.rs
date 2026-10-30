@@ -2,13 +2,14 @@ use super::clock::TaskDeadline;
 use super::*;
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 use crate::setup::kind::TokioTask;
+use crate::{AktorClosure, operation::Operation};
 use crate::{
-    ActorFailure, ActorOutcome, AktorClosures, AktorError, AktorGroup, AktorNew, AktorStartError,
+    AktorClosures, AktorError, AktorFailureReport, AktorGroup, AktorNew, AktorOutcome,
+    AktorStartError,
     group::shutdown::{contain_drop, panic_message},
     operation::hooks::AktorHooks,
     setup::kind::AktorMode,
 };
-use crate::{AktorClosure, operation::Operation};
 use core::task::{Context, Poll};
 use futures_util::{FutureExt, future::Either};
 use hooks::{AktorTaskEnd, AktorTaskInterval};
@@ -43,16 +44,16 @@ struct TaskInterval<S: 'static> {
 
 struct Completion {
     cleanup: Arc<parking_lot::Mutex<Vec<Arc<crate::AktorFailure>>>>,
-    report: ActorOutcome,
+    report: AktorOutcome,
     kill: KillSwitch,
-    completed: Option<oneshot::Sender<ActorOutcome>>,
+    completed: Option<oneshot::Sender<AktorOutcome>>,
     finished: watch::Sender<AktorTaskStatus>,
     failed: bool,
 }
 impl Completion {
     fn fail(&mut self, phase: &str, message: String) -> bool {
         self.failed = true;
-        self.kill.fail(ActorFailure {
+        self.kill.fail(AktorFailureReport {
             actor: self.report.actor.clone(),
             kind: self.report.kind,
             phase: phase.into(),
@@ -62,7 +63,7 @@ impl Completion {
 
     fn fail_startup(&mut self, message: String) -> bool {
         self.failed = true;
-        self.kill.fail_startup(ActorFailure {
+        self.kill.fail_startup(AktorFailureReport {
             actor: self.report.actor.clone(),
             kind: self.report.kind,
             phase: "setup".into(),
@@ -120,6 +121,7 @@ impl Completion {
 impl Drop for Completion {
     fn drop(&mut self) {
         if self.completed.is_some() {
+            self.report.retirement = crate::RetirementStatus::Unconfirmed;
             let message = "actor task cancelled before cleanup completed";
 
             if !self.fail("owner", message.into()) {
@@ -219,7 +221,8 @@ where
                 let _sent = forcing.send(());
             }),
             Box::pin(async move {
-                let mut report = outcome.await.unwrap_or_else(|_| ActorOutcome {
+                let mut report = outcome.await.unwrap_or_else(|_| AktorOutcome {
+                    retirement: crate::RetirementStatus::Unconfirmed,
                     actor: label,
                     kind: Some(kind),
                     diagnostics: vec![AktorError::new("actor task observer stopped", ())],
@@ -238,7 +241,8 @@ where
     let cleanup_errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let completion = Completion {
         cleanup: cleanup_errors.clone(),
-        report: ActorOutcome {
+        report: AktorOutcome {
+            retirement: crate::RetirementStatus::Unconfirmed,
             actor: (*name).clone(),
             kind: Some(kind),
             diagnostics: Vec::new(),
@@ -448,6 +452,7 @@ async fn drive<S, Start, Fut>(
     let state = match result {
         Some(Ok(Ok(state))) => state,
         Some(Ok(Err(error))) => {
+            completion.report.retirement = crate::RetirementStatus::Confirmed;
             if let AktorStartError::Init(error) = &error
                 && !error.primary
             {
@@ -726,8 +731,11 @@ async fn drive<S, Start, Fut>(
         completion.dispose(cleanup, "task cleanup drop");
 
         match result {
-            Some(Ok(Ok(()))) => {}
+            Some(Ok(Ok(()))) => {
+                completion.report.retirement = crate::RetirementStatus::Confirmed;
+            }
             Some(Ok(Err(mut error))) => {
+                completion.report.retirement = crate::RetirementStatus::Confirmed;
                 error.primary = primary;
 
                 if !primary {
@@ -749,6 +757,7 @@ async fn drive<S, Start, Fut>(
             }
             None => {
                 completion.report.timed_out = true;
+                completion.report.retirement = crate::RetirementStatus::Unconfirmed;
                 completion
                     .report
                     .diagnostics
@@ -860,7 +869,8 @@ mod tests {
 
             let completion = Completion {
                 cleanup: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                report: ActorOutcome {
+                report: AktorOutcome {
+                    retirement: crate::RetirementStatus::Confirmed,
                     actor: "chain".into(),
                     kind: Some(crate::AktorExecution::BevyTask),
                     diagnostics: vec![],

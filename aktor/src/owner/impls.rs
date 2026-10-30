@@ -140,7 +140,7 @@ impl<S: 'static> Aktor<S> {
         });
 
         if let Err(error) = result {
-            owner.actor.request_shutdown();
+            owner.control.request_shutdown();
 
             let observing = observing.lock().take();
 
@@ -217,7 +217,7 @@ impl<S: 'static> Aktor<S> {
         Ok((
             Self {
                 handle,
-                actor: Lifecycle { inner: actor },
+                control: Lifecycle { inner: actor },
                 completion: OwnerCompletion { result },
             },
             observing,
@@ -240,7 +240,7 @@ impl<S, Role> Aktor<S, Role> {
     pub fn with_role<NewRole>(self) -> Aktor<S, NewRole> {
         Aktor {
             handle: self.handle.with_role(),
-            actor: self.actor,
+            control: self.control,
             completion: self.completion,
         }
     }
@@ -249,7 +249,7 @@ impl<S: 'static, Role> Aktor<S, Role> {
     /// Finish queued calls and cleanup. Once started, it keeps going if you stop awaiting it.
     /// Owners started with `Aktor::spawn` need their runtime running until completion.
     pub fn shutdown(&self) -> OwnerCompletion {
-        self.actor.request_shutdown();
+        self.control.request_shutdown();
         self.completion.new_observer()
     }
 }
@@ -373,6 +373,17 @@ impl From<OwnerFailure> for OwnerError {
     }
 }
 impl OwnerError {
+    /// Whether the OS thread was joined. Cleanup may have failed or been skipped.
+    pub fn physically_joined(&self) -> bool {
+        match &self.error {
+            OwnerFailure::Cleanup(_) | OwnerFailure::Cancelled => true,
+            OwnerFailure::Panicked(cause) | OwnerFailure::PanickedWithCleanup { cause, .. } => {
+                cause.physically_joined
+            }
+            OwnerFailure::RuntimeStopped => false,
+        }
+    }
+
     #[doc(hidden)]
     pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.diagnostics.report)
@@ -537,7 +548,7 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(250), owner.completion.wait()).await;
 
         if result.is_err() {
-            owner.actor.shutdown().await.unwrap();
+            owner.control.shutdown().await.unwrap();
         }
 
         drop((input, output));
@@ -584,7 +595,7 @@ mod tests {
 
         entering.await.unwrap();
 
-        let mut replacing = Box::pin(owner.actor.replace(|| Ok::<_, AktorSetupError>(2)));
+        let mut replacing = Box::pin(owner.control.replace(|| Ok::<_, AktorSetupError>(2)));
 
         assert!(replacing.as_mut().now_or_never().is_none());
         drop(replacing);
@@ -647,7 +658,7 @@ mod tests {
 
         // Leave no stuck owner behind when running this against the broken handoff.
         if completed.is_err() {
-            owner.actor.shutdown().await.unwrap();
+            owner.control.shutdown().await.unwrap();
         }
 
         if grouped {

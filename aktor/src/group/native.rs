@@ -316,7 +316,7 @@ impl AktorGroup {
             Err(_) => {
                 let error = DedicatedStartError::NoRuntime;
 
-                kill.fail_startup(ActorFailure {
+                kill.fail_startup(AktorFailureReport {
                     kind: None,
                     actor: name,
                     phase: "setup".into(),
@@ -355,7 +355,8 @@ impl AktorGroup {
                         forcing.send_replace(true);
                     }),
                     outcome: Box::pin(async move {
-                        outcome.await.unwrap_or_else(|_| ActorOutcome {
+                        outcome.await.unwrap_or_else(|_| AktorOutcome {
+                            retirement: crate::RetirementStatus::Unconfirmed,
                             kind: None,
                             actor: label,
                             diagnostics: vec![AktorCleanupError::new(
@@ -399,7 +400,8 @@ impl AktorGroup {
 
                         let sent = started.send(Err(error));
                         super::shutdown::contain_drop(sent, &kill, "startup reply drop");
-                        let _sent = completed.send(ActorOutcome {
+                        let _sent = completed.send(AktorOutcome {
+                            retirement: crate::RetirementStatus::Unconfirmed,
                             kind: None,
                             actor: name,
                             diagnostics: Vec::new(),
@@ -409,7 +411,7 @@ impl AktorGroup {
                         return;
                     }
 
-                    let first = kill.fail_startup(ActorFailure {
+                    let first = kill.fail_startup(AktorFailureReport {
                         kind: None,
                         actor: name.clone(),
                         phase: "setup".into(),
@@ -438,9 +440,20 @@ impl AktorGroup {
                         failure.message = diagnostics.clone();
                     }
 
+                    let retirement = match &error {
+                        DedicatedStartError::Panicked { .. } | DedicatedStartError::Closed => {
+                            crate::RetirementStatus::Unconfirmed
+                        }
+                        DedicatedStartError::Init(_)
+                        | DedicatedStartError::NotStarted
+                        | DedicatedStartError::NoRuntime
+                        | DedicatedStartError::InvalidCapacity
+                        | DedicatedStartError::Thread(_) => crate::RetirementStatus::Confirmed,
+                    };
                     let sent = started.send(Err(error));
                     super::shutdown::contain_drop(sent, &kill, "startup reply drop");
-                    let _sent = completed.send(ActorOutcome {
+                    let _sent = completed.send(AktorOutcome {
+                        retirement,
                         kind: None,
                         actor: name,
                         diagnostics: if first || primary {
@@ -457,7 +470,7 @@ impl AktorGroup {
 
             let mut observing = core::pin::pin!(observing);
             let mut joined = false;
-            let actor = owner.actor.new_controller();
+            let actor = owner.control.new_controller();
             let completion = owner.completion();
             let alive = owner.new_handle();
             let _sent = started.send(Ok(owner));
@@ -495,7 +508,12 @@ impl AktorGroup {
 
             drop(alive);
 
-            let mut outcome = ActorOutcome {
+            let mut outcome = AktorOutcome {
+                retirement: if actor.cleanup_completed() {
+                    crate::RetirementStatus::Confirmed
+                } else {
+                    crate::RetirementStatus::Unconfirmed
+                },
                 kind: None,
                 actor: name,
                 diagnostics: Vec::new(),
@@ -525,7 +543,7 @@ impl AktorGroup {
                         }
                     };
 
-                    first = kill.fail(ActorFailure {
+                    first = kill.fail(AktorFailureReport {
                         kind: None,
                         actor: outcome.actor.clone(),
                         phase: phase.into(),
@@ -580,7 +598,7 @@ impl AktorGroup {
         if let Err(error) = scheduled {
             let kill = self.killswitch();
 
-            kill.fail_startup(ActorFailure {
+            kill.fail_startup(AktorFailureReport {
                 kind: Some(kind),
                 actor: actor_name.clone(),
                 phase: "setup".into(),
@@ -595,6 +613,7 @@ impl AktorGroup {
             Err(DedicatedStartError::Panicked {
                 actor: actor_name.clone(),
                 cause: DedicatedJoinError {
+                    physically_joined: false,
                     payload: parking_lot::Mutex::new(Box::new("startup observer stopped")),
                 },
             })
@@ -605,7 +624,7 @@ impl AktorGroup {
                 matches!(error, DedicatedStartError::Closed) && self.killswitch().is_stopping();
 
             if !cancelled {
-                self.killswitch().fail_startup(ActorFailure {
+                self.killswitch().fail_startup(AktorFailureReport {
                     kind: None,
                     actor: actor_name,
                     phase: "setup".into(),

@@ -110,22 +110,30 @@ pub struct AktorArgs<Setup, Cleanup> {
 pub struct ShutdownReport {
     /// Stopped during root startup, or because a new actor could not initialize.
     pub startup: bool,
-    pub failure: Option<ActorFailure>,
-    pub actors: Vec<ActorOutcome>,
+    pub failure: Option<AktorFailureReport>,
+    pub actors: Vec<AktorOutcome>,
     pub application: Vec<AktorError>,
     pub timed_out: bool,
 }
 
 #[derive(Clone, Debug)]
-pub struct ActorFailure {
+pub struct AktorFailureReport {
     pub actor: String,
     pub kind: Option<AktorExecution>,
     pub phase: String,
     pub message: String,
 }
 
+/// Whether an owner finished its managed work and cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetirementStatus {
+    Confirmed,
+    Unconfirmed,
+}
+
 #[derive(Clone, Debug)]
-pub struct ActorOutcome {
+pub struct AktorOutcome {
+    pub retirement: RetirementStatus,
     pub actor: String,
     pub kind: Option<AktorExecution>,
     pub diagnostics: Vec<AktorCleanupError>,
@@ -186,11 +194,11 @@ mod prepared {
         pub capacity: usize,
     }
 
-    pub struct AktorSetup<Actors, Shutdown, ShutdownOutput>
+    pub struct AktorSetup<Setups, Shutdown, ShutdownOutput>
     where
         Shutdown: FnOnce(ShutdownReport) -> ShutdownOutput,
     {
-        pub actors: Actors,
+        pub actors: Setups,
         pub shutdown: Shutdown,
         pub options: AktorOptions,
     }

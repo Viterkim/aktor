@@ -189,7 +189,7 @@ fn capacity() {
     for capacity in [0, max + 1] {
         assert!(matches!(
             channel::<()>(capacity),
-            Err(ActorError::InvalidCapacity)
+            Err(AktorStateError::InvalidCapacity)
         ));
     }
 

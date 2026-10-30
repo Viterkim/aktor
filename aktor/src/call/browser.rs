@@ -1,6 +1,13 @@
 use super::*;
-use crate::worker::{WorkerReply, WorkerRequest};
+use crate::worker::{WorkerError, WorkerReply, WorkerRequest};
 use core::time::Duration;
+
+impl<'a, T, I, S, O: 'static, Role, L> Call<T, I, WorkerRequest<'a, S, O, Role>, L> {
+    /// Wait for admission and return a refusal without waiting for cleanup.
+    pub async fn admit(self) -> Result<WorkerReply<O>, WorkerError> {
+        self.into_request().admit().await
+    }
+}
 
 impl<'a, S, O: 'static, Role> SendRequest for WorkerRequest<'a, S, O, Role> {
     type Reply = WorkerReply<O>;

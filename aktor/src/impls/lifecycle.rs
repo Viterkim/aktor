@@ -1,6 +1,6 @@
 use crate::{
     AktorArgs, AktorCleanupError, AktorCleanupOutput, AktorExecution, AktorShutdownAsync,
-    AktorShutdownFuture, AktorShutdownOutput, AktorShutdownSync, ShutdownReport,
+    AktorShutdownFuture, AktorShutdownOutput, AktorShutdownSync, RetirementStatus, ShutdownReport,
 };
 use alloc::string::String;
 use core::fmt;
@@ -79,16 +79,17 @@ impl ShutdownReport {
         self.failure.is_some()
             || self.timed_out
             || !self.application.is_empty()
-            || self
-                .actors
-                .iter()
-                .any(|actor| actor.timed_out || !actor.diagnostics.is_empty())
+            || self.actors.iter().any(|actor| {
+                actor.retirement == RetirementStatus::Unconfirmed
+                    || actor.timed_out
+                    || !actor.diagnostics.is_empty()
+            })
     }
 }
 impl fmt::Display for ShutdownReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(failure) = &self.failure {
-            write!(f, "Actor {:?}", failure.actor)?;
+            write!(f, "Aktor {:?}", failure.actor)?;
             write_kind(f, failure.kind)?;
             writeln!(f, " died during {}: {}", failure.phase, failure.message)?;
         }
@@ -98,6 +99,10 @@ impl fmt::Display for ShutdownReport {
                 write!(f, "{}", actor.actor)?;
                 write_kind(f, actor.kind)?;
                 writeln!(f, " cleanup:\n{}", report.diagnostics)?;
+            }
+
+            if actor.retirement == RetirementStatus::Unconfirmed {
+                writeln!(f, "{} cleanup remains unconfirmed", actor.actor)?;
             }
 
             if actor.timed_out {

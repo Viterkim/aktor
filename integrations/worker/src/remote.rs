@@ -274,7 +274,7 @@ pub async fn remote_preflight_check(program: String) -> Result<bool, JsValue> {
 
     client.ready().await.map_err(error)?;
     assert_eq!(add(&client, 1).await, Ok(8));
-    client.shutdown().await.map_err(error)?;
+    client.shutdown().report().await.map_err(error)?;
     Ok(true)
 }
 

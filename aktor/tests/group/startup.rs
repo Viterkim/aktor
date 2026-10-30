@@ -191,7 +191,7 @@ async fn startup() {
                         caller_started.notify_one();
                         call(&database.handle, |_, ()| panic!("storage died"), ()).await;
                     } else {
-                        database.actor.pause().await.unwrap();
+                        database.control.pause().await.unwrap();
                         caller_started.notify_one();
                         call(&database.handle, |_, ()| (), ()).await;
                     }

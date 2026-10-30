@@ -2,7 +2,7 @@ use aktor::listener::{
     AbandonedSetup, DedicatedStartError, Handle, LifecycleError, ReplaceError, RunError,
     WeakHandle, channel, spawn, spawn_local, spawn_local_with_policy, spawn_runner,
 };
-use aktor::message::{ActorError, Reply, Request, call};
+use aktor::message::{AktorStateError, Reply, Request, call};
 use aktor::*;
 
 #[path = "../support/mod.rs"]
@@ -16,9 +16,11 @@ mod admission;
 mod deadlines;
 #[cfg(feature = "macros")]
 mod latest;
+mod outcome;
 mod ownership;
 mod pause;
 mod replace;
+mod retirement;
 mod runner;
 #[cfg(all(feature = "macros", not(target_family = "wasm")))]
 mod setup;

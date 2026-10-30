@@ -45,15 +45,24 @@ async fn cutoff() {
 async fn waiting_admission() {
     let (entered, running) = oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
+    let (guard, dropped) = std::sync::mpsc::channel::<()>();
+    let (draining, drain_started) = oneshot::channel();
+    let (finish, finish_drain) = std::sync::mpsc::channel();
 
     let (handle, actor, thread) = spawn(SpawnArgs {
         name: "waiting admission".into(),
         capacity: 1,
         failure: FailurePolicy::Unwind,
         setup: || Ok::<_, std::convert::Infallible>(0usize),
-        cleanup: |state| {
+        cleanup: move |state| {
             assert_eq!(state, 2);
-            Ok::<_, std::convert::Infallible>(())
+
+            match dropped.recv_timeout(Duration::from_secs(1)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+                _ => Err(std::io::Error::other(
+                    "queued replacement still owns cleanup guard",
+                )),
+            }
         },
     })
     .await
@@ -73,7 +82,17 @@ async fn waiting_admission() {
 
     running.await.unwrap();
 
-    let second = call(&handle, |state, ()| *state += 1, ()).send().await;
+    let second = call(
+        &handle,
+        move |state, ()| {
+            draining.send(()).unwrap();
+            finish_drain.recv().unwrap();
+            *state += 1;
+        },
+        (),
+    )
+    .send()
+    .await;
 
     let mut waiting = Box::pin(call(&handle, |state, ()| *state += 100, ()));
 
@@ -84,6 +103,15 @@ async fn waiting_admission() {
     assert!(poll(stopping.as_mut()).is_pending());
 
     release.send(()).unwrap();
+    drain_started.await.unwrap();
+
+    let mut replacing = Box::pin(actor.replace(move || {
+        drop(guard);
+        panic!("replacement ran after terminal shutdown");
+    }));
+    let _outcome = poll(replacing.as_mut());
+
+    finish.send(()).unwrap();
     stopping.await.unwrap();
 
     first.await;

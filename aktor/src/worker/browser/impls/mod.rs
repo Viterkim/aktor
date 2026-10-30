@@ -51,12 +51,63 @@ impl<S, Role, E> Worker<S, Role, E> {
         Completion {
             result: self.inner.finished.subscribe(),
             diagnostics: self.inner.diagnostics.clone(),
+            retired: self.inner.retired.clone(),
             data: PhantomData,
         }
     }
 
     pub fn terminate(&self) {
         self.inner.fail(WorkerCause::Closed);
+        self.inner.continue_shutdown(true);
+    }
+
+    /// Connect an external owner's join before exposing the worker to calls.
+    /// Once attached, normal and forced shutdown wait for it. Keep unconfirmed
+    /// work owned inside this future until its physical owner has retired.
+    /// Refusal still runs the supplied join and retains this handle, without
+    /// registering another shutdown dependency.
+    pub fn before_shutdown(
+        self,
+        joining: impl Future<Output = Result<(), crate::AktorError>> + 'static,
+    ) -> Result<Self, WorkerError>
+    where
+        S: 'static,
+        Role: 'static,
+        E: 'static,
+    {
+        let occupied = match &*self.inner.shutdown_join.borrow() {
+            ShutdownJoin::Ready => false,
+            ShutdownJoin::Waiting(_) | ShutdownJoin::Joining { .. } => true,
+        };
+
+        let refused = occupied
+            || self.inner.ready.borrow().is_some()
+            || self.inner.next.get() != 0
+            || self.inner.closed.get()
+            || self.inner.handles.get() != 1;
+
+        if refused {
+            let diagnostics = self.inner.diagnostics.clone();
+            drop(ShutdownDependency::new(Some(Box::pin(async move {
+                let result = joining.await;
+
+                if let Err(error) = &result {
+                    diagnostics.borrow_mut().push(error.clone());
+                }
+
+                drop(self);
+                result
+            }))));
+
+            return Err(WorkerError::new(
+                CallError::NotAdmitted,
+                WorkerCause::Closed,
+            ));
+        }
+
+        *self.inner.shutdown_join.borrow_mut() = ShutdownJoin::Waiting(Box::pin(joining));
+
+        Ok(self)
     }
 
     pub fn executing(&self) -> bool {

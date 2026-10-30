@@ -17,7 +17,7 @@ pub trait AktorSetupGroup: Sized + Unpin {
     fn killswitch(&self) -> Self::KillSwitch;
     fn completion(&self) -> Self::Completion;
     fn stop(kill: &Self::KillSwitch);
-    fn fail_startup(kill: &Self::KillSwitch, failure: crate::ActorFailure) -> bool;
+    fn fail_startup(kill: &Self::KillSwitch, failure: crate::AktorFailureReport) -> bool;
     fn is_stopping(kill: &Self::KillSwitch) -> bool;
     fn set_starting(kill: &Self::KillSwitch, starting: bool) -> bool;
     fn closing(&self) -> Self::Closing;
@@ -74,7 +74,7 @@ impl AktorSetupGroup for crate::AktorGroup {
         kill.stop();
     }
 
-    fn fail_startup(kill: &Self::KillSwitch, failure: crate::ActorFailure) -> bool {
+    fn fail_startup(kill: &Self::KillSwitch, failure: crate::AktorFailureReport) -> bool {
         kill.fail_startup(failure)
     }
 
@@ -135,7 +135,7 @@ impl<Clock: crate::local::clock::AktorGroupClock> AktorSetupGroup
         kill.stop();
     }
 
-    fn fail_startup(kill: &Self::KillSwitch, failure: crate::ActorFailure) -> bool {
+    fn fail_startup(kill: &Self::KillSwitch, failure: crate::AktorFailureReport) -> bool {
         kill.fail_startup(failure)
     }
 

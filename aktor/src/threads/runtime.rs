@@ -86,6 +86,7 @@ self.onmessage = async ({ data }) => {
             // Pending Promise callbacks must never enter Wasm after this last call.
             retired = true;
             if (destroy) destroy();
+            outcome.retired = true;
         } catch (error) {
             outcome = { error: String(error?.stack || error) };
         }
@@ -111,8 +112,10 @@ export function openThread(program, module, memory, job) {
         URL.revokeObjectURL(url);
     }
 
+    const thread = { worker, job, retired: false };
     const finished = new Promise((resolve, reject) => {
         worker.onmessage = ({ data }) => {
+            thread.retired = data.retired === true;
             if (data.done) resolve();
             else reject(new Error(data.error));
         };
@@ -128,7 +131,12 @@ export function openThread(program, module, memory, job) {
         worker.terminate();
         throw error;
     }
-    return { worker, finished, job };
+    thread.finished = finished;
+    return thread;
+}
+
+export function threadRetired(thread) {
+    return thread.retired;
 }
 
 export function finishThread(thread) {
@@ -151,6 +159,9 @@ extern "C" {
         job: u32,
     ) -> Result<Thread, JsValue>;
 
+    #[wasm_bindgen(js_name = threadRetired)]
+    pub fn retired(thread: &Thread) -> bool;
+
     #[wasm_bindgen(js_name = finishThread)]
     pub fn finished(thread: &Thread) -> js_sys::Promise;
 
@@ -167,6 +178,10 @@ impl Thread {
         wasm_bindgen_futures::JsFuture::from(finished(self))
             .await
             .map(|_| ())
+    }
+
+    pub fn retirement_received(&self) -> bool {
+        retired(self)
     }
 
     pub fn cancel(&self) {

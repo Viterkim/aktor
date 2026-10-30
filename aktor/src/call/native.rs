@@ -2,11 +2,16 @@ use super::*;
 use crate::{
     Timeout,
     dispatch::Queued,
-    message::{Reply, Request},
+    message::{CallError, Reply, Request},
 };
 use core::time::Duration;
 
 impl<'a, T, I, S: 'static, O, L> Call<T, I, Request<'a, S, O>, L> {
+    /// Wait for admission and return a refusal without waiting for cleanup.
+    pub async fn admit(self) -> Result<Reply<O>, CallError> {
+        self.into_request().admit().await
+    }
+
     pub fn operation(mut self, operation: Operation) -> Self {
         self.operation = operation;
 
@@ -21,6 +26,11 @@ impl<'a, T, I, S: 'static, O: Send + 'static, Role, L> Call<T, I, Queued<'a, S, 
 where
     I: Send + 'static,
 {
+    /// Wait for admission and return a refusal without waiting for cleanup.
+    pub async fn admit(self) -> Result<Reply<O>, CallError> {
+        self.into_request().into_request().admit().await
+    }
+
     pub fn operation(mut self, operation: Operation) -> Self {
         self.operation = operation;
 

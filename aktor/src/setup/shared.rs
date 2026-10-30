@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    ActorFailure, ActorOutcome, AktorError, AktorGroup, cross_core,
+    AktorError, AktorFailureReport, AktorGroup, AktorOutcome, cross_core,
     local::hooks::AktorHooks,
     threads::{self, Thread},
 };
@@ -130,7 +130,7 @@ where
                 threads::remove(job);
 
                 if let Some(error) = &error {
-                    let failure = ActorFailure {
+                    let failure = AktorFailureReport {
                         actor: label,
                         kind: Some(kind),
                         phase: if initialized.get() { "owner" } else { "setup" }.into(),
@@ -148,7 +148,7 @@ where
                     }
                 }
 
-                let _sent = finished.send(error);
+                let _sent = finished.send((error, monitor.retirement_received()));
             });
 
             let cancelled = Rc::new(Cell::new(false));
@@ -175,7 +175,13 @@ where
                     cancel.cancel();
                 }),
                 Box::pin(async move {
-                    let error = result.await.ok().flatten();
+                    let result = result.await;
+                    let (error, received) = result.unwrap_or((None, false));
+                    let confirmed = received
+                        && diagnostics
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|handle| handle.completion().cleanup_completed());
                     let mut diagnostics = diagnostics
                         .borrow()
                         .as_ref()
@@ -186,7 +192,12 @@ where
                         diagnostics.push(error);
                     }
 
-                    ActorOutcome {
+                    AktorOutcome {
+                        retirement: if !confirmed {
+                            crate::RetirementStatus::Unconfirmed
+                        } else {
+                            crate::RetirementStatus::Confirmed
+                        },
                         actor: label,
                         kind: Some(kind),
                         diagnostics,

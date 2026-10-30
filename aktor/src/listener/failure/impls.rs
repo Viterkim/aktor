@@ -43,7 +43,7 @@ impl FailurePolicy {
                 }
             }
             Self::Group(group) => {
-                group.fail(crate::group::ActorFailure {
+                group.fail(crate::group::AktorFailureReport {
                     kind: None,
                     actor: failure.actor.clone(),
                     phase: format!("{:?}", failure.kind),

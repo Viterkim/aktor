@@ -425,7 +425,7 @@ async fn listening(spawner: Spawner) {
 
         assert!(matches!(
             actors.spawn_value::<u32, 2>("early", 0),
-            Err(aktor::message::ActorError::NotStarted)
+            Err(aktor::message::AktorStateError::NotStarted)
         ));
 
         let kill = actors.killswitch();
@@ -472,7 +472,7 @@ async fn listening(spawner: Spawner) {
                 drop(actors.shutdown());
                 assert!(matches!(
                     actors.spawn_value::<u32, 2>("late", 0),
-                    Err(aktor::message::ActorError::Closed)
+                    Err(aktor::message::AktorStateError::Closed)
                 ));
             }
         };
@@ -844,7 +844,7 @@ async fn driver_cancellation() {
         assert!(group.listen().is_err());
         assert!(matches!(
             group.spawn_value::<u32, 1>("late", 7),
-            Err(aktor::message::ActorError::Closed)
+            Err(aktor::message::AktorStateError::Closed)
         ));
     }
 
@@ -940,7 +940,7 @@ async fn driver_cancellation() {
         assert!(group.listen().is_err());
         assert!(matches!(
             group.spawn_value::<u32, 1>("late", 7),
-            Err(aktor::message::ActorError::Closed)
+            Err(aktor::message::AktorStateError::Closed)
         ));
         assert_eq!(hook.get(), stage == 4);
     }

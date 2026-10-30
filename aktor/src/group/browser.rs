@@ -60,7 +60,7 @@ impl AktorGroup {
         let worker = match opened {
             Ok(worker) => worker,
             Err(error) => {
-                self.killswitch().fail_startup(ActorFailure {
+                self.killswitch().fail_startup(AktorFailureReport {
                     kind: None,
                     actor: name,
                     phase: "setup".into(),
@@ -95,17 +95,23 @@ impl AktorGroup {
                     cancel.terminate();
                 }),
                 outcome: Box::pin(async move {
-                    let mut outcome = ActorOutcome {
+                    let retirement = match completion.wait().await {
+                        crate::worker::Retirement::Confirmed(_) => {
+                            crate::RetirementStatus::Confirmed
+                        }
+                        crate::worker::Retirement::Unconfirmed(_) => {
+                            crate::RetirementStatus::Unconfirmed
+                        }
+                    };
+                    let diagnostics = completion.wait_diagnostics().await;
+
+                    AktorOutcome {
+                        retirement,
                         kind: None,
                         actor: label,
-                        diagnostics: Vec::new(),
-                        timed_out: false,
-                    };
-
-                    outcome.diagnostics = completion.wait_diagnostics().await;
-                    outcome.timed_out = timed_out.get();
-
-                    outcome
+                        diagnostics,
+                        timed_out: timed_out.get(),
+                    }
                 }),
             });
         }

@@ -284,7 +284,7 @@ fn shutdown() {
                     let failure = mode == "reentrant failure";
                     let waker = Waker::from(Arc::new(StopWake {
                         kill: stopping.clone(),
-                        actor: failure.then(|| actor.actor.new_controller()),
+                        actor: failure.then(|| actor.control.new_controller()),
                     }));
                     let mut waiting = Box::pin(stopping.wait_stopping());
 
@@ -296,7 +296,7 @@ fn shutdown() {
                     );
 
                     if failure {
-                        actor.actor.cancel();
+                        actor.control.cancel();
                     }
 
                     let racers: Vec<_> = (0..2)

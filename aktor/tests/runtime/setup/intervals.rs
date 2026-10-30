@@ -663,13 +663,13 @@ async fn pause() {
         message::call(&actors.handles.handle, |state, ()| *state, ()).await,
         1
     );
-    actors.handles.actor.pause().await.unwrap();
+    actors.handles.control.pause().await.unwrap();
     tokio::time::advance(Duration::from_secs(3600)).await;
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 
     actors
         .handles
-        .actor
+        .control
         .resume(|| Ok::<_, AktorSetupError>(100))
         .await
         .unwrap();

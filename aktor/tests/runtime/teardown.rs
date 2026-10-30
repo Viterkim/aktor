@@ -136,10 +136,18 @@ fn teardown() {
                 return;
             }
 
-            let payload = AssertUnwindSafe(owner.run((), async |_| Ok(())))
-                .catch_unwind()
-                .await
-                .unwrap_err();
+            let queued = mode.ends_with("queue");
+            let dropped = count.clone();
+            let payload = AssertUnwindSafe(owner.run((), async move |_| {
+                if queued {
+                    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+                }
+
+                Ok(())
+            }))
+            .catch_unwind()
+            .await
+            .unwrap_err();
 
             assert_eq!(
                 payload.downcast_ref::<&str>(),
@@ -214,10 +222,21 @@ fn teardown() {
                 return;
             }
 
-            let payload = AssertUnwindSafe(owner.run_with(async || Ok(()), async |_| Ok(())))
-                .catch_unwind()
-                .await
-                .unwrap_err();
+            let queued = mode.ends_with("queue");
+            let dropped = count.clone();
+            let payload = AssertUnwindSafe(owner.run_with(
+                async || Ok(()),
+                async move |_| {
+                    if queued {
+                        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+                    }
+
+                    Ok(())
+                },
+            ))
+            .catch_unwind()
+            .await
+            .unwrap_err();
 
             assert_eq!(
                 payload.downcast_ref::<&str>(),

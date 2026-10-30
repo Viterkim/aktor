@@ -5,6 +5,42 @@ use core::{
 };
 
 impl<O> WorkerReply<O> {
+    /// Receive this call's outcome without waiting for worker cleanup.
+    pub async fn receive_settled(mut self) -> Result<O, WorkerError> {
+        core::future::poll_fn(|cx| self.poll_outcome(cx)).await
+    }
+
+    pub(in crate::worker::browser) fn poll_outcome(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<O, WorkerError>> {
+        if let Some(error) = self.error.take() {
+            self.taken = true;
+            return Poll::Ready(Err(error.without_data()));
+        }
+
+        if self.taken {
+            crate::message::consumed();
+        }
+
+        match Pin::new(&mut self.response).poll(cx) {
+            Poll::Ready(result) => {
+                self.taken = true;
+                Poll::Ready(
+                    result
+                        .unwrap_or_else(|_| {
+                            Err(WireError::new(
+                                CallError::OutcomeUnknown,
+                                WorkerCause::Closed,
+                            ))
+                        })
+                        .map_err(WireError::without_data),
+                )
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
     /// Take a ready output once. A pending reply can still be awaited.
     pub fn try_take(&mut self) -> Option<O> {
         if self.taken || self.parked {
@@ -30,6 +66,8 @@ impl<O> WorkerReply<O> {
         self.parked = true;
         let error = WireError::new(CallError::OutcomeUnknown, WorkerCause::Closed);
 
+        self.error = Some(error.clone());
+
         if let Some(inner) = self.inner.upgrade() {
             inner.lost(error)
         } else if let Some((name, group)) = &self.group {
@@ -37,7 +75,7 @@ impl<O> WorkerReply<O> {
                 fatal(error);
             }
 
-            group.fail(crate::ActorFailure {
+            group.fail(crate::AktorFailureReport {
                 kind: None,
                 actor: name.clone(),
                 phase: "worker".into(),
@@ -56,6 +94,7 @@ impl<O> WorkerReply<O> {
                 Poll::Ready(output)
             }
             Err(error) => {
+                self.error = Some(error.clone());
                 self.parked = true;
 
                 if self.group.is_some() {

@@ -3,7 +3,7 @@
 For several actors, give each one a name:
 
 ```rust
-let actors = aktor_start(AktorSetup {
+let mut actors = aktor_start(AktorSetup {
     actors: aktor_setups! {
         users: users_actor,
         archive: archive_actor,
@@ -67,21 +67,21 @@ Skip opening SQLite and give the function a response:
 ```rust
 let database = Preset::<Connection>::new()
     .on(insert_user::handler(async |_| Ok(7)))
-    .start(&mut actors)
+    .start(&mut actors.group)
     .await?;
 
 assert_eq!(insert_user(&database, "Katten".into()).await?, 7);
 ```
 
-You get a `Mock<Connection>`, so the app can call it as usual. Another .on replaces the response. Missing handlers fail the test. Check the shutdown report too, it catches panics in handlers whose replies you dropped.
+You get a `Mock<Connection>`, so the app can call it as usual. Adding the same handler again replaces its response. Missing handlers fail the test. Check the shutdown report too, it catches panics in handlers whose replies you dropped.
 
 [App with test presets](../examples/presets.rs)
 
 ## Pause / resume (TokioThread)
 
 ```rust
-database.actor.pause().await?;
-database.actor.resume(open_database).await?;
+database.control.pause().await?;
+database.control.resume(open_database).await?;
 ```
 
 pause finishes queued calls and closes the resource. New calls wait for resume, a failed reopen leaves it paused.

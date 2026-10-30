@@ -1,22 +1,22 @@
 use super::super::*;
 
 /// Capacity bounds queued work. One operation can also be running.
-pub fn channel<S, const N: usize, E>() -> Result<Channel<S, N, E>, ActorError> {
+pub fn channel<S, const N: usize, E>() -> Result<Channel<S, N, E>, AktorStateError> {
     channel_with_capacity(N)
 }
 
 pub fn channel_with_capacity<S, const N: usize, E>(
     capacity: usize,
-) -> Result<Channel<S, N, E>, ActorError> {
+) -> Result<Channel<S, N, E>, AktorStateError> {
     channel_with_clock::<S, N, E, ()>(capacity)
 }
 
 #[doc(hidden)]
 pub fn channel_with_clock<S, const N: usize, E, Clock>(
     capacity: usize,
-) -> Result<Channel<S, N, E, Clock>, ActorError> {
+) -> Result<Channel<S, N, E, Clock>, AktorStateError> {
     if capacity == 0 {
-        return Err(ActorError::InvalidCapacity);
+        return Err(AktorStateError::InvalidCapacity);
     }
 
     let inner = Rc::new(Inner {
@@ -31,6 +31,7 @@ pub fn channel_with_clock<S, const N: usize, E, Clock>(
         capacity,
         closed: Event::default(),
         completion: Rc::new(Completed {
+            cleanup_completed: Rc::new(Cell::new(false)),
             ready: RefCell::new(None),
             result: RefCell::new(None),
             diagnostics: Rc::new(RefCell::new(alloc::vec::Vec::new())),

@@ -2,7 +2,7 @@ pub use crate::local::{
     AktorArgs, Completion, LatestResults, LatestSender, Owner, OwnerError, OwnerFailure,
     ShutdownReport,
 };
-use crate::{local, message::ActorError};
+use crate::{local, message::AktorStateError};
 
 pub type AktorGroup = local::AktorGroup<local::clock::Embassy>;
 pub type GroupCompletion = local::GroupCompletion<local::clock::Embassy>;
@@ -19,6 +19,6 @@ pub type Channel<S, const N: usize, E = core::convert::Infallible> =
     local::Channel<S, N, E, local::clock::Embassy>;
 
 /// Capacity bounds queued work. One operation can also be running.
-pub fn channel<S, const N: usize, E>() -> Result<Channel<S, N, E>, ActorError> {
+pub fn channel<S, const N: usize, E>() -> Result<Channel<S, N, E>, AktorStateError> {
     local::channel_with_clock::<S, N, E, local::clock::Embassy>(N)
 }

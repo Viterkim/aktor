@@ -406,7 +406,14 @@ async fn cleanup() {
             "cleanup sentinel"
         };
         assert_eq!(report.to_string().matches(message).count(), 1, "{report}");
-        assert!(!report.timed_out);
+        assert_eq!(
+            report.actors[0].retirement,
+            if mode == 1 {
+                RetirementStatus::Unconfirmed
+            } else {
+                RetirementStatus::Confirmed
+            }
+        );
     }
 }
 

@@ -11,17 +11,18 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         kind: crate::AktorExecution,
         shutdown: Box<dyn Fn()>,
         owner: LocalFuture<'static, Option<AktorCleanupError>>,
-    ) -> Result<(), ActorError> {
+    ) -> Result<(), AktorStateError> {
         if self.killswitch().is_stopping() {
-            return Err(ActorError::Closed);
+            return Err(AktorStateError::Closed);
         }
 
         if !self.control.listening.get() {
-            return Err(ActorError::NotStarted);
+            return Err(AktorStateError::NotStarted);
         }
 
         self.control.kinds.borrow_mut().push((name.clone(), kind));
         self.owners.borrow_mut().push(Entry {
+            cleanup_completed: None,
             name,
             kind,
             shutdown,
@@ -132,7 +133,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
     }
 
     /// Run dependent application work on this group's local driver.
-    pub fn spawn_task<F>(&self, future: F) -> Result<(), ActorError>
+    pub fn spawn_task<F>(&self, future: F) -> Result<(), AktorStateError>
     where
         F: Future<Output = ()> + 'static,
     {
@@ -141,11 +142,11 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
                 self.killswitch().record_diagnostic(error);
             }
 
-            return Err(ActorError::Closed);
+            return Err(AktorStateError::Closed);
         }
 
         if !self.control.listening.get() {
-            return Err(ActorError::NotStarted);
+            return Err(AktorStateError::NotStarted);
         }
 
         self.control.callers.borrow_mut().push(Box::pin(future));
@@ -167,7 +168,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         &mut self,
         name: impl Into<String>,
         value: S,
-    ) -> Result<Handle<S, N, (), (), Clock>, ActorError> {
+    ) -> Result<Handle<S, N, (), (), Clock>, AktorStateError> {
         self.spawn(AktorArgs {
             name: name.into(),
             capacity: N,
@@ -182,9 +183,9 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
             impl AsyncFnOnce() -> Result<S, AktorSetupError<E>> + 'static,
             impl AsyncFnOnce(S) -> Result<(), AktorCleanupError<E>> + 'static,
         >,
-    ) -> Result<Handle<S, N, E, (), Clock>, ActorError> {
+    ) -> Result<Handle<S, N, E, (), Clock>, AktorStateError> {
         if args.capacity != N {
-            return Err(ActorError::InvalidCapacity);
+            return Err(AktorStateError::InvalidCapacity);
         }
 
         self.spawn_in(
@@ -204,7 +205,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         >,
         hooks: hooks::AktorHooks<S>,
         kind: crate::AktorExecution,
-    ) -> Result<Handle<S, 0, E, (), Clock>, ActorError> {
+    ) -> Result<Handle<S, 0, E, (), Clock>, AktorStateError> {
         self.spawn_in(args, hooks, kind, serve_on::<Clock, _, 0, E>)
     }
 
@@ -218,7 +219,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         hooks: hooks::AktorHooks<S>,
         kind: crate::AktorExecution,
         runner: Runner,
-    ) -> Result<Handle<S, 0, E, (), Clock>, ActorError>
+    ) -> Result<Handle<S, 0, E, (), Clock>, AktorStateError>
     where
         SetupOutput: crate::local::impls::runner::LocalSetupOutput<S, E>,
         CleanupOutput: crate::local::impls::runner::LocalCleanupOutput<E>,
@@ -236,18 +237,18 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
         hooks: hooks::AktorHooks<S>,
         kind: crate::AktorExecution,
         runner: Runner,
-    ) -> Result<Handle<S, N, E, (), Clock>, ActorError>
+    ) -> Result<Handle<S, N, E, (), Clock>, AktorStateError>
     where
         SetupOutput: crate::local::impls::runner::LocalSetupOutput<S, E>,
         CleanupOutput: crate::local::impls::runner::LocalCleanupOutput<E>,
         Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S, N, E>) -> Result<(), AktorError> + 'static,
     {
         if self.killswitch().is_stopping() {
-            return Err(ActorError::Closed);
+            return Err(AktorStateError::Closed);
         }
 
         if !self.control.listening.get() {
-            return Err(ActorError::NotStarted);
+            return Err(AktorStateError::NotStarted);
         }
 
         let (handle, mut owner) = channel_with_clock::<S, N, E, Clock>(args.capacity)?;
@@ -262,6 +263,7 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
             .borrow_mut()
             .push((args.name.clone(), kind));
         self.owners.borrow_mut().push(Entry {
+            cleanup_completed: Some(owner.inner.completion.cleanup_completed.clone()),
             name: args.name,
             diagnostics: owner.inner.completion.diagnostics.clone(),
             kind,
@@ -463,11 +465,11 @@ impl<Clock: AktorGroupClock> KillSwitch<Clock> {
     }
 
     #[doc(hidden)]
-    pub fn fail_startup(&self, reason: ActorFailure) -> bool {
+    pub fn fail_startup(&self, reason: AktorFailureReport) -> bool {
         self.record_failure(reason, true)
     }
 
-    pub fn fail(&self, reason: ActorFailure) -> bool {
+    pub fn fail(&self, reason: AktorFailureReport) -> bool {
         self.record_failure(reason, false)
     }
 
@@ -478,7 +480,7 @@ impl<Clock: AktorGroupClock> KillSwitch<Clock> {
         kind: crate::AktorExecution,
         error: crate::AktorSetupError,
     ) -> crate::AktorFailure {
-        let primary = self.fail_startup(ActorFailure {
+        let primary = self.fail_startup(AktorFailureReport {
             actor,
             kind: Some(kind),
             phase: "setup".into(),
@@ -491,7 +493,7 @@ impl<Clock: AktorGroupClock> KillSwitch<Clock> {
         }
     }
 
-    fn record_failure(&self, mut reason: ActorFailure, startup: bool) -> bool {
+    fn record_failure(&self, mut reason: AktorFailureReport, startup: bool) -> bool {
         if reason.kind.is_none() && reason.actor != "application" {
             let kinds = self.control.kinds.borrow();
             let mut matching = kinds

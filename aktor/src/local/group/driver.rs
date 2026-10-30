@@ -13,7 +13,7 @@ impl<Clock: AktorGroupClock> Drop for Driver<Clock> {
             startup_failure: None,
         };
 
-        kill.fail(ActorFailure {
+        kill.fail(AktorFailureReport {
             kind: None,
             actor: "application".into(),
             phase: "driver".into(),
@@ -30,7 +30,8 @@ impl<Clock: AktorGroupClock> Drop for Driver<Clock> {
             }
 
             if !entry.finished {
-                self.control.report.borrow_mut().actors.push(ActorOutcome {
+                self.control.report.borrow_mut().actors.push(AktorOutcome {
+                    retirement: crate::RetirementStatus::Unconfirmed,
                     kind: Some(entry.kind),
                     actor: entry.name,
                     diagnostics: alloc::vec![AktorError::new(
@@ -99,15 +100,15 @@ pub fn poll_owners<Clock: AktorGroupClock>(
             continue;
         }
 
-        let error = match capture(|| entry.owner.as_mut().poll(cx)) {
+        let (error, fallback) = match capture(|| entry.owner.as_mut().poll(cx)) {
             Ok(Poll::Pending) => continue,
-            Ok(Poll::Ready(error)) => error,
+            Ok(Poll::Ready(error)) => (error, crate::RetirementStatus::Confirmed),
             Err(error) => {
                 KillSwitch {
                     control: control.clone(),
                     startup_failure: None,
                 }
-                .fail(ActorFailure {
+                .fail(AktorFailureReport {
                     kind: Some(entry.kind),
                     actor: entry.name.clone(),
                     phase: "owner".into(),
@@ -120,7 +121,7 @@ pub fn poll_owners<Clock: AktorGroupClock>(
                     control.report.borrow_mut().application.push(secondary);
                 }
 
-                Some(error)
+                (Some(error), crate::RetirementStatus::Unconfirmed)
             }
         };
 
@@ -129,7 +130,17 @@ pub fn poll_owners<Clock: AktorGroupClock>(
         let mut diagnostics = core::mem::take(&mut *entry.diagnostics.borrow_mut());
 
         diagnostics.extend(error);
-        control.report.borrow_mut().actors.push(ActorOutcome {
+        control.report.borrow_mut().actors.push(AktorOutcome {
+            retirement: entry
+                .cleanup_completed
+                .as_ref()
+                .map_or(fallback, |receipt| {
+                    if receipt.get() {
+                        crate::RetirementStatus::Confirmed
+                    } else {
+                        crate::RetirementStatus::Unconfirmed
+                    }
+                }),
             kind: Some(entry.kind),
             actor: entry.name.clone(),
             diagnostics,
@@ -201,7 +212,7 @@ fn task_failure<Clock: AktorGroupClock>(
         startup_failure: None,
     };
 
-    let primary = kill.fail(ActorFailure {
+    let primary = kill.fail(AktorFailureReport {
         kind: None,
         actor: "application".into(),
         phase: phase.into(),

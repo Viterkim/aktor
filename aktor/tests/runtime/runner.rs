@@ -27,7 +27,6 @@ async fn cleanup() -> TestResult {
             move |listener, _| {
                 stopping.blocking_recv().unwrap();
                 listener.close();
-                drop(listener.try_recv().unwrap());
 
                 outcome
             },
@@ -35,11 +34,10 @@ async fn cleanup() -> TestResult {
         .await
         .unwrap();
 
-        let mut queued = Box::pin(call(
-            &handle,
-            |_: &mut usize, ()| panic!("queued work ran"),
-            (),
-        ));
+        let mut queued = call(&handle, |_: &mut usize, ()| panic!("queued work ran"), ())
+            .admit()
+            .await
+            .unwrap();
 
         let mut waiting = Box::pin(call(
             &handle,
@@ -47,22 +45,23 @@ async fn cleanup() -> TestResult {
             (),
         ));
 
-        assert!(poll(queued.as_mut()).is_pending());
         assert!(poll(waiting.as_mut()).is_pending());
 
         stop.send(()).unwrap();
         cleanup_started.await?;
 
-        assert!(poll(queued.as_mut()).is_pending());
+        assert!(poll(&mut queued).is_pending());
         assert!(poll(waiting.as_mut()).is_pending());
 
+        let settled =
+            tokio::time::timeout(Duration::from_millis(100), queued.receive_settled()).await;
         release.send(()).unwrap();
 
-        let (finished, queued, waiting) =
-            tokio::join!(actor.join_async(), panics(queued), panics(waiting));
+        let (finished, waiting) = tokio::join!(actor.join_async(), panics(waiting));
+
+        assert_eq!(settled.unwrap(), Err(aktor::message::CallError::Discarded));
 
         assert_eq!(finished?, outcome.map_err(RunError::Failed));
-        assert!(queued);
         assert!(waiting);
     }
 

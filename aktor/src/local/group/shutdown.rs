@@ -55,7 +55,8 @@ impl<Clock: AktorGroupClock> AktorGroup<Clock> {
 
         for entry in entries {
             if !entry.finished {
-                kill.control.report.borrow_mut().actors.push(ActorOutcome {
+                kill.control.report.borrow_mut().actors.push(AktorOutcome {
+                    retirement: crate::RetirementStatus::Unconfirmed,
                     kind: Some(entry.kind),
                     actor: entry.name.clone(),
                     diagnostics: Vec::new(),
@@ -146,7 +147,7 @@ fn record_drop<Clock: AktorGroupClock>(
     error: Option<AktorError>,
 ) {
     if let Some(error) = error {
-        let primary = kill.fail(ActorFailure {
+        let primary = kill.fail(AktorFailureReport {
             actor: name.into(),
             kind: Some(kind),
             phase: "owner drop".into(),
@@ -160,7 +161,7 @@ fn record_drop<Clock: AktorGroupClock>(
 }
 
 fn record_hook<Clock: AktorGroupClock>(kill: &KillSwitch<Clock>, phase: &str, error: AktorError) {
-    let primary = kill.fail(ActorFailure {
+    let primary = kill.fail(AktorFailureReport {
         kind: None,
         actor: "application".into(),
         phase: phase.into(),

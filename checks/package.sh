@@ -28,17 +28,17 @@ EOF
 cd -- "$package_dir"
 export CARGO_TARGET_DIR="$package_dir/target"
 
-cargo +1.89.0 test --manifest-path aktor/Cargo.toml --features tokio --all-targets
-cargo +1.89.0 test --manifest-path aktor-remote/Cargo.toml --all-features
-RUSTDOCFLAGS="-D warnings" cargo +1.89.0 doc --manifest-path aktor/Cargo.toml --features tokio --no-deps
-cargo +1.89.0 test --manifest-path aktor/Cargo.toml --no-default-features --features tokio --all-targets
-cargo +1.89.0 check --manifest-path aktor/Cargo.toml --no-default-features \
+cargo +1.95.0 test --manifest-path aktor/Cargo.toml --features tokio --all-targets
+cargo +1.95.0 test --manifest-path aktor-remote/Cargo.toml --all-features
+RUSTDOCFLAGS="-D warnings" cargo +1.95.0 doc --manifest-path aktor/Cargo.toml --features tokio --no-deps
+cargo +1.95.0 test --manifest-path aktor/Cargo.toml --no-default-features --features tokio --all-targets
+cargo +1.95.0 check --manifest-path aktor/Cargo.toml --no-default-features \
     --features macros,wasm_browser_workers --target wasm32-unknown-unknown
-cargo +1.89.0 test --manifest-path integrations/Cargo.toml
-cargo +1.89.0 run --manifest-path integrations/Cargo.toml -p renamed
-cargo +1.89.0 check --manifest-path integrations/Cargo.toml -p aktor-worker-proof \
+cargo +1.95.0 test --manifest-path integrations/Cargo.toml
+cargo +1.95.0 run --manifest-path integrations/Cargo.toml -p renamed
+cargo +1.95.0 check --manifest-path integrations/Cargo.toml -p aktor-worker-proof \
     --target wasm32-unknown-unknown
 for target in thumbv6m-none-eabi thumbv7em-none-eabihf; do
-    cargo +1.89.0 check --manifest-path integrations/Cargo.toml -p aktor-embassy-proof \
+    cargo +1.95.0 check --manifest-path integrations/Cargo.toml -p aktor-embassy-proof \
         --target "$target"
 done

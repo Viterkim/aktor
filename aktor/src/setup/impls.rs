@@ -191,15 +191,15 @@ impl<Group: AktorSetupGroup> Clone for AktorStartContext<Group> {
     }
 }
 
-pub fn aktor_start<Actors, Shutdown, ShutdownOutput, ShutdownMode, StartMode>(
-    setup: AktorSetup<Actors, Shutdown, ShutdownOutput>,
-) -> AktorStartup<Actors, StartMode>
+pub fn aktor_start<Setups, Shutdown, ShutdownOutput, ShutdownMode, StartMode>(
+    setup: AktorSetup<Setups, Shutdown, ShutdownOutput>,
+) -> AktorStartup<Setups, StartMode>
 where
-    Actors: AktorStart<StartMode>,
-    Actors::Group: shutdown::AktorShutdown<Shutdown, ShutdownOutput, ShutdownMode>,
+    Setups: AktorStart<StartMode>,
+    Setups::Group: shutdown::AktorShutdown<Shutdown, ShutdownOutput, ShutdownMode>,
     Shutdown: FnOnce(crate::ShutdownReport) -> ShutdownOutput + 'static,
 {
-    let mut group = Actors::Group::new(setup.options.shutdown_grace);
+    let mut group = Setups::Group::new(setup.options.shutdown_grace);
 
     group.track_startup();
     let registered = shutdown::AktorShutdown::on_shutdown(&group, setup.shutdown);
@@ -220,7 +220,7 @@ where
         startup.failure = Some(Box::new(error.into()));
 
         if let Some(group) = &startup.group {
-            Actors::Group::stop(&startup.killswitch);
+            Setups::Group::stop(&startup.killswitch);
             startup.shutdown = Some(Box::pin(group.closing()));
         }
     }
@@ -317,7 +317,7 @@ pub fn validation_error<Group: AktorSetupGroup>(
 ) -> AktorStartError {
     Group::fail_startup(
         &group.killswitch(),
-        crate::ActorFailure {
+        crate::AktorFailureReport {
             actor: actor.into(),
             kind: Some(kind),
             phase: "setup".into(),

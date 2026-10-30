@@ -23,7 +23,7 @@ mod tests;
 use failure::Failures;
 pub use failure::{Failure, FailureKind, FailurePolicy, Operation, RunError};
 pub use lifecycle::spawn::{spawn, spawn_async, spawn_async_with_hooks};
-pub use lifecycle::{AbandonedSetup, Actor, CleanupErrors, LifecycleError, ReplaceError};
+pub use lifecycle::{AbandonedSetup, AktorControl, CleanupErrors, LifecycleError, ReplaceError};
 pub use spawn::channel;
 #[cfg(feature = "tokio")]
 use spawn::startup_cause;
@@ -75,6 +75,8 @@ pub struct CompletionObserver {
 #[derive(Er)]
 #[er(display = Self::fmt_display)]
 pub struct DedicatedJoinError {
+    /// The OS join completed, including a thread that panicked.
+    pub physically_joined: bool,
     pub payload: parking_lot::Mutex<Box<dyn std::any::Any + Send>>,
 }
 

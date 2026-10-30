@@ -30,7 +30,7 @@ impl Failures {
 
                     if let (Some(group), Some(failure)) = (&self.group, &mut self.first) {
                         let message = failure.to_string();
-                        failure.group_primary = group.fail(crate::group::ActorFailure {
+                        failure.group_primary = group.fail(crate::group::AktorFailureReport {
                             kind: None,
                             actor: failure.actor.clone(),
                             phase: format!("{:?}", failure.kind),

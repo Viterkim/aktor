@@ -180,4 +180,4 @@ pub use owner::Aktor;
     target_family = "wasm",
     target_os = "unknown"
 ))]
-pub use setup::{AktorWorkerNew, AktorWorkerOptions};
+pub use setup::{AktorOptionalWorkerNew, AktorWorkerNew, AktorWorkerOptions};

@@ -10,7 +10,7 @@ pub mod run;
 pub mod spawn;
 use answer::{ReplaceReply, ResumeReply, SetupAnswer};
 
-pub struct Actor<S, E, C> {
+pub struct AktorControl<S, E, C> {
     admission: Arc<crate::queue::Admission>,
     commands: mpsc::Sender<Command<S, E, C>>,
     force: watch::Sender<bool>,
@@ -21,6 +21,7 @@ pub struct Actor<S, E, C> {
 }
 
 pub struct FailedCleanup<C> {
+    completed: bool,
     errors: Vec<Arc<C>>,
     diagnostics: Vec<crate::AktorError>,
     group_primary: bool,

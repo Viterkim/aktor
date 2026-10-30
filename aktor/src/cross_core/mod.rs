@@ -111,6 +111,7 @@ struct Status {
 
 #[derive(Default)]
 struct State {
+    cleanup_completed: bool,
     managed: bool,
     closing: bool,
     finishing: bool,

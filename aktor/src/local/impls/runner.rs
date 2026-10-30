@@ -261,6 +261,12 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                     drop((cleanup, runner));
                 }
 
+                #[cfg(feature = "std")]
+                if !setup_panicked {
+                    self.inner.completion.cleanup_completed.set(true);
+                }
+                #[cfg(not(feature = "std"))]
+                self.inner.completion.cleanup_completed.set(true);
                 let result = Err(error);
 
                 #[cfg(feature = "std")]
@@ -382,18 +388,41 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         self.inner.close();
 
         #[cfg(feature = "std")]
+        if let Err(error) = self
+            .inner
+            .settle(
+                "queue drop",
+                async { self.inner.discard_queued() },
+                &mut primary,
+            )
+            .await
+        {
+            self.inner.completion.diagnostics.borrow_mut().push(error);
+        }
+        #[cfg(not(feature = "std"))]
+        self.inner.discard_queued();
+
+        #[cfg(feature = "std")]
         let mut cleaned = self
             .inner
             .settle(
                 "cleanup",
-                async { cleanup(state).await.into_owner_cleanup() },
+                async {
+                    let result = cleanup(state).await.into_owner_cleanup();
+                    self.inner.completion.cleanup_completed.set(true);
+                    result
+                },
                 &mut primary,
             )
             .await
             .map_err(|error| Rc::new(OwnerFailure::Runner(error)))
             .and_then(|result| result.map_err(Rc::new));
         #[cfg(not(feature = "std"))]
-        let mut cleaned = cleanup(state).await.into_owner_cleanup().map_err(Rc::new);
+        let mut cleaned = {
+            let result = cleanup(state).await.into_owner_cleanup().map_err(Rc::new);
+            self.inner.completion.cleanup_completed.set(true);
+            result
+        };
 
         if let Err(error) = &mut cleaned {
             let primary = self.inner.fail(error);

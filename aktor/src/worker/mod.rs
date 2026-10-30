@@ -18,9 +18,16 @@ mod wire;
     target_family = "wasm",
     target_os = "unknown"
 ))]
+pub(crate) use browser::ShutdownDependency;
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
 pub use browser::{
-    Completion, LatestResults, LatestSender, Server, Worker, WorkerReply, WorkerRequest, serve,
-    serve_for, serve_setup, serve_with, setup_failed,
+    Completion, LatestResults, LatestSender, OptionalReply, OptionalRequest, OptionalWorker,
+    Server, Worker, WorkerReply, WorkerRequest, serve, serve_for, serve_setup, serve_with,
+    setup_failed,
 };
 pub use codec::{decode, encode};
 #[doc(hidden)]
@@ -33,7 +40,7 @@ pub use wire::Codec;
 
 pub use crate::dispatch::{Native, Remote};
 
-pub const VERSION: u32 = 0;
+pub const VERSION: u32 = 1;
 
 #[cfg(all(
     feature = "wasm_browser_workers",
@@ -50,6 +57,15 @@ pub struct Options {
     pub capacity: usize,
     /// Ordinary admission budget. Oversized calls take the whole budget, latest sessions bypass it.
     pub max_outstanding_bytes: usize,
+}
+
+/// Whether the worker's managed resources have retired.
+/// Unconfirmed retirement keeps Aktor's ownership retained automatically.
+#[must_use = "check retirement before releasing or replacing the owner"]
+#[derive(Debug, Clone)]
+pub enum Retirement<E = ()> {
+    Confirmed(Result<(), WorkerError<E>>),
+    Unconfirmed(WorkerError<E>),
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, er::Er)]
@@ -125,6 +141,7 @@ enum Outgoing {
         output: Result<Vec<u8>, WireError>,
     },
     Finished(Result<(), WireError>),
+    SetupRetired,
 }
 
 #[doc(hidden)]

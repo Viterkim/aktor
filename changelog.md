@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.0.10
+
+Now requires rust 1.95 (updated parking_lot to 0.13).
+
+Optional browser workers choose failure behavior during setup. Their ordinary calls return delivery errors.
+
+Lifecycle code can use admit() and receive_settled() to observe call outcomes before cleanup. Abandoned queued calls settle before cleanup starts.
+
+Browser worker shutdown now returns Retirement. Completed cleanup can report an error. Interrupted cleanup stays unconfirmed and keeps uncertain work retained. Attach external joins during construction.
+
+OwnerError::physically_joined() reports whether the native OS join completed, including a panicked thread.
+
+Renamed:
+
+- Actor to AktorControl, accessed through .control instead of .actor.
+- ActorError and ActorResult to AktorStateError and AktorStateResult.
+- ActorFailure to AktorFailureReport.
+- ActorOutcome to AktorOutcome.
+
 ## 0.0.9
 
 BrowserThread shares Wasm memory, pass Send values without encoding them.

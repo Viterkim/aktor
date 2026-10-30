@@ -10,7 +10,7 @@ pub async fn spawn_async<S, E, C, Setup, SetupFuture, Cleanup, CleanupFuture>(
 ) -> Result<
     (
         Handle<S>,
-        Actor<S, E, C>,
+        AktorControl<S, E, C>,
         Dedicated<Result<(), CleanupErrors<C>>>,
     ),
     DedicatedStartError<E>,
@@ -33,7 +33,7 @@ pub async fn spawn_async_with_hooks<S, E, C, Setup, SetupFuture, Cleanup, Cleanu
 ) -> Result<
     (
         Handle<S>,
-        Actor<S, E, C>,
+        AktorControl<S, E, C>,
         Dedicated<Result<(), CleanupErrors<C>>>,
     ),
     DedicatedStartError<E>,
@@ -57,7 +57,7 @@ pub async fn spawn_async_on<S, E, C, Setup, SetupFuture, Cleanup, CleanupFuture>
 ) -> Result<
     (
         Handle<S>,
-        Actor<S, E, C>,
+        AktorControl<S, E, C>,
         Dedicated<Result<(), CleanupErrors<C>>>,
     ),
     DedicatedStartError<E>,
@@ -81,7 +81,7 @@ pub async fn spawn_async_initial_on<S, E, Initial, C, Setup, SetupFuture, Cleanu
 ) -> Result<
     (
         Handle<S>,
-        Actor<S, E, C>,
+        AktorControl<S, E, C>,
         Dedicated<Result<(), CleanupErrors<C>>>,
     ),
     DedicatedStartError<Initial>,
@@ -130,6 +130,7 @@ where
     let abandoned_setup = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let retained_setup = abandoned_setup.clone();
     let failed_cleanup = Arc::new(Mutex::new(FailedCleanup {
+        completed: false,
         errors: Vec::new(),
         diagnostics: Vec::new(),
         group_primary: false,
@@ -204,7 +205,7 @@ where
 
             Ok((
                 handle,
-                Actor {
+                AktorControl {
                     admission,
                     commands,
                     force,
@@ -341,7 +342,7 @@ pub async fn spawn<S, E, C, Setup, Cleanup>(
 ) -> Result<
     (
         Handle<S>,
-        Actor<S, E, C>,
+        AktorControl<S, E, C>,
         Dedicated<Result<(), CleanupErrors<C>>>,
     ),
     DedicatedStartError<E>,
@@ -374,6 +375,7 @@ where
 #[cfg(not(feature = "tokio"))]
 fn standard_cause<T>(joined: std::thread::Result<T>) -> crate::listener::DedicatedJoinError {
     crate::listener::DedicatedJoinError {
+        physically_joined: true,
         payload: parking_lot::Mutex::new(match joined {
             Err(payload) => payload,
             Ok(_) => Box::new("actor startup ended before ready"),

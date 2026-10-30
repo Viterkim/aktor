@@ -1,7 +1,9 @@
 use super::{Lifecycle, LifecycleError, ReplaceError};
 use crate::{
     AktorDiagnostic, AktorFailure, AktorSetupError,
-    listener::{Actor, LifecycleError as RawLifecycleError, ReplaceError as RawReplaceError},
+    listener::{
+        AktorControl, LifecycleError as RawLifecycleError, ReplaceError as RawReplaceError,
+    },
 };
 use core::{convert::Infallible, fmt, future::Future, ops::Deref};
 use std::sync::Arc;
@@ -73,7 +75,7 @@ impl<S> Clone for Lifecycle<S> {
     }
 }
 impl<S> Deref for Lifecycle<S> {
-    type Target = Actor<S, AktorSetupError, AktorFailure>;
+    type Target = AktorControl<S, AktorSetupError, AktorFailure>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner

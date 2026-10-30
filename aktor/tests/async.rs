@@ -161,6 +161,8 @@ async fn panic_after_await() {
 
     let error = database.completion.wait().await.unwrap_err();
 
+    assert!(error.physically_joined());
+
     let OwnerFailure::PanickedWithCleanup { cause, cleanup } = &error.error else {
         panic!("expected operation panic and cleanup failure")
     };

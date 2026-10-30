@@ -87,6 +87,12 @@ pub fn setup_failed<T: Serialize>(error: crate::AktorSetupError<T>) -> Result<()
     )
 }
 
+pub fn setup_retired(error: WireError) -> Result<(), WireError> {
+    let scope = scope()?;
+    respond(&scope, Outgoing::SetupFailed(error))?;
+    respond(&scope, Outgoing::SetupRetired)
+}
+
 pub fn serve<S: 'static>(state: S) -> Result<Server, WireError> {
     serve_with(
         state,
@@ -351,7 +357,7 @@ where
     })
 }
 
-fn lifecycle_error<E: Serialize>(mut error: WireError, data: &E) -> WireError {
+pub(super) fn lifecycle_error<E: Serialize>(mut error: WireError, data: &E) -> WireError {
     match encode(data) {
         Ok(data) => error.data = Some(data),
         Err(codec) => error = error.data_error(codec),

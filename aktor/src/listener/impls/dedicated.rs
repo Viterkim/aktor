@@ -13,9 +13,11 @@ impl<S> Dedicated<S> {
         match self.thread.join() {
             Ok(Some(state)) => Ok(state),
             Err(payload) => Err(DedicatedJoinError {
+                physically_joined: true,
                 payload: parking_lot::Mutex::new(payload),
             }),
             Ok(None) => Err(DedicatedJoinError {
+                physically_joined: true,
                 payload: parking_lot::Mutex::new(Box::new("actor thread returned no output")),
             }),
         }
@@ -32,6 +34,7 @@ impl<S> Dedicated<S> {
         task::spawn_blocking(move || self.join())
             .await
             .map_err(|error| DedicatedJoinError {
+                physically_joined: false,
                 payload: parking_lot::Mutex::new(if error.is_panic() {
                     error.into_panic()
                 } else {

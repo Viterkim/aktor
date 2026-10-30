@@ -12,6 +12,27 @@ extern "C" {
 }
 
 #[wasm_bindgen(inline_js = r#"
+let previousWorker;
+let trackedWorker;
+
+export function trackThread() {
+    previousWorker = globalThis.Worker;
+    globalThis.Worker = class extends previousWorker {
+        constructor(...args) {
+            super(...args);
+            trackedWorker = this;
+        }
+    };
+}
+
+export function restoreWorker() {
+    globalThis.Worker = previousWorker;
+}
+
+export function failThread() {
+    trackedWorker.dispatchEvent(new ErrorEvent('error', { message: 'early worker error' }));
+}
+
 export function delayedProbe(memory, address) {
     const view = new Uint32Array(memory.buffer, address, 2);
     const PreviousError = Error;
@@ -33,6 +54,12 @@ export function delayedProbe(memory, address) {
 extern "C" {
     #[wasm_bindgen(js_name = delayedProbe)]
     fn delayed_probe(memory: JsValue, address: u32) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = trackThread)]
+    fn track_thread();
+    #[wasm_bindgen(js_name = restoreWorker)]
+    fn restore_worker();
+    #[wasm_bindgen(js_name = failThread)]
+    fn fail_thread();
 }
 
 static CLEANED: AtomicUsize = AtomicUsize::new(0);
@@ -84,7 +111,7 @@ async fn hold(_: &State, entered: Arc<AtomicBool>, release: Arc<AtomicBool>) {
 #[aktor]
 async fn stop(_: &State, kill: KillSwitch, fail: bool) {
     if fail {
-        kill.fail(ActorFailure {
+        kill.fail(AktorFailureReport {
             actor: "worker control".into(),
             kind: Some(AktorExecution::BrowserThread),
             phase: "call".into(),
@@ -299,11 +326,15 @@ pub async fn failures(program: String) -> Result<(), JsValue> {
         }
     }
 
-    for mode in 0..3 {
+    for mode in 0..4 {
         let mut owner = setup(&program, "failure");
 
         if mode == 0 {
             owner.closures.end = bad_cleanup;
+        }
+
+        if mode == 3 {
+            track_thread();
         }
 
         let actors = aktor_start(AktorSetup {
@@ -313,27 +344,48 @@ pub async fn failures(program: String) -> Result<(), JsValue> {
                 shutdown_grace: std::time::Duration::from_millis(300),
             },
         })
-        .await
-        .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
+        .await;
+
+        if mode == 3 {
+            restore_worker();
+        }
+
+        let actors = actors.map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
         let mut abandoned = None;
+        let release = Arc::new(AtomicBool::new(false));
 
         if mode == 1 {
             crash(&actors.handles).cast().await;
-        } else if mode == 2 {
+        } else if mode >= 2 {
+            let entered = Arc::new(AtomicBool::new(false));
             abandoned = Some(
-                hold(
-                    &actors.handles,
-                    Arc::new(AtomicBool::new(false)),
-                    Arc::new(AtomicBool::new(false)),
-                )
-                .send()
-                .await,
+                hold(&actors.handles, entered.clone(), release.clone())
+                    .send()
+                    .await,
             );
+
+            if mode == 3 {
+                while !entered.load(Ordering::Acquire) {
+                    gloo_timers::future::TimeoutFuture::new(1).await;
+                }
+
+                fail_thread();
+            }
         }
 
         let report = actors.shutdown().await;
+        release.store(true, Ordering::Release);
 
-        if !report.failed() || report.timed_out != (mode == 2) {
+        let expected = if mode == 0 {
+            RetirementStatus::Confirmed
+        } else {
+            RetirementStatus::Unconfirmed
+        };
+
+        if !report.failed()
+            || report.timed_out != (mode == 2)
+            || report.actors[0].retirement != expected
+        {
             return Err(JsValue::from_str(&format!(
                 "shared failure mode {mode}: {report}"
             )));

@@ -4,7 +4,7 @@ Write normal functions, call them with a handle and .await. Go to definition tak
 
 ```toml
 [dependencies]
-aktor = { version = "0.0.9", features = ["tokio"] }
+aktor = { version = "0.0.10", features = ["tokio"] }
 ```
 
 The API can change before 0.1.
@@ -45,7 +45,7 @@ let actors = aktor_start(AktorSetup {
 let count = add(&actors.handles, 5).await;
 ```
 
-Keep actors alive, dropping it starts shutdown. Await actors.shutdown() to finish cleanup and get the report.
+Keep the returned owner alive. Dropping it starts shutdown, and actors.shutdown().await waits for cleanup and returns the report.
 
 An actor failure shuts down the group and runs cleanup. A query returning Err just gives you the error. A native actor stuck past the shutdown deadline takes the process down with it.
 

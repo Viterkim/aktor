@@ -37,7 +37,7 @@ impl<S> Listener<S> {
 
         failures.capture(FailureKind::Runtime, || self.serve_blocking(&mut state));
 
-        failures.capture(FailureKind::Teardown, || self.receiver.close());
+        self.discard_queued(&mut failures);
 
         let state = if failures.first.is_some() {
             failures.capture(FailureKind::Cleanup, || drop(state));

@@ -65,7 +65,7 @@ pub use tuple::AktorTupleStartup;
     target_family = "wasm",
     target_os = "unknown"
 ))]
-pub use worker::{AktorWorkerNew, AktorWorkerOptions};
+pub use worker::{AktorOptionalWorkerNew, AktorWorkerNew, AktorWorkerOptions};
 
 pub use closures::{AktorClosure, AktorIntervalLogic};
 #[cfg(all(

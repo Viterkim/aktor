@@ -102,7 +102,8 @@ where
     let config = match configuration(options.clone(), operations).await {
         Ok(config) => config,
         Err(error) => {
-            respond(&scope()?, Outgoing::SetupFailed(error.clone()))?;
+            drop(logic);
+            server::setup_retired(error.clone())?;
             return Err(error);
         }
     };
@@ -119,15 +120,21 @@ where
     if intervals.iter().any(|interval| interval.every.is_zero()) {
         let error = WireError::setup(CallError::NotAdmitted, "interval duration must be positive");
 
-        respond(&scope()?, Outgoing::SetupFailed(error.clone()))?;
+        drop((start, end, intervals, before_each, after_each));
+        server::setup_retired(error.clone())?;
         return Err(error);
     }
 
     let state = match start().await {
         Ok(state) => state,
         Err(error) => {
-            setup_failed(error.clone())?;
-            return Err(WireError::setup(CallError::NotAdmitted, error.diagnostics));
+            let failure = server::lifecycle_error(
+                WireError::setup(CallError::NotAdmitted, error.diagnostics.clone()),
+                &error.data,
+            );
+            drop((error, end, intervals, before_each, after_each));
+            server::setup_retired(failure.clone())?;
+            return Err(failure);
         }
     };
 

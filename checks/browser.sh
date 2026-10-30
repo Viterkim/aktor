@@ -6,19 +6,19 @@ extras_dir=${AKTOR_EXTRAS:-"$PWD/../aktor-extras"}
 
 cargo test --locked --manifest-path "$extras_dir/checks/Cargo.toml" --lib --test harness
 
-cargo +1.89.0 check -p aktor --no-default-features --features macros,transport --target wasm32-unknown-unknown
+cargo +1.95.0 check -p aktor --no-default-features --features macros,transport --target wasm32-unknown-unknown
 cargo clippy -p aktor --no-default-features --features macros,transport --target wasm32-unknown-unknown -- -D warnings
 
-cargo +1.89.0 check -p aktor --no-default-features --features macros,bevy --target wasm32-unknown-unknown
+cargo +1.95.0 check -p aktor --no-default-features --features macros,bevy --target wasm32-unknown-unknown
 cargo clippy -p aktor --no-default-features --features macros,bevy --target wasm32-unknown-unknown -- -D warnings
 
-cargo +1.89.0 check -p aktor --no-default-features --features macros,browser_local --target wasm32-unknown-unknown
+cargo +1.95.0 check -p aktor --no-default-features --features macros,browser_local --target wasm32-unknown-unknown
 cargo clippy -p aktor --no-default-features --features macros,browser_local --target wasm32-unknown-unknown -- -D warnings
-cargo +1.89.0 check -p aktor --no-default-features --features std_thread,local --target wasm32-unknown-unknown --lib
+cargo +1.95.0 check -p aktor --no-default-features --features std_thread,local --target wasm32-unknown-unknown --lib
 cargo clippy -p aktor --no-default-features --features macros,browser_local,std_thread,bevy --target wasm32-unknown-unknown -- -D warnings
-cargo +1.89.0 check -p aktor --no-default-features --features macros,wasm_browser_workers --target wasm32-unknown-unknown
+cargo +1.95.0 check -p aktor --no-default-features --features macros,wasm_browser_workers --target wasm32-unknown-unknown
 cargo clippy -p aktor --no-default-features --features macros,wasm_browser_workers --target wasm32-unknown-unknown -- -D warnings
-cargo +1.89.0 check --manifest-path integrations/Cargo.toml -p aktor-worker-proof --target wasm32-unknown-unknown
+cargo +1.95.0 check --manifest-path integrations/Cargo.toml -p aktor-worker-proof --target wasm32-unknown-unknown
 cargo clippy --manifest-path integrations/Cargo.toml -p aktor-worker-proof --target wasm32-unknown-unknown -- -D warnings
 for profile in debug release; do
     bash integrations/worker/build.sh "$profile"

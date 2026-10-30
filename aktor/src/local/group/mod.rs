@@ -1,6 +1,6 @@
 use super::*;
-use crate::{ActorFailure, ActorOutcome, AktorError};
 pub use crate::{AktorArgs, ShutdownReport};
+use crate::{AktorError, AktorFailureReport, AktorOutcome};
 use alloc::{string::String, vec::Vec};
 use clock::AktorGroupClock;
 use core::{future::poll_fn, ops::AsyncFnOnce, time::Duration};
@@ -41,7 +41,7 @@ struct Control<Clock: AktorGroupClock> {
     grace: Duration,
     deadline: Cell<Option<Clock::Deadline>>,
     kinds: RefCell<Vec<(String, crate::AktorExecution)>>,
-    failure: RefCell<Option<ActorFailure>>,
+    failure: RefCell<Option<AktorFailureReport>>,
     completed: RefCell<Option<ShutdownReport>>,
     report: RefCell<ShutdownReport>,
     changed: Event,
@@ -56,6 +56,7 @@ struct Driver<Clock: AktorGroupClock> {
 }
 
 struct Entry {
+    cleanup_completed: Option<Rc<Cell<bool>>>,
     name: String,
     kind: crate::AktorExecution,
     shutdown: Box<dyn Fn()>,

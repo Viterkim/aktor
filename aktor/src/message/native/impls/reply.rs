@@ -2,6 +2,18 @@ use super::super::*;
 use core::task::ready;
 
 impl<O> Reply<O> {
+    /// Receive the call outcome without waiting for actor cleanup.
+    /// An outcome does not confirm retirement of the actor or its external work.
+    pub async fn receive_settled(mut self) -> Result<O, CallError> {
+        let output = match self.error.take() {
+            Some(error) => Err(error),
+            None => core::future::poll_fn(|cx| self.answer.poll(cx)).await,
+        };
+
+        self.taken = true;
+        output
+    }
+
     #[doc(hidden)]
     pub async fn receive(mut self) -> Result<O, CallError> {
         let output = core::future::poll_fn(|cx| self.poll_result(cx)).await;
@@ -74,7 +86,7 @@ impl<O> Reply<O> {
             ready!(closing.as_mut().poll(cx));
         }
 
-        match self.error.take() {
+        match self.error {
             Some(error) => Poll::Ready(Err(error)),
             None => Poll::Ready(Err(CallError::OutcomeUnknown)),
         }

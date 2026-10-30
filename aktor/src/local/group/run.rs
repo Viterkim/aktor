@@ -107,7 +107,7 @@ fn record_failure<Clock: AktorGroupClock>(
     phase: &str,
     error: AktorError,
 ) {
-    let primary = kill.fail(ActorFailure {
+    let primary = kill.fail(AktorFailureReport {
         kind: None,
         actor: "application".into(),
         phase: phase.into(),

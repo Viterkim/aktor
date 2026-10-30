@@ -47,7 +47,7 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
         self.reply
     }
 
-    #[doc(hidden)]
+    /// Wait for admission, returning a reply whose outcome can be observed before cleanup.
     pub async fn admit(mut self) -> Result<Reply<O>, CallError> {
         if poll_fn(|cx| self.poll_submit(cx)).await {
             Ok(self.reply)

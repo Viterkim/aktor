@@ -346,7 +346,7 @@ async fn pause() {
                     .await
                     .unwrap();
 
-                database.actor.pause().await.unwrap();
+                database.control.pause().await.unwrap();
 
                 let request = call(&database.handle, |value, ()| *value, ());
 
@@ -357,7 +357,7 @@ async fn pause() {
                         .is_err()
                 );
                 database
-                    .actor
+                    .control
                     .resume(|| {
                         Err(AktorError {
                             diagnostics: "opening failed".into(),
@@ -373,7 +373,7 @@ async fn pause() {
                         .is_err()
                 );
                 database
-                    .actor
+                    .control
                     .resume(|| Ok::<_, AktorError>(19usize))
                     .await
                     .unwrap();
