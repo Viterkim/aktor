@@ -66,8 +66,28 @@ impl<S> Inner<S> {
         self.queue.lock(|queue| {
             self.close_queue(&mut queue.borrow_mut());
         });
-        self.changed.notify();
-        self.status.changed.notify();
+        self.notify();
+    }
+
+    fn notify(&self) {
+        #[cfg(feature = "std")]
+        if let Some(payload) = crate::local::panic::capture_each(
+            [&self.changed, &self.status.changed],
+            |event| event.notify(),
+            |payload| {
+                let error = AktorError::new(panic_message(payload), ());
+                self.status
+                    .state
+                    .lock(|state| state.borrow_mut().diagnostics.push(error));
+            },
+        ) {
+            std::panic::resume_unwind(payload);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            self.changed.notify();
+            self.status.changed.notify();
+        }
     }
 
     fn close_queue(&self, queue: &mut Queue<S>) {
@@ -303,8 +323,7 @@ impl<S, Role> Drop for Handle<S, Role> {
         }
 
         if last {
-            self.inner.changed.notify();
-            self.inner.status.changed.notify();
+            self.inner.notify();
         }
     }
 }

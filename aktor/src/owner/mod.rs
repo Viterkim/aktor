@@ -67,12 +67,6 @@ pub struct ReplaceError {
     pub diagnostics: Option<crate::AktorDiagnostic>,
 }
 
-#[derive(Debug)]
-struct CompletionScheduleError {
-    cause: std::io::Error,
-    cleanup: Arc<OwnerError>,
-}
-
 pub struct Lifecycle<S> {
     inner: crate::listener::AktorControl<S, crate::AktorSetupError, AktorFailure>,
 }

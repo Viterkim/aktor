@@ -229,10 +229,8 @@ fn shutdown() {
                 assert!(
                     matches!(
                         &result,
-                        Err(aktor::owner::StartError {
-                            error: aktor::listener::DedicatedStartError::Closed,
-                            ..
-                        })
+                        Err(error) if matches!(error.error.primary(),
+                            aktor::listener::DedicatedStartError::Closed)
                     ),
                     "{result:?}"
                 );

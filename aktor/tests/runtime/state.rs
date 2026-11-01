@@ -59,7 +59,11 @@ async fn init() {
     )
     .await;
 
-    assert!(matches!(result, Err(DedicatedStartError::Init("no state"))));
+    let error = result.err().unwrap();
+    assert!(matches!(
+        error.primary(),
+        DedicatedStartError::Init("no state")
+    ));
 }
 
 #[tokio::test]

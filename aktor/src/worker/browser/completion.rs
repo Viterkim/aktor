@@ -70,7 +70,7 @@ impl<E> Completion<E> {
     }
 }
 impl<E: DeserializeOwned> Completion<E> {
-    /// Wait for the outcome, including whether cleanup has been confirmed.
+    /// Wait for the outcome and its cleanup status.
     pub async fn wait(&self) -> Retirement<E> {
         let result = self.report().await;
 
@@ -87,8 +87,7 @@ impl<E: DeserializeOwned> Completion<E> {
         }
     }
 
-    /// Wait for a cleanup receipt after an earlier unconfirmed failure.
-    /// This stays pending while the physical owner has not acknowledged retirement.
+    /// Wait for cleanup confirmation after an earlier unconfirmed failure.
     pub async fn wait_retired(&self) -> Retirement<E> {
         let mut result = self.result.clone();
 
@@ -101,7 +100,7 @@ impl<E: DeserializeOwned> Completion<E> {
         self.wait().await
     }
 
-    /// Observe an early failure report without waiting for a cleanup receipt.
+    /// Read the report without waiting for cleanup confirmation.
     pub async fn report(&self) -> Result<(), WorkerError<E>> {
         observe(self.result.clone()).await.map_err(typed)
     }

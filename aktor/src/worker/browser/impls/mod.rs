@@ -61,11 +61,11 @@ impl<S, Role, E> Worker<S, Role, E> {
         self.inner.continue_shutdown(true);
     }
 
-    /// Connect an external owner's join before exposing the worker to calls.
-    /// Once attached, normal and forced shutdown wait for it. Keep unconfirmed
-    /// work owned inside this future until its physical owner has retired.
-    /// Refusal still runs the supplied join and retains this handle, without
-    /// registering another shutdown dependency.
+    /// Attach an external join during construction.
+    /// Normal and forced shutdown wait for an accepted join. Keep its resources
+    /// here until the external work stops, including when the join returns an error.
+    ///
+    /// A refused join runs independently and keeps this handle alive until it finishes.
     pub fn before_shutdown(
         self,
         joining: impl Future<Output = Result<(), crate::AktorError>> + 'static,

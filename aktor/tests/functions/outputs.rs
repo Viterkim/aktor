@@ -63,8 +63,8 @@ async fn supplied<T>(
 ) -> impl Iterator<Item = T> + Send
 where
     T: Send + 'static,
-    // The iterator itself is made owned here, regardless of the input iterator type.
 {
+    // Collect first so the returned iterator owns its items.
     values.into_iter().collect::<Vec<_>>().into_iter()
 }
 

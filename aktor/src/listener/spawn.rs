@@ -43,6 +43,16 @@ pub fn channel<S>(capacity: usize) -> AktorStateResult<(Handle<S>, Listener<S>)>
 }
 
 #[cfg(feature = "tokio")]
+pub fn startup_join<T>(
+    joined: Result<std::thread::Result<Option<T>>, tokio::task::JoinError>,
+) -> StartupJoin {
+    match joined {
+        Ok(Ok(_)) => StartupJoin::Joined,
+        failed => StartupJoin::Failed(Arc::new(startup_cause(failed))),
+    }
+}
+
+#[cfg(feature = "tokio")]
 pub fn startup_cause<T>(
     joined: Result<std::thread::Result<Option<T>>, tokio::task::JoinError>,
 ) -> DedicatedJoinError {
@@ -107,7 +117,7 @@ pub fn spawn_thread_with_policy<S: Send + 'static>(
     let thread = thread::Builder::new()
         .name("actor".into())
         .spawn(move || Some(listener.run_blocking(state)))
-        .map_err(DedicatedStartError::Thread)?;
+        .map_err(DedicatedStartError::ThreadNotCreated)?;
 
     let finished = handle.inner.finished.clone();
 
@@ -185,7 +195,7 @@ where
                 None
             }
         })
-        .map_err(DedicatedStartError::Thread)?;
+        .map_err(DedicatedStartError::ThreadNotCreated)?;
 
     match ready.await {
         Ok(Ok(())) => {
@@ -196,7 +206,10 @@ where
             let joined = task::spawn_blocking(move || thread.join()).await;
 
             match result {
-                Ok(Err(error)) => Err(DedicatedStartError::Init(error)),
+                Ok(Err(error)) => Err(DedicatedStartError::Startup {
+                    cause: Box::new(DedicatedStartError::Init(error)),
+                    join: startup_join(joined),
+                }),
                 _ => Err(DedicatedStartError::Panicked {
                     actor: actor_name,
                     cause: startup_cause(joined),

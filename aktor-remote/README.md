@@ -3,7 +3,7 @@
 Your service owns the resource. Other processes call its functions over Unix sockets, TCP or UDP. Runs on Unix with Tokio.
 
 ```toml
-aktor-remote = "0.0.10"
+aktor-remote = "0.0.11"
 ```
 
 ## Shared functions
@@ -32,7 +32,7 @@ let server = Server::listen_with("/run/power.sock", &actors.handles, ServerOptio
 }).await?;
 ```
 
-All clients queue on that actor. Close the listener with server.shutdown(), then await actors.shutdown() to finish the work and cleanup.
+All clients queue on that actor. Await server.shutdown() before actors.shutdown() so clients stop submitting work before the actor closes.
 
 ## Client
 
@@ -58,7 +58,7 @@ let target = set_target(&power, 10)
     .await?;
 ```
 
-Four attempts total, five seconds each. A lost reply can mean the work already ran, so retrying can run it twice. The function's own errors don't trigger retries.
+That's four attempts including the first call. A lost reply can mean the work already ran, so retrying can run it twice. The function's own errors don't trigger retries.
 
 ## TCP / UDP
 

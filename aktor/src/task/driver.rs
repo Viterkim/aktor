@@ -511,7 +511,7 @@ async fn drive<S, Start, Fut>(
 
     let state = Arc::new(Mutex::new(Some(state)));
     let _sent = ready.send(Ok(()));
-    // Keep their wake registrations between calls.
+    // Reuse these waits so calls don't resubscribe to shutdown.
     let closing = async move {
         let _closed = closed.await;
     };

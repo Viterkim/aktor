@@ -17,7 +17,7 @@ pub struct AktorWorkerNew<S, Config, Role = AktorNoRole> {
 impl<S, Config, Role> Drop for AktorWorkerNew<S, Config, Role> {
     fn drop(&mut self) {
         if let Some(joining) = self.options.before_shutdown.take() {
-            // A rejected or cancelled setup may never reach start_in.
+            // Keep the join alive even when setup never starts.
             drop(ShutdownDependency::new(Some(joining)));
         }
     }
@@ -38,10 +38,14 @@ impl<S, Config, Role> AktorWorkerNew<S, Config, Role> {
 pub struct AktorWorkerOptions {
     pub transport: Options,
     /// Join external work before normal or forced worker shutdown.
-    /// Returning, including Err, confirms that dependency has physically finished.
-    /// Keep its resources owned here until its actual retirement receipt arrives.
+    /// Returning Ok or Err confirms that the external work has stopped.
+    /// Keep unfinished work owned by this future.
     pub before_shutdown:
         Option<crate::message::LocalFuture<'static, Result<(), crate::AktorError>>>,
+    /// Keep accepted work running when shutdown is forced so cleanup can finish.
+    pub retain_unconfirmed: bool,
+    /// Keep a completion observer when worker startup fails.
+    pub observe_retirement: Option<Box<dyn FnOnce(crate::worker::Completion)>>,
 }
 
 impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
@@ -76,6 +80,7 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
         let joining = ShutdownDependency::new(setup.options.before_shutdown.take());
 
         Box::pin(async move {
+            let mut observer = setup.options.observe_retirement.take();
             let dependency = joining.completion();
             match OptionalWorker::<S, Role>::with_config(
                 &setup.kind.program,
@@ -83,6 +88,14 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
                 &setup.config,
             )
             .and_then(OptionalWorker::into_worker)
+            .map(|worker| {
+                let worker = worker.retain_unconfirmed(setup.options.retain_unconfirmed);
+                if let Some(observer) = observer.take() {
+                    observer(worker.completion());
+                }
+
+                worker
+            })
             .and_then(|worker| joining.attach(worker))
             {
                 Ok(worker) => {
@@ -91,6 +104,10 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
                 }
                 Err(error) => {
                     let worker = OptionalWorker::unavailable(error, dependency);
+                    if let Some(observer) = observer {
+                        observer(worker.completion());
+                    }
+
                     register_unavailable(
                         &worker,
                         core::mem::take(&mut setup.name.name),
@@ -110,18 +127,30 @@ fn start_worker<S: 'static, Config: Serialize + 'static, Role: 'static>(
     let joining = ShutdownDependency::new(setup.options.before_shutdown.take());
 
     Box::pin(async move {
+        let mut observer = setup.options.observe_retirement.take();
         let dependency = joining.completion();
         let worker = Worker::<S, Role>::with_config(
             &setup.kind.program,
             core::mem::take(&mut setup.options.transport),
             &setup.config,
         )
+        .map(|worker| {
+            let worker = worker.retain_unconfirmed(setup.options.retain_unconfirmed);
+            if let Some(observer) = observer.take() {
+                observer(worker.completion());
+            }
+
+            worker
+        })
         .and_then(|worker| joining.attach(worker));
         let worker = match worker {
             Ok(worker) => worker,
             Err(error) => {
                 let message = alloc::format!("{error:#}");
                 let worker = OptionalWorker::<S, Role>::unavailable(error, dependency);
+                if let Some(observer) = observer {
+                    observer(worker.completion());
+                }
 
                 register_unavailable(&worker, setup.name.name.clone(), &mut context)?;
                 return Err(validation_error(

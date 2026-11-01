@@ -122,12 +122,20 @@ pub async fn catch<F: Future>(
 
 pub fn discard<T>(
     values: impl IntoIterator<Item = T>,
+    secondary: impl FnMut(&Box<dyn Any + Send>),
+) -> Option<Box<dyn Any + Send>> {
+    capture_each(values, drop, secondary)
+}
+
+pub fn capture_each<T>(
+    values: impl IntoIterator<Item = T>,
+    mut action: impl FnMut(T),
     mut secondary: impl FnMut(&Box<dyn Any + Send>),
 ) -> Option<Box<dyn Any + Send>> {
     let mut primary = None;
 
     for value in values {
-        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(value))) {
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| action(value))) {
             if primary.is_none() {
                 primary = Some(payload);
             } else {

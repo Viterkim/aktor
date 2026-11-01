@@ -26,11 +26,11 @@ pub use lifecycle::spawn::{spawn, spawn_async, spawn_async_with_hooks};
 pub use lifecycle::{AbandonedSetup, AktorControl, CleanupErrors, LifecycleError, ReplaceError};
 pub use spawn::channel;
 #[cfg(feature = "tokio")]
-use spawn::startup_cause;
-#[cfg(feature = "tokio")]
 pub use spawn::{
     spawn_local, spawn_local_with_policy, spawn_runner, spawn_thread, spawn_thread_with_policy,
 };
+#[cfg(feature = "tokio")]
+use spawn::{startup_cause, startup_join};
 
 /// Setup and cleanup run on the actor thread.
 pub struct SpawnArgs<Setup, Cleanup> {
@@ -80,12 +80,36 @@ pub struct DedicatedJoinError {
     pub payload: parking_lot::Mutex<Box<dyn std::any::Any + Send>>,
 }
 
+#[derive(Clone, Er)]
+pub enum StartupJoin {
+    /// The OS join returned normally.
+    Joined,
+    /// Inspect physically_joined to distinguish a joined panic from a failed join task.
+    Failed(#[er(source, skip)] Arc<DedicatedJoinError>),
+}
+
 #[derive(Er)]
 pub enum DedicatedStartError<E> {
+    /// Setup failed after the thread started. Includes the thread's join result.
+    Startup {
+        #[er(source, skip)]
+        cause: Box<DedicatedStartError<E>>,
+        #[er(skip)]
+        join: StartupJoin,
+    },
+    #[cfg(not(target_family = "wasm"))]
+    /// Scheduling the completion observer failed after the owner started.
+    Observer {
+        #[er(source, skip)]
+        cause: io::Error,
+        #[er(skip)]
+        completion: Result<(), Arc<crate::owner::OwnerError>>,
+    },
     NotStarted,
     Closed,
     NoRuntime,
     InvalidCapacity,
+    ThreadNotCreated(#[er(source, skip)] io::Error),
     Thread(#[er(source, skip)] io::Error),
     Init(#[er(source, skip)] E),
     Panicked {

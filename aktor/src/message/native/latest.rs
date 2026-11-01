@@ -1,4 +1,5 @@
 use super::*;
+use crate::listener::failure::{FailureKind, Failures};
 use crate::{
     latest::{SendLatest, Session},
     queue::Phase,
@@ -162,12 +163,16 @@ where
         let wake = slot.wake.take();
 
         drop(slot);
-        drop(pending);
-        self.schedule();
 
-        if let Some(wake) = wake {
-            wake.wake();
-        }
+        let mut failures = Failures::new(String::new());
+        failures.capture(FailureKind::Teardown, || drop(pending));
+        failures.capture(FailureKind::Teardown, || self.schedule());
+        failures.capture(FailureKind::Teardown, || {
+            if let Some(wake) = wake {
+                wake.wake();
+            }
+        });
+        failures.resume();
     }
 }
 impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static, F> Input<I>

@@ -25,7 +25,9 @@ use completion::observe;
 use impls::fatal;
 pub use latest::{LatestResults, LatestSender};
 pub use optional::{OptionalReply, OptionalRequest, OptionalWorker};
-pub use server::{Server, serve, serve_for, serve_with, setup_failed};
+pub use server::{
+    Server, retain_cleanup, retain_setup, serve, serve_for, serve_with, setup_failed,
+};
 pub use setup::serve_setup;
 
 type State<S, Role, E> = PhantomData<fn() -> (S, Role, E)>;
@@ -107,6 +109,7 @@ struct Inner {
     optional: bool,
     accepted: Cell<bool>,
     retired: Rc<Cell<bool>>,
+    retain_unconfirmed: Cell<bool>,
     uncertain: RefCell<Vec<Work>>,
     failure: RefCell<Option<WireError>>,
     diagnostics: Rc<RefCell<Vec<crate::AktorError>>>,

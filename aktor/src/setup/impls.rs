@@ -278,6 +278,22 @@ impl<E: 'static> AktorStartError<E> {
                 crate::listener::DedicatedStartError::Panicked { .. }
                 | crate::listener::DedicatedStartError::InvalidCapacity,
             ) => true,
+            #[cfg(all(
+                any(feature = "tokio", feature = "std_thread"),
+                not(target_family = "wasm")
+            ))]
+            Self::Startup(error) => match error.error.primary() {
+                crate::listener::DedicatedStartError::Init(_)
+                | crate::listener::DedicatedStartError::Panicked { .. }
+                | crate::listener::DedicatedStartError::InvalidCapacity => true,
+                crate::listener::DedicatedStartError::Startup { .. }
+                | crate::listener::DedicatedStartError::Observer { .. }
+                | crate::listener::DedicatedStartError::NotStarted
+                | crate::listener::DedicatedStartError::Closed
+                | crate::listener::DedicatedStartError::NoRuntime
+                | crate::listener::DedicatedStartError::ThreadNotCreated(_)
+                | crate::listener::DedicatedStartError::Thread(_) => false,
+            },
             #[cfg(feature = "local")]
             Self::Local(crate::local::OwnerError {
                 error:
@@ -306,6 +322,11 @@ pub fn start_diagnostics(error: &AktorStartError) -> String {
             not(target_family = "wasm")
         ))]
         AktorStartError::Thread(_) => diagnostics(error),
+        #[cfg(all(
+            any(feature = "tokio", feature = "std_thread"),
+            not(target_family = "wasm")
+        ))]
+        AktorStartError::Startup(error) => alloc::format!("{error:#}"),
     }
 }
 

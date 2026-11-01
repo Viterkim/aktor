@@ -44,11 +44,15 @@ pub fn check() -> Result<(), String> {
 
         match failed {
             Err(AktorStartupError {
-                error: AktorStartError::Init(error),
+                error: AktorStartError::Startup(error),
                 report: Some(report),
                 ..
             }) => {
-                assert_eq!(error.diagnostics, "storage refused");
+                let listener::DedicatedStartError::Init(failure) = error.error.primary() else {
+                    return Err("typed startup lost its original failure".into());
+                };
+
+                assert_eq!(failure.diagnostics, "storage refused");
                 if !report.failed() {
                     return Err("typed startup lost its rollback report".into());
                 }

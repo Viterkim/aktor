@@ -2,7 +2,7 @@ use super::*;
 #[cfg(any(feature = "tokio", feature = "std_thread"))]
 use crate::{
     Aktor, AktorDiagnostic, AktorSetupError, FailurePolicy, SpawnArgs,
-    listener::{DedicatedJoinError, DedicatedStartError},
+    listener::{DedicatedJoinError, DedicatedStartError, StartupJoin},
     owner::{OwnerFailure, StartError},
 };
 #[cfg(any(feature = "tokio", feature = "std_thread"))]
@@ -395,7 +395,17 @@ impl AktorGroup {
             {
                 Ok(owner) => owner,
                 Err(error) => {
-                    if matches!(error, DedicatedStartError::Closed) && kill.is_stopping() {
+                    let join_failed = matches!(
+                        &error,
+                        DedicatedStartError::Startup {
+                            join: StartupJoin::Failed(_),
+                            ..
+                        }
+                    );
+                    if !join_failed
+                        && matches!(error.primary(), DedicatedStartError::Closed)
+                        && kill.is_stopping()
+                    {
                         kill.control.lock().report.timed_out = true;
 
                         let sent = started.send(Err(error));
@@ -418,7 +428,9 @@ impl AktorGroup {
                         message: "actor initialization failed".into(),
                     });
 
-                    let (diagnostics, primary) = match &error {
+                    let (diagnostics, primary) = match error.primary() {
+                        DedicatedStartError::Startup { .. } => (error.to_string(), false),
+                        DedicatedStartError::Observer { cause, .. } => (cause.to_string(), false),
                         DedicatedStartError::Init(error) => describe_initial(error),
                         DedicatedStartError::NotStarted => {
                             ("actor group has not started".into(), false)
@@ -430,25 +442,54 @@ impl AktorGroup {
                         DedicatedStartError::InvalidCapacity => {
                             ("invalid actor capacity".into(), false)
                         }
-                        DedicatedStartError::Thread(error) => (error.to_string(), false),
+                        DedicatedStartError::ThreadNotCreated(error)
+                        | DedicatedStartError::Thread(error) => (error.to_string(), false),
                         DedicatedStartError::Panicked { actor, cause } => {
                             (format!("actor {actor} startup panicked: {cause}"), false)
                         }
                     };
 
+                    let join_diagnostics = if let DedicatedStartError::Startup {
+                        join: StartupJoin::Failed(cause),
+                        ..
+                    } = &error
+                    {
+                        Some(format!("Startup join failed: {cause}"))
+                    } else {
+                        None
+                    };
+                    let diagnostics = match &join_diagnostics {
+                        Some(join) => format!("{diagnostics}\n{join}"),
+                        None => diagnostics,
+                    };
                     if first && let Some(failure) = &mut kill.control.lock().report.failure {
                         failure.message = diagnostics.clone();
                     }
 
-                    let retirement = match &error {
-                        DedicatedStartError::Panicked { .. } | DedicatedStartError::Closed => {
-                            crate::RetirementStatus::Unconfirmed
+                    let retirement = if join_failed {
+                        crate::RetirementStatus::Unconfirmed
+                    } else {
+                        match error.primary() {
+                            DedicatedStartError::Startup { .. }
+                            | DedicatedStartError::Observer { .. }
+                            | DedicatedStartError::Panicked { .. }
+                            | DedicatedStartError::Closed => crate::RetirementStatus::Unconfirmed,
+                            DedicatedStartError::Init(_)
+                            | DedicatedStartError::NotStarted
+                            | DedicatedStartError::NoRuntime
+                            | DedicatedStartError::InvalidCapacity
+                            | DedicatedStartError::ThreadNotCreated(_)
+                            | DedicatedStartError::Thread(_) => crate::RetirementStatus::Confirmed,
                         }
-                        DedicatedStartError::Init(_)
-                        | DedicatedStartError::NotStarted
-                        | DedicatedStartError::NoRuntime
-                        | DedicatedStartError::InvalidCapacity
-                        | DedicatedStartError::Thread(_) => crate::RetirementStatus::Confirmed,
+                    };
+                    let diagnostics = if first {
+                        Vec::new()
+                    } else if let Some(join) = join_diagnostics {
+                        vec![AktorError::new(join, ())]
+                    } else if primary {
+                        Vec::new()
+                    } else {
+                        vec![AktorError::new(diagnostics, ())]
                     };
                     let sent = started.send(Err(error));
                     super::shutdown::contain_drop(sent, &kill, "startup reply drop");
@@ -456,11 +497,7 @@ impl AktorGroup {
                         retirement,
                         kind: None,
                         actor: name,
-                        diagnostics: if first || primary {
-                            Vec::new()
-                        } else {
-                            vec![AktorError::new(diagnostics, ())]
-                        },
+                        diagnostics,
                         timed_out: false,
                     });
 
@@ -480,12 +517,12 @@ impl AktorGroup {
             let result = loop {
                 if !stopping && *closed.borrow_and_update() {
                     stopping = true;
-                    actor.request_shutdown();
+                    super::shutdown::contain(|| actor.request_shutdown(), &kill, "shutdown notification");
                 }
 
                 if !cancelling && *forced.borrow_and_update() {
                     cancelling = true;
-                    actor.cancel();
+                    super::shutdown::contain(|| actor.cancel(), &kill, "cancellation notification");
                 }
 
                 tokio::select! {
@@ -494,13 +531,13 @@ impl AktorGroup {
                     changed = closed.changed(), if !stopping => {
                         if changed.is_err() {
                             stopping = true;
-                            actor.request_shutdown();
+                            super::shutdown::contain(|| actor.request_shutdown(), &kill, "shutdown notification");
                         }
                     },
                     changed = forced.changed(), if !cancelling => {
                         if changed.is_err() {
                             cancelling = true;
-                            actor.cancel();
+                            super::shutdown::contain(|| actor.cancel(), &kill, "cancellation notification");
                         }
                     },
                 }
@@ -606,7 +643,7 @@ impl AktorGroup {
             });
 
             self.completion().wait().await;
-            return Err(DedicatedStartError::Thread(error));
+            return Err(DedicatedStartError::ThreadNotCreated(error));
         }
 
         let result = ready.await.unwrap_or_else(|_| {
@@ -620,8 +657,15 @@ impl AktorGroup {
         });
 
         if let Err(error) = &result {
-            let cancelled =
-                matches!(error, DedicatedStartError::Closed) && self.killswitch().is_stopping();
+            let cancelled = matches!(error.primary(), DedicatedStartError::Closed)
+                && !matches!(
+                    error,
+                    DedicatedStartError::Startup {
+                        join: StartupJoin::Failed(_),
+                        ..
+                    }
+                )
+                && self.killswitch().is_stopping();
 
             if !cancelled {
                 self.killswitch().fail_startup(AktorFailureReport {

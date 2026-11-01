@@ -30,14 +30,14 @@ impl<E> Completion<E> {
         }
     }
 
-    /// Observe completion without retaining the owner's typed failure data.
+    /// Wait for the owner to finish, returning a diagnostic on failure.
     pub async fn wait(&self) -> Result<(), OwnerError> {
         self.wait_with_data()
             .await
             .map_err(SharedOwnerError::without_data)
     }
 
-    /// Observe the exact lifecycle error and its data on this executor.
+    /// Wait for the owner to finish and get the error with its application data.
     pub async fn wait_with_data(&self) -> Result<(), SharedOwnerError<E>> {
         let changed = self.inner.changed.listen();
 

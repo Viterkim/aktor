@@ -29,9 +29,9 @@ impl<S: 'static, Role: 'static, E> OptionalWorker<S, Role, E> {
         Ok(Self::from_worker(worker))
     }
 
-    /// Connect the external join while constructing this handle.
-    /// Refusal still runs the supplied join and retains this handle, without
-    /// registering another shutdown dependency.
+    /// Attach an external join during construction.
+    /// Normal and forced shutdown wait for accepted joins.
+    /// A refused join runs independently and keeps this handle alive until it finishes.
     pub fn before_shutdown(
         self,
         joining: impl Future<Output = Result<(), crate::AktorError>> + 'static,

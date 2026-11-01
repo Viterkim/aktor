@@ -26,8 +26,8 @@ pub(crate) use browser::ShutdownDependency;
 ))]
 pub use browser::{
     Completion, LatestResults, LatestSender, OptionalReply, OptionalRequest, OptionalWorker,
-    Server, Worker, WorkerReply, WorkerRequest, serve, serve_for, serve_setup, serve_with,
-    setup_failed,
+    Server, Worker, WorkerReply, WorkerRequest, retain_cleanup, retain_setup, serve, serve_for,
+    serve_setup, serve_with, setup_failed,
 };
 pub use codec::{decode, encode};
 #[doc(hidden)]
@@ -40,7 +40,7 @@ pub use wire::Codec;
 
 pub use crate::dispatch::{Native, Remote};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[cfg(all(
     feature = "wasm_browser_workers",
@@ -55,7 +55,8 @@ pub struct Options {
     pub build: String,
     /// Ordinary calls waiting for replies, including the running call.
     pub capacity: usize,
-    /// Ordinary admission budget. Oversized calls take the whole budget, latest sessions bypass it.
+    /// Soft byte budget for admitted calls. Oversized calls take the whole budget.
+    /// Waiting inputs and latest sessions are outside it.
     pub max_outstanding_bytes: usize,
 }
 
@@ -142,6 +143,7 @@ enum Outgoing {
     },
     Finished(Result<(), WireError>),
     SetupRetired,
+    Unconfirmed(WireError),
 }
 
 #[doc(hidden)]

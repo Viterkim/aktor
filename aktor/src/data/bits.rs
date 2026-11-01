@@ -116,6 +116,14 @@ pub fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
 }
 
 fn pack(values: &[bool]) -> u8 {
+    if let &[a, b, c, d, e, f, g, h] = values {
+        let bytes = [a, b, c, d, e, f, g, h].map(u8::from);
+        let word = u64::from_le_bytes(bytes);
+
+        // Each byte holds one bit. Multiplication gathers them into the top byte.
+        return (word.wrapping_mul(0x0102_0408_1020_4080) >> 56) as u8;
+    }
+
     values
         .iter()
         .enumerate()

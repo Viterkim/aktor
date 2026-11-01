@@ -1,6 +1,7 @@
 use super::*;
 use crate::FailurePolicy;
 use crate::listener::{FailureKind, Failures};
+use crate::message::LocalFuture;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run<S, E, Initial, C, CleanupFuture>(
@@ -19,6 +20,7 @@ pub fn run<S, E, Initial, C, CleanupFuture>(
 where
     CleanupFuture: core::future::Future<Output = Result<(), C>>,
 {
+    let mut execution = Execution::new(runtime, force);
     let policy = listener.failure.clone();
     let mut failures = Failures::new(listener.name.clone());
 
@@ -45,7 +47,7 @@ where
                 commands.close();
             }
 
-            let Some(event) = execute(runtime, &force, async {
+            let Some(event) = execution.run(async {
                 tokio::select! {
                     biased;
                     command = commands.recv(), if controls_open => Event::Command(command),
@@ -71,12 +73,12 @@ where
                     listener.admission.close();
 
                     if let Some(state) = &mut state {
-                        drain(runtime, &force, &mut listener, state);
+                        drain(&mut execution, &mut listener, state);
                     }
 
                     status.send_replace(false);
 
-                    let result = clean(runtime, &force, &mut state, &mut cleanup, &mut errors, &failed_cleanup);
+                    let result = clean(&mut execution, &mut state, &mut cleanup, &mut errors, &failed_cleanup);
                     let _sent = reply.send(result);
                 }
 
@@ -85,7 +87,7 @@ where
                         Err(LifecycleError::AlreadyRunning)
                     } else {
                         failed_cleanup.lock().completed = false;
-                        match execute(runtime, &force, async { setup().await }) {
+                        match execution.run(async { setup().await }) {
                             Some(Ok(next)) => {
                                 state = Some(next);
                                 listener.admission.open();
@@ -114,17 +116,17 @@ where
                     listener.admission.close();
 
                     if let Some(state) = &mut state {
-                        drain(runtime, &force, &mut listener, state);
+                        drain(&mut execution, &mut listener, state);
                     }
 
                     status.send_replace(false);
 
-                    let result = match clean(runtime, &force, &mut state, &mut cleanup, &mut errors, &failed_cleanup) {
+                    let result = match clean(&mut execution, &mut state, &mut cleanup, &mut errors, &failed_cleanup) {
                         Err(LifecycleError::Failed(error)) => Err(ReplaceError::Cleanup(error)),
                         Err(LifecycleError::Closed | LifecycleError::AlreadyRunning) => Err(ReplaceError::Closed),
                         Ok(()) => {
                             failed_cleanup.lock().completed = false;
-                            match execute(runtime, &force, async { setup().await }) {
+                            match execution.run(async { setup().await }) {
                                 Some(Ok(next)) => {
                                     state = Some(next);
                                     listener.admission.open();
@@ -160,7 +162,7 @@ where
                     listener.close();
 
                     if let Some(state) = &mut state {
-                        execute(runtime, &force, listener.serve(state));
+                        execution.run(listener.serve(state));
                     }
 
                     status.send_replace(false);
@@ -178,7 +180,7 @@ where
 
                 Event::Message(Some(message)) => {
                     if let Some(state) = &mut state
-                        && execute(runtime, &force, message.run_with(state, &mut listener.hooks)).is_none()
+                        && execution.run(message.run_with(state, &mut listener.hooks)).is_none()
                     {
                         break;
                     }
@@ -195,7 +197,7 @@ where
 
     listener.discard_queued(&mut failures);
 
-    // Queued setup closures can panic on drop too.
+    // Cleanup can be waiting for resources held by these queued setup closures.
     commands.close();
 
     while let Ok(command) = commands.try_recv() {
@@ -206,8 +208,7 @@ where
 
     let cleaned = failures.capture(FailureKind::Cleanup, || {
         clean(
-            runtime,
-            &force,
+            &mut execution,
             &mut state,
             &mut cleanup,
             &mut errors,
@@ -249,9 +250,8 @@ where
     }
 }
 
-pub fn clean<S, C, CleanupFuture>(
-    runtime: &crate::executor::Driver,
-    force: &watch::Receiver<bool>,
+fn clean<S, C, CleanupFuture>(
+    execution: &mut Execution<'_>,
     state: &mut Option<S>,
     cleanup: &mut impl FnMut(S) -> CleanupFuture,
     errors: &mut Vec<Arc<C>>,
@@ -264,7 +264,7 @@ where
         return Ok(());
     };
     let result = FailureKind::Cleanup.during(|| {
-        execute(runtime, force, async {
+        execution.run(async {
             let result = cleanup(state).await;
             receipt.lock().completed = true;
             result
@@ -282,18 +282,16 @@ where
     }
 }
 
-pub fn drain<S>(
-    runtime: &crate::executor::Driver,
-    force: &watch::Receiver<bool>,
-    listener: &mut Listener<S>,
-    state: &mut S,
-) {
+fn drain<S>(execution: &mut Execution<'_>, listener: &mut Listener<S>, state: &mut S) {
     let queued = listener.receiver.len();
 
     for _ in 0..queued {
         match listener.receiver.try_recv() {
             Ok(message) => {
-                if execute(runtime, force, message.run_with(state, &mut listener.hooks)).is_none() {
+                if execution
+                    .run(message.run_with(state, &mut listener.hooks))
+                    .is_none()
+                {
                     break;
                 }
             }
@@ -302,23 +300,44 @@ pub fn drain<S>(
     }
 }
 
-fn execute<F: core::future::Future>(
-    runtime: &crate::executor::Driver,
-    force: &watch::Receiver<bool>,
-    future: F,
-) -> Option<F::Output> {
-    let mut force = force.clone();
-
-    runtime.block_on(async move {
-        tokio::select! {
-            biased;
-            _ = async {
+struct Execution<'a> {
+    runtime: &'a crate::executor::Driver,
+    force: LocalFuture<'static, ()>,
+    forced: bool,
+}
+impl<'a> Execution<'a> {
+    fn new(runtime: &'a crate::executor::Driver, mut force: watch::Receiver<bool>) -> Self {
+        Self {
+            runtime,
+            force: Box::pin(async move {
                 loop {
-                    if *force.borrow_and_update() { return; }
-                    if force.changed().await.is_err() { core::future::pending::<()>().await; }
+                    if *force.borrow_and_update() {
+                        return;
+                    }
+
+                    if force.changed().await.is_err() {
+                        core::future::pending::<()>().await;
+                    }
                 }
-            } => None,
-            output = future => Some(output),
+            }),
+            forced: false,
         }
-    })
+    }
+
+    fn run<F: core::future::Future>(&mut self, future: F) -> Option<F::Output> {
+        if self.forced {
+            return None;
+        }
+
+        let result = self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = &mut self.force => None,
+                output = future => Some(output),
+            }
+        });
+
+        self.forced = result.is_none();
+        result
+    }
 }

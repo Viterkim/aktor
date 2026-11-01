@@ -58,17 +58,21 @@ fn respond_with(
     } else {
         js_sys::Uint8Array::from(output.as_slice()).buffer()
     };
-    let transfers = js_sys::Array::new();
+    let sent = if output.len() < super::buffer::MIN_REUSE {
+        scope.post_message(&buffer)
+    } else {
+        let transfers = js_sys::Array::new();
 
-    transfers.push(&buffer);
-    scope
-        .post_message_with_transfer(&buffer, &transfers)
-        .map_err(|error| {
-            WireError::new(
-                CallError::OutcomeUnknown,
-                WorkerCause::Codec(format!("{error:?}")),
-            )
-        })
+        transfers.push(&buffer);
+        scope.post_message_with_transfer(&buffer, &transfers)
+    };
+
+    sent.map_err(|error| {
+        WireError::new(
+            CallError::OutcomeUnknown,
+            WorkerCause::Codec(format!("{error:?}")),
+        )
+    })
 }
 
 pub fn scope() -> Result<DedicatedWorkerGlobalScope, WireError> {
@@ -85,6 +89,38 @@ pub fn setup_failed<T: Serialize>(error: crate::AktorSetupError<T>) -> Result<()
             &error.data,
         )),
     )
+}
+
+/// Report a setup failure when rollback cannot confirm cleanup.
+/// This never returns, keeping the setup's captures alive.
+pub async fn retain_setup<T, E: Serialize>(
+    error: crate::AktorSetupError<E>,
+) -> Result<T, crate::AktorSetupError<E>> {
+    let failure = lifecycle_error(
+        WireError::setup(CallError::OutcomeUnknown, error.diagnostics.clone()),
+        &error.data,
+    );
+    let reported = scope().and_then(|scope| respond(&scope, Outgoing::Unconfirmed(failure)));
+
+    let result = core::future::pending().await;
+    drop((error, reported));
+    result
+}
+
+/// Report a cleanup failure without confirming retirement.
+/// This never returns, so cleanup keeps ownership of its unfinished work.
+pub async fn retain_cleanup<E: Serialize>(
+    error: crate::AktorCleanupError<E>,
+) -> Result<(), crate::AktorCleanupError<E>> {
+    let failure = lifecycle_error(
+        WireError::cleanup(CallError::OutcomeUnknown, error.diagnostics.clone()),
+        &error.data,
+    );
+    let reported = scope().and_then(|scope| respond(&scope, Outgoing::Unconfirmed(failure)));
+
+    let result = core::future::pending().await;
+    drop((error, reported));
+    result
 }
 
 pub fn setup_retired(error: WireError) -> Result<(), WireError> {

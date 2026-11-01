@@ -36,14 +36,14 @@ impl<S, const N: usize, E, Role, Clock> Handle<S, N, E, Role, Clock> {
         }
     }
 
-    /// Wait for setup, or get an owned diagnostic without retaining setup data.
+    /// Wait for setup, returning a diagnostic on failure.
     pub async fn ready(&self) -> Result<(), OwnerError> {
         self.ready_with_data()
             .await
             .map_err(SharedOwnerError::without_data)
     }
 
-    /// Observe the original setup error and its data on this executor.
+    /// Wait for setup and get the error with its application data.
     pub async fn ready_with_data(&self) -> Result<(), SharedOwnerError<E>> {
         let changed = self.inner.completion.changed.listen();
 

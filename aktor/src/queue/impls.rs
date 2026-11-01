@@ -1,5 +1,8 @@
 use super::*;
-use crate::message::Message;
+use crate::{
+    listener::failure::{FailureKind, Failures},
+    message::Message,
+};
 
 impl Admission {
     pub fn set_standard(&self, standard: bool) {
@@ -165,7 +168,8 @@ impl Admission {
         drop(state);
         drop(lock);
 
-        self.changed.send_replace(epoch);
+        let mut failures = Failures::new(String::new());
+        failures.capture(FailureKind::Teardown, || self.changed.send_replace(epoch));
 
         let callbacks: Vec<_> = {
             let lock = self.state.lock();
@@ -176,8 +180,10 @@ impl Admission {
         };
 
         for callback in callbacks {
-            callback(phase);
+            failures.capture(FailureKind::Teardown, || callback(phase));
         }
+
+        failures.resume();
     }
 }
 
@@ -220,6 +226,126 @@ mod tests {
         crate::message::call(&handle, |_, ()| (), ()).cast().await;
         drop(receiver);
         listener.try_recv().unwrap().run(&mut 0).await;
+    }
+
+    #[test]
+    fn closing_sessions() {
+        use crate::latest::{SendLatest, Session};
+        use core::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            task::Wake,
+        };
+
+        struct BrokenWake;
+        impl Wake for BrokenWake {
+            fn wake(self: Arc<Self>) {
+                panic!("session wake failed");
+            }
+        }
+
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        struct BrokenInput;
+        impl Drop for BrokenInput {
+            fn drop(&mut self) {
+                panic!("session input drop failed");
+            }
+        }
+
+        let (handle, mut listener) = crate::listener::channel::<()>(1).unwrap();
+        let operation = crate::operation::Operation {
+            name: "closing sessions",
+            caller: std::panic::Location::caller(),
+        };
+        let (_first, mut first) = (&handle).session(operation, async |_: &mut (), _: ()| ());
+        let (second, mut second_output) =
+            (&handle).session(operation, async |_: &mut (), _: BrokenInput| ());
+        let (_third, mut third) = (&handle).session(operation, async |_: &mut (), _: ()| ());
+        let broken = Waker::from(Arc::new(BrokenWake));
+        let count = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+
+        handle.inner.admission.close();
+        second.send(BrokenInput);
+
+        let _pending = Box::pin(first.next())
+            .as_mut()
+            .poll(&mut Context::from_waker(&broken));
+        let _pending = Box::pin(second_output.next())
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker));
+        let _pending = Box::pin(third.next())
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker));
+
+        let mut failures = Failures::new("closing sessions".into());
+        failures.capture(FailureKind::Runtime, || listener.close());
+
+        assert_eq!(count.0.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            Box::pin(third.next())
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(None)
+        );
+        let failure = failures.first.unwrap();
+        assert_eq!(
+            failure.payload.downcast_ref::<&str>(),
+            Some(&"session wake failed")
+        );
+        assert!(
+            failure
+                .diagnostics
+                .iter()
+                .any(|error| error.diagnostics.contains("session input drop failed"))
+        );
+
+        #[cfg(feature = "local")]
+        {
+            let (handle, _owner) = crate::local::channel::<(), 1, ()>().unwrap();
+            let count = Arc::new(CountWake(AtomicUsize::new(0)));
+            let waker = Waker::from(count.clone());
+            let (_first, mut first) = (&handle).session(operation, async |_: &mut (), _: ()| ());
+            let (_second, mut second) = (&handle).session(operation, async |_: &mut (), _: ()| ());
+            let _pending = Box::pin(first.next())
+                .as_mut()
+                .poll(&mut Context::from_waker(&broken));
+            let _pending = Box::pin(second.next())
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker));
+
+            let _failure =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(handle.shutdown())));
+            assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        }
+
+        #[cfg(feature = "embassy_cross_core")]
+        {
+            let (handle, _owner) = crate::cross_core::channel::<()>(1).unwrap();
+            let count = Arc::new(CountWake(AtomicUsize::new(0)));
+            let waker = Waker::from(count.clone());
+            let (_first, mut first) = (&handle).session(operation, async |_: &mut (), _: ()| ());
+            let (_second, mut second) = (&handle).session(operation, async |_: &mut (), _: ()| ());
+            let _pending = Box::pin(first.next())
+                .as_mut()
+                .poll(&mut Context::from_waker(&broken));
+            let _pending = Box::pin(second.next())
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker));
+
+            let _failure =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(handle.shutdown())));
+            assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[test]

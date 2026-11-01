@@ -348,7 +348,7 @@ async fn startup_rollback() {
         .unwrap()
         .unwrap_err();
 
-    let aktor::listener::DedicatedStartError::Init(error) = &failed.error else {
+    let aktor::listener::DedicatedStartError::Init(error) = failed.error.primary() else {
         panic!("typed setup error was lost");
     };
 

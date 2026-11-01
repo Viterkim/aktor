@@ -127,9 +127,29 @@ impl Inner {
         self.fail_error(WireError::new(CallError::OutcomeUnknown, cause));
     }
 
+    pub fn retain_failure(self: &Rc<Self>, error: WireError) {
+        if self.retired.get() {
+            return;
+        }
+
+        self.accepted.set(true);
+        self.retain_unconfirmed.set(true);
+        *self.retained.borrow_mut() = Some(self.clone());
+
+        if self.finished.borrow().is_some() {
+            self.record(&error);
+        } else {
+            self.fail_error(error);
+        }
+    }
+
     pub fn fail_error(self: &Rc<Self>, error: WireError) {
         if self.finished.borrow().is_some() || self.failed.replace(true) {
             return;
+        }
+
+        if self.retain_unconfirmed.get() && self.accepted.get() {
+            *self.retained.borrow_mut() = Some(self.clone());
         }
 
         self.record(&error);
@@ -368,6 +388,15 @@ impl Inner {
         }
 
         if force {
+            if self.retain_unconfirmed.get() {
+                if self.accepted.get() {
+                    *self.retained.borrow_mut() = Some(self.clone());
+                } else {
+                    self.finish(Ok(()));
+                }
+                return;
+            }
+
             self.worker.terminate();
 
             if !self.accepted.get() {
@@ -380,9 +409,13 @@ impl Inner {
 
         if self.failed.get() {
             if !self.accepted.get() {
-                self.worker.terminate();
-                self.buffers.clear();
-                self.retained.borrow_mut().take();
+                if self.retain_unconfirmed.get() {
+                    self.finish(Ok(()));
+                } else {
+                    self.worker.terminate();
+                    self.buffers.clear();
+                    self.retained.borrow_mut().take();
+                }
             } else {
                 self.shutdown_sent.set(true);
                 let _result = post(&self.worker, &self.buffers, &Incoming::Shutdown);
@@ -432,15 +465,19 @@ pub fn post(
     } else {
         js_sys::Uint8Array::from(input.as_slice()).buffer()
     };
-    let transfers = js_sys::Array::new();
+    let sent = if input.len() < super::super::buffer::MIN_REUSE {
+        worker.post_message(&buffer)
+    } else {
+        let transfers = js_sys::Array::new();
 
-    transfers.push(&buffer);
-    worker
-        .post_message_with_transfer(&buffer, &transfers)
-        .map_err(|error| {
-            WireError::new(
-                CallError::NotAdmitted,
-                WorkerCause::Codec(format!("{error:?}")),
-            )
-        })
+        transfers.push(&buffer);
+        worker.post_message_with_transfer(&buffer, &transfers)
+    };
+
+    sent.map_err(|error| {
+        WireError::new(
+            CallError::NotAdmitted,
+            WorkerCause::Codec(format!("{error:?}")),
+        )
+    })
 }

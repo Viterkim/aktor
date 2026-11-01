@@ -47,6 +47,7 @@ struct Limits<'a> {
     remaining: &'a Cell<usize>,
 }
 impl Limits<'_> {
+    #[inline]
     fn value<E: de::Error>(&self) -> Result<(), E> {
         let remaining = self.remaining.get();
 
@@ -58,6 +59,7 @@ impl Limits<'_> {
         Ok(())
     }
 
+    #[inline]
     fn enter<E: de::Error>(self) -> Result<Self, E> {
         if self.depth >= MAX_DEPTH {
             return Err(E::custom("worker data is nested too deeply"));

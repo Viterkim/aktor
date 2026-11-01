@@ -1,23 +1,27 @@
 # Changelog
 
+## 0.0.11
+
+Fixed lost startup errors and shutdown hangs. Faster native calls and AktorData encoding.
+
 ## 0.0.10
 
-Now requires rust 1.95 (updated parking_lot to 0.13).
+Requires Rust 1.95. Updated parking_lot to 0.13.
 
 Optional browser workers choose failure behavior during setup. Their ordinary calls return delivery errors.
 
-Lifecycle code can use admit() and receive_settled() to observe call outcomes before cleanup. Abandoned queued calls settle before cleanup starts.
+Fixed shutdown deadlocks involving queued calls. Lifecycle code can use `admit()` and `receive_settled()` to get a call's outcome before cleanup finishes.
 
-Browser worker shutdown now returns Retirement. Completed cleanup can report an error. Interrupted cleanup stays unconfirmed and keeps uncertain work retained. Attach external joins during construction.
+Browser shutdown now returns `Retirement`. Cleanup that finished with an error is confirmed, interrupted cleanup stays unconfirmed. Attach external joins during construction.
 
-OwnerError::physically_joined() reports whether the native OS join completed, including a panicked thread.
+`OwnerError::physically_joined()` tells you whether the native thread was joined, including after a panic.
 
 Renamed:
 
-- Actor to AktorControl, accessed through .control instead of .actor.
-- ActorError and ActorResult to AktorStateError and AktorStateResult.
-- ActorFailure to AktorFailureReport.
-- ActorOutcome to AktorOutcome.
+- `Actor` to `AktorControl`, accessed through `.control` instead of `.actor`.
+- `ActorError` and `ActorResult` to `AktorStateError` and `AktorStateResult`.
+- `ActorFailure` to `AktorFailureReport`.
+- `ActorOutcome` to `AktorOutcome`.
 
 ## 0.0.9
 
@@ -35,11 +39,11 @@ ActorArgs is now AktorArgs.
 
 Timeouts keep their deadline during shutdown.
 
-Worker registrations survive optimized builds across dependency archives.
+Fixed worker registration in release builds.
 
-Saved reports use AktorDiagnostic and include startup rollback. Display is short, use .error for lifecycle outcomes and .diagnostics for worker setup/cleanup reports.
+Saved reports use `AktorDiagnostic` and include startup rollback. Use `.error` for lifecycle failures and `.diagnostics` for worker setup and cleanup reports.
 
-Group control returns AktorGroupError, run() returns AktorRunError. ShutdownReport no longer implements Error.
+Group control returns `AktorGroupError`, `run()` returns `AktorRunError`. `ShutdownReport` no longer implements `Error`.
 
 ## 0.0.7
 
@@ -62,8 +66,6 @@ Complete redesign.
 ## 0.0.3
 
 Redesign.
-
-Cut down the docs and cleaned up the code.
 
 ## 0.0.2
 

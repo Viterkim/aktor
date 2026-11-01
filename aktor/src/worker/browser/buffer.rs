@@ -42,7 +42,7 @@ extern "C" {
     fn transfer_capacity(buffer: &ArrayBuffer) -> f64;
 }
 
-// Calls pass the buffer back and forth. Control messages leave it alone.
+// Large call buffers come back with the reply. Control messages leave the cache alone.
 pub struct Buffers {
     cached: RefCell<Option<(ArrayBuffer, f64)>>,
     limit: usize,

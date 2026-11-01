@@ -148,17 +148,11 @@ impl<S: 'static> Aktor<S> {
                 observing.await;
             }
 
-            if let Err(cleanup) = owner.completion.wait().await {
-                return Err(DedicatedStartError::Thread(std::io::Error::new(
-                    error.kind(),
-                    CompletionScheduleError {
-                        cause: error,
-                        cleanup,
-                    },
-                )));
-            }
-
-            return Err(DedicatedStartError::Thread(error));
+            let completion = owner.completion.wait().await;
+            return Err(DedicatedStartError::Observer {
+                cause: error,
+                completion,
+            });
         }
 
         Ok(owner)
@@ -337,17 +331,6 @@ impl fmt::Display for OwnerFailure {
     }
 }
 
-impl fmt::Display for CompletionScheduleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if f.alternate() {
-            write!(f, "{}; {:#}", self.cause, self.cleanup)
-        } else {
-            write!(f, "{}; {}", self.cause, self.cleanup)
-        }
-    }
-}
-impl core::error::Error for CompletionScheduleError {}
-
 impl core::future::IntoFuture for OwnerCompletion {
     type Output = Result<(), Arc<OwnerError>>;
     type IntoFuture = core::pin::Pin<Box<dyn Future<Output = Self::Output> + Send>>;
@@ -402,19 +385,76 @@ mod tests {
     #[tokio::test]
     async fn owner_handoff() {
         handoff(false).await;
-        notification().await;
+        notification(false).await;
         replacement().await;
     }
 
     #[tokio::test]
     async fn group_handoff() {
         handoff(true).await;
+        notification(true).await;
     }
 
     #[tokio::test]
     async fn join_handoff() {
         for failed_cleanup in [false, true] {
             join_failure(failed_cleanup).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_join() {
+        struct Tail;
+        impl Drop for Tail {
+            fn drop(&mut self) {
+                panic!("startup join tail failed");
+            }
+        }
+
+        for cancelled in [false, true] {
+            let mut group = AktorGroup::with_grace(Duration::from_secs(1));
+            group.start().unwrap();
+            let kill = group.killswitch();
+            let tail = Tail;
+            let error = group
+                .spawn_async(AktorArgs {
+                    name: "startup join".into(),
+                    capacity: 1,
+                    setup: move || async move {
+                        if cancelled {
+                            kill.stop();
+                            core::future::pending::<Result<(), AktorSetupError>>().await
+                        } else {
+                            Err(AktorSetupError::new("original setup failure", ()))
+                        }
+                    },
+                    cleanup: move |_: ()| {
+                        let _retained = &tail;
+                        core::future::ready(Ok::<_, AktorCleanupError>(()))
+                    },
+                })
+                .await
+                .err()
+                .unwrap();
+
+            let DedicatedStartError::Startup {
+                join: crate::listener::StartupJoin::Failed(join),
+                ..
+            } = &error.error
+            else {
+                panic!("startup lost its failed join");
+            };
+            assert!(join.physically_joined);
+
+            let report = group.completion().wait().await;
+            assert_eq!(
+                report.actors[0].retirement,
+                crate::RetirementStatus::Unconfirmed
+            );
+            assert!(
+                report.to_string().contains("startup join tail failed"),
+                "{report}"
+            );
         }
     }
 
@@ -476,20 +516,24 @@ mod tests {
             panic!("completion scheduling failure was lost");
         };
 
-        assert_eq!(
-            error
-                .diagnostics
-                .as_ref()
-                .unwrap()
-                .report
-                .contains("cleanup also failed"),
-            failed_cleanup
-        );
-        assert!(!error.to_string().contains("cleanup also failed"));
+        let DedicatedStartError::Observer { cause, completion } = &error.error else {
+            panic!("observer failure lost its typed causes");
+        };
+
+        assert!(cause.to_string().contains("injected"));
+        match completion {
+            Ok(()) => assert!(!failed_cleanup),
+            Err(error) => {
+                assert!(failed_cleanup);
+                assert!(error.physically_joined());
+                assert!(format!("{error:#}").contains("cleanup also failed"));
+            }
+        }
+
         assert_eq!(cleaned.load(Ordering::Relaxed), 1);
     }
 
-    async fn notification() {
+    async fn notification(grouped: bool) {
         use crate::latest::Session;
         use futures_util::Stream;
         use std::{
@@ -509,22 +553,32 @@ mod tests {
 
         let cleaned = Arc::new(AtomicUsize::new(0));
         let cleanup = cleaned.clone();
-        let owner = Aktor::spawn_async_on(
-            SpawnArgs {
-                name: "notification".into(),
-                capacity: 1,
-                failure: FailurePolicy::Unwind,
-                setup: || core::future::ready(Ok::<_, AktorSetupError>(0_u32)),
-                cleanup: move |_| {
-                    cleanup.fetch_add(1, Ordering::Relaxed);
-                    core::future::ready(Ok::<_, AktorCleanupError>(()))
-                },
+        let args = SpawnArgs {
+            name: "notification".into(),
+            capacity: 1,
+            failure: FailurePolicy::Unwind,
+            setup: || core::future::ready(Ok::<_, AktorSetupError>(0_u32)),
+            cleanup: move |_| {
+                cleanup.fetch_add(1, Ordering::Relaxed);
+                core::future::ready(Ok::<_, AktorCleanupError>(()))
             },
-            Default::default(),
-            true,
-        )
-        .await
-        .unwrap();
+        };
+        let mut group = AktorGroup::new();
+        let owner = if grouped {
+            group.start_standard().unwrap();
+            group
+                .spawn_async_on(
+                    AktorArgs::new(args.name, args.setup, args.cleanup),
+                    Default::default(),
+                    true,
+                )
+                .await
+                .unwrap()
+        } else {
+            Aktor::spawn_async_on(args, Default::default(), true)
+                .await
+                .unwrap()
+        };
 
         let (input, mut output) = (&owner.handle).session(
             crate::operation::Operation {
@@ -542,8 +596,24 @@ mod tests {
                 .is_pending()
         );
 
-        let _notification =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+        if grouped {
+            group.killswitch().stop();
+            let report = group.completion().wait().await;
+            assert!(
+                report
+                    .to_string()
+                    .contains("subscriber notification failed"),
+                "{report}"
+            );
+            assert_eq!(
+                report.actors[0].retirement,
+                crate::RetirementStatus::Confirmed
+            );
+        } else {
+            let _notification =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.shutdown()));
+        }
+
         let result =
             tokio::time::timeout(Duration::from_millis(250), owner.completion.wait()).await;
 
@@ -656,7 +726,7 @@ mod tests {
 
         crate::executor::FAIL_SPAWN.with(|setting| setting.set(None));
 
-        // Leave no stuck owner behind when running this against the broken handoff.
+        // Stop the owner if the completion observer never finished.
         if completed.is_err() {
             owner.control.shutdown().await.unwrap();
         }

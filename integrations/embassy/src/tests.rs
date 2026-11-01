@@ -590,7 +590,7 @@ fn reply_callbacks() {
         *stored.borrow_mut() = Some(Box::pin(owner.run(Sensor { readings }, async |_| Ok(()))));
     });
 
-    // No pointer data or ownership, cloning drives this thread's owner once.
+    // The null data pointer owns nothing. Cloning polls only this thread's owner.
     let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &CALLBACKS)) };
     let result = Pin::new(&mut reply).poll(&mut Context::from_waker(&waker));
 

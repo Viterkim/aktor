@@ -282,12 +282,19 @@ async fn interval_wait(every: Duration, standard: bool) {
 impl From<DedicatedStartError<AktorFailure>> for AktorStartError {
     fn from(error: DedicatedStartError<AktorFailure>) -> Self {
         match error {
+            error
+            @ (DedicatedStartError::Startup { .. } | DedicatedStartError::Observer { .. }) => {
+                Self::Startup(Box::new(error.into()))
+            }
             DedicatedStartError::Init(error) => Self::Init(error),
             DedicatedStartError::NotStarted => Self::Thread(DedicatedStartError::NotStarted),
             DedicatedStartError::Closed => Self::Thread(DedicatedStartError::Closed),
             DedicatedStartError::NoRuntime => Self::Thread(DedicatedStartError::NoRuntime),
             DedicatedStartError::InvalidCapacity => {
                 Self::Thread(DedicatedStartError::InvalidCapacity)
+            }
+            DedicatedStartError::ThreadNotCreated(error) => {
+                Self::Thread(DedicatedStartError::ThreadNotCreated(error))
             }
             DedicatedStartError::Thread(error) => Self::Thread(DedicatedStartError::Thread(error)),
             DedicatedStartError::Panicked { actor, cause } => {

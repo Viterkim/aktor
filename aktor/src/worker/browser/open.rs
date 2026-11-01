@@ -16,6 +16,11 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
         Ok(worker)
     }
 
+    pub(crate) fn retain_unconfirmed(self, retain: bool) -> Self {
+        self.inner.retain_unconfirmed.set(retain);
+        self
+    }
+
     pub fn new(url: &str) -> Result<Self, WorkerError> {
         Self::with_options(url, Options::default())
     }
@@ -59,6 +64,7 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
             optional,
             accepted: Cell::new(true),
             retired: Rc::new(Cell::new(false)),
+            retain_unconfirmed: Cell::new(false),
             uncertain: RefCell::new(Vec::new()),
             failure: RefCell::new(None),
             diagnostics: Rc::new(RefCell::new(Vec::new())),
@@ -172,6 +178,8 @@ impl<S: 'static, Role: 'static, E> Worker<S, Role, E> {
                     inner.ready.send_replace(Some(Err(error.clone())));
                     inner.fail_error(error);
                 }
+
+                Ok(Outgoing::Unconfirmed(error)) => inner.retain_failure(error),
 
                 Ok(Outgoing::Started { id }) => {
                     if inner.active.get() == Some(id) {

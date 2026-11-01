@@ -258,10 +258,14 @@ async fn data() {
     let tree = er::ErTree::from(result.err().unwrap());
     match tree.top {
         AktorStartupError {
-            error: AktorStartError::Init(_),
+            error: AktorStartError::Startup(error),
             report: Some(report),
             ..
-        } => {
+        } if matches!(
+            error.error.primary(),
+            aktor::listener::DedicatedStartError::Init(_)
+        ) =>
+        {
             assert!(!report.timed_out, "{report}");
             assert_eq!(
                 report.to_string().matches("setup data").count(),

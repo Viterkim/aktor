@@ -196,7 +196,7 @@ where
             }
         })
     })
-    .map_err(DedicatedStartError::Thread)?;
+    .map_err(DedicatedStartError::ThreadNotCreated)?;
 
     match ready.await {
         Ok(Ok(())) => {
@@ -219,25 +219,45 @@ where
         }
         result => {
             #[cfg(feature = "tokio")]
-            let cause = {
-                let joined = if standard {
+            let joined = {
+                if standard {
                     Ok(thread.join())
                 } else {
                     task::spawn_blocking(move || thread.join()).await
-                };
-
-                crate::listener::startup_cause(joined)
+                }
             };
 
             #[cfg(not(feature = "tokio"))]
-            let cause = standard_cause(thread.join());
+            let joined = thread.join();
 
             match result {
-                Ok(Err(error)) => Err(error),
-                _ => Err(DedicatedStartError::Panicked {
-                    actor: actor_name,
-                    cause,
-                }),
+                Ok(Err(error)) => {
+                    #[cfg(feature = "tokio")]
+                    let join = crate::listener::startup_join(joined);
+                    #[cfg(not(feature = "tokio"))]
+                    let join = match joined {
+                        Ok(_) => super::super::StartupJoin::Joined,
+                        failed => {
+                            super::super::StartupJoin::Failed(Arc::new(standard_cause(failed)))
+                        }
+                    };
+
+                    Err(DedicatedStartError::Startup {
+                        cause: Box::new(error),
+                        join,
+                    })
+                }
+                _ => {
+                    #[cfg(feature = "tokio")]
+                    let cause = crate::listener::startup_cause(joined);
+                    #[cfg(not(feature = "tokio"))]
+                    let cause = standard_cause(joined);
+
+                    Err(DedicatedStartError::Panicked {
+                        actor: actor_name,
+                        cause,
+                    })
+                }
             }
         }
     }
@@ -255,15 +275,111 @@ fn spawn_owner<T: Send + 'static>(
     thread::Builder::new().name(name).spawn(owner)
 }
 
-#[cfg(all(test, feature = "tokio"))]
+pub async fn spawn<S, E, C, Setup, Cleanup>(
+    args: SpawnArgs<Setup, Cleanup>,
+) -> Result<
+    (
+        Handle<S>,
+        AktorControl<S, E, C>,
+        Dedicated<Result<(), CleanupErrors<C>>>,
+    ),
+    DedicatedStartError<E>,
+>
+where
+    S: 'static,
+    E: Send + 'static,
+    C: Send + Sync + 'static,
+    Setup: FnOnce() -> Result<S, E> + Send + 'static,
+    Cleanup: FnMut(S) -> Result<(), C> + Send + 'static,
+{
+    let SpawnArgs {
+        name,
+        capacity,
+        failure,
+        setup,
+        mut cleanup,
+    } = args;
+
+    spawn_async(SpawnArgs {
+        name,
+        capacity,
+        failure,
+        setup: move || core::future::ready(setup()),
+        cleanup: move |state| core::future::ready(cleanup(state)),
+    })
+    .await
+}
+
+#[cfg(not(feature = "tokio"))]
+fn standard_cause<T>(joined: std::thread::Result<T>) -> crate::listener::DedicatedJoinError {
+    crate::listener::DedicatedJoinError {
+        physically_joined: true,
+        payload: parking_lot::Mutex::new(match joined {
+            Err(payload) => payload,
+            Ok(_) => Box::new("actor startup ended before ready"),
+        }),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "tokio")]
     use crate::{
         AktorClosures, AktorGroup, AktorKind, AktorName, AktorNew, AktorNewOptions, AktorNoRole,
         AktorSetupError, AktorStartError, aktor_start_in, executor::FAIL_SPAWN,
     };
+    #[cfg(feature = "tokio")]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct Tail;
+    impl Drop for Tail {
+        fn drop(&mut self) {
+            panic!("startup tail failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_join() {
+        for standard in [true, false] {
+            if !standard && !cfg!(feature = "tokio") {
+                continue;
+            }
+
+            let tail = Tail;
+            let error = spawn_async_on(
+                SpawnArgs {
+                    name: "startup join".into(),
+                    capacity: 1,
+                    failure: crate::FailurePolicy::Unwind,
+                    setup: || core::future::ready(Err::<(), _>(17_u8)),
+                    cleanup: move |_: ()| {
+                        let _retained = &tail;
+                        core::future::ready(Ok::<_, ()>(()))
+                    },
+                },
+                Default::default(),
+                standard,
+            )
+            .await
+            .err()
+            .unwrap();
+
+            let DedicatedStartError::Startup {
+                cause,
+                join: crate::listener::StartupJoin::Failed(join),
+            } = error
+            else {
+                panic!("startup failure lost its join result");
+            };
+
+            assert!(matches!(*cause, DedicatedStartError::Init(17)));
+            assert!(join.physically_joined);
+            assert_eq!(join.to_string(), "startup tail failed");
+        }
+    }
+
+    #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn thread_failure() {
         struct Reset;
@@ -327,58 +443,13 @@ mod tests {
         .err()
         .unwrap();
 
-        let AktorStartError::Thread(DedicatedStartError::Thread(cause)) = error.error else {
+        let AktorStartError::Thread(DedicatedStartError::ThreadNotCreated(cause)) = error.error
+        else {
             panic!("thread failure lost its typed cause");
         };
 
         assert_eq!(cause.to_string(), "injected owner thread failure");
         assert!(!error.report.unwrap().timed_out);
         assert_eq!(cleaned.load(Ordering::SeqCst), 1);
-    }
-}
-
-pub async fn spawn<S, E, C, Setup, Cleanup>(
-    args: SpawnArgs<Setup, Cleanup>,
-) -> Result<
-    (
-        Handle<S>,
-        AktorControl<S, E, C>,
-        Dedicated<Result<(), CleanupErrors<C>>>,
-    ),
-    DedicatedStartError<E>,
->
-where
-    S: 'static,
-    E: Send + 'static,
-    C: Send + Sync + 'static,
-    Setup: FnOnce() -> Result<S, E> + Send + 'static,
-    Cleanup: FnMut(S) -> Result<(), C> + Send + 'static,
-{
-    let SpawnArgs {
-        name,
-        capacity,
-        failure,
-        setup,
-        mut cleanup,
-    } = args;
-
-    spawn_async(SpawnArgs {
-        name,
-        capacity,
-        failure,
-        setup: move || core::future::ready(setup()),
-        cleanup: move |state| core::future::ready(cleanup(state)),
-    })
-    .await
-}
-
-#[cfg(not(feature = "tokio"))]
-fn standard_cause<T>(joined: std::thread::Result<T>) -> crate::listener::DedicatedJoinError {
-    crate::listener::DedicatedJoinError {
-        physically_joined: true,
-        payload: parking_lot::Mutex::new(match joined {
-            Err(payload) => payload,
-            Ok(_) => Box::new("actor startup ended before ready"),
-        }),
     }
 }

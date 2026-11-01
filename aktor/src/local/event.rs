@@ -29,6 +29,11 @@ impl Event {
             .filter_map(|waiter| waiter.borrow_mut().take())
             .collect();
 
+        #[cfg(feature = "std")]
+        if let Some(payload) = super::panic::capture_each(wakers, Waker::wake, |_| {}) {
+            std::panic::resume_unwind(payload);
+        }
+        #[cfg(not(feature = "std"))]
         for waker in wakers {
             waker.wake();
         }

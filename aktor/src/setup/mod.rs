@@ -77,7 +77,7 @@ use group::AktorSetupGroup;
 pub use impls::{aktor_start, aktor_start_in};
 #[doc(hidden)]
 pub use impls::{start_diagnostics, validation_error};
-/// Setup choices, each with its own type and executor requirements.
+/// Choose where the worker runs.
 pub use kind as AktorKind;
 pub use kind::{AktorExecution, AktorMode};
 
@@ -99,8 +99,8 @@ pub struct AktorStartup<Setup: AktorStart<Mode>, Mode = ()> {
     shutdown: Option<Pin<Box<<Setup::Group as AktorSetupGroup>::Closing>>>,
 }
 
-/// The startup failure and its completed rollback report.
-/// report is None if startup was rejected before adding actors to the group.
+/// A startup error and the shutdown report from rolling back.
+/// report is None when startup is rejected before it begins.
 #[derive(Er)]
 #[er(no_constructors, format = "actor startup failed", display_alt = Self::fmt_details)]
 pub struct AktorStartupError {
@@ -123,6 +123,11 @@ pub enum AktorStartError<E: 'static = crate::AktorFailure> {
         not(target_family = "wasm")
     ))]
     Thread(#[er(source, skip)] DedicatedStartError<core::convert::Infallible>),
+    #[cfg(all(
+        any(feature = "tokio", feature = "std_thread"),
+        not(target_family = "wasm")
+    ))]
+    Startup(#[er(source, skip)] Box<crate::owner::StartError>),
 }
 
 #[doc(hidden)]

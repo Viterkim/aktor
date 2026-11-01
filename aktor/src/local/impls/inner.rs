@@ -15,8 +15,39 @@ impl<S, const N: usize, E> Inner<S, N, E> {
 
     pub fn close(&self) {
         if self.open.replace(false) {
-            self.closed.notify();
-            self.wake_sessions();
+            self.notify(&self.closed);
+        }
+    }
+
+    fn notify(&self, event: &Event) {
+        let notify = || event.notify();
+        let sessions = || self.wake_sessions();
+
+        #[cfg(feature = "std")]
+        {
+            let actions: [&dyn Fn(); 2] = [&notify, &sessions];
+            let primary = crate::local::panic::capture_each(
+                actions,
+                |action| action(),
+                |payload| {
+                    self.completion
+                        .diagnostics
+                        .borrow_mut()
+                        .push(crate::AktorError::new(
+                            crate::panic::panic_message(payload),
+                            (),
+                        ));
+                },
+            );
+
+            if let Some(payload) = primary {
+                std::panic::resume_unwind(payload);
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            notify();
+            sessions();
         }
     }
 
@@ -27,6 +58,25 @@ impl<S, const N: usize, E> Inner<S, N, E> {
             sessions.iter().filter_map(Weak::upgrade).collect()
         };
 
+        #[cfg(feature = "std")]
+        if let Some(payload) = crate::local::panic::capture_each(
+            callbacks,
+            |callback| {
+                callback();
+            },
+            |payload| {
+                self.completion
+                    .diagnostics
+                    .borrow_mut()
+                    .push(crate::AktorError::new(
+                        crate::panic::panic_message(payload),
+                        (),
+                    ));
+            },
+        ) {
+            std::panic::resume_unwind(payload);
+        }
+        #[cfg(not(feature = "std"))]
         for callback in callbacks {
             callback();
         }
@@ -217,8 +267,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         }
 
         *self.completion.result.borrow_mut() = Some(result);
-        self.completion.changed.notify();
-        self.wake_sessions();
+        self.notify(&self.completion.changed);
     }
 }
 

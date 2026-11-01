@@ -14,9 +14,17 @@ impl Failures {
         match panic::catch_unwind(AssertUnwindSafe(action)) {
             Ok(output) => Some(output),
             Err(payload) => {
-                let (kind, payload) = match payload.downcast::<FailurePanic>() {
-                    Ok(failure) => (failure.kind, failure.payload),
-                    Err(payload) => (kind, payload),
+                let (kind, payload, annotated) = match payload.downcast::<FailurePanic>() {
+                    Ok(failure) => (failure.kind, failure.payload, true),
+                    Err(payload) => (kind, payload, false),
+                };
+                let (kind, payload, diagnostics) = match payload.downcast::<Failure>() {
+                    Ok(failure) => (
+                        if annotated { kind } else { failure.kind },
+                        failure.payload,
+                        failure.diagnostics,
+                    ),
+                    Err(payload) => (kind, payload, Vec::new()),
                 };
 
                 if self.first.is_none() {
@@ -37,11 +45,17 @@ impl Failures {
                             message,
                         });
                     }
+
+                    // Completion prints these separately. Including them above would repeat them.
+                    if let Some(first) = &mut self.first {
+                        first.diagnostics.extend(diagnostics);
+                    }
                 } else if let Some(first) = &mut self.first {
                     first.diagnostics.push(crate::AktorError::new(
                         format!("{kind:?}: {}", crate::panic::panic_message(&payload)),
                         (),
                     ));
+                    first.diagnostics.extend(diagnostics);
                     dispose_secondary(payload);
                 }
 
@@ -61,6 +75,12 @@ impl Failures {
             Ok(output) => output,
             Err(payload) => panic::resume_unwind(payload),
         })
+    }
+
+    pub fn resume(self) {
+        if let Some(failure) = self.first {
+            panic::resume_unwind(Box::new(failure));
+        }
     }
 
     pub fn finish(self, policy: &FailurePolicy) {

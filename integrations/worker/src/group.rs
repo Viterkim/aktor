@@ -52,6 +52,15 @@ export function fail_transport() {
     globalThis.proofWorkers.at(-1).dispatchEvent(new ErrorEvent('error', { message: 'transport probe' }));
 }
 
+export function retained_owner() {
+    const worker = globalThis.proofWorkers.at(-1);
+    return worker.proofTerminated !== true && !worker.proofEvents.includes('retained_drop');
+}
+
+export function note_retained_drop() {
+    postMessage({ proof: 'retained_drop' });
+}
+
 export function shutdown_started() {
     const worker = globalThis.proofWorkers.at(-1);
     return worker.proofTerminated === true || worker.proofShutdowns > 0;
@@ -83,6 +92,8 @@ extern "C" {
     fn configured() -> js_sys::Promise;
     fn fail_transport();
     fn release_worker();
+    fn retained_owner() -> bool;
+    fn note_retained_drop();
     fn shutdown_started() -> bool;
     fn break_post();
     fn restore_post();
@@ -1273,6 +1284,135 @@ pub async fn optional_worker_check(url: String, crash: bool) -> Result<bool, JsV
     Ok(true)
 }
 
+struct RetainedGuard;
+impl Drop for RetainedGuard {
+    fn drop(&mut self) {
+        note_retained_drop();
+    }
+}
+
+#[wasm_bindgen]
+pub async fn start_unconfirmed_worker(mode: u8) -> Result<(), JsValue> {
+    if mode == 0 {
+        let guard = RetainedGuard;
+        let result =
+            worker::retain_setup::<(), _>(AktorSetupError::new("early setup still owns work", ()))
+                .await;
+        drop(guard);
+        return result.map_err(|error| JsValue::from_str(&error.to_string()));
+    }
+    let server = worker::serve_setup((), options(), move |(): ()| AktorClosures {
+        start: async move || {
+            if mode != 1 {
+                Ok(0_u32)
+            } else {
+                let guard = RetainedGuard;
+                let result =
+                    worker::retain_setup(AktorSetupError::new("setup still owns work", ())).await;
+                drop(guard);
+                result
+            }
+        },
+        end: async move |_: u32| {
+            let guard = RetainedGuard;
+            if mode == 3 {
+                wasm_bindgen_futures::JsFuture::from(cleanup_gate())
+                    .await
+                    .unwrap();
+                drop(guard);
+                return Ok(());
+            }
+
+            let result =
+                worker::retain_cleanup(AktorCleanupError::new("cleanup still owns work", ())).await;
+            drop(guard);
+            result
+        },
+        intervals: vec![],
+        before_each: None,
+        after_each: None,
+    })
+    .await
+    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+
+    SERVER.with(|slot| *slot.borrow_mut() = Some(server));
+    Ok(())
+}
+
+async fn unconfirmed_owner(url: &str, mode: u8) {
+    use aktor::*;
+
+    let mut group = AktorGroup::with_grace(Duration::from_millis(2));
+    group.start().unwrap();
+    let observed = Rc::new(RefCell::new(None));
+    let observing = observed.clone();
+    let program = if mode == 3 {
+        format!(
+            "{}?unconfirmed=3&cleanup_gate",
+            url.replace("group-worker.js", "gate-worker.js")
+        )
+    } else {
+        format!("{url}?unconfirmed={mode}")
+    };
+    let starting = aktor_start_in(
+        &group,
+        AktorWorkerNew::<u32, _> {
+            name: AktorName::new("unconfirmed owner"),
+            role: AktorNoRole,
+            kind: AktorKind::BrowserWebWorker(program),
+            config: (),
+            options: AktorWorkerOptions {
+                transport: options(),
+                retain_unconfirmed: mode == 3,
+                observe_retirement: Some(Box::new(move |completion| {
+                    *observing.borrow_mut() = Some(completion);
+                })),
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+
+    if mode == 3 {
+        let worker = starting.unwrap();
+        let reply = operation(&worker, 4).admit().await.unwrap();
+        while !worker.executing() {
+            gloo_timers::future::TimeoutFuture::new(1).await;
+        }
+
+        fail_transport();
+        let _outcome = reply.receive_settled().await;
+        worker.terminate();
+        assert!(retained_owner());
+        assert!(worker.outstanding().1 > 0);
+        release_worker();
+        match worker.completion().wait_retired().await {
+            worker::Retirement::Confirmed(Err(_)) => {}
+            other => panic!("late owner retirement: {other:?}"),
+        }
+        assert_eq!(worker.outstanding().1, 0);
+        return;
+    }
+
+    if mode == 2 {
+        let worker = starting.unwrap();
+        let _retirement = worker.shutdown().await;
+        worker.terminate();
+        let _report = group.shutdown().await;
+    } else {
+        assert!(starting.is_err());
+    }
+
+    let completion = observed.borrow_mut().take().unwrap();
+    match completion.wait().await {
+        worker::Retirement::Unconfirmed(error) => {
+            assert!(format!("{error:#}").contains("still owns work"))
+        }
+        other => panic!("unconfirmed owner retirement: {other:?}"),
+    }
+    assert!(retained_owner());
+}
+
 struct OwnedJoin(Rc<Cell<u32>>);
 impl Drop for OwnedJoin {
     fn drop(&mut self) {
@@ -1405,6 +1545,10 @@ pub async fn optional_group_check(url: String) -> Result<bool, JsValue> {
     release.send(()).unwrap();
     joined.await.unwrap();
     assert_eq!(drops.get(), 2);
+
+    for mode in 0..4 {
+        unconfirmed_owner(&url, mode).await;
+    }
 
     for mode in 0..3 {
         unstarted_join(&configured, mode).await;
