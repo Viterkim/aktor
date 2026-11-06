@@ -11,7 +11,7 @@ impl<S, E, C> AktorControl<S, E, C> {
         self.close_admission();
     }
 
-    /// Cancel running async work and cleanup after the shutdown budget is spent.
+    /// Cancel running async work after the shutdown budget is spent. Cleanup keeps running.
     pub fn cancel(&self) {
         if self
             .admission

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.12
+
+Fix cancel/cleanup.
+
 ## 0.0.11
 
 Fixed lost startup errors and shutdown hangs. Faster native calls and AktorData encoding.

@@ -226,17 +226,43 @@ async fn stop_failure() {
 
 #[tokio::test]
 async fn deadline() {
-    for operation in [false, true] {
-        let group = AktorGroup::with_grace(Duration::from_millis(200));
-        let kill = group.killswitch();
-        let cleaned = Arc::new(AtomicBool::new(false));
-        let cleanup_started = cleaned.clone();
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            group.run(
-                async |app| {
-                    let db = app
-                        .spawn_async(AktorArgs {
+    let Ok(case) = std::env::var("AKTOR_CHILD") else {
+        for case in [
+            "cleanup",
+            "operation",
+            "failure",
+            #[cfg(feature = "std_thread")]
+            "standard cleanup",
+        ] {
+            let output = support::child("deadline", case);
+
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == "cleanup remains pending")
+            );
+            assert!(!output.status.success());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+
+                assert_eq!(output.status.signal(), Some(9));
+            }
+        }
+
+        return;
+    };
+
+    let group = AktorGroup::with_grace(Duration::from_secs(1));
+    let kill = group.killswitch();
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let cleanup_started = cleaned.clone();
+    let result = group
+        .run(
+            async |app| {
+                let db = app
+                    .spawn_async_on(
+                        AktorArgs {
                             name: "stalled actor".into(),
                             capacity: 1,
                             setup: async || Ok::<_, AktorError>(0usize),
@@ -249,86 +275,56 @@ async fn deadline() {
                                     Ok::<_, AktorError>(())
                                 }
                             },
-                        })
-                        .await
-                        .unwrap();
-
-                    if operation {
-                        let entered = Arc::new(Notify::new());
-                        let inside = entered.clone();
-                        let reply = call_async(
-                            &db.handle,
-                            async move |_, ()| {
-                                inside.notify_one();
-                                core::future::pending::<()>().await;
-                            },
-                            (),
-                        )
-                        .send()
-                        .await;
-
-                        entered.notified().await;
-                        kill.stop();
-                        reply.await;
-                    } else {
-                        kill.stop();
-                        core::future::pending::<()>().await;
-                    }
-
-                    Ok::<_, AktorError>(())
-                },
-                async |_| {
-                    core::future::pending::<()>().await;
-                    Ok::<_, AktorError>(())
-                },
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-
-        assert!(result.report.timed_out);
-        assert!(result.report.actors[0].timed_out);
-        assert_eq!(cleaned.load(Ordering::SeqCst), !operation);
-    }
-}
-
-#[tokio::test]
-async fn early_failure() {
-    let group = AktorGroup::with_grace(Duration::from_millis(200));
-    let result = tokio::time::timeout(
-        Duration::from_secs(1),
-        group.run(
-            async |app| {
-                let db = app
-                    .spawn_async(AktorArgs {
-                        name: "early failure".into(),
-                        capacity: 1,
-                        setup: async || Ok::<_, AktorError>(0usize),
-                        cleanup: async |_| {
-                            core::future::pending::<()>().await;
-                            Ok::<_, AktorError>(())
                         },
-                    })
+                        Default::default(),
+                        case == "standard cleanup",
+                    )
                     .await
                     .unwrap();
 
-                call(
-                    &db.handle,
-                    |_, ()| -> () { panic!("failed before cleanup") },
-                    (),
-                )
-                .await;
+                if case == "operation" {
+                    let entered = Arc::new(Notify::new());
+                    let inside = entered.clone();
+                    let reply = call_async(
+                        &db.handle,
+                        async move |_, ()| {
+                            inside.notify_one();
+                            core::future::pending::<()>().await;
+                        },
+                        (),
+                    )
+                    .send()
+                    .await;
+
+                    entered.notified().await;
+                    kill.stop();
+                    reply.await;
+                } else if case == "failure" {
+                    call(&db.handle, |_, ()| panic!("failed before cleanup"), ()).await;
+                } else {
+                    kill.stop();
+                    core::future::pending::<()>().await;
+                }
+
                 Ok::<_, AktorError>(())
             },
             async |_| Ok::<_, AktorError>(()),
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap_err();
+        )
+        .await
+        .unwrap_err();
 
-    assert_eq!(result.report.failure.unwrap().actor, "early failure");
+    assert_eq!(
+        result.report.actors[0].retirement,
+        aktor::RetirementStatus::Unconfirmed
+    );
+    assert!(cleaned.load(Ordering::SeqCst));
+    if case == "failure" {
+        assert_eq!(result.report.failure.unwrap().actor, "stalled actor");
+    }
+
+    eprintln!("cleanup remains pending");
+    std::thread::sleep(Duration::from_secs(2));
+    panic!("shutdown watchdog left cleanup running");
 }
 
 #[tokio::test]

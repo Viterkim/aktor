@@ -264,7 +264,7 @@ where
         return Ok(());
     };
     let result = FailureKind::Cleanup.during(|| {
-        execution.run(async {
+        execution.runtime.block_on(async {
             let result = cleanup(state).await;
             receipt.lock().completed = true;
             result
@@ -272,13 +272,12 @@ where
     });
 
     match result {
-        Some(Ok(())) => Ok(()),
-        Some(Err(error)) => {
+        Ok(()) => Ok(()),
+        Err(error) => {
             let error = Arc::new(error);
             errors.push(error.clone());
             Err(LifecycleError::Failed(error))
         }
-        None => Err(LifecycleError::Closed),
     }
 }
 

@@ -578,30 +578,6 @@ fn standard() {
         assert_eq!(output.next().await, None);
         assert_eq!(log.lock().unwrap().last(), Some(&("end", 8)));
         drop(input);
-
-        let actors = aktor_start(AktorSetup {
-            actors: AktorNew {
-                name: AktorName::new("standard cleanup"),
-                role: AktorNoRole,
-                kind: AktorKind::StdThread,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(0u32),
-                    end: async |_: u32| core::future::pending::<()>().await,
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: AktorNewOptions { capacity: 32 },
-            },
-            shutdown: |_| {},
-            options: AktorOptions {
-                shutdown_grace: Duration::from_millis(200),
-            },
-        })
-        .await
-        .unwrap();
-
-        assert!(actors.shutdown().await.timed_out);
     });
 }
 

@@ -3,7 +3,7 @@
 Your service owns the resource. Other processes call its functions over Unix sockets, TCP or UDP. Runs on Unix with Tokio.
 
 ```toml
-aktor-remote = "0.0.11"
+aktor-remote = "0.0.12"
 ```
 
 ## Shared functions

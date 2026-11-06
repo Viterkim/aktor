@@ -1,9 +1,5 @@
 use super::*;
 use aktor::setup::AktorStart;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 
 async fn cleanup_panics(_: ()) -> Result<(), AktorCleanupError> {
     panic!("cleanup interrupted");
@@ -59,8 +55,6 @@ async fn cleanup_receipt() {
 #[tokio::test]
 async fn shutdown_receipt() {
     for force in [false, true] {
-        let entered = Arc::new(AtomicBool::new(false));
-        let cleanup_entered = entered.clone();
         let mut group = AktorGroup::with_grace(Duration::from_millis(300));
 
         group.start().unwrap();
@@ -69,11 +63,8 @@ async fn shutdown_receipt() {
             .spawn_async(AktorArgs::new(
                 "forced cleanup",
                 async || Ok::<_, AktorSetupError>(()),
-                move |_| {
-                    cleanup_entered.store(true, Ordering::SeqCst);
-                    async {
-                        Err::<(), _>(AktorCleanupError::new("cleanup finished with an error", ()))
-                    }
+                async |_| {
+                    Err::<(), _>(AktorCleanupError::new("cleanup finished with an error", ()))
                 },
             ))
             .await
@@ -98,14 +89,6 @@ async fn shutdown_receipt() {
 
         let report = group.shutdown().await;
 
-        assert_eq!(entered.load(Ordering::SeqCst), !force);
-        assert_eq!(
-            report.actors[0].retirement,
-            if force {
-                RetirementStatus::Unconfirmed
-            } else {
-                RetirementStatus::Confirmed
-            }
-        );
+        assert_eq!(report.actors[0].retirement, RetirementStatus::Confirmed);
     }
 }

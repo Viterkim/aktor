@@ -4,7 +4,7 @@ Write normal functions, call them with a handle and .await. Go to definition tak
 
 ```toml
 [dependencies]
-aktor = { version = "0.0.11", features = ["tokio"] }
+aktor = { version = "0.0.12", features = ["tokio"] }
 ```
 
 The API can change before 0.1.
