@@ -20,15 +20,16 @@ impl<S> DerefMut for OwnedState<S> {
     }
 }
 
-#[doc(hidden)]
-pub struct Direct<F> {
-    future: Pin<Box<F>>,
+pin_project_lite::pin_project! {
+    #[doc(hidden)]
+    pub struct Direct<F> {
+        #[pin]
+        future: F,
+    }
 }
 impl<F> Direct<F> {
     pub fn new(future: F) -> Self {
-        Self {
-            future: Box::pin(future),
-        }
+        Self { future }
     }
 }
 impl<F, L, O> Future for Direct<F>
@@ -37,8 +38,8 @@ where
 {
     type Output = O;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
-        self.future.as_mut().poll(cx).map(|(_, output)| output)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
+        self.project().future.poll(cx).map(|(_, output)| output)
     }
 }
 

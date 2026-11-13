@@ -7,14 +7,14 @@ exclude = ["integrations"]
 license = "MIT-0"
 readme = "README.md"
 repository = "https://github.com/Viterkim/aktor"
-version = "0.0.12"
+version = "0.0.13"
 edition = "2024"
 rust-version = "1.95"
 publish = true
 
 [workspace.dependencies]
-aktor-macros = { version = "=0.0.12", path = "aktor-macros" }
-er = { version = "0.8", default-features = false, features = ["macros"] }
+aktor-macros = { version = "=0.0.13", path = "aktor-macros" }
+er = { version = "0.9", path = "../er/er", default-features = false, features = ["macros"] }
 proc-macro-crate = "3.5"
 proc-macro2 = "1.0"
 quote = "1.0"
@@ -44,6 +44,7 @@ gloo-timers = { version = ">=0.3, <0.5", features = ["futures"] }
 web-sys = { version = "0.3", features = ["Worker", "WorkerOptions", "WorkerType", "MessageEvent", "ErrorEvent", "DedicatedWorkerGlobalScope"] }
 js-sys = "0.3"
 rustix = { version = "1.1", default-features = false, features = ["process"] }
+socket2 = "0.6"
 rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 tempfile = "3"
 getrandom = "0.4"

@@ -2,9 +2,13 @@ use super::*;
 use core::fmt;
 
 impl Options {
-    pub fn validate(&self) -> Result<(), WorkerError> {
+    pub fn validate(&self) -> Result<(), (WorkerError, String)> {
+        self.validate_limits().map_err(Into::into)
+    }
+
+    pub(super) fn validate_limits(&self) -> Result<(), WorkerFailure> {
         if self.capacity == 0 || self.capacity > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(WorkerError::setup(
+            return Err(WorkerFailure::setup(
                 CallError::NotAdmitted,
                 "worker queue capacity is outside the supported range",
             ));
@@ -14,7 +18,7 @@ impl Options {
             || self.max_outstanding_bytes > u32::MAX as usize
             || self.max_outstanding_bytes > tokio::sync::Semaphore::MAX_PERMITS
         {
-            return Err(WorkerError::setup(
+            return Err(WorkerFailure::setup(
                 CallError::NotAdmitted,
                 "worker byte budget is outside the supported range",
             ));
@@ -36,26 +40,62 @@ impl Default for Options {
 impl<T> WorkerError<T> {
     #[doc(hidden)]
     pub fn fmt_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match &self.cause {
-            WorkerCause::Setup => Some("worker setup failed"),
-            WorkerCause::Cleanup => Some("worker cleanup failed"),
-            WorkerCause::Operations { .. } => Some("worker operations do not match"),
-            _ => None,
-        };
-
-        if let Some(message) = message {
-            write!(f, "worker call {:?}: {message}", self.outcome)
-        } else {
-            write!(f, "worker call {:?}: {:?}", self.outcome, self.cause)
+        write_error(f, self.outcome, &self.cause)
+    }
+}
+impl WorkerError {
+    #[doc(hidden)]
+    pub fn new(outcome: CallError, cause: WorkerCause) -> Self {
+        Self {
+            outcome,
+            cause,
+            data: None,
         }
     }
+}
 
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.diagnostics {
-            Some(diagnostics) => f.write_str(&diagnostics.report),
-            None => write!(f, "worker call {:?}: {:?}", self.outcome, self.cause),
+pub(super) fn write_error(
+    f: &mut fmt::Formatter<'_>,
+    outcome: CallError,
+    cause: &WorkerCause,
+) -> fmt::Result {
+    let message = match cause {
+        WorkerCause::Setup => "worker setup failed",
+        WorkerCause::Cleanup => "worker cleanup failed",
+        WorkerCause::Operations { .. } => "worker operations do not match",
+        cause => return write!(f, "worker call {outcome:?}: {cause:?}"),
+    };
+
+    write!(f, "worker call {outcome:?}: {message}")
+}
+
+impl<T> From<WorkerFailure<T>> for (WorkerError<T>, String) {
+    fn from(failure: WorkerFailure<T>) -> Self {
+        let error = WorkerError {
+            outcome: failure.outcome,
+            cause: failure.cause,
+            data: failure.data,
+        };
+        let report = failure.diagnostics.unwrap_or_else(|| error.to_string());
+
+        (error, report)
+    }
+}
+impl<T> From<WorkerError> for WorkerFailure<T> {
+    fn from(error: WorkerError) -> Self {
+        Self {
+            outcome: error.outcome,
+            cause: error.cause,
+            diagnostics: None,
+            data: None,
         }
+    }
+}
+
+impl<T> WorkerFailure<T> {
+    #[doc(hidden)]
+    pub fn fmt_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_error(f, self.outcome, &self.cause)
     }
 
     #[cfg(all(
@@ -66,36 +106,38 @@ impl<T> WorkerError<T> {
     #[doc(hidden)]
     pub fn data_error(mut self, error: WorkerError) -> Self {
         if let Some(diagnostics) = &mut self.diagnostics {
-            diagnostics.report.push_str("\nOptional lifecycle data: ");
-            diagnostics.report.push_str(&alloc::format!("{error:#}"));
+            diagnostics.push_str("\nOptional lifecycle data: ");
+            diagnostics.push_str(&alloc::format!("{error:#}"));
         }
         self
     }
 
+    #[doc(hidden)]
     pub fn setup(outcome: CallError, report: impl Into<String>) -> Self {
         Self {
             outcome,
             cause: WorkerCause::Setup,
-            diagnostics: Some(crate::AktorDiagnostic::new("worker setup failed", report)),
+            diagnostics: Some(report.into()),
             data: None,
         }
     }
 
+    #[doc(hidden)]
     pub fn cleanup(outcome: CallError, report: impl Into<String>) -> Self {
         Self {
             outcome,
             cause: WorkerCause::Cleanup,
-            diagnostics: Some(crate::AktorDiagnostic::new("worker cleanup failed", report)),
+            diagnostics: Some(report.into()),
             data: None,
         }
     }
 
+    #[doc(hidden)]
     pub fn new(outcome: CallError, cause: WorkerCause) -> Self {
         let diagnostics = match &cause {
-            WorkerCause::Operations { .. } => Some(crate::AktorDiagnostic::new(
-                "worker operations do not match",
-                alloc::format!("worker call {outcome:?}: {cause:?}"),
-            )),
+            WorkerCause::Operations { .. } => {
+                Some(alloc::format!("worker call {outcome:?}: {cause:?}"))
+            }
             _ => None,
         };
 
@@ -112,12 +154,21 @@ impl<T> WorkerError<T> {
         target_family = "wasm",
         target_os = "unknown"
     ))]
-    pub fn without_data<U>(self) -> WorkerError<U> {
-        WorkerError {
+    pub fn without_data<U>(self) -> WorkerFailure<U> {
+        WorkerFailure {
             outcome: self.outcome,
             cause: self.cause,
             diagnostics: self.diagnostics,
             data: None,
         }
+    }
+
+    #[cfg(all(
+        feature = "wasm_browser_workers",
+        target_family = "wasm",
+        target_os = "unknown"
+    ))]
+    pub(crate) fn report_without_data<U>(self) -> (WorkerError<U>, String) {
+        self.without_data().into()
     }
 }

@@ -35,14 +35,26 @@ pub struct LatestResults<O> {
 }
 impl<O> LatestResults<O> {
     pub async fn next(&mut self) -> Option<O> {
-        poll_fn(|cx| self.output.poll(cx)).await
+        poll_fn(|cx| self.poll_output(cx)).await
+    }
+
+    /// Receive the next output or the actor's failure without waiting for cleanup.
+    pub async fn next_settled(&mut self) -> Result<Option<O>, CallError> {
+        poll_fn(|cx| self.output.poll(cx, true)).await
+    }
+
+    fn poll_output(&self, cx: &mut Context<'_>) -> Poll<Option<O>> {
+        self.output.poll(cx, false).map(|result| match result {
+            Ok(output) => output,
+            Err(_) => stopped(),
+        })
     }
 }
 impl<O> futures_util::Stream for LatestResults<O> {
     type Item = O;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<O>> {
-        self.output.poll(cx)
+        self.poll_output(cx)
     }
 }
 impl<O> Drop for LatestResults<O> {
@@ -58,7 +70,7 @@ trait Input<I>: Send + Sync {
 }
 
 trait Output<O>: Send + Sync {
-    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>>;
+    fn poll(&self, cx: &mut Context<'_>, settled: bool) -> Poll<Result<Option<O>, CallError>>;
     fn close_receiver(&self);
 }
 
@@ -102,7 +114,6 @@ where
                 || !slot.receiver
                 || slot.failed
                 || slot.pending.is_none()
-                || matches!(slot.phase, Phase::Paused)
             {
                 return;
             }
@@ -153,19 +164,11 @@ where
 
         slot.phase = phase;
 
-        let pending = if let Phase::Closing { paused: true } = phase {
-            slot.senders = 0;
-            slot.pending.take()
-        } else {
-            None
-        };
-
         let wake = slot.wake.take();
 
         drop(slot);
 
         let mut failures = Failures::new(String::new());
-        failures.capture(FailureKind::Teardown, || drop(pending));
         failures.capture(FailureKind::Teardown, || self.schedule());
         failures.capture(FailureKind::Teardown, || {
             if let Some(wake) = wake {
@@ -183,7 +186,7 @@ where
     fn send(&self, input: I) {
         let mut slot = self.state.lock();
 
-        if !slot.receiver || slot.failed || matches!(slot.phase, Phase::Closing { .. }) {
+        if !slot.receiver || slot.failed || slot.phase.is_closing() {
             return;
         }
 
@@ -217,7 +220,7 @@ where
     }
 }
 impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> {
-    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>> {
+    fn poll(&self, cx: &mut Context<'_>, settled: bool) -> Poll<Result<Option<O>, CallError>> {
         let replacement = cx.waker().clone();
         let mut slot = self.state.lock();
 
@@ -249,13 +252,17 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> 
         if !slot.failed
             && let Some(output) = slot.output.take()
         {
-            return Poll::Ready(Some(output));
+            return Poll::Ready(Ok(Some(output)));
         }
 
-        if slot.failed || (slot.finished && !matches!(slot.phase, Phase::Closing { .. })) {
+        if slot.failed || (slot.finished && !slot.phase.is_closing()) {
             let finished = slot.finished;
 
             drop(slot);
+
+            if settled {
+                return Poll::Ready(Err(CallError::OutcomeUnknown));
+            }
 
             if !finished {
                 return Poll::Pending;
@@ -266,15 +273,15 @@ impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Shared<S, I, O, F, Role> 
                 return Poll::Pending;
             }
 
-            stopped();
+            return Poll::Ready(Err(CallError::OutcomeUnknown));
         }
 
-        if (slot.senders == 0 || matches!(slot.phase, Phase::Closing { .. }))
+        if (slot.senders == 0 || slot.phase.is_closing())
             && slot.pending.is_none()
             && !slot.running
             && !slot.scheduled
         {
-            return Poll::Ready(None);
+            return Poll::Ready(Ok(None));
         }
 
         let previous = slot.wake.replace(replacement);
@@ -319,7 +326,7 @@ where
     fn run<'a>(
         &'a self,
         state: &'a mut S,
-        hooks: &'a mut crate::listener::hooks::AktorHooks<S>,
+        hooks: &'a mut crate::listener::hooks::CallHooks<S>,
         operation: crate::operation::Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
@@ -328,7 +335,7 @@ where
 
                 slot.scheduled = false;
 
-                if !slot.receiver || matches!(slot.phase, Phase::Paused) {
+                if !slot.receiver {
                     return;
                 }
 
@@ -406,7 +413,7 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static> Session<S,
         F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
     {
         let shared = Arc::new_cyclic(|this: &Weak<Shared<S, I, O, F, Role>>| Shared {
-            handle: self.new_handle(),
+            handle: self.clone(),
             state: Mutex::new(Slot {
                 revision: 0,
                 pending: None,

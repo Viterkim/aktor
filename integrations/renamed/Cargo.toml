@@ -10,3 +10,6 @@ publish.workspace = true
 actor = { package = "aktor", path = "../../aktor", default-features = false, features = ["macros", "tokio", "wasm_browser_workers"] }
 er = { workspace = true, default-features = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

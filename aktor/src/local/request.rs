@@ -38,14 +38,9 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock>
                 parked: false,
                 taken: false,
                 answer,
-                group: handle
-                    .inner
-                    .group
-                    .borrow()
-                    .as_ref()
-                    .map(|(_, group)| group.clone()),
+                group: None,
             },
-            closed: handle.inner.closed.listen(),
+            space: None,
             submitted: false,
         }
     }
@@ -56,7 +51,7 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock>
         feature = "embassy",
         feature = "browser_local"
     ))]
-    pub fn timeout(self, duration: core::time::Duration) -> crate::Timeout<Self>
+    pub fn timeout(self, duration: core::time::Duration) -> crate::AktorTimeout<Self>
     where
         Clock: clock::AktorClock,
     {
@@ -70,7 +65,15 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock>
             stopped();
         }
 
+        self.reply.group = self.handle.inner.group.borrow().clone();
         self.reply
+    }
+
+    fn poll_reply(&mut self, context: &mut Context<'_>) -> Poll<O> {
+        self.reply.poll_with(context, |reply| {
+            reply.group = self.handle.inner.group.borrow().clone();
+            reply.lost();
+        })
     }
 
     fn poll_submit(&mut self, context: &mut Context<'_>) -> Poll<bool> {
@@ -92,9 +95,22 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock>
             return Poll::Ready(true);
         }
 
-        self.closed.register(context);
+        if self.space.is_none() {
+            let admitted = self.try_admit();
+            if admitted.is_ready() {
+                return admitted;
+            }
+        }
 
+        self.space
+            .get_or_insert_with(|| self.handle.inner.space.listen())
+            .register(context);
+        self.try_admit()
+    }
+
+    fn try_admit(&mut self) -> Poll<bool> {
         if !self.handle.inner.open.get() {
+            self.space = None;
             return Poll::Ready(false);
         }
 
@@ -105,6 +121,7 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock>
         match self.handle.inner.enqueue(message) {
             Ok(()) => {
                 self.submitted = true;
+                self.space = None;
                 Poll::Ready(true)
             }
             Err(message) => {
@@ -126,7 +143,7 @@ impl<S: 'static, const N: usize, E, O: 'static, Role, Clock> Future
             stopped();
         }
 
-        let output = Pin::new(&mut this.reply).poll(context);
+        let output = this.poll_reply(context);
 
         if output.is_ready() {
             this.submitted = false;
@@ -141,7 +158,7 @@ impl<S: 'static, const N: usize, E, Role, Clock> Request<'_, S, N, E, (), Role, 
         let admitted = poll_fn(|cx| self.poll_admit(cx)).await;
 
         if admitted {
-            self.reply.await;
+            poll_fn(|cx| self.poll_reply(cx)).await;
         }
 
         admitted
@@ -189,21 +206,23 @@ impl<O> Answer<O> {
     }
 
     fn poll(&self, context: &mut Context<'_>) -> Poll<Result<O, CallError>> {
-        let replacement = context.waker().clone();
-        let previous = {
-            let mut result = self.result.borrow_mut();
-            core::mem::replace(&mut *result, AnswerState::Consumed)
-        };
-
-        match previous {
-            AnswerState::Ready(output) => Poll::Ready(output),
-            AnswerState::Waiting(previous) => {
-                *self.result.borrow_mut() = AnswerState::Waiting(Some(replacement));
-                drop(previous);
-                Poll::Pending
-            }
-            _ => consumed(),
+        if let Some(output) = self.try_take() {
+            return Poll::Ready(output);
         }
+
+        let replacement = context.waker().clone();
+        let mut result = self.result.borrow_mut();
+
+        if let AnswerState::Waiting(waiter) = &mut *result {
+            let old = waiter.replace(replacement);
+            drop(result);
+            drop(old);
+            return Poll::Pending;
+        }
+
+        // Cloning the waker can run code that completes the call.
+        drop(result);
+        self.try_take().map_or_else(|| consumed(), Poll::Ready)
     }
 }
 
@@ -214,7 +233,7 @@ where
     fn run<'s>(
         &'s mut self,
         state: &'s mut S,
-        hooks: &'s mut hooks::AktorHooks<S>,
+        hooks: &'s mut hooks::CallHooks<S>,
         operation: Operation,
     ) -> LocalFuture<'s, ()> {
         Box::pin(async move {
@@ -256,13 +275,16 @@ impl<O, Clock> Reply<O, Clock> {
     }
 
     fn lost(&mut self) -> Option<O> {
-        if let Some(group) = &self.group {
-            group.fail(crate::AktorFailureReport {
-                kind: None,
-                actor: "actor".into(),
-                phase: "call".into(),
-                message: "actor stopped without an output".into(),
-            });
+        if let Some((actor, group)) = &self.group {
+            // During shutdown a lost reply is a call shutdown cancelled, a crash reports itself.
+            if !group.is_stopping() {
+                group.fail(crate::AktorFailureReport {
+                    kind: None,
+                    actor: actor.as_ref().into(),
+                    phase: "call".into(),
+                    message: "actor stopped without an output".into(),
+                });
+            }
 
             self.parked = true;
             None
@@ -277,13 +299,30 @@ impl<O, Clock> Reply<O, Clock> {
         feature = "embassy",
         feature = "browser_local"
     ))]
-    pub fn timeout(&mut self, duration: core::time::Duration) -> crate::Timeout<&mut Self>
+    pub fn timeout(&mut self, duration: core::time::Duration) -> crate::AktorTimeout<&mut Self>
     where
         Clock: clock::AktorClock,
     {
         Clock::timeout(self, duration, |_| crate::timeout::WaitStatus {
             admitted: true,
         })
+    }
+
+    fn poll_with(&mut self, context: &mut Context<'_>, lost: impl FnOnce(&mut Self)) -> Poll<O> {
+        if self.parked {
+            return Poll::Pending;
+        }
+
+        match ready!(self.answer.poll(context)) {
+            Ok(output) => {
+                self.taken = true;
+                Poll::Ready(output)
+            }
+            Err(_) => {
+                lost(self);
+                Poll::Pending
+            }
+        }
     }
 }
 impl<O, Clock> Future for Reply<O, Clock> {
@@ -292,20 +331,9 @@ impl<O, Clock> Future for Reply<O, Clock> {
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<O> {
         let this = self.get_mut();
 
-        if this.parked {
-            return Poll::Pending;
-        }
-
-        match ready!(this.answer.poll(context)) {
-            Ok(output) => {
-                this.taken = true;
-                Poll::Ready(output)
-            }
-            Err(_) => {
-                this.lost();
-                Poll::Pending
-            }
-        }
+        this.poll_with(context, |reply| {
+            reply.lost();
+        })
     }
 }
 impl<O, Clock> Drop for Reply<O, Clock> {

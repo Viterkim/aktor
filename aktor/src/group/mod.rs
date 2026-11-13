@@ -1,5 +1,5 @@
-pub use crate::{AktorArgs, AktorFailureReport, AktorOutcome, ShutdownReport};
-use crate::{AktorCleanupError, AktorError, AktorExecution};
+pub use crate::{AktorArgs, AktorFailureReport, AktorOutcome, AktorShutdownReport};
+use crate::{AktorError, AktorExecution};
 use core::{future::Future, pin::Pin};
 #[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
@@ -51,11 +51,6 @@ mod impls;
 mod intervals;
 #[cfg(not(target_family = "wasm"))]
 mod native;
-#[cfg(any(
-    any(feature = "tokio", feature = "wasm_browser_workers"),
-    target_family = "wasm"
-))]
-mod run;
 pub mod shutdown;
 
 #[cfg(target_family = "wasm")]
@@ -75,52 +70,32 @@ pub struct AktorGroup {
     actors: Rc<RefCell<Vec<Entry>>>,
     #[cfg(target_family = "wasm")]
     shutdown_hook: Rc<RefCell<Option<ShutdownHook>>>,
+    /// The shared state stays Send, so the late collector lives here in the browser.
+    #[cfg(target_family = "wasm")]
+    late: Rc<RefCell<Option<Late>>>,
 }
 
 /// Put this in your Ctrl+C or Close handler. Clones stop the same group.
 #[derive(Clone)]
-pub struct KillSwitch {
+pub struct AktorKillSwitch {
     control: Arc<Control>,
     startup_failure: Option<Arc<AtomicBool>>,
 }
 
 /// Get the shutdown report again later.
 #[derive(Clone)]
-pub struct GroupCompletion {
-    result: watch::Receiver<Option<ShutdownReport>>,
+pub struct AktorGroupCompletion {
+    result: watch::Receiver<Option<Completed>>,
 }
 
-#[cfg(any(
-    feature = "tokio",
-    feature = "wasm_browser_workers",
-    target_family = "wasm"
-))]
+struct Completed {
+    report: AktorShutdownReport,
+    retirement_final: bool,
+}
+
+#[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 struct ApplicationLife {
-    kill: KillSwitch,
-    stop_on_drop: bool,
-}
-
-#[cfg(any(
-    feature = "tokio",
-    feature = "wasm_browser_workers",
-    target_family = "wasm"
-))]
-struct ApplicationFactory<Owner, Application, Cleanup> {
-    owner: Option<Owner>,
-    application: Option<Application>,
-    cleanup: Option<Cleanup>,
-    kill: KillSwitch,
-    life: Option<ApplicationLife>,
-}
-
-#[cfg(any(
-    feature = "tokio",
-    feature = "wasm_browser_workers",
-    target_family = "wasm"
-))]
-struct OwnedApplication<F> {
-    future: Option<Pin<Box<F>>>,
-    kill: KillSwitch,
+    kill: AktorKillSwitch,
 }
 
 struct Control {
@@ -133,8 +108,10 @@ struct Control {
     intervals: Mutex<Option<tokio::sync::mpsc::UnboundedSender<intervals::Pending>>>,
     state: Mutex<State>,
     changed: watch::Sender<Option<Instant>>,
-    completed: watch::Sender<Option<ShutdownReport>>,
+    completed: watch::Sender<Option<Completed>>,
     grace: Duration,
+    #[cfg(not(target_family = "wasm"))]
+    shutdown_policy: crate::AktorShutdownPolicy,
     application_changed: watch::Sender<()>,
     #[cfg(not(target_family = "wasm"))]
     wake: std::sync::Condvar,
@@ -145,19 +122,39 @@ struct Control {
 #[derive(Default)]
 struct State {
     starting: bool,
-    report: ShutdownReport,
+    report: AktorShutdownReport,
     listening: bool,
     deadline: Option<Instant>,
     finished: bool,
-    force_exit: bool,
+    #[cfg(not(target_family = "wasm"))]
+    actors_and_hooks_done: bool,
+    #[cfg(not(target_family = "wasm"))]
+    callback_running: bool,
+    #[cfg(not(target_family = "wasm"))]
+    watchdog_disposal: WatchdogDisposal,
+    #[cfg(not(target_family = "wasm"))]
+    listener_hook: Option<ShutdownHook>,
     #[cfg(not(target_family = "wasm"))]
     shutdown_hook: Option<ShutdownHook>,
     kinds: Vec<(String, AktorExecution)>,
     #[cfg(not(target_family = "wasm"))]
-    running: Vec<Arc<String>>,
+    /// Each thread with its actor's `stuck`, the watchdog only waits for the `Kill` ones.
+    running: Vec<(Arc<String>, crate::AktorStuck)>,
     applications: usize,
     #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
     callers: Vec<tokio::task::JoinHandle<()>>,
+    /// Keeps collecting outcomes of actors shutdown gave up on, after the report went out.
+    #[cfg(not(target_family = "wasm"))]
+    late: Option<Late>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Default, PartialEq, Eq)]
+enum WatchdogDisposal {
+    #[default]
+    Available,
+    Requested,
+    Gone,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -166,6 +163,11 @@ pub struct ThreadLife {
     control: Arc<Control>,
     name: Arc<String>,
 }
+
+#[cfg(not(target_family = "wasm"))]
+type Late = Pin<Box<dyn Future<Output = ()> + Send>>;
+#[cfg(target_family = "wasm")]
+type Late = Pin<Box<dyn Future<Output = ()>>>;
 
 #[cfg(not(target_family = "wasm"))]
 type CloseFuture = Pin<Box<dyn Future<Output = AktorOutcome> + Send>>;
@@ -177,20 +179,38 @@ type Action = Box<dyn FnOnce() + Send>;
 #[cfg(target_family = "wasm")]
 type Action = Box<dyn FnOnce()>;
 
+/// Final status and diagnostics when an unconfirmed owner retires.
 #[cfg(not(target_family = "wasm"))]
-type ShutdownFuture = Pin<Box<dyn Future<Output = Result<(), AktorCleanupError>> + Send>>;
+type ConfirmLater =
+    Pin<Box<dyn Future<Output = Option<(crate::AktorRetireStatus, Vec<AktorError>)>> + Send>>;
 #[cfg(target_family = "wasm")]
-type ShutdownFuture = Pin<Box<dyn Future<Output = Result<(), AktorCleanupError>>>>;
+type ConfirmLater =
+    Pin<Box<dyn Future<Output = Option<(crate::AktorRetireStatus, Vec<AktorError>)>>>>;
+
+/// Returns whether the owner is gone for sure afterwards, like a terminated browser worker.
+#[cfg(not(target_family = "wasm"))]
+type GiveUp = Box<dyn FnOnce() -> bool + Send>;
+#[cfg(target_family = "wasm")]
+type GiveUp = Box<dyn FnOnce() -> bool>;
 
 #[cfg(not(target_family = "wasm"))]
-type ShutdownHook = Box<dyn FnOnce(ShutdownReport) -> ShutdownFuture + Send>;
+type ShutdownFuture = Pin<Box<dyn Future<Output = Result<(), AktorError>> + Send>>;
 #[cfg(target_family = "wasm")]
-type ShutdownHook = Box<dyn FnOnce(ShutdownReport) -> ShutdownFuture>;
+type ShutdownFuture = Pin<Box<dyn Future<Output = Result<(), AktorError>>>>;
+
+#[cfg(not(target_family = "wasm"))]
+type ShutdownHook = Box<dyn FnOnce(AktorShutdownReport) -> ShutdownFuture + Send>;
+#[cfg(target_family = "wasm")]
+type ShutdownHook = Box<dyn FnOnce(AktorShutdownReport) -> ShutdownFuture>;
 
 struct Entry {
     name: String,
     kind: AktorExecution,
     start: Action,
     cancel: Action,
+    /// Runs when shutdown gives up on the owner, for owners that can be stopped from outside.
+    give_up: Option<GiveUp>,
+    /// Only browser workers, their retained work can confirm after the report went out.
+    confirm_later: Option<ConfirmLater>,
     outcome: CloseFuture,
 }

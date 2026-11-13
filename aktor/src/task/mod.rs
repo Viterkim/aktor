@@ -1,6 +1,6 @@
 use crate::{
-    KillSwitch,
-    operation::{Operation, hooks::AktorHooks},
+    AktorKillSwitch,
+    operation::{Operation, hooks::CallHooks},
 };
 use core::{
     future::Future,
@@ -10,7 +10,7 @@ use core::{
 };
 use pin_project_lite::pin_project;
 use std::sync::Arc;
-use tokio::sync::{Mutex, OwnedMappedMutexGuard, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, SemaphorePermit, mpsc, oneshot, watch};
 
 mod clock;
 mod dispatch;
@@ -43,16 +43,17 @@ pub enum AktorTaskStatus {
 pub struct AktorTask<S, Role = crate::AktorNoRole> {
     pub cleanup: Arc<parking_lot::Mutex<Vec<Arc<crate::AktorFailure>>>>,
     pub name: Arc<String>,
-    sender: mpsc::Sender<Message<S>>,
+    sender: mpsc::UnboundedSender<Message<S>>,
+    slots: Arc<Semaphore>,
     services: Arc<service::Services<S>>,
-    kill: KillSwitch,
+    kill: AktorKillSwitch,
     finished: watch::Receiver<AktorTaskStatus>,
     role: PhantomData<fn() -> Role>,
     clock: TaskClock,
 }
 
 pub struct AktorTaskState<S> {
-    guard: OwnedMappedMutexGuard<Option<S>, S>,
+    guard: OwnedMutexGuard<Option<S>>,
 }
 
 pub type AktorTaskFuture<'a, O> = Pin<Box<dyn Future<Output = O> + Send + 'a>>;
@@ -71,9 +72,10 @@ trait Job<S> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         state: Option<AktorTaskState<S>>,
-        hooks: &mut AktorHooks<S>,
+        owner: &Arc<Mutex<Option<S>>>,
+        hooks: &mut CallHooks<S>,
         operation: Operation,
-    ) -> Poll<()>;
+    ) -> Poll<Option<AktorTaskState<S>>>;
 }
 
 pin_project! {

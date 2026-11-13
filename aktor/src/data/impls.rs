@@ -1,4 +1,4 @@
-use super::{AktorData, Owned, Ref, bits, floats};
+use super::{AktorData, Owned, Ref, bits, fixed};
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -65,7 +65,6 @@ macro_rules! scalar {
 }
 scalar!(
     (),
-    i8,
     i16,
     i32,
     i64,
@@ -89,8 +88,8 @@ impl AktorData for String {
     }
 }
 
-macro_rules! float {
-    ($($ty:ty),* $(,)?) => { $(
+macro_rules! fixed {
+    ($($ty:ty => $decode:expr),* $(,)?) => { $(
         impl AktorData for $ty {
             fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 self.serialize(serializer)
@@ -101,11 +100,19 @@ macro_rules! float {
             }
 
             fn serialize_slice<S: Serializer>(values: &[Self], serializer: S) -> Result<S::Ok, S::Error> {
-                floats::serialize_slice(values, serializer, |value| value.to_le_bytes())
+                if serializer.is_human_readable() {
+                    return values.serialize(serializer);
+                }
+
+                fixed::serialize_slice(values, serializer, |value| value.to_le_bytes())
             }
 
             fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Self>, D::Error> {
-                floats::deserialize_vec(deserializer, Self::from_le_bytes)
+                if deserializer.is_human_readable() {
+                    return Vec::deserialize(deserializer);
+                }
+
+                ($decode)(deserializer)
             }
 
             fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
@@ -116,7 +123,43 @@ macro_rules! float {
         }
     )* };
 }
-float!(f32, f64);
+fixed!(
+    u8 => fixed::deserialize_unsigned_bytes,
+    f32 => |deserializer| fixed::deserialize_vec(deserializer, f32::from_le_bytes),
+    f64 => |deserializer| fixed::deserialize_vec(deserializer, f64::from_le_bytes),
+);
+
+impl AktorData for i8 {
+    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialize(serializer)
+    }
+
+    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::deserialize(deserializer)
+    }
+
+    fn serialize_slice<S: Serializer>(values: &[Self], serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            return serialize_slice(values, serializer);
+        }
+
+        fixed::serialize_slice(values, serializer, |value| value.to_le_bytes())
+    }
+
+    fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Self>, D::Error> {
+        if deserializer.is_human_readable() {
+            return deserialize_vec(deserializer);
+        }
+
+        fixed::deserialize_signed_bytes(deserializer)
+    }
+
+    fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
+        deserializer: D,
+    ) -> Result<[Self; N], D::Error> {
+        copy_array(deserializer)
+    }
+}
 
 impl AktorData for bool {
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -128,10 +171,18 @@ impl AktorData for bool {
     }
 
     fn serialize_slice<S: Serializer>(values: &[Self], serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            return values.serialize(serializer);
+        }
+
         bits::serialize_slice(values, serializer)
     }
 
     fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Self>, D::Error> {
+        if deserializer.is_human_readable() {
+            return Vec::deserialize(deserializer);
+        }
+
         bits::deserialize_vec(deserializer)
     }
 
@@ -139,50 +190,21 @@ impl AktorData for bool {
         values: &[Self; N],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            return serialize_array(values, serializer);
+        }
+
         bits::serialize_array(values, serializer)
     }
 
     fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
         deserializer: D,
     ) -> Result<[Self; N], D::Error> {
-        bits::deserialize_array(deserializer)
-    }
-}
-
-impl AktorData for u8 {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u8(*self)
-    }
-
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::deserialize(deserializer)
-    }
-
-    fn serialize_slice<S: Serializer>(values: &[Self], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(values)
-    }
-
-    fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Self>, D::Error> {
-        struct Bytes;
-        impl<'de> Visitor<'de> for Bytes {
-            type Value = Vec<u8>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("bytes")
-            }
-
-            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
-                Ok(bytes.to_vec())
-            }
+        if deserializer.is_human_readable() {
+            return copy_array(deserializer);
         }
 
-        deserializer.deserialize_bytes(Bytes)
-    }
-
-    fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
-        deserializer: D,
-    ) -> Result<[Self; N], D::Error> {
-        copy_array(deserializer)
+        bits::deserialize_array(deserializer)
     }
 }
 

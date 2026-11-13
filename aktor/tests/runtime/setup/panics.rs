@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 #[cfg(feature = "std_thread")]
 use std::{
     error::Error,
@@ -34,6 +35,50 @@ impl Error for FormatPanic {
 
 #[cfg(feature = "std_thread")]
 #[tokio::test]
+async fn native_cleanup_primary() {
+    struct Hook;
+    impl Drop for Hook {
+        fn drop(&mut self) {
+            panic!("hook drop died");
+        }
+    }
+
+    for standard in [false, true] {
+        let mut group = AktorGroup::new();
+
+        if standard {
+            group.start_standard().unwrap();
+        } else {
+            group.start_threaded().unwrap();
+        }
+
+        let hook = Hook;
+        let _actor = group
+            .spawn_async_with_hooks(
+                AktorArgs::new(
+                    "failed cleanup",
+                    || core::future::ready(Ok::<_, String>(())),
+                    |_| core::future::ready(Err(String::from("cleanup refused"))),
+                ),
+                listener::hooks::CallHooks {
+                    before_each: Some(Box::new(move |_, _| {
+                        let _retained = &hook;
+                    })),
+                    after_each: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let report = group.shutdown().await;
+
+        assert_eq!(report.failure.as_ref().unwrap().message, "cleanup refused");
+        assert!(report.to_string().contains("hook drop died"));
+    }
+}
+
+#[cfg(feature = "std_thread")]
+#[tokio::test]
 async fn native() {
     let mut missing = Vec::new();
 
@@ -47,10 +92,10 @@ async fn native() {
         let cleaned = Arc::new(AtomicUsize::new(0));
         let count = cleaned.clone();
         let actor = group
-            .spawn(AktorArgs::new(
+            .spawn_args(AktorArgs::new(
                 "failed operation",
-                || Ok::<_, AktorSetupError>(0u32),
-                move |_| -> Result<(), AktorCleanupError> {
+                || Ok::<_, String>(0u32),
+                move |_| -> Result<(), String> {
                     count.fetch_add(1, Ordering::SeqCst);
                     panic!("secondary cleanup sentinel");
                 },
@@ -90,8 +135,8 @@ async fn native() {
                 "standard={standard}: missing secondary cleanup panic"
             ));
         }
-        let completed = actor.completion().wait().await.unwrap_err();
-        if !format!("{completed:#}").contains("secondary cleanup sentinel") {
+        let (_, report) = actor.completion().wait().await.unwrap_err();
+        if !report.contains("secondary cleanup sentinel") {
             missing.push(format!(
                 "standard={standard}: missing completion diagnostic"
             ));
@@ -104,61 +149,45 @@ async fn native() {
                 aktor_start(AktorSetup {
                     actors: (
                         AktorNew {
-                            name: AktorName::new("ready"),
-                            role: AktorNoRole,
+                            name: "ready".into(),
                             kind: $kind,
-                            closures: AktorClosures {
-                                start: async || Ok::<_, AktorSetupError>(()),
-                                end: async move |_| {
-                                    count.fetch_add(1, Ordering::SeqCst);
-                                    Err(AktorCleanupError::new(
-                                        format!("{}", FormatPanic(false)),
-                                        (),
-                                    ))
-                                },
-                                intervals: vec![],
-                                before_each: None,
-                                after_each: None,
+                            start: async || Ok::<_, String>(()),
+                            end: async move |_| {
+                                count.fetch_add(1, Ordering::SeqCst);
+                                Err(String::from(format!("{}", FormatPanic(false))))
                             },
-                            options: Default::default(),
+                            hooks: Default::default(),
+                            capacity: 32,
+                            stuck: AktorStuck::Kill,
                         },
                         AktorNew {
-                            name: AktorName::new("failed setup"),
-                            role: AktorNoRole,
+                            name: "failed setup".into(),
                             kind: $kind,
-                            closures: AktorClosures {
-                                start: async || {
-                                    Err::<(), _>(AktorSetupError::new(
-                                        format!("{}", FormatPanic(false)),
-                                        (),
-                                    ))
-                                },
-                                end: (),
-                                intervals: vec![],
-                                before_each: None,
-                                after_each: None,
-                            },
-                            options: Default::default(),
+                            start: async || Err::<(), _>(format!("{}", FormatPanic(false))),
+                            end: (),
+                            hooks: Default::default(),
+                            capacity: 32,
+                            stuck: AktorStuck::Kill,
                         },
                     ),
                     shutdown: |_| {},
-                    options: Default::default(),
+                    grace: Duration::from_secs(5),
                 })
                 .await
                 .err()
                 .unwrap()
             };
         }
-        let error = if standard {
+        let (error, error_report) = if standard {
             rollback!(AktorKind::StdThread)
         } else {
             rollback!(AktorKind::TokioThread)
         };
         let printed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (format!("{error:#}"), format!("{error:?}"))
+            (error_report.clone(), format!("{error:?}"))
         }))
         .expect("public startup formatting panicked");
-        assert_eq!(printed.1, "actor startup failed");
+        assert!(printed.1.starts_with("actor startup failed"));
         assert!(printed.0.contains("failed setup"));
         assert_eq!(printed.0.matches("rollback panic sentinel").count(), 2);
 
@@ -185,36 +214,32 @@ async fn native() {
     }
 
     for source in [false, true] {
-        let error = aktor_start(AktorSetup {
+        let (error, error_report) = aktor_start(AktorSetup {
             actors: AktorNew {
-                name: AktorName::new("hostile startup"),
-                role: AktorNoRole,
+                name: "hostile startup".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async move || {
-                        let error = FormatPanic(source);
-                        error.source();
-                        Err::<(), _>(AktorSetupError::new(format!("{error}"), ()))
-                    },
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: async move || {
+                    let error = FormatPanic(source);
+                    error.source();
+                    Err::<(), _>(format!("{error}"))
                 },
-                options: Default::default(),
+                end: (),
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
             shutdown: |_| {},
-            options: Default::default(),
+            grace: Duration::from_secs(5),
         })
         .await
         .err()
         .unwrap();
         let printed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (format!("{error:#}"), format!("{error:?}"))
+            (error_report.clone(), format!("{error:?}"))
         }))
         .expect("public startup formatting panicked");
 
-        assert_eq!(printed.1, "actor startup failed");
+        assert!(printed.1.starts_with("actor startup failed"));
         assert!(printed.0.contains("hostile startup"));
         let sentinel = if source {
             "source panic sentinel"
@@ -252,24 +277,20 @@ async fn siblings() {
             macro_rules! actor {
                 ($name:expr) => {
                     AktorNew {
-                        name: AktorName::new($name),
-                        role: AktorNoRole,
+                        name: $name.into(),
                         kind: $kind,
-                        closures: AktorClosures {
-                            start: async || Ok::<_, AktorSetupError>(0u32),
-                            end: (),
-                            intervals: vec![],
-                            before_each: None,
-                            after_each: None,
-                        },
-                        options: Default::default(),
+                        start: async || Ok::<_, String>(0u32),
+                        end: (),
+                        hooks: Default::default(),
+                        capacity: 32,
+                        stuck: AktorStuck::Kill,
                     }
                 };
             }
             let actors = aktor_start(AktorSetup {
                 actors: (actor!("first"), actor!("later")),
                 shutdown: |_| {},
-                options: Default::default(),
+                grace: Duration::from_secs(5),
             })
             .await
             .unwrap();
@@ -350,8 +371,8 @@ async fn siblings() {
 #[cfg(feature = "local")]
 #[test]
 fn closures() {
-    if std::env::var("AKTOR_CHILD").as_deref() != Ok("closure drops") {
-        let output = support::child("setup::panics::closures", "closure drops");
+    if std::env::var("AKTOR_TEST_CASE").as_deref() != Ok("closure drops") {
+        let output = support::run_test("setup::panics::closures", "closure drops");
         assert!(
             output.status.success(),
             "{}",
@@ -379,7 +400,7 @@ fn closures() {
         let runner = Broken(dropped.clone(), 2, "runner capture sentinel");
         let error = owner
             .run_with_custom(
-                async || Err(AktorSetupError::new("initialization refused", ())),
+                async || Err(AktorError::new("initialization refused", ())),
                 async move |_| {
                     std::hint::black_box(&cleanup);
                     Ok(())
@@ -392,7 +413,7 @@ fn closures() {
             .await
             .unwrap_err();
 
-        assert!(matches!(error.error, local::OwnerFailure::Setup(_)));
+        assert!(matches!(error.0, local::OwnerError::Setup(_)));
         assert_eq!(dropped.get(), 3);
         let diagnostics = completion
             .diagnostics()

@@ -3,10 +3,14 @@
     not(target_family = "wasm")
 ))]
 use crate::listener::DedicatedStartError;
-use crate::{AktorNoRole, AktorSetupError};
+use crate::{AktorError, AktorGroupError};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::{future::Future, pin::Pin, time::Duration};
 use er::Er;
+#[doc(hidden)]
+pub mod initial;
+use initial::InitError;
+pub use initial::{AktorBranch, aktor_ready};
 
 #[cfg(feature = "bevy")]
 mod bevy;
@@ -15,11 +19,18 @@ pub mod closures;
 mod cross_core;
 #[cfg(feature = "local")]
 mod custom;
-#[cfg(all(
-    any(feature = "tokio", feature = "std_thread"),
-    not(target_family = "wasm")
+#[cfg(any(
+    all(
+        any(feature = "tokio", feature = "std_thread"),
+        not(target_family = "wasm")
+    ),
+    all(
+        any(feature = "browser_local", feature = "wasm_browser_workers"),
+        target_family = "wasm",
+        target_os = "unknown"
+    )
 ))]
-mod definition;
+pub(crate) mod definition;
 #[cfg(feature = "local")]
 mod driven;
 #[doc(hidden)]
@@ -67,13 +78,26 @@ pub use tuple::AktorTupleStartup;
 ))]
 pub use worker::{AktorOptionalWorkerNew, AktorWorkerNew, AktorWorkerOptions};
 
+pub(crate) use crate::report::diagnostics;
 pub use closures::{AktorClosure, AktorIntervalLogic};
+#[cfg(any(
+    all(
+        any(feature = "tokio", feature = "std_thread"),
+        not(target_family = "wasm")
+    ),
+    all(
+        any(feature = "browser_local", feature = "wasm_browser_workers"),
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
+pub use definition::AktorDefinition;
+use group::AktorSetupGroup;
 #[cfg(all(
     any(feature = "tokio", feature = "std_thread"),
     not(target_family = "wasm")
 ))]
-pub use definition::AktorDefinition;
-use group::AktorSetupGroup;
+pub use impls::aktor_start_with_policy;
 pub use impls::{aktor_start, aktor_start_in};
 #[doc(hidden)]
 pub use impls::{start_diagnostics, validation_error};
@@ -81,43 +105,68 @@ pub use impls::{start_diagnostics, validation_error};
 pub use kind as AktorKind;
 pub use kind::{AktorExecution, AktorMode};
 
-pub use crate::types::{
-    AktorClosures, AktorInterval, AktorName, AktorNew, AktorNewOptions, AktorOptions, AktorSetup,
-    AktorStarted,
-};
+pub use crate::types::{AktorHooks, AktorInterval, AktorNew, AktorSetup, AktorStarted};
+
+type Closing<Group> =
+    <<Group as AktorSetupGroup>::Completion as core::future::IntoFuture>::IntoFuture;
 
 #[must_use = "await startup to get the actor handles"]
-pub struct AktorStartup<Setup: AktorStart<Mode>, Mode = ()> {
-    mode: core::marker::PhantomData<fn() -> Mode>,
-    pub killswitch: <Setup::Group as AktorSetupGroup>::KillSwitch,
+pub struct AktorStartup<Setup: AktorStart> {
+    pub killswitch: <Setup::Group as AktorSetupGroup>::AktorKillSwitch,
     pub completion: <Setup::Group as AktorSetupGroup>::Completion,
     begin: bool,
     group: Option<Setup::Group>,
     setup: Option<Box<Setup>>,
     starting: Option<Pin<Box<Setup::Startup>>>,
-    failure: Option<Box<AktorStartError>>,
-    shutdown: Option<Pin<Box<<Setup::Group as AktorSetupGroup>::Closing>>>,
+    failure: Option<Box<AktorStartError<Setup::Error>>>,
+    shutdown: Option<Pin<Box<Closing<Setup::Group>>>>,
 }
 
-/// A startup error and the shutdown report from rolling back.
-/// report is None when startup is rejected before it begins.
+/// What happened to the initializers in this startup attempt.
+#[cfg_attr(feature = "transport", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AktorInitOutcome<E> {
+    /// None of them ran.
+    NotRun,
+    /// An initializer reported this error. A worker can report it while rollback is still running.
+    Failed(E),
+    /// An initializer may have run. It may have acquired resources before startup stopped.
+    Unconfirmed,
+}
+
+/// A failed start. `aktor_start` returns this error with the report text. Use `.er()` to keep both.
+/// `report` is `None` when there's no rollback report, for example when `group.spawn`
+/// gets called after the group closes.
 #[derive(Er)]
-#[er(no_constructors, format = "actor startup failed", display_alt = Self::fmt_details)]
-pub struct AktorStartupError {
-    pub error: AktorStartError,
-    #[er(source, skip)]
-    pub diagnostics: Box<crate::AktorDiagnostic>,
-    pub report: Option<Box<crate::ShutdownReport>>,
-    /// The startup diagnostic represents the group's first failure.
-    pub source_is_failure: bool,
+#[er(no_constructors, format = "actor startup failed")]
+#[non_exhaustive]
+pub struct AktorStartError<E = core::convert::Infallible> {
+    #[er(skip)]
+    pub init: AktorInitOutcome<E>,
+    pub cause: AktorStartCause,
+    pub report: Option<Box<crate::AktorShutdownReport>>,
 }
 
 #[derive(Er)]
-pub enum AktorStartError<E: 'static = crate::AktorFailure> {
+#[er(no_constructors)]
+pub enum AktorStartCause<E: 'static = crate::AktorFailure> {
     Init(#[er(source, skip)] E),
-    Setup(#[er(source, skip)] AktorSetupError),
+    Setup(#[er(source, skip)] AktorError),
+    Group(#[er(source, skip)] AktorGroupError),
     #[cfg(feature = "local")]
-    Local(#[er(source, skip)] crate::local::OwnerError),
+    Local(
+        #[er(source, skip)] crate::local::OwnerError,
+        #[er(skip)] String,
+    ),
+    #[cfg(all(
+        feature = "wasm_browser_workers",
+        target_family = "wasm",
+        target_os = "unknown"
+    ))]
+    Worker(
+        #[er(source, skip)] crate::worker::WorkerError,
+        #[er(skip)] String,
+    ),
     #[cfg(all(
         any(feature = "tokio", feature = "std_thread"),
         not(target_family = "wasm")
@@ -131,20 +180,25 @@ pub enum AktorStartError<E: 'static = crate::AktorFailure> {
 }
 
 #[doc(hidden)]
-pub trait AktorStart<Mode = ()>: Sized {
+pub trait AktorStart: Sized {
     type Group: AktorSetupGroup;
     type Handles;
-    type Startup: Future<Output = Result<Self::Handles, AktorStartError>>;
+    type Error;
+    type Startup: Future<Output = Result<Self::Handles, AktorStartError<Self::Error>>>;
 
-    fn source_is_setup(error: &AktorStartError) -> bool {
+    fn source_is_setup(error: &AktorStartCause) -> bool {
         error.source_is_setup()
     }
 
-    fn diagnostics(error: &AktorStartError) -> String {
+    fn diagnostics(error: &AktorStartCause) -> String {
         impls::start_diagnostics(error)
     }
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError>;
+    fn needs_tokio_group(&self) -> bool {
+        false
+    }
+
+    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorStartCause>;
     fn start_in(self, context: AktorStartContext<Self::Group>) -> Self::Startup;
 }
 
@@ -153,20 +207,7 @@ pub struct AktorStartContext<Group: AktorSetupGroup> {
     group: Group,
 }
 
-pub type AktorDiagnostics = String;
-
 pub type AktorThreadFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
-#[cfg(all(
-    any(feature = "tokio", feature = "std_thread"),
-    not(target_family = "wasm")
-))]
-type AktorClosingFuture = AktorThreadFuture<crate::ShutdownReport>;
-#[cfg(all(
-    any(feature = "browser_local", feature = "wasm_browser_workers"),
-    target_family = "wasm"
-))]
-type AktorClosingFuture = crate::message::LocalFuture<'static, crate::ShutdownReport>;
 
 #[cfg(all(
     feature = "wasm_threads",

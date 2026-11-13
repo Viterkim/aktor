@@ -13,10 +13,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
     )
-    .await?;
-    let before = get_state(&power).await?;
-    let cycled = power_cycle_gnss(&power, 1).await?;
-    let after = get_state(&power).await?;
+    .await
+    .map_err(|(_, report)| report)?;
+    let before = get_state(&power).await.map_err(|(_, report)| report)?;
+    let cycled = power_cycle_gnss(&power, 1)
+        .await
+        .map_err(|(_, report)| report)?;
+    let after = get_state(&power).await.map_err(|(_, report)| report)?;
 
     println!("before: {before:?}, command: {cycled:?}, after: {after:?}");
     Ok(())

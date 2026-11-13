@@ -41,8 +41,7 @@ impl<O> Reply<O> {
             return None;
         }
 
-        if self.group.is_some() {
-            self.admission.lost();
+        if self.admission.lost() {
             self.parked = true;
             None
         } else {
@@ -50,10 +49,10 @@ impl<O> Reply<O> {
         }
     }
 
-    pub fn timeout(&mut self, duration: core::time::Duration) -> crate::Timeout<&mut Self> {
+    pub fn timeout(&mut self, duration: core::time::Duration) -> crate::AktorTimeout<&mut Self> {
         let standard = self.admission.is_standard();
 
-        crate::Timeout::queued(
+        crate::AktorTimeout::queued(
             self,
             duration,
             |_| crate::timeout::WaitStatus { admitted: true },
@@ -107,8 +106,7 @@ impl<O> Future for Reply<O> {
                 this.taken = true;
                 Poll::Ready(output)
             }
-            Err(_) if this.group.is_some() => {
-                this.admission.lost();
+            Err(_) if this.admission.lost() => {
                 this.parked = true;
                 Poll::Pending
             }

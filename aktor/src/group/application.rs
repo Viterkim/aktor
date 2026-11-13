@@ -8,13 +8,12 @@ use {
     std::panic::AssertUnwindSafe,
 };
 
+#[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 impl Drop for ApplicationLife {
     fn drop(&mut self) {
         self.kill.control.lock().applications -= 1;
         self.kill.control.application_changed.send_replace(());
-        if self.stop_on_drop {
-            self.kill.stop();
-        }
+        self.kill.control.wake.notify_all();
     }
 }
 
@@ -29,43 +28,57 @@ impl AktorGroup {
             Ok(runtime) => runtime,
             Err(_) => {
                 contain_drop(future, &self.killswitch(), "rejected task drop");
-                return Err(AktorGroupError::new(
-                    "application tasks need a Tokio runtime",
-                ));
+                return Err(AktorGroupError::NoTokio);
             }
         };
         let mut state = self.control.lock();
 
-        if !state.listening || state.deadline.is_some() || state.finished {
+        let refused = if state.finished {
+            Some(AktorGroupError::Stopped)
+        } else if state.deadline.is_some() {
+            Some(AktorGroupError::Stopping)
+        } else if !state.listening {
+            Some(AktorGroupError::NotStarted)
+        } else {
+            None
+        };
+
+        if let Some(error) = refused {
             drop(state);
             contain_drop(future, &self.killswitch(), "rejected task drop");
-            return Err(AktorGroupError::new(
-                "actor group cannot accept application work",
-            ));
+            return Err(error);
         }
 
-        state.applications += 1;
+        // Shutdown waits for the handle to be registered and for the task's destructor to return.
+        state.applications += 2;
         let kill = self.killswitch();
-        let registration = ApplicationLife {
-            kill: kill.clone(),
-            stop_on_drop: false,
-        };
+        let registration = ApplicationLife { kill: kill.clone() };
         drop(state);
         let mut caller = Caller {
             future: Some(Box::pin(future)),
-            kill: kill.clone(),
+            life: ApplicationLife { kill },
         };
         let task = runtime.spawn(async move {
             if let Some(future) = caller.future.as_mut()
                 && let Err(payload) = AssertUnwindSafe(future).catch_unwind().await
             {
-                fail_application(&kill, "task", panic_message(&payload));
-                contain_drop(payload, &kill, "task panic drop");
+                fail_application(&caller.life.kill, "task", panic_message(&payload));
+                contain_drop(payload, &caller.life.kill, "task panic drop");
             }
-            contain_drop(caller.future.take(), &kill, "application task drop");
+            contain_drop(
+                caller.future.take(),
+                &caller.life.kill,
+                "application task drop",
+            );
             drop(caller);
         });
         let mut state = self.control.lock();
+        if state.deadline.is_some() {
+            drop(state);
+            task.abort();
+            state = self.control.lock();
+        }
+
         state.callers.retain(|task| !task.is_finished());
         state.callers.push(task);
         drop(state);
@@ -77,46 +90,18 @@ impl AktorGroup {
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 struct Caller<F> {
     future: Option<Pin<Box<F>>>,
-    kill: KillSwitch,
+    life: ApplicationLife,
 }
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 impl<F> Drop for Caller<F> {
     fn drop(&mut self) {
-        if self.future.is_some() && !self.kill.is_stopping() {
+        if self.future.is_some() && !self.life.kill.is_stopping() {
             fail_application(
-                &self.kill,
+                &self.life.kill,
                 "task",
                 "application task cancelled before completion".into(),
             );
         }
-        contain_drop(self.future.take(), &self.kill, "application task drop");
-    }
-}
-
-impl<F> Drop for OwnedApplication<F> {
-    fn drop(&mut self) {
-        super::shutdown::contain_drop(self.future.take(), &self.kill, "application drop");
-    }
-}
-impl<F: Future> Future for OwnedApplication<F> {
-    type Output = F::Output;
-
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        match self.get_mut().future.as_mut() {
-            Some(future) => future.as_mut().poll(cx),
-            None => core::task::Poll::Pending,
-        }
-    }
-}
-
-impl<Owner, Application, Cleanup> Drop for ApplicationFactory<Owner, Application, Cleanup> {
-    fn drop(&mut self) {
-        super::shutdown::contain_drop(self.application.take(), &self.kill, "application drop");
-        super::shutdown::contain_drop(self.cleanup.take(), &self.kill, "cleanup drop");
-        super::shutdown::contain_drop(self.owner.take(), &self.kill, "application owner drop");
-        drop(self.life.take());
+        contain_drop(self.future.take(), &self.life.kill, "application task drop");
     }
 }

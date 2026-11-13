@@ -16,7 +16,7 @@ if (parameters.has('unconfirmed')) {
 } else if (parameters.has('rollback')) {
     await start_rejected_worker();
 } else if (parameters.has('configured')) {
-    await start_group_setup_worker();
+    await start_group_setup_worker(parameters.get('mode') || '');
 } else if (parameters.has('fail_setup')) {
     typed_setup_failed();
 } else if (parameters.has('other')) {

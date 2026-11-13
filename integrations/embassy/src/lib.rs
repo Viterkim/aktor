@@ -6,7 +6,7 @@ extern crate std;
 extern crate alloc;
 
 use aktor::*;
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{rc::Rc, string::String, vec::Vec};
 use core::cell::RefCell;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 use embassy_time::Timer;
@@ -27,7 +27,7 @@ pub struct SensorError {
 #[aktor]
 pub async fn record(sensor: &mut Sensor, value: u32) -> ErResult<usize, SensorError> {
     if value == 0 {
-        er_bail!(|_| value);
+        er_bail!(value);
     }
 
     sensor.readings.borrow_mut().push(value);
@@ -99,66 +99,46 @@ async fn setup_driver(driver: aktor::message::LocalFuture<'static, ()>) {
 
 pub fn sensor_setup(
     spawner: embassy_executor::Spawner,
-) -> AktorNew<
-    Sensor,
-    impl core::ops::AsyncFnOnce() -> Result<Sensor, AktorSetupError>,
-    aktor::AktorKind::EmbassyLocal,
-> {
+) -> impl aktor::embassy::AktorDefinition<aktor::embassy::Handle<Sensor, 0, ()>> {
     AktorNew {
-        name: AktorName::new("sensor"),
-        role: AktorNoRole,
+        name: "sensor".into(),
         kind: AktorKind::EmbassyLocal(move |future| {
-            let task = setup_driver(future)
-                .map_err(|_| AktorSetupError::new("no sensor driver slot", ()))?;
+            let task = setup_driver(future).map_err(|_| String::from("no sensor driver slot"))?;
 
             spawner.spawn(task);
             Ok(())
         }),
-        closures: AktorClosures {
-            start: async || {
-                Ok(Sensor {
-                    readings: Rc::new(RefCell::new(Vec::new())),
-                })
-            },
-
-            end: (),
-            intervals: Vec::new(),
-            before_each: None,
-            after_each: None,
+        start: async || {
+            aktor::aktor_ready(Sensor {
+                readings: Rc::new(RefCell::new(Vec::new())),
+            })
         },
-        options: AktorNewOptions { capacity: 32 },
+        end: (),
+        hooks: Default::default(),
+        capacity: 32,
+        stuck: AktorStuck::Kill,
     }
 }
 
 pub fn shared_sensor_setup(
     spawner: embassy_executor::Spawner,
-) -> AktorNew<
-    Sensor,
-    impl core::ops::AsyncFnOnce() -> Result<Sensor, AktorSetupError>,
-    aktor::AktorKind::EmbassyCrossCore,
-> {
+) -> impl aktor::embassy::AktorDefinition<aktor::cross_core::Handle<Sensor>> {
     AktorNew {
-        name: AktorName::new("shared sensor"),
-        role: AktorNoRole,
+        name: "shared sensor".into(),
         kind: AktorKind::EmbassyCrossCore(move |future| {
-            let task = setup_driver(future)
-                .map_err(|_| AktorSetupError::new("no sensor driver slot", ()))?;
+            let task = setup_driver(future).map_err(|_| String::from("no sensor driver slot"))?;
 
             spawner.spawn(task);
             Ok(())
         }),
-        closures: AktorClosures {
-            start: async || {
-                Ok(Sensor {
-                    readings: Rc::new(RefCell::new(Vec::new())),
-                })
-            },
-
-            end: (),
-            intervals: Vec::new(),
-            before_each: None,
-            after_each: None,
+        start: async || {
+            aktor::aktor_ready(Sensor {
+                readings: Rc::new(RefCell::new(Vec::new())),
+            })
         },
-        options: AktorNewOptions { capacity: 1 },
+        end: (),
+        hooks: Default::default(),
+        capacity: 1,
+        stuck: AktorStuck::Kill,
     }
 }

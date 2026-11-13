@@ -4,7 +4,7 @@
     feature = "embassy",
     feature = "browser_local"
 ))]
-use crate::{Timeout, timeout::WaitStatus};
+use crate::{AktorTimeout, timeout::WaitStatus};
 #[cfg(any(
     feature = "embassy",
     all(
@@ -29,15 +29,15 @@ use core::time::Duration;
 ))]
 #[doc(hidden)]
 pub trait AktorClock {
-    fn timeout<F>(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Timeout<F>;
+    fn timeout<F>(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> AktorTimeout<F>;
 }
 
 #[cfg(feature = "tokio")]
 pub struct Tokio;
 #[cfg(feature = "tokio")]
 impl AktorClock for Tokio {
-    fn timeout<F>(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Timeout<F> {
-        Timeout::native(future, duration, status)
+    fn timeout<F>(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> AktorTimeout<F> {
+        AktorTimeout::native(future, duration, status)
     }
 }
 
@@ -45,8 +45,8 @@ impl AktorClock for Tokio {
 pub struct Embassy;
 #[cfg(feature = "embassy")]
 impl AktorClock for Embassy {
-    fn timeout<F>(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Timeout<F> {
-        Timeout::local(future, duration, status)
+    fn timeout<F>(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> AktorTimeout<F> {
+        AktorTimeout::local(future, duration, status)
     }
 }
 
@@ -62,8 +62,8 @@ pub struct Browser;
     target_os = "unknown"
 ))]
 impl AktorClock for Browser {
-    fn timeout<F>(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Timeout<F> {
-        Timeout::browser(future, duration, status)
+    fn timeout<F>(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> AktorTimeout<F> {
+        AktorTimeout::browser(future, duration, status)
     }
 }
 
@@ -128,8 +128,8 @@ impl AktorGroupClock for Browser {
 pub struct Std;
 #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
 impl AktorClock for Std {
-    fn timeout<F>(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Timeout<F> {
-        Timeout::standard(future, duration, status)
+    fn timeout<F>(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> AktorTimeout<F> {
+        AktorTimeout::standard(future, duration, status)
     }
 }
 #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]

@@ -23,7 +23,7 @@ async fn cutoff() {
     .await
     .unwrap();
 
-    let observer = actor.new_controller();
+    let observer = actor.clone();
     let stopping = tokio::spawn(async move { actor.shutdown().await });
 
     cleaned.await.unwrap();
@@ -45,7 +45,6 @@ async fn cutoff() {
 async fn waiting_admission() {
     let (entered, running) = oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
-    let (guard, dropped) = std::sync::mpsc::channel::<()>();
     let (draining, drain_started) = oneshot::channel();
     let (finish, finish_drain) = std::sync::mpsc::channel();
 
@@ -57,12 +56,7 @@ async fn waiting_admission() {
         cleanup: move |state| {
             assert_eq!(state, 2);
 
-            match dropped.recv_timeout(Duration::from_secs(1)) {
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(()),
-                _ => Err(std::io::Error::other(
-                    "queued replacement still owns cleanup guard",
-                )),
-            }
+            Ok::<_, std::io::Error>(())
         },
     })
     .await
@@ -105,42 +99,12 @@ async fn waiting_admission() {
     release.send(()).unwrap();
     drain_started.await.unwrap();
 
-    let mut replacing = Box::pin(actor.replace(move || {
-        drop(guard);
-        panic!("replacement ran after terminal shutdown");
-    }));
-    let _outcome = poll(replacing.as_mut());
-
     finish.send(()).unwrap();
     stopping.await.unwrap();
 
     first.await;
     second.await;
     assert!(AssertUnwindSafe(waiting).catch_unwind().await.is_err());
-    thread.join_async().await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn paused() {
-    let (handle, actor, thread) = spawn(SpawnArgs {
-        name: "shutdown".into(),
-        capacity: 1,
-        failure: FailurePolicy::Abort,
-        setup: || Ok::<_, &'static str>(()),
-        cleanup: |_| Ok::<_, std::io::Error>(()),
-    })
-    .await
-    .unwrap();
-
-    actor.pause().await.unwrap();
-    assert!(
-        call(&handle, |_: &mut (), ()| panic!("paused work ran"), ())
-            .timeout(Duration::from_millis(1))
-            .await
-            .is_err()
-    );
-
-    actor.shutdown().await.unwrap();
     thread.join_async().await.unwrap().unwrap();
 }
 

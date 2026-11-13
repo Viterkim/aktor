@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 #[cfg(feature = "embassy_cross_core")]
 #[tokio::test]
@@ -125,17 +126,13 @@ async fn data() {
     let handle = aktor_start_in(
         &group,
         AktorNew {
-            name: AktorName::new("typed counter"),
-            role: aktors::Users,
+            name: "typed counter".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(17_u32),
-                end: async |_: u32| Err(AktorCleanupError::new("cleanup data", ())),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: Default::default(),
+            start: async || Ok::<_, String>(17_u32),
+            end: async |_: u32| Err(String::from("cleanup data")),
+            hooks: Default::default(),
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         },
     )
     .await
@@ -150,46 +147,42 @@ async fn data() {
     let tree = aktor_start_in(
         &group,
         AktorNew {
-            name: AktorName::new("ordinary cleanup"),
-            role: AktorNoRole,
+            name: "ordinary cleanup".into(),
             kind: AktorKind::StdThread,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(31_u32),
-                end: async |value| {
-                    Err(er::ErTree::new(
-                        CloseErr { value },
-                        [
-                            std::io::Error::other("flush failed"),
-                            std::io::Error::other("journal failed"),
-                        ],
-                    ))
-                    .er_into(|report| report)
-                },
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
+            start: async || Ok::<_, String>(31_u32),
+            end: async |value| {
+                Err(er::ErTree::new(
+                    CloseErr { value },
+                    [
+                        std::io::Error::other("flush failed"),
+                        std::io::Error::other("journal failed"),
+                    ],
+                ))
+                .er_report()
             },
-            options: Default::default(),
+            hooks: Default::default(),
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         },
     )
     .await
     .unwrap();
 
-    let error = handle.shutdown().wait().await.unwrap_err();
+    let (error, _) = handle.shutdown().wait().await.unwrap_err();
 
-    match &error.error {
-        owner::OwnerFailure::Cleanup(errors) => {
+    match &*error {
+        owner::OwnerError::Cleanup(errors) => {
             assert_eq!(errors.errors[0].diagnostics, "cleanup data");
         }
         error => panic!("unexpected completion: {error:?}"),
     }
 
-    let error = tree.shutdown().wait().await.unwrap_err();
+    let (error, report) = tree.shutdown().wait().await.unwrap_err();
 
-    let owner::OwnerFailure::Cleanup(errors) = &error.error else {
+    let owner::OwnerError::Cleanup(errors) = &*error else {
         panic!("cleanup tree was lost: {error}");
     };
-    let diagnostic = &errors.errors[0].diagnostics;
+    let diagnostic = &report;
 
     assert!(diagnostic.contains("journal failed"));
     assert_eq!(
@@ -202,71 +195,51 @@ async fn data() {
     let cleaned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = cleaned.clone();
     let result = aktor_start(AktorSetup {
-        actors: aktor_setups! {
-            ready: AktorNew {
-                name: AktorName::new("ready"),
-                role: AktorNoRole,
+        actors: (
+            AktorNew {
+                name: "ready".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: async move |_: u32| {
-                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Err(AktorCleanupError::new("rollback cleanup refused", ()))
-                    },
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: async || Ok::<_, String>(0_u32),
+                end: async move |_: u32| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(String::from("rollback cleanup refused"))
                 },
-                options: AktorNewOptions { capacity: 32 },
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
-            failed: AktorNew {
-                name: AktorName::new("failed"),
-                role: AktorNoRole,
+            AktorNew {
+                name: "failed".into(),
                 kind: AktorKind::StdThread,
-                closures: AktorClosures {
-                    start: async || {
-                        Err::<u32, _>(AktorSetupError {
-                            diagnostics: "setup data".into(),
-                            data: (),
-                        })
-                    },
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: AktorNewOptions { capacity: 32 },
+                start: async || Err::<u32, _>(String::from("setup data")),
+                end: (),
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
-        },
+        ),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await;
 
-    let failure = result.as_ref().err().unwrap();
+    let (failure, printed) = result.err().unwrap();
     assert_eq!(failure.to_string(), "actor startup failed");
-    let printed = &failure.diagnostics.report;
     assert_eq!(printed.matches("setup data").count(), 1);
     assert_eq!(printed.matches("rollback cleanup refused").count(), 1);
-    assert!(
-        !failure
-            .er_report_string()
-            .contains("rollback cleanup refused")
-    );
-    let tree = er::ErTree::from(result.err().unwrap());
+    assert!(!failure.er_report().contains("rollback cleanup refused"));
+    let tree = er::ErTree::from(failure);
     match tree.top {
-        AktorStartupError {
-            error: AktorStartError::Startup(error),
+        AktorStartError {
+            cause: AktorStartCause::Startup(error),
             report: Some(report),
             ..
         } if matches!(
-            error.error.primary(),
+            error.cause.primary(),
             aktor::listener::DedicatedStartError::Init(_)
         ) =>
         {
-            assert!(!report.timed_out, "{report}");
+            assert!(!report.ran_past_grace, "{report}");
             assert_eq!(
                 report.to_string().matches("setup data").count(),
                 1,
@@ -304,49 +277,37 @@ async fn diagnostic() {
                 let startup = aktor_start(AktorSetup {
                     actors: (
                         AktorNew {
-                            name: AktorName::new("cleanup only"),
-                            role: AktorNoRole,
+                            name: "cleanup only".into(),
                             kind: AktorKind::TokioLocal(&executor),
-                            closures: AktorClosures {
-                                start: async || Ok::<_, AktorSetupError>(()),
-                                end: async |_: ()| {
-                                    Err(AktorCleanupError::new("cleanup refused", ()))
-                                },
-                                intervals: vec![],
-                                before_each: None,
-                                after_each: None,
-                            },
-                            options: AktorNewOptions { capacity: 32 },
+                            start: async || Ok::<_, String>(()),
+                            end: async |_: ()| Err(String::from("cleanup refused")),
+                            hooks: Default::default(),
+                            capacity: 32,
+                            stuck: AktorStuck::Kill,
                         },
                         AktorNew {
-                            name: AktorName::new("sibling"),
-                            role: AktorNoRole,
+                            name: "sibling".into(),
                             kind: AktorKind::TokioLocal(&executor),
-                            closures: AktorClosures {
-                                start: async move || {
-                                    if rollback {
-                                        Err::<(), _>(AktorSetupError::new("setup refused", ()))
-                                    } else {
-                                        Ok(())
-                                    }
-                                },
-                                end: (),
-                                intervals: vec![],
-                                before_each: None,
-                                after_each: None,
+                            start: async move || {
+                                if rollback {
+                                    Err::<(), _>(String::from("setup refused"))
+                                } else {
+                                    Ok(())
+                                }
                             },
-                            options: Default::default(),
+                            end: (),
+                            hooks: Default::default(),
+                            capacity: 32,
+                            stuck: AktorStuck::Kill,
                         },
                     ),
                     shutdown: |_| {},
-                    options: AktorOptions {
-                        shutdown_grace: Duration::from_secs(5),
-                    },
+                    grace: Duration::from_secs(5),
                 })
                 .await;
 
                 let report = if rollback {
-                    *startup.err().unwrap().report.unwrap()
+                    *startup.err().unwrap().0.report.unwrap()
                 } else {
                     startup.unwrap().shutdown().await
                 };
@@ -380,11 +341,11 @@ async fn diagnostic() {
     let mut group = local::AktorGroup::<local::clock::Tokio>::new();
     let mut driver = group.listen().unwrap();
     let _handle = group
-        .spawn::<(), 1, ()>(AktorArgs {
+        .spawn_args::<(), 1, ()>(AktorArgs {
             name: "driven cleanup only".into(),
             capacity: 1,
             setup: async || Ok(()),
-            cleanup: async |_| Err(AktorCleanupError::new("cleanup refused", ())),
+            cleanup: async |_| Err(AktorError::new("cleanup refused", ())),
         })
         .unwrap();
 
@@ -411,17 +372,17 @@ async fn local_data() {
     async fn ready<E>(
         handle: &local::Handle<(), 1, E>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        handle.ready().await?;
+        handle.ready().await.map_err(|(error, _)| error)?;
         Ok(())
     }
 
     async fn completion<E>(completion: &local::Completion<E>) -> er::ErTest {
-        completion.await?;
+        er::ErTestExt::er_test(completion.await)?;
         Ok(())
     }
 
     async fn owned_completion<E: 'static>(completion: local::Completion<E>) -> er::ErTest {
-        completion.await?;
+        er::ErTestExt::er_test(completion.await)?;
         Ok(())
     }
 
@@ -436,7 +397,7 @@ async fn local_data() {
             owner
                 .run_with(
                     async move || {
-                        Err(AktorSetupError {
+                        Err(AktorError {
                             diagnostics: "local data".into(),
                             data,
                         })
@@ -447,7 +408,7 @@ async fn local_data() {
         } else {
             owner
                 .run((), async move |_| {
-                    Err(AktorCleanupError {
+                    Err(AktorError {
                         diagnostics: "local data".into(),
                         data,
                     })
@@ -455,33 +416,34 @@ async fn local_data() {
                 .await
         };
 
-        let error: Box<dyn Error + Send + Sync> = result.unwrap_err().into();
-        assert!(!error.er_report_string().contains("local data"));
+        let (error, report) = result.unwrap_err();
+        let error: Box<dyn Error + Send + Sync> = error.into();
+        assert!(!error.er_report().contains("local data"));
         assert!(completion(&completed).await.is_err());
-        assert!(owned_completion(completed.new_observer()).await.is_err());
+        assert!(owned_completion(completed.clone()).await.is_err());
 
-        let typed = completed.wait_with_data().await.unwrap_err();
-        let observed = completed.new_observer().wait_with_data().await.unwrap_err();
-        assert!(Rc::ptr_eq(&typed.error, &observed.error));
+        let (typed, _) = completed.wait_with_data().await.unwrap_err();
+        let (observed, _) = completed.clone().wait_with_data().await.unwrap_err();
+        assert!(Rc::ptr_eq(&typed.cause, &observed.cause));
         let local_report: Box<dyn Error> = typed.clone().into();
-        assert!(!local_report.er_report_string().contains("local data"));
-        let data = match &*typed.error {
-            local::OwnerFailure::Setup(error) | local::OwnerFailure::Cleanup(error) => &error.data,
+        assert!(!local_report.er_report().contains("local data"));
+        let data = match &*typed.cause {
+            local::OwnerError::Setup(error) | local::OwnerError::Cleanup(error) => &error.data,
             error => panic!("unexpected lifecycle error: {error}"),
         };
         assert!(Rc::ptr_eq(&data.0, &value));
 
         if setup_failure {
             assert!(ready(&handle).await.is_err());
-            let ready = handle.ready_with_data().await.unwrap_err();
-            assert!(Rc::ptr_eq(&ready.error, &typed.error));
+            let (ready, _) = handle.ready_with_data().await.unwrap_err();
+            assert!(Rc::ptr_eq(&ready.cause, &typed.cause));
         } else {
             ready(&handle).await.unwrap();
         }
 
         drop((typed, observed, local_report, completed, handle));
         assert!(
-            std::thread::spawn(move || format!("{error:#}"))
+            std::thread::spawn(move || report)
                 .join()
                 .unwrap()
                 .contains("local data")
@@ -491,24 +453,24 @@ async fn local_data() {
     let data = Cell::new(13);
     let (handle, owner) = local::channel::<(), 1, &Cell<u32>>().unwrap();
     let completed = owner.completion();
-    let error = owner
+    let (_, report) = owner
         .run_with(
-            async || Err(AktorSetupError::new("borrowed setup data", &data)),
+            async || Err(AktorError::new("borrowed setup data", &data)),
             async |_| Ok(()),
         )
         .await
         .unwrap_err();
 
     assert!(ready(&handle).await.is_err());
-    let typed = completed.wait_with_data().await.unwrap_err();
-    match &*typed.error {
-        local::OwnerFailure::Setup(error) => assert!(std::ptr::eq(error.data, &data)),
+    let (typed, _) = completed.wait_with_data().await.unwrap_err();
+    match &*typed.cause {
+        local::OwnerError::Setup(error) => assert!(std::ptr::eq(error.data, &data)),
         error => panic!("unexpected lifecycle error: {error}"),
     }
 
     drop((typed, completed, handle));
     assert!(
-        std::thread::spawn(move || format!("{error:#}"))
+        std::thread::spawn(move || report)
             .join()
             .unwrap()
             .contains("borrowed setup data")
@@ -518,7 +480,7 @@ async fn local_data() {
 #[cfg(feature = "local")]
 #[tokio::test]
 async fn initialization() {
-    use er::ErErrorPresentationExt;
+    use er::ErErrorContextExt;
     use futures_util::FutureExt;
     use std::{cell::Cell, panic::AssertUnwindSafe, rc::Rc};
 
@@ -528,43 +490,35 @@ async fn initialization() {
         .run_until(async {
             let cleaned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let count = cleaned.clone();
-            let failed = aktor_start(AktorSetup {
+            let (failed, failed_report) = aktor_start(AktorSetup {
                 actors: (
                     AktorNew {
-                        name: AktorName::new("ready sibling"),
-                        role: AktorNoRole,
+                        name: "ready sibling".into(),
                         kind: AktorKind::TokioLocal(&executor),
-                        closures: AktorClosures {
-                            start: async || Ok::<_, AktorSetupError>(()),
-                            end: async move |_| {
-                                tokio::task::yield_now().await;
-                                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                Ok::<_, AktorCleanupError>(())
-                            },
-                            intervals: vec![],
-                            before_each: None,
-                            after_each: None,
+                        start: async || Ok::<_, String>(()),
+                        end: async move |_| {
+                            tokio::task::yield_now().await;
+                            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok::<_, String>(())
                         },
-                        options: Default::default(),
+                        hooks: Default::default(),
+                        capacity: 32,
+                        stuck: AktorStuck::Kill,
                     },
                     AktorNew {
-                        name: AktorName::new("panicked setup"),
-                        role: AktorNoRole,
+                        name: "panicked setup".into(),
                         kind: AktorKind::TokioLocal(&executor),
-                        closures: AktorClosures {
-                            start: async || -> Result<(), AktorSetupError> {
-                                panic!("local initialization sentinel")
-                            },
-                            end: (),
-                            intervals: vec![],
-                            before_each: None,
-                            after_each: None,
+                        start: async || -> Result<(), String> {
+                            panic!("local initialization sentinel")
                         },
-                        options: Default::default(),
+                        end: (),
+                        hooks: Default::default(),
+                        capacity: 32,
+                        stuck: AktorStuck::Kill,
                     },
                 ),
                 shutdown: |_| {},
-                options: Default::default(),
+                grace: Duration::from_secs(5),
             })
             .await
             .err()
@@ -572,20 +526,22 @@ async fn initialization() {
 
             assert_eq!(cleaned.load(std::sync::atomic::Ordering::SeqCst), 1);
             assert_eq!(
-                format!("{failed:#}")
+                failed_report
                     .matches("local initialization sentinel")
                     .count(),
                 1,
-                "{failed:#}"
+                "{failed_report}"
             );
+            assert!(!failed_report.contains("before cleanup completed"));
+
+            let wrapped = (failed, failed_report).er(|| std::fmt::Error);
             assert_eq!(
-                failed
-                    .er_report_string()
+                wrapped
+                    .er_report()
                     .matches("local initialization sentinel")
                     .count(),
-                0
+                1
             );
-            assert!(!format!("{failed:#}").contains("before cleanup completed"));
         })
         .await;
 
@@ -607,9 +563,7 @@ async fn initialization() {
         std::hint::black_box(&hook);
     }));
     let result = AssertUnwindSafe(owner.run_with(
-        async || -> Result<(), AktorSetupError<String>> {
-            panic!("retained initialization sentinel")
-        },
+        async || -> Result<(), AktorError<String>> { panic!("retained initialization sentinel") },
         async move |_| {
             std::hint::black_box(&cleanup);
             Ok(())
@@ -619,15 +573,13 @@ async fn initialization() {
     .await;
 
     assert!(result.is_err());
-    let ready = handle.ready_with_data().await.unwrap_err();
-    let completed = completion.wait_with_data().await.unwrap_err();
+    let (ready, _) = handle.ready_with_data().await.unwrap_err();
+    let (completed, _) = completion.wait_with_data().await.unwrap_err();
 
     assert_eq!(disposed.get(), 2);
-    assert!(Rc::ptr_eq(&ready.error, &completed.error));
-    assert!(
-        matches!(&*ready.error, local::OwnerFailure::SetupPanic(error)
-        if error.diagnostics == "retained initialization sentinel")
-    );
+    assert!(Rc::ptr_eq(&ready.cause, &completed.cause));
+    assert!(matches!(&*ready.cause, local::OwnerError::SetupPanic(error)
+        if error.diagnostics == "retained initialization sentinel"));
 
     let (handle, owner) = local::channel::<(), 1, String>().unwrap();
     let completion = owner.completion();
@@ -635,16 +587,10 @@ async fn initialization() {
     drop(owner);
     assert!(matches!(
         handle.ready().await,
-        Err(local::OwnerError {
-            error: local::OwnerFailure::Cancelled,
-            ..
-        })
+        Err((local::OwnerError::Cancelled, _))
     ));
     assert!(matches!(
         completion.wait().await,
-        Err(local::OwnerError {
-            error: local::OwnerFailure::Cancelled,
-            ..
-        })
+        Err((local::OwnerError::Cancelled, _))
     ));
 }

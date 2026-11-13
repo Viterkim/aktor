@@ -1,15 +1,24 @@
 use super::*;
 use crate::{
-    Timeout,
+    AktorTimeout,
     dispatch::Queued,
     message::{CallError, Reply, Request},
 };
 use core::time::Duration;
 
 impl<'a, T, I, S: 'static, O, L> Call<T, I, Request<'a, S, O>, L> {
-    /// Wait for admission and return a refusal without waiting for cleanup.
+    /// Wait for the call to enter the queue and return a reply to await later. If
+    /// admission fails, return the error. Use `receive_settled()` on the reply to
+    /// get the outcome during cleanup.
     pub async fn admit(self) -> Result<Reply<O>, CallError> {
         self.into_request().admit().await
+    }
+
+    /// If the queue has closed, return `NotAdmitted`. Once admitted, wait for the
+    /// call's outcome through shutdown. Use [`admit`](Self::admit) to keep the reply
+    /// and [`receive_settled`](Reply::receive_settled) later.
+    pub async fn settle(self) -> Result<O, CallError> {
+        self.admit().await?.receive_settled().await
     }
 
     pub fn operation(mut self, operation: Operation) -> Self {
@@ -26,9 +35,18 @@ impl<'a, T, I, S: 'static, O: Send + 'static, Role, L> Call<T, I, Queued<'a, S, 
 where
     I: Send + 'static,
 {
-    /// Wait for admission and return a refusal without waiting for cleanup.
+    /// Wait for the call to enter the queue and return a reply to await later. If
+    /// admission fails, return the error. Use `receive_settled()` on the reply to
+    /// get the outcome during cleanup.
     pub async fn admit(self) -> Result<Reply<O>, CallError> {
         self.into_request().into_request().admit().await
+    }
+
+    /// If the queue has closed, return `NotAdmitted`. Once admitted, wait for the
+    /// call's outcome through shutdown. Use [`admit`](Self::admit) to keep the reply
+    /// and [`receive_settled`](Reply::receive_settled) later.
+    pub async fn settle(self) -> Result<O, CallError> {
+        self.admit().await?.receive_settled().await
     }
 
     pub fn operation(mut self, operation: Operation) -> Self {
@@ -50,7 +68,7 @@ impl<'a, S: 'static, O> SendRequest for Request<'a, S, O> {
     }
 }
 impl<'a, S: 'static, O> TimeoutRequest for Request<'a, S, O> {
-    type Timed = crate::Timeout<Self>;
+    type Timed = crate::AktorTimeout<Self>;
 
     fn timeout(self, duration: Duration) -> Self::Timed {
         self.timeout(duration)
@@ -76,7 +94,7 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> SendRequest
 impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> TimeoutRequest
     for Queued<'a, S, I, O, Role>
 {
-    type Timed = Timeout<Request<'a, S, O>>;
+    type Timed = AktorTimeout<Request<'a, S, O>>;
 
     fn timeout(self, duration: Duration) -> Self::Timed {
         self.timeout(duration)

@@ -21,13 +21,16 @@ impl Event {
     }
 
     pub fn notify(&self) {
-        let wakers: Vec<_> = self
-            .waiters
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter_map(|waiter| waiter.borrow_mut().take())
-            .collect();
+        let (first, rest) = {
+            let waiters = self.waiters.borrow();
+            let mut ready = waiters
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter_map(|waiter| waiter.borrow_mut().take());
+
+            (ready.next(), ready.collect::<Vec<_>>())
+        };
+        let wakers = first.into_iter().chain(rest);
 
         #[cfg(feature = "std")]
         if let Some(payload) = super::panic::capture_each(wakers, Waker::wake, |_| {}) {
@@ -46,8 +49,7 @@ pub struct Listener<'a> {
 }
 impl Listener<'_> {
     pub fn register(&self, context: &Context<'_>) {
-        let old = self.waker.replace(Some(context.waker().clone()));
-        drop(old);
+        register(&self.waker, context.waker());
     }
 }
 impl Drop for Listener<'_> {
@@ -59,4 +61,18 @@ impl Drop for Listener<'_> {
             .borrow_mut()
             .retain(|waiter| !waiter.ptr_eq(&weak));
     }
+}
+
+pub fn register(slot: &RefCell<Option<Waker>>, wake: &Waker) -> bool {
+    if slot
+        .borrow()
+        .as_ref()
+        .is_some_and(|old| old.will_wake(wake))
+    {
+        return false;
+    }
+
+    let old = slot.replace(Some(wake.clone()));
+    drop(old);
+    true
 }

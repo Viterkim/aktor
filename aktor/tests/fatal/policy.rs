@@ -13,7 +13,7 @@ async fn abort() {
 
     executor
         .run_until(async {
-            if let Ok(case) = std::env::var("AKTOR_CHILD") {
+            if let Ok(case) = std::env::var("AKTOR_TEST_CASE") {
                 match case.as_str() {
                     "dedicated" => {
                         let (handle, _, thread) = spawn(SpawnArgs {
@@ -37,8 +37,9 @@ async fn abort() {
                     "hook" | "payload" => {
                         let (handle, mut listener) = channel::<usize>(1).unwrap();
 
+                        let held = (case == "payload").then(|| Bomb);
                         listener.failure = FailurePolicy::shutdown(move |_| {
-                            if case == "payload" {
+                            if held.is_some() {
                                 std::panic::panic_any(Bomb);
                             }
 
@@ -49,9 +50,9 @@ async fn abort() {
 
                         crash(&handle).cast().await;
 
-                        let _result = task.await;
-
-                        eprintln!("state cleaned");
+                        let failure = task.await.unwrap_err().into_panic();
+                        assert_eq!(failure.downcast_ref::<&str>(), Some(&"operation failed"));
+                        return;
                     }
 
                     "task" | "cancel" | "unpolled" => {
@@ -73,7 +74,7 @@ async fn abort() {
 
                         let _result = task.await;
                     }
-                    _ => panic!("unknown child case"),
+                    _ => panic!("unknown test case"),
                 }
 
                 eprintln!("FORBIDDEN_FALLBACK");
@@ -81,14 +82,20 @@ async fn abort() {
             }
 
             for case in ["dedicated", "task", "cancel", "unpolled", "hook", "payload"] {
-                let output = support::child("policy::abort", case);
+                let output = support::run_test("policy::abort", case);
                 let stderr = String::from_utf8_lossy(&output.stderr);
 
-                assert!(!stderr.contains("FORBIDDEN_FALLBACK"), "{case}: {stderr}");
-
-                if case != "hook" && case != "payload" {
-                    assert!(stderr.contains("state cleaned"), "{case}: {stderr}");
+                if matches!(case, "hook" | "payload") {
+                    assert!(output.status.success(), "{case}: {stderr}");
+                    assert!(
+                        stderr.contains("shutdown hook panicked:"),
+                        "{case}: {stderr}"
+                    );
+                    continue;
                 }
+
+                assert!(!stderr.contains("FORBIDDEN_FALLBACK"), "{case}: {stderr}");
+                assert!(stderr.contains("state cleaned"), "{case}: {stderr}");
 
                 #[cfg(unix)]
                 {
@@ -99,7 +106,7 @@ async fn abort() {
                 assert!(stderr.contains("actor "), "{case}: {stderr}");
 
                 if case == "cancel" || case == "unpolled" {
-                    assert!(stderr.contains("Cancelled"), "{stderr}");
+                    assert!(stderr.contains("during cancel"), "{stderr}");
                 }
 
                 assert!(!output.status.success(), "{case}: {stderr}");
@@ -117,7 +124,7 @@ impl Drop for Bomb {
 
 #[tokio::test]
 async fn discard() {
-    if let Ok(case) = std::env::var("AKTOR_CHILD") {
+    if let Ok(case) = std::env::var("AKTOR_TEST_CASE") {
         let failure = if case == "hook" {
             FailurePolicy::shutdown(|_| eprintln!("HOOK_RAN"))
         } else {
@@ -163,7 +170,7 @@ async fn discard() {
     }
 
     for case in ["abort", "hook"] {
-        let output = support::child("policy::discard", case);
+        let output = support::run_test("policy::discard", case);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if case == "hook" {

@@ -1,66 +1,83 @@
 use super::*;
 
+#[cfg(feature = "std_thread")]
+#[test]
+fn mixed_group_runtime() {
+    use aktor::{AktorKind, AktorNew, AktorSetup, AktorStuck, aktor_ready, aktor_start};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let actors = runtime
+        .block_on(aktor_start(AktorSetup {
+            actors: (
+                AktorNew {
+                    name: "standard".into(),
+                    kind: AktorKind::StdThread,
+                    start: async || aktor_ready(()),
+                    end: (),
+                    hooks: Default::default(),
+                    capacity: 1,
+                    stuck: AktorStuck::Kill,
+                },
+                AktorNew {
+                    name: "tokio".into(),
+                    kind: AktorKind::TokioThread,
+                    start: async || aktor_ready(()),
+                    end: (),
+                    hooks: Default::default(),
+                    capacity: 1,
+                    stuck: AktorStuck::Kill,
+                },
+            ),
+            shutdown: |_| {},
+            grace: Duration::from_secs(1),
+        }))
+        .unwrap();
+
+    drop(runtime);
+
+    assert!(actors.group.spawner(false).is_ok());
+}
+
 #[tokio::test]
 async fn startup_failure() {
     let cleaned = Arc::new(AtomicBool::new(false));
     let closed = cleaned.clone();
-    let result = AktorGroup::new()
-        .run(
-            async |app| -> Result<(), AktorError> {
-                let _first = app
-                    .spawn(AktorArgs {
-                        name: "opened resource".into(),
-                        capacity: 1,
-                        setup: || Ok::<_, AktorError>(()),
-                        cleanup: move |_| {
-                            closed.store(true, Ordering::SeqCst);
-                            Ok::<_, AktorError>(())
-                        },
-                    })
-                    .await
-                    .map_err(|error| AktorError {
-                        diagnostics: error.to_string(),
-                        data: (),
-                    })?;
+    let mut group = AktorGroup::new();
+    let completed = group.start().unwrap();
 
-                let _second = app
-                    .spawn(AktorArgs {
-                        name: "failed setup".into(),
-                        capacity: 1,
-                        setup: || {
-                            Err::<(), _>(AktorError {
-                                diagnostics: "setup went wrong".into(),
-                                data: (),
-                            })
-                        },
-                        cleanup: |_| Ok::<_, AktorError>(()),
-                    })
-                    .await
-                    .map_err(|error| AktorError {
-                        diagnostics: error.to_string(),
-                        data: (),
-                    })?;
-
-                Ok(())
+    group
+        .spawn_args(AktorArgs {
+            name: "opened resource".into(),
+            capacity: 1,
+            setup: || Ok::<_, String>(()),
+            cleanup: move |_| {
+                closed.store(true, Ordering::SeqCst);
+                Ok::<_, String>(())
             },
-            async |_| Ok::<_, AktorError>(()),
-        )
+        })
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert!(result.report.startup);
+    let failed = group
+        .spawn_args(AktorArgs {
+            name: "failed setup".into(),
+            capacity: 1,
+            setup: || Err::<(), _>(String::from("setup went wrong")),
+            cleanup: |_| Ok::<_, String>(()),
+        })
+        .await;
+
+    assert!(failed.is_err());
+
+    let report = completed.wait().await;
+
+    assert!(report.startup);
     assert!(cleaned.load(Ordering::SeqCst));
-    let failure = result.report.failure.as_ref().unwrap();
-
-    assert_eq!(failure.phase, "setup");
-    assert_eq!(
-        result
-            .diagnostics
-            .report
-            .matches("setup went wrong")
-            .count(),
-        1
-    );
+    assert_eq!(report.failure.as_ref().unwrap().phase, "setup");
+    assert_eq!(report.to_string().matches("setup went wrong").count(), 1);
 }
 
 struct ReleaseOnDrop(Arc<Notify>);
@@ -74,7 +91,7 @@ impl Drop for ReleaseOnDrop {
 #[tokio::test]
 async fn cancelled_startup() {
     for setup_fails in [true, false] {
-        let group = AktorGroup::with_grace(Duration::from_secs(1));
+        let mut group = AktorGroup::with_grace(Duration::from_secs(1));
         let kill = group.killswitch();
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -85,39 +102,39 @@ async fn cancelled_startup() {
             kill.stop();
         });
 
-        let result = group
-            .run(
-                async move |app| -> Result<(), AktorError> {
-                    let _release = ReleaseOnDrop(release);
-                    let _owner = app
-                        .spawn_async(AktorArgs {
-                            name: "cancelled startup".into(),
-                            capacity: 1,
-                            setup: async move || {
-                                inside.notify_one();
-                                setup_release.notified().await;
+        let completed = group.start().unwrap();
+        let killswitch = group.killswitch();
 
-                                if setup_fails {
-                                    Err(AktorError::new("late setup error", ()))
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            cleanup: async |_| Err(AktorError::new("late cleanup error", ())),
-                        })
-                        .await
-                        .unwrap();
+        killswitch
+            .run(async move {
+                let _release = ReleaseOnDrop(release);
+                group
+                    .spawn_async(AktorArgs {
+                        name: "cancelled startup".into(),
+                        capacity: 1,
+                        setup: async move || {
+                            inside.notify_one();
+                            setup_release.notified().await;
 
-                    Ok(())
-                },
-                async |_| Ok::<_, AktorError>(()),
-            )
-            .await
-            .unwrap_err();
+                            if setup_fails {
+                                Err(String::from("late setup error"))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                        cleanup: async |_| Err(String::from("late cleanup error")),
+                    })
+                    .await
+                    .unwrap();
+            })
+            .await;
+        killswitch.stop();
+
+        let result = completed.wait().await;
 
         trigger.await.unwrap();
 
-        assert!(!result.report.timed_out);
+        assert!(!result.ran_past_grace);
 
         let expected = if setup_fails {
             "late setup error"
@@ -125,22 +142,12 @@ async fn cancelled_startup() {
             "late cleanup error"
         };
 
-        let failure = result.report.failure.as_ref().unwrap();
+        let failure = result.failure.as_ref().unwrap();
 
         assert_eq!(failure.phase, if setup_fails { "setup" } else { "cleanup" });
-        assert_eq!(result.diagnostics.report.matches(expected).count(), 1);
+        assert_eq!(result.to_string().matches(expected).count(), 1);
 
-        if setup_fails {
-            assert!(result.report.actors[0].diagnostics.is_empty());
-            assert!(failure.message.contains(expected));
-        } else {
-            assert!(
-                result.report.actors[0]
-                    .diagnostics
-                    .iter()
-                    .any(|error| error.diagnostics.contains(expected))
-            );
-        }
+        assert_eq!(failure.message, expected);
     }
 }
 
@@ -157,23 +164,19 @@ async fn startup() {
         let closing = actors
             .start_with(async move |_| {
                 hook_count.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, AktorError>(())
+                Ok::<_, String>(())
             })
             .unwrap();
 
-        assert!(
-            actors
-                .start_with(async |_| Ok::<_, AktorError>(()))
-                .is_err()
-        );
+        assert!(actors.start_with(async |_| Ok::<_, String>(())).is_err());
 
-        let setup = || Ok::<_, AktorError>(0usize);
+        let setup = || Ok::<_, String>(0usize);
         let cleanup = move |_| {
             cleanup.store(true, Ordering::SeqCst);
-            Ok::<_, AktorError>(())
+            Ok::<_, String>(())
         };
         let database = actors
-            .spawn(AktorArgs::new("database", setup, cleanup))
+            .spawn_args(AktorArgs::new("database", setup, cleanup))
             .await
             .unwrap();
         let caller_kill = kill.clone();
@@ -191,9 +194,8 @@ async fn startup() {
                         caller_started.notify_one();
                         call(&database.handle, |_, ()| panic!("storage died"), ()).await;
                     } else {
-                        database.control.pause().await.unwrap();
                         caller_started.notify_one();
-                        call(&database.handle, |_, ()| (), ()).await;
+                        core::future::pending::<()>().await;
                     }
                 } => panic!("caller continued after permanent loss"),
             }
@@ -231,16 +233,19 @@ async fn startup() {
 
         assert!(matches!(
             actors
-                .spawn(AktorArgs::new(
+                .spawn_args(AktorArgs::new(
                     "late",
-                    || Ok::<_, AktorError>(()),
-                    |_| Ok::<_, AktorError>(())
+                    || Ok::<_, String>(()),
+                    |_| Ok::<_, String>(())
                 ))
                 .await,
-            Err(aktor::owner::StartError {
-                error: aktor::listener::DedicatedStartError::Closed,
-                ..
-            })
+            Err((
+                aktor::owner::StartError {
+                    kind: AktorStartKind::Stopping,
+                    ..
+                },
+                _
+            ))
         ));
     }
 }
@@ -256,48 +261,6 @@ async fn default_group() {
     assert!(!(&closing).await.failed());
     assert_eq!(closing.await.to_string(), shutdown.await.to_string());
     assert!(actor.completion().wait().await.is_ok());
-
-    let count = std::rc::Rc::new(std::cell::Cell::new(0));
-
-    AktorGroup::new()
-        .run(
-            async |_| Ok::<_, AktorError>(()),
-            |_| count.set(count.get() + 1),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(count.get(), 1);
-}
-
-#[tokio::test]
-async fn application_creation() {
-    use futures_util::FutureExt;
-    use std::{future::Ready, panic::AssertUnwindSafe};
-
-    fn application(_: &mut AktorGroup) -> Ready<Result<(), AktorError>> {
-        panic!("application creation failed");
-    }
-
-    let group = AktorGroup::new();
-    let completed = group.completion();
-    let cleanup = Arc::new(AtomicBool::new(false));
-    let cleaned = cleanup.clone();
-    let result = AssertUnwindSafe(group.run(application, async move |_| {
-        cleaned.store(true, Ordering::SeqCst);
-        Ok::<_, AktorError>(())
-    }))
-    .catch_unwind()
-    .await;
-
-    let report = completed.wait().await;
-
-    assert!(result.is_ok(), "application creation escaped run()");
-    assert_eq!(
-        report.failure.unwrap().message,
-        "application creation failed"
-    );
-    assert!(cleanup.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -308,19 +271,19 @@ async fn startup_rollback() {
     let closing = actors
         .start_with(async move |_| {
             hook.store(true, Ordering::SeqCst);
-            Ok::<_, AktorError>(())
+            Ok::<_, String>(())
         })
         .unwrap();
 
     let cleaned = Arc::new(AtomicBool::new(false));
     let cleanup = cleaned.clone();
     let _sibling = actors
-        .spawn(AktorArgs::new(
+        .spawn_args(AktorArgs::new(
             "audio",
-            || Ok::<_, AktorError>(()),
+            || Ok::<_, String>(()),
             move |_| {
                 cleanup.store(true, Ordering::SeqCst);
-                Err(AktorError::new("audio cleanup failed", ()))
+                Err(String::from("audio cleanup failed"))
             },
         ))
         .await
@@ -328,37 +291,29 @@ async fn startup_rollback() {
 
     let startup = tokio::spawn(async move {
         actors
-            .spawn(AktorArgs::new(
+            .spawn_args(AktorArgs::new(
                 "storage",
-                || {
-                    Err::<(), _>(AktorError {
-                        diagnostics: "could not open".into(),
-                        data: (),
-                    })
-                },
-                |_| Ok::<_, AktorError>(()),
+                || Err::<(), _>(String::from("could not open")),
+                |_| Ok::<_, String>(()),
             ))
             .await?;
-        Ok::<_, aktor::owner::StartError>(())
+        Ok::<_, (aktor::owner::StartError, String)>(())
     });
 
-    let failed = tokio::time::timeout(Duration::from_secs(2), startup)
+    let (failed, diagnostics) = tokio::time::timeout(Duration::from_secs(2), startup)
         .await
         .unwrap()
         .unwrap()
         .unwrap_err();
 
-    let aktor::listener::DedicatedStartError::Init(error) = failed.error.primary() else {
+    let aktor::listener::DedicatedStartError::Init(error) = failed.cause.primary() else {
         panic!("typed setup error was lost");
     };
 
     assert_eq!(error.diagnostics, "could not open");
 
-    let tree = ErTree::from(failed);
-    let diagnostic = tree.er_find::<aktor::AktorDiagnostic>().unwrap();
-
     for message in ["could not open", "audio cleanup failed"] {
-        assert_eq!(diagnostic.report.matches(message).count(), 1);
+        assert_eq!(diagnostics.matches(message).count(), 1);
     }
 
     assert!(cleaned.load(Ordering::SeqCst));
@@ -374,9 +329,7 @@ async fn listener_cancel() {
     for setup_fails in [false, true] {
         let mut actors = AktorGroup::new();
         let kill = actors.killswitch();
-        let closing = actors
-            .start_with(async |_| Ok::<_, AktorError>(()))
-            .unwrap();
+        let closing = actors.start_with(async |_| Ok::<_, String>(())).unwrap();
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let setup_entered = entered.clone();
@@ -390,12 +343,12 @@ async fn listener_cancel() {
                         setup_release.notified().await;
 
                         if setup_fails {
-                            Err(AktorError::new("late setup failed", ()))
+                            Err(String::from("late setup failed"))
                         } else {
                             Ok(())
                         }
                     },
-                    async |_| Err::<(), _>(AktorError::new("late cleanup failed", ())),
+                    async |_| Err::<(), _>(String::from("late cleanup failed")),
                 ))
                 .await
         });
@@ -418,25 +371,8 @@ async fn listener_cancel() {
         assert!(report.failed());
 
         let failure = report.failure.as_ref().unwrap();
-        let actor = report
-            .actors
-            .iter()
-            .find(|actor| actor.actor == "storage")
-            .unwrap();
-
         assert_eq!(failure.phase, if setup_fails { "setup" } else { "cleanup" });
         assert_eq!(report.to_string().matches(expected).count(), 1);
-
-        if setup_fails {
-            assert!(actor.diagnostics.is_empty());
-            assert!(failure.message.contains(expected));
-        } else {
-            assert!(
-                actor
-                    .diagnostics
-                    .iter()
-                    .any(|error| error.diagnostics.contains(expected))
-            );
-        }
+        assert_eq!(failure.message, expected);
     }
 }

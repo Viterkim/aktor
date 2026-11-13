@@ -1,8 +1,8 @@
 use super::*;
 use core::task::{Context, Poll};
 
-impl<Setup: AktorStart<Mode>, Mode> AktorStartup<Setup, Mode> {
-    pub fn killswitch(&self) -> <Setup::Group as AktorSetupGroup>::KillSwitch {
+impl<Setup: AktorStart> AktorStartup<Setup> {
+    pub fn killswitch(&self) -> <Setup::Group as AktorSetupGroup>::AktorKillSwitch {
         self.killswitch.clone()
     }
 
@@ -10,17 +10,19 @@ impl<Setup: AktorStart<Mode>, Mode> AktorStartup<Setup, Mode> {
         self.completion.clone()
     }
 
-    fn closing(&mut self, error: AktorStartError) {
+    fn closing(&mut self, error: AktorStartError<Setup::Error>) {
         self.failure = Some(Box::new(error));
 
         if let Some(group) = &self.group {
             Setup::Group::set_starting(&self.killswitch, true);
             Setup::Group::stop(&self.killswitch);
-            self.shutdown = Some(Box::pin(group.closing()));
+            self.shutdown = Some(Box::pin(core::future::IntoFuture::into_future(
+                group.completion(),
+            )));
         }
     }
 }
-impl<Setup: AktorStart<Mode>, Mode> Drop for AktorStartup<Setup, Mode> {
+impl<Setup: AktorStart> Drop for AktorStartup<Setup> {
     fn drop(&mut self) {
         if self.group.is_some() {
             Setup::Group::set_starting(&self.killswitch, true);
@@ -28,8 +30,9 @@ impl<Setup: AktorStart<Mode>, Mode> Drop for AktorStartup<Setup, Mode> {
         }
     }
 }
-impl<Setup: AktorStart<Mode>, Mode> Future for AktorStartup<Setup, Mode> {
-    type Output = Result<AktorStarted<Setup::Handles, Setup::Group>, AktorStartupError>;
+impl<Setup: AktorStart> Future for AktorStartup<Setup> {
+    type Output =
+        Result<AktorStarted<Setup::Handles, Setup::Group>, (AktorStartError<Setup::Error>, String)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -40,7 +43,7 @@ impl<Setup: AktorStart<Mode>, Mode> Future for AktorStartup<Setup, Mode> {
             let begun = if this.begin {
                 setup.begin(group)
             } else {
-                group.check_started()
+                Ok(())
             };
 
             match begun {
@@ -49,7 +52,7 @@ impl<Setup: AktorStart<Mode>, Mode> Future for AktorStartup<Setup, Mode> {
                         group: group.registration(),
                     })));
                 }
-                Err(error) => this.closing(error.into()),
+                Err(error) => this.closing(AktorStartError::not_run(error)),
             }
         }
 
@@ -71,9 +74,7 @@ impl<Setup: AktorStart<Mode>, Mode> Future for AktorStartup<Setup, Mode> {
 
                     if !initialized {
                         drop(handles);
-                        this.closing(
-                            AktorSetupError::new("actor group stopped during startup", ()).into(),
-                        );
+                        this.closing(AktorGroupError::Stopping.into());
                     } else if let Some(group) = this.group.take() {
                         return Poll::Ready(Ok(AktorStarted { handles, group }));
                     }
@@ -91,12 +92,11 @@ impl<Setup: AktorStart<Mode>, Mode> Future for AktorStartup<Setup, Mode> {
             this.shutdown = None;
 
             if let Some(error) = this.failure.take() {
-                let diagnostics = Setup::diagnostics(&error);
-                let source_is_failure = Setup::source_is_setup(&error)
+                let diagnostics = Setup::diagnostics(&error.cause);
+                let source_is_failure = Setup::source_is_setup(&error.cause)
                     && Setup::Group::source_is_failure(&this.killswitch);
 
-                return Poll::Ready(Err(AktorStartupError::from_failure(
-                    *error,
+                return Poll::Ready(Err(error.with_report(
                     diagnostics,
                     Some(Box::new(report)),
                     source_is_failure,
@@ -104,8 +104,11 @@ impl<Setup: AktorStart<Mode>, Mode> Future for AktorStartup<Setup, Mode> {
             }
         }
 
-        Poll::Ready(Err(AktorStartupError::from_failure(
-            AktorSetupError::new("actor startup was polled after completion", ()).into(),
+        Poll::Ready(Err(AktorStartError::from(AktorError::new(
+            "actor startup was polled after completion",
+            (),
+        ))
+        .with_report(
             "actor startup was polled after completion".into(),
             None,
             false,

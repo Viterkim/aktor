@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 #[tokio::test]
 async fn stopping() {
@@ -18,7 +19,7 @@ async fn stopping() {
             let owner = group
                 .spawn_async(AktorArgs::new(
                     "closing admission",
-                    async || Ok::<_, AktorSetupError>(()),
+                    async || Ok::<_, String>(()),
                     move |_| {
                         let entered = entered.clone();
                         let release = release.clone();
@@ -28,7 +29,7 @@ async fn stopping() {
                             release.notified().await;
 
                             if cleanup_fails {
-                                Err(AktorCleanupError::new("real cleanup failure", ()))
+                                Err(String::from("real cleanup failure"))
                             } else {
                                 Ok(())
                             }
@@ -86,31 +87,25 @@ async fn local_stopping() {
                     let released = release.clone();
                     let actors = aktor_start(AktorSetup {
                         actors: AktorNew {
-                            name: AktorName::new("local closure"),
-                            role: AktorNoRole,
+                            name: "local closure".into(),
                             kind: AktorKind::TokioLocal(&executor),
-                            closures: AktorClosures {
-                                start: async || Ok::<_, AktorSetupError>(()),
-                                end: async move |_| {
-                                    entered.notify_one();
-                                    release.notified().await;
+                            start: async || Ok::<_, String>(()),
+                            end: async move |_| {
+                                entered.notify_one();
+                                release.notified().await;
 
-                                    if cleanup_fails {
-                                        Err(AktorCleanupError::new("real cleanup failure", ()))
-                                    } else {
-                                        Ok::<_, AktorCleanupError>(())
-                                    }
-                                },
-                                intervals: vec![],
-                                before_each: None,
-                                after_each: None,
+                                if cleanup_fails {
+                                    Err(String::from("real cleanup failure"))
+                                } else {
+                                    Ok::<_, String>(())
+                                }
                             },
-                            options: AktorNewOptions { capacity: 32 },
+                            hooks: Default::default(),
+                            capacity: 32,
+                            stuck: AktorStuck::Kill,
                         },
                         shutdown: |_| {},
-                        options: AktorOptions {
-                            shutdown_grace: Duration::from_secs(5),
-                        },
+                        grace: Duration::from_secs(5),
                     })
                     .await
                     .unwrap();

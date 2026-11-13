@@ -6,7 +6,7 @@ impl<S> Listener<S> {
         failures.capture(FailureKind::Teardown, || self.admission.shutdown());
         failures.capture(FailureKind::Teardown, || self.receiver.close());
 
-        while let Ok(message) = self.receiver.try_recv() {
+        for message in self.receiver.take_queued() {
             failures.capture(FailureKind::Teardown, || drop(message));
         }
     }

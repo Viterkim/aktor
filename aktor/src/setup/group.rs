@@ -1,26 +1,53 @@
 use super::*;
-use crate::ShutdownReport;
+use crate::AktorShutdownReport;
 
 #[doc(hidden)]
 pub trait AktorSetupGroup: Sized + Unpin {
-    type KillSwitch: Clone + Unpin;
-    type Completion: Clone + Unpin;
-    type Closing: Future<Output = ShutdownReport>;
+    type AktorKillSwitch: Clone + Unpin;
+    type Completion: Clone + Unpin + core::future::IntoFuture<Output = AktorShutdownReport>;
 
     fn new(grace: Duration) -> Self;
     fn registration(&self) -> Self;
     fn track_startup(&mut self) {}
-    fn source_is_failure(_kill: &Self::KillSwitch) -> bool {
+    fn source_is_failure(_kill: &Self::AktorKillSwitch) -> bool {
         false
     }
-    fn check_started(&self) -> Result<(), AktorSetupError>;
-    fn killswitch(&self) -> Self::KillSwitch;
+    fn check_started(&self) -> Result<(), AktorGroupError>;
+    fn killswitch(&self) -> Self::AktorKillSwitch;
     fn completion(&self) -> Self::Completion;
-    fn stop(kill: &Self::KillSwitch);
-    fn fail_startup(kill: &Self::KillSwitch, failure: crate::AktorFailureReport) -> bool;
-    fn is_stopping(kill: &Self::KillSwitch) -> bool;
-    fn set_starting(kill: &Self::KillSwitch, starting: bool) -> bool;
-    fn closing(&self) -> Self::Closing;
+    fn stop(kill: &Self::AktorKillSwitch);
+    fn fail_startup(kill: &Self::AktorKillSwitch, failure: crate::AktorFailureReport) -> bool;
+    fn is_stopping(kill: &Self::AktorKillSwitch) -> bool;
+    fn set_starting(kill: &Self::AktorKillSwitch, starting: bool) -> bool;
+}
+
+#[cfg(any(
+    all(
+        any(feature = "tokio", feature = "std_thread"),
+        not(target_family = "wasm")
+    ),
+    all(
+        any(feature = "browser_local", feature = "wasm_browser_workers"),
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
+impl crate::AktorGroup {
+    /// Start an actor in this group and get its handle back.
+    /// Pass a tuple to start several actors and get their handles in the same order.
+    ///
+    /// ```rust,ignore
+    /// let counter = group.spawn(AktorNew { .. }).await.er(())?;
+    /// ```
+    pub async fn spawn<Setup>(
+        &self,
+        setup: Setup,
+    ) -> Result<Setup::Handles, (AktorStartError<Setup::Error>, String)>
+    where
+        Setup: AktorStart<Group = Self>,
+    {
+        aktor_start_in(self, setup).await
+    }
 }
 
 #[cfg(any(
@@ -35,9 +62,8 @@ pub trait AktorSetupGroup: Sized + Unpin {
     )
 ))]
 impl AktorSetupGroup for crate::AktorGroup {
-    type KillSwitch = crate::KillSwitch;
-    type Completion = crate::GroupCompletion;
-    type Closing = AktorClosingFuture;
+    type AktorKillSwitch = crate::AktorKillSwitch;
+    type Completion = crate::AktorGroupCompletion;
 
     fn new(grace: Duration) -> Self {
         let group = Self::with_grace(grace);
@@ -54,15 +80,15 @@ impl AktorSetupGroup for crate::AktorGroup {
         self.track_startup();
     }
 
-    fn source_is_failure(kill: &Self::KillSwitch) -> bool {
+    fn source_is_failure(kill: &Self::AktorKillSwitch) -> bool {
         kill.has_startup_failure()
     }
 
-    fn check_started(&self) -> Result<(), AktorSetupError> {
+    fn check_started(&self) -> Result<(), AktorGroupError> {
         self.check_started()
     }
 
-    fn killswitch(&self) -> Self::KillSwitch {
+    fn killswitch(&self) -> Self::AktorKillSwitch {
         self.killswitch()
     }
 
@@ -70,25 +96,35 @@ impl AktorSetupGroup for crate::AktorGroup {
         self.completion()
     }
 
-    fn stop(kill: &Self::KillSwitch) {
+    fn stop(kill: &Self::AktorKillSwitch) {
         kill.stop();
     }
 
-    fn fail_startup(kill: &Self::KillSwitch, failure: crate::AktorFailureReport) -> bool {
+    fn fail_startup(kill: &Self::AktorKillSwitch, failure: crate::AktorFailureReport) -> bool {
         kill.fail_startup(failure)
     }
 
-    fn is_stopping(kill: &Self::KillSwitch) -> bool {
+    fn is_stopping(kill: &Self::AktorKillSwitch) -> bool {
         kill.is_stopping()
     }
 
-    fn set_starting(kill: &Self::KillSwitch, starting: bool) -> bool {
+    fn set_starting(kill: &Self::AktorKillSwitch, starting: bool) -> bool {
         kill.set_starting(starting)
     }
+}
 
-    fn closing(&self) -> Self::Closing {
-        let completion = self.completion();
-        Box::pin(async move { completion.wait().await })
+#[cfg(feature = "local")]
+impl<Clock: crate::local::clock::AktorGroupClock> crate::local::AktorGroup<Clock> {
+    /// Start an actor in this group and get its handle back.
+    /// Pass a tuple to start several actors and get their handles in the same order.
+    pub async fn spawn<Setup>(
+        &self,
+        setup: Setup,
+    ) -> Result<Setup::Handles, (AktorStartError<Setup::Error>, String)>
+    where
+        Setup: AktorStart<Group = Self>,
+    {
+        aktor_start_in(self, setup).await
     }
 }
 
@@ -96,9 +132,8 @@ impl AktorSetupGroup for crate::AktorGroup {
 impl<Clock: crate::local::clock::AktorGroupClock> AktorSetupGroup
     for crate::local::AktorGroup<Clock>
 {
-    type KillSwitch = crate::local::KillSwitch<Clock>;
-    type Completion = crate::local::GroupCompletion<Clock>;
-    type Closing = crate::message::LocalFuture<'static, ShutdownReport>;
+    type AktorKillSwitch = crate::local::AktorKillSwitch<Clock>;
+    type Completion = crate::local::AktorGroupCompletion<Clock>;
 
     fn new(grace: Duration) -> Self {
         let group = Self::with_grace(grace);
@@ -115,15 +150,15 @@ impl<Clock: crate::local::clock::AktorGroupClock> AktorSetupGroup
         self.track_startup();
     }
 
-    fn source_is_failure(kill: &Self::KillSwitch) -> bool {
+    fn source_is_failure(kill: &Self::AktorKillSwitch) -> bool {
         kill.has_startup_failure()
     }
 
-    fn check_started(&self) -> Result<(), AktorSetupError> {
+    fn check_started(&self) -> Result<(), AktorGroupError> {
         self.check_started()
     }
 
-    fn killswitch(&self) -> Self::KillSwitch {
+    fn killswitch(&self) -> Self::AktorKillSwitch {
         self.killswitch()
     }
 
@@ -131,24 +166,19 @@ impl<Clock: crate::local::clock::AktorGroupClock> AktorSetupGroup
         self.completion()
     }
 
-    fn stop(kill: &Self::KillSwitch) {
+    fn stop(kill: &Self::AktorKillSwitch) {
         kill.stop();
     }
 
-    fn fail_startup(kill: &Self::KillSwitch, failure: crate::AktorFailureReport) -> bool {
+    fn fail_startup(kill: &Self::AktorKillSwitch, failure: crate::AktorFailureReport) -> bool {
         kill.fail_startup(failure)
     }
 
-    fn is_stopping(kill: &Self::KillSwitch) -> bool {
+    fn is_stopping(kill: &Self::AktorKillSwitch) -> bool {
         kill.is_stopping()
     }
 
-    fn set_starting(kill: &Self::KillSwitch, starting: bool) -> bool {
+    fn set_starting(kill: &Self::AktorKillSwitch, starting: bool) -> bool {
         kill.set_starting(starting)
-    }
-
-    fn closing(&self) -> Self::Closing {
-        let completion = self.completion();
-        Box::pin(async move { completion.wait().await })
     }
 }

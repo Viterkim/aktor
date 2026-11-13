@@ -1,13 +1,13 @@
-use crate::{CallError, Cause, Error};
+use crate::{CallError, Cause, Failure};
 use std::{
     fmt, io,
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite, BufReader, ReadBuf},
     net::{TcpListener, TcpStream, UnixListener, UnixStream},
 };
 
@@ -25,6 +25,8 @@ pub enum Stream {
     #[cfg(feature = "udp")]
     Udp(utp::UtpStream),
 }
+
+pub type BufferedStream = BufReader<Stream>;
 
 pub enum Listener {
     Unix(UnixListener),
@@ -80,6 +82,18 @@ impl From<&String> for Address {
 }
 
 impl Stream {
+    pub fn configure(&self) -> io::Result<()> {
+        if let Self::Tcp(stream) = self {
+            stream.set_nodelay(true)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn buffered(self) -> BufferedStream {
+        BufReader::with_capacity(4 * 1024, self)
+    }
+
     pub fn compresses(&self) -> bool {
         match self {
             Self::Unix(_) => false,
@@ -90,23 +104,46 @@ impl Stream {
             Self::Udp(_) => true,
         }
     }
+}
 
-    pub fn idle(&mut self) -> Result<bool, Error> {
-        let mut byte = [0];
-        let mut buffer = ReadBuf::new(&mut byte);
-        let mut context = Context::from_waker(std::task::Waker::noop());
-        match Pin::new(self).poll_read(&mut context, &mut buffer) {
-            Poll::Pending => Ok(true),
-            Poll::Ready(Err(_)) => Ok(false),
-            Poll::Ready(Ok(())) if buffer.filled().is_empty() => Ok(false),
-            Poll::Ready(Ok(())) => Err(Error::new(
-                CallError::NotAdmitted,
-                Cause::Protocol,
-                "unexpected data on an idle connection",
-            )),
-        }
+pub fn idle(stream: &mut BufferedStream) -> Result<bool, Failure> {
+    let unexpected = || {
+        Failure::new(
+            CallError::NotAdmitted,
+            Cause::Protocol,
+            "unexpected data on an idle connection",
+        )
+    };
+    if !stream.buffer().is_empty() {
+        return Err(unexpected());
+    }
+
+    let mut byte = [0];
+    let result = match stream.get_ref() {
+        Stream::Unix(stream) => Some(stream.try_read(&mut byte)),
+        Stream::Tcp(stream) => Some(stream.try_read(&mut byte)),
+        #[cfg(feature = "udp")]
+        Stream::Udp(_) => None,
+    };
+    if let Some(result) = result {
+        return match result {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+            Err(_) | Ok(0) => Ok(false),
+            Ok(_) => Err(unexpected()),
+        };
+    }
+
+    let mut buffer = ReadBuf::new(&mut byte);
+    let mut context = Context::from_waker(Waker::noop());
+
+    match Pin::new(stream).poll_read(&mut context, &mut buffer) {
+        Poll::Pending => Ok(true),
+        Poll::Ready(Err(_)) => Ok(false),
+        Poll::Ready(Ok(())) if buffer.filled().is_empty() => Ok(false),
+        Poll::Ready(Ok(())) => Err(unexpected()),
     }
 }
+
 impl Listener {
     pub async fn accept(&self) -> io::Result<Stream> {
         match self {
@@ -114,11 +151,10 @@ impl Listener {
                 .accept()
                 .await
                 .map(|(stream, _)| Stream::Unix(stream)),
-            Self::Tcp(listener) => {
-                let (stream, _) = listener.accept().await?;
-                stream.set_nodelay(true)?;
-                Ok(Stream::Tcp(stream))
-            }
+            Self::Tcp(listener) => listener
+                .accept()
+                .await
+                .map(|(stream, _)| Stream::Tcp(stream)),
             #[cfg(feature = "udp")]
             Self::Udp(listener) => listener
                 .socket
@@ -144,6 +180,15 @@ impl AsyncRead for Stream {
     }
 }
 impl AsyncWrite for Stream {
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Unix(stream) => stream.is_write_vectored(),
+            Self::Tcp(stream) => stream.is_write_vectored(),
+            #[cfg(feature = "udp")]
+            Self::Udp(stream) => stream.is_write_vectored(),
+        }
+    }
+
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -154,6 +199,19 @@ impl AsyncWrite for Stream {
             Self::Tcp(stream) => Pin::new(stream).poll_write(cx, bytes),
             #[cfg(feature = "udp")]
             Self::Udp(stream) => Pin::new(stream).poll_write(cx, bytes),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Unix(stream) => Pin::new(stream).poll_write_vectored(cx, buffers),
+            Self::Tcp(stream) => Pin::new(stream).poll_write_vectored(cx, buffers),
+            #[cfg(feature = "udp")]
+            Self::Udp(stream) => Pin::new(stream).poll_write_vectored(cx, buffers),
         }
     }
 

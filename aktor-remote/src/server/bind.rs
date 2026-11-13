@@ -1,4 +1,5 @@
 use super::*;
+use socket2::{Domain, SockAddr, Socket, Type};
 
 pub struct Bound {
     pub listener: Listener,
@@ -6,7 +7,7 @@ pub struct Bound {
     pub socket: Option<SocketPath>,
 }
 
-pub async fn bind(address: Address, options: &ServerOptions) -> Result<Bound, Error> {
+pub async fn bind(address: Address, options: &ServerOptions) -> Result<Bound, Failure> {
     match address {
         Address::Unix(path) => unix(&path, options).await,
         Address::Tcp(address) => {
@@ -33,7 +34,7 @@ pub async fn bind(address: Address, options: &ServerOptions) -> Result<Bound, Er
     }
 }
 
-async fn unix(path: &Path, options: &ServerOptions) -> Result<Bound, Error> {
+async fn unix(path: &Path, options: &ServerOptions) -> Result<Bound, Failure> {
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".lock");
     // Keep this file between restarts so concurrent listeners lock the same inode.
@@ -45,15 +46,17 @@ async fn unix(path: &Path, options: &ServerOptions) -> Result<Bound, Error> {
         .mode(options.permissions)
         .open(lock_path)?;
     lock.try_lock().map_err(|error| {
-        Error::new(
+        Failure::new(
             CallError::NotAdmitted,
             Cause::Connection,
             format!("socket {} is already owned: {error}", path.display()),
         )
     })?;
 
-    let listener = match UnixListener::bind(path) {
-        Ok(listener) => listener,
+    let address = SockAddr::unix(path)?;
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    match listener.bind(&address) {
+        Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
             let stale = matches!(
                 timeout(Duration::from_millis(100), UnixStream::connect(path)).await,
@@ -65,10 +68,10 @@ async fn unix(path: &Path, options: &ServerOptions) -> Result<Bound, Error> {
             }
 
             std::fs::remove_file(path)?;
-            UnixListener::bind(path)?
+            listener.bind(&address)?;
         }
         Err(error) => return Err(error.into()),
-    };
+    }
     let metadata = std::fs::symlink_metadata(path)?;
     let socket = SocketPath {
         path: path.into(),
@@ -77,6 +80,9 @@ async fn unix(path: &Path, options: &ServerOptions) -> Result<Bound, Error> {
         _lock: lock,
     };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(options.permissions))?;
+    listener.set_nonblocking(true)?;
+    listener.listen(1024)?;
+    let listener = UnixListener::from_std(listener.into())?;
 
     Ok(Bound {
         listener: Listener::Unix(listener),

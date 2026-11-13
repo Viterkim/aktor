@@ -146,16 +146,13 @@ where
         }
 
         let this = self.this.upgrade()?;
-        let committed = self.handle.inner.commit(
-            Message {
-                operation: self.operation,
-                job: Box::new(LatestJob {
-                    shared: this,
-                    finished: false,
-                }),
-            },
-            true,
-        );
+        let committed = self.handle.inner.commit_service(Message {
+            operation: self.operation,
+            job: Box::new(LatestJob {
+                shared: this,
+                finished: false,
+            }),
+        });
 
         slot.scheduled = committed.is_ok();
         slot.failed |= committed.is_err();
@@ -275,7 +272,7 @@ where
     fn run<'a>(
         &'a mut self,
         state: &'a mut S,
-        hooks: &'a mut AktorHooks<S>,
+        hooks: &'a mut CallHooks<S>,
         operation: Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
@@ -348,7 +345,7 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static> Session<S,
         F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
     {
         let shared = Arc::new_cyclic(|this| Shared {
-            handle: self.new_handle(),
+            handle: self.clone(),
             slot: Mutex::new(RefCell::new(Slot {
                 revision: 0,
                 pending: None,

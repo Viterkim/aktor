@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::atomic::AtomicBool;
-use tokio::sync::{Notify, mpsc};
+use std::time::Duration;
+use tokio::sync::{Notify, mpsc, oneshot};
 
 #[aktor]
 async fn count(state: &u32) -> Result<u32, &'static str> {
@@ -37,32 +38,25 @@ async fn shutdown() {
         let hook_cleaned = cleaned.clone();
         let actors = aktor_start(AktorSetup {
             actors: AktorNew {
-                name: AktorName::new("application database"),
-                role: AktorNoRole,
+                name: "application database".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: async move |_: u32| {
-                        while cleanup_disposed.load(Ordering::SeqCst) != 4 {
-                            tokio::task::yield_now().await;
-                        }
-                        cleanup_done.store(true, Ordering::SeqCst);
-                        Err(AktorCleanupError::new("cleanup report", ()))
-                    },
-
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: async || Ok::<_, String>(0_u32),
+                end: async move |_: u32| {
+                    while cleanup_disposed.load(Ordering::SeqCst) != 4 {
+                        tokio::task::yield_now().await;
+                    }
+                    cleanup_done.store(true, Ordering::SeqCst);
+                    Err(String::from("cleanup report"))
                 },
-                options: AktorNewOptions { capacity: 1 },
+                hooks: Default::default(),
+                capacity: 1,
+                stuck: AktorStuck::Kill,
             },
             shutdown: move |report| {
                 assert!(hook_cleaned.load(Ordering::SeqCst));
                 closed.send(report).unwrap();
             },
-            options: AktorOptions {
-                shutdown_grace: Duration::from_secs(2),
-            },
+            grace: Duration::from_secs(2),
         })
         .await
         .unwrap();
@@ -89,7 +83,7 @@ async fn shutdown() {
         let (ready, mut started) = mpsc::channel(4);
         for index in 0..3 {
             let held = Held(disposed.clone());
-            let handle = actors.handles.new_handle();
+            let handle = actors.handles.clone();
             let ready = ready.clone();
             let reply = if index == 0 { reply.take() } else { None };
             let after = continued.clone();
@@ -109,7 +103,7 @@ async fn shutdown() {
         }
         let held = Held(disposed.clone());
         let kill = actors.killswitch();
-        let handle = actors.handles.new_handle();
+        let handle = actors.handles.clone();
         let after = continued.clone();
         let external = tokio::spawn(async move {
             let _held = held;
@@ -143,35 +137,20 @@ async fn shutdown() {
 
 #[tokio::test]
 async fn task_failure() {
-    let after = Arc::new(AtomicBool::new(false));
-    let continued = after.clone();
-    let report = tokio::time::timeout(
-        Duration::from_secs(3),
-        AktorGroup::new().run(
-            async |group| {
-                group.spawn_task(async { panic!("dependent task failed") })?;
-                core::future::pending::<()>().await;
-                continued.store(true, Ordering::SeqCst);
-                Ok::<_, AktorError>(())
-            },
-            async |_| Ok::<_, AktorCleanupError>(()),
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap_err();
+    let mut group = AktorGroup::new();
+    let completed = group.start().unwrap();
 
-    assert!(!after.load(Ordering::SeqCst));
-    assert_eq!(report.report.failure.as_ref().unwrap().phase, "task");
-    assert!(
-        report
-            .report
-            .failure
-            .as_ref()
-            .unwrap()
-            .message
-            .contains("dependent task failed")
-    );
+    group
+        .spawn_task(async { panic!("dependent task failed") })
+        .unwrap();
+
+    let report = tokio::time::timeout(Duration::from_secs(3), completed.wait())
+        .await
+        .unwrap();
+    let failure = report.failure.unwrap();
+
+    assert_eq!(failure.phase, "task");
+    assert!(failure.message.contains("dependent task failed"));
 }
 
 #[tokio::test]
@@ -181,25 +160,19 @@ async fn callers() {
         let (closed, closing) = oneshot::channel();
         let actors = aktor_start(AktorSetup {
             actors: AktorNew {
-                name: AktorName::new("application cancellation"),
-                role: AktorNoRole,
+                name: "application cancellation".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: AktorNewOptions { capacity: 32 },
+                start: async || Ok::<_, String>(0_u32),
+                end: (),
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
             shutdown: async move |report| {
                 closed.send(report).unwrap();
-                Ok::<_, AktorCleanupError>(())
+                Ok::<_, String>(())
             },
-            options: AktorOptions {
-                shutdown_grace: Duration::from_secs(5),
-            },
+            grace: Duration::from_secs(5),
         })
         .await
         .unwrap();
@@ -250,27 +223,20 @@ async fn cleanup() {
     let cleanup = cleaned.clone();
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("coordinated shutdown"),
-            role: AktorNoRole,
+            name: "coordinated shutdown".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(0_u32),
-                end: async move |_: u32| {
-                    let (done, changed) = &*cleanup;
-                    *done.lock().unwrap() = true;
-                    changed.notify_all();
-                },
-
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
+            start: async || Ok::<_, String>(0_u32),
+            end: async move |_: u32| {
+                let (done, changed) = &*cleanup;
+                *done.lock().unwrap() = true;
+                changed.notify_all();
             },
-            options: AktorNewOptions { capacity: 1 },
+            hooks: Default::default(),
+            capacity: 1,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(3),
-        },
+        grace: Duration::from_secs(3),
     })
     .await
     .unwrap();
@@ -289,6 +255,35 @@ async fn cleanup() {
         .await
         .unwrap();
     assert!(!result.failed(), "{result}");
+}
+
+#[tokio::test]
+async fn task_finishes_during_shutdown_hook() {
+    struct WaitForHook(std::sync::mpsc::Receiver<()>);
+    impl Drop for WaitForHook {
+        fn drop(&mut self) {
+            self.0.recv_timeout(Duration::from_secs(4)).unwrap();
+        }
+    }
+
+    let (release, waiting) = std::sync::mpsc::channel();
+    let mut group = AktorGroup::with_grace(Duration::from_secs(2));
+    group
+        .start_with(async move |_| {
+            release.send(()).unwrap();
+            Ok::<_, String>(())
+        })
+        .unwrap();
+
+    let held = WaitForHook(waiting);
+    group
+        .spawn_task(async move {
+            let _held = held;
+            core::future::pending::<()>().await;
+        })
+        .unwrap();
+
+    assert!(!group.shutdown().await.ran_past_grace);
 }
 
 #[tokio::test]
@@ -311,60 +306,49 @@ async fn shutdown_hook_errors() {
     let held = Held(disposed.clone());
     let startup = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("abandoned startup"),
-            role: AktorNoRole,
+            name: "abandoned startup".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(0_u32),
-                end: (),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 32 },
+            start: async || Ok::<_, String>(0_u32),
+            end: (),
+            hooks: Default::default(),
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         },
         shutdown: async move |_| {
             calls.fetch_add(1, Ordering::SeqCst);
             drop(held);
-            Ok::<_, AktorCleanupError>(())
+            Ok::<_, String>(())
         },
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     });
     let completion = startup.completion();
     drop(startup);
+    completion.wait().await;
+
     assert_eq!(disposed.load(Ordering::SeqCst), 1);
     assert_eq!(called.load(Ordering::SeqCst), 0);
-    completion.wait().await;
 
     for (panic, actor_failed) in [(true, true), (false, false), (true, false), (false, true)] {
         let called = Arc::new(AtomicUsize::new(0));
         let calls = called.clone();
         let startup = aktor_start(AktorSetup {
             actors: AktorNew {
-                name: AktorName::new("shutdown hook"),
-                role: AktorNoRole,
+                name: "shutdown hook".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: AktorNewOptions { capacity: 32 },
+                start: async || Ok::<_, String>(0_u32),
+                end: (),
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
             shutdown: async move |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 if panic {
                     panic!("shutdown hook panicked");
                 }
-                Err(AktorCleanupError::new("shutdown hook failed", ()))
+                Err(String::from("shutdown hook failed"))
             },
-            options: AktorOptions {
-                shutdown_grace: Duration::from_secs(5),
-            },
+            grace: Duration::from_secs(5),
         });
         let actors = startup.await.unwrap();
         if actor_failed {

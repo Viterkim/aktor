@@ -131,7 +131,7 @@ async fn actor() -> (AktorGroup, Aktor<State>) {
         |_| {},
     );
     args.capacity = 1;
-    let actor = actors.spawn(args).await.unwrap();
+    let actor = actors.spawn_args(args).await.unwrap();
 
     (actors, actor)
 }
@@ -222,7 +222,7 @@ async fn unavailable() {
     let client = Client::<State>::new(&socket);
     let error = read(&client).await.unwrap_err();
     assert_eq!(
-        (error.cause, error.outcome),
+        (error.0.cause, error.0.outcome),
         (Cause::Connection, CallError::NotAdmitted)
     );
 
@@ -319,7 +319,7 @@ async fn conversion() {
     .unwrap_err();
     drop(unblock);
     assert_eq!(
-        (error.cause, error.outcome),
+        (error.0.cause, error.0.outcome),
         (Cause::Timeout, CallError::OutcomeUnknown)
     );
 
@@ -349,7 +349,7 @@ async fn owner_failure() {
                 .expect("call waited for the listener deadline after owner failure")
                 .unwrap_err()
         };
-        assert_eq!(error.cause, Cause::Closed);
+        assert_eq!(error.0.cause, Cause::Closed);
 
         let _ = server.shutdown().await;
         actors.shutdown().await;
@@ -465,7 +465,7 @@ async fn lost_reply() {
             );
         } else {
             let error = increment(&client, 1).await.unwrap_err();
-            assert_eq!(error.outcome, CallError::OutcomeUnknown);
+            assert_eq!(error.0.outcome, CallError::OutcomeUnknown);
             assert_eq!(read(&actor).await.0, 1);
         }
 
@@ -550,7 +550,7 @@ async fn retry_limit() {
     };
     let error = output.unwrap_err();
     assert_eq!(
-        (error.cause, error.outcome),
+        (error.0.cause, error.0.outcome),
         (Cause::Timeout, CallError::OutcomeUnknown)
     );
     assert_eq!(value, 1);
@@ -605,7 +605,7 @@ async fn interrupted_write() {
             1
         }
         Err(error) => {
-            assert_eq!(error.outcome, CallError::OutcomeUnknown);
+            assert_eq!(error.0.outcome, CallError::OutcomeUnknown);
             0
         }
     };
@@ -681,7 +681,7 @@ async fn deadline() {
         .unwrap_err();
 
     assert_eq!(
-        (error.cause, error.outcome),
+        (error.0.cause, error.0.outcome),
         (Cause::Timeout, CallError::OutcomeUnknown)
     );
     release.notify_one();
@@ -697,50 +697,53 @@ async fn publication() {
     let socket = directory.path().join("power.sock");
     let server = listen(&socket, &actor).await.unwrap();
     let mut errors = server.errors();
-    let mut operations = aktor::worker::Operations::for_remote::<State, ()>();
-    operations.0.truncate(1);
-    let mut stream = UnixStream::connect(&socket).await.unwrap();
-    wire::write(
-        &mut stream,
-        &wire::Message::Hello {
-            version: wire::VERSION,
-            build: String::new(),
-            operations,
-            max_frame: wire::MAX_FRAME as u32,
-        },
-        wire::MAX_HANDSHAKE,
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        wire::read(&mut stream, wire::MAX_FRAME).await.unwrap(),
-        wire::Message::Ready { .. }
-    ));
+    let long = "nonexistent".repeat(30);
+    for (name, limit) in [(history::NAME, wire::MAX_FRAME), (&long, wire::MIN_FRAME)] {
+        let mut operations = aktor::worker::Operations::for_remote::<State, ()>();
+        operations.0.truncate(1);
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        wire::write(
+            &mut stream,
+            &wire::Message::Hello {
+                version: wire::VERSION,
+                build: String::new(),
+                operations,
+                max_frame: limit as u32,
+            },
+            wire::MAX_HANDSHAKE,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            wire::read(&mut stream, limit).await.unwrap(),
+            wire::Message::Ready { .. }
+        ));
 
-    wire::write(
-        &mut stream,
-        &wire::Message::Call {
-            id: 1,
-            operation: history::NAME.into(),
-            input: Vec::new(),
-        },
-        wire::MAX_FRAME,
-    )
-    .await
-    .unwrap();
-    let wire::Message::Answer {
-        output: Err(error), ..
-    } = wire::read(&mut stream, wire::MAX_FRAME).await.unwrap()
-    else {
-        panic!("local helper was remotely callable")
-    };
-    assert_eq!(error.cause, Cause::Protocol);
-    assert!(
-        diagnostic(&mut errors, "unpublished operation")
-            .await
-            .diagnostics
-            .contains(history::NAME)
-    );
+        wire::write(
+            &mut stream,
+            &wire::Message::Call {
+                id: 1,
+                operation: name.into(),
+                input: (&[][..]).into(),
+            },
+            wire::MAX_FRAME,
+        )
+        .await
+        .unwrap();
+        let wire::Message::Answer {
+            output: Err(error), ..
+        } = wire::read(&mut stream, limit).await.unwrap()
+        else {
+            panic!("expected a rejection for {name:?}");
+        };
+        assert_eq!(
+            (error.outcome, error.cause),
+            (CallError::Discarded, Cause::Protocol)
+        );
+        let (_, details) = diagnostic(&mut errors, "unpublished operation").await;
+        assert!(details.contains(&name[..name.len().min(128)]));
+        assert!(details.len() < 256);
+    }
 
     server.shutdown().await.unwrap();
     actors.shutdown().await;
@@ -762,7 +765,7 @@ async fn compatibility() {
     .await
     .err()
     .unwrap();
-    assert_eq!(error.cause, Cause::Protocol);
+    assert_eq!(error.0.cause, Cause::Protocol);
 
     let mut stream = UnixStream::connect(&socket).await.unwrap();
     use tokio::io::AsyncWriteExt;
@@ -779,6 +782,7 @@ async fn frame_limit() {
     let (actors, actor) = actor().await;
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
+    let proxy = directory.path().join("proxy.sock");
     let server = Server::listen_with(
         &socket,
         &actor,
@@ -789,26 +793,33 @@ async fn frame_limit() {
     )
     .await
     .unwrap();
-    let client = Client::<State>::connect_with(
-        &socket,
-        ClientOptions {
-            max_frame: 128,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let error = large(&client).await.unwrap_err();
+    let listener = UnixListener::bind(&proxy).unwrap();
+    let forwarding = tokio::spawn(async move {
+        let (mut client, mut backend) = proxy_pair(&listener, &socket).await;
+        drop(listener);
 
-    assert_eq!(error.cause, Cause::Codec);
+        tokio::io::copy_bidirectional(&mut client, &mut backend)
+            .await
+            .unwrap();
+    });
+    let client = Client::<State>::new(&proxy);
 
     let error = echo(&client, vec![0; 8192]).await.unwrap_err();
     assert_eq!(
-        (error.cause, error.outcome),
+        (error.0.cause, error.0.outcome),
         (Cause::Codec, CallError::NotAdmitted)
     );
-    assert_eq!(read(&actor).await.0, 0);
 
+    let reply = large(&client).send().await.unwrap();
+    assert_eq!(reply.await.unwrap_err().0.cause, Cause::Codec);
+    assert_eq!(
+        echo(&client, vec![0; 8192]).await.unwrap_err().0.cause,
+        Cause::Codec
+    );
+    assert_eq!(read(&client).await.unwrap().0, 0);
+
+    drop(client);
+    forwarding.await.unwrap();
     server.shutdown().await.unwrap();
     actors.shutdown().await;
 }
@@ -915,7 +926,7 @@ async fn stopping_admission() {
     }
     let (stopped, output) = tokio::join!(server.shutdown(), &mut pending);
     stopped.unwrap();
-    assert_eq!(output.unwrap_err().outcome, CallError::NotAdmitted);
+    assert_eq!(output.unwrap_err().0.outcome, CallError::NotAdmitted);
     release.notify_one();
     running.await;
     queued.await.unwrap();
@@ -962,7 +973,7 @@ async fn protocol_deadlines() {
     let mut errors = server.errors();
     let silent = UnixStream::connect(&socket).await.unwrap();
     assert_eq!(
-        diagnostic(&mut errors, "handshake").await.diagnostics,
+        diagnostic(&mut errors, "handshake").await.1,
         "remote handshake timed out"
     );
     drop(silent);
@@ -971,7 +982,7 @@ async fn protocol_deadlines() {
         let mut partial = raw_client(&socket).await;
         partial.write_all(prefix).await.unwrap();
         assert_eq!(
-            diagnostic(&mut errors, "frame").await.diagnostics,
+            diagnostic(&mut errors, "frame").await.1,
             "remote frame timed out"
         );
     }
@@ -993,7 +1004,10 @@ async fn protocol_deadlines() {
     actors.shutdown().await;
 }
 
-async fn diagnostic(errors: &mut tokio::sync::broadcast::Receiver<Error>, phase: &str) -> Error {
+async fn diagnostic(
+    errors: &mut tokio::sync::broadcast::Receiver<(Error, String)>,
+    phase: &str,
+) -> (Error, String) {
     tokio::time::timeout(Duration::from_secs(2), errors.recv())
         .await
         .unwrap_or_else(|_| panic!("{phase} did not produce a diagnostic"))
@@ -1039,12 +1053,10 @@ async fn rejection() {
         panic!("missing rejection")
     };
     assert_eq!(error.diagnostics, "remote operation catalogue mismatch");
-    assert!(
-        diagnostic(&mut errors, "catalogue")
-            .await
-            .diagnostics
-            .contains(&incompatible)
-    );
+    let (_, details) = diagnostic(&mut errors, "catalogue").await;
+    assert!(details.contains("unsupported operation \"incompatible"));
+    assert!(details.ends_with("...\""));
+    assert!(details.len() < 256);
     assert!(wire::validate(wire::MIN_FRAME - 1).is_err());
 
     server.shutdown().await.unwrap();
@@ -1060,5 +1072,5 @@ async fn owner_shutdown() {
         .unwrap();
     actors.shutdown().await;
 
-    assert_eq!(server.wait().await.unwrap_err().cause, Cause::Closed);
+    assert_eq!(server.wait().await.unwrap_err().0.cause, Cause::Closed);
 }

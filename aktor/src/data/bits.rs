@@ -48,6 +48,10 @@ pub fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec
             }
 
             let remaining = 7 - last.leading_zeros() as usize;
+            if bytes.is_empty() {
+                return Ok((0..remaining).map(|bit| last & (1 << bit) != 0).collect());
+            }
+
             let count = bytes
                 .len()
                 .checked_mul(8)
@@ -56,7 +60,7 @@ pub fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec
             let mut values = Vec::with_capacity(count);
 
             for byte in bytes {
-                values.extend((0..8).map(|bit| byte & (1 << bit) != 0));
+                values.extend_from_slice(&unpack(*byte));
             }
 
             values.extend((0..remaining).map(|bit| last & (1 << bit) != 0));
@@ -64,7 +68,7 @@ pub fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec
         }
     }
 
-    deserializer.deserialize_bytes(Vector)
+    deserializer.deserialize_byte_buf(Vector)
 }
 
 pub fn serialize_array<S: Serializer, const N: usize>(
@@ -128,4 +132,11 @@ fn pack(values: &[bool]) -> u8 {
         .iter()
         .enumerate()
         .fold(0_u8, |byte, (bit, value)| byte | (u8::from(*value) << bit))
+}
+
+fn unpack(byte: u8) -> [bool; 8] {
+    let halves = u64::from(byte & 0x0f) | (u64::from(byte >> 4) << 32);
+    // Copy each nibble at bit offsets 0, 7, 14 and 21. The mask keeps one bit from each copy.
+    let bits = (halves * 0x0020_4081) & 0x0101_0101_0101_0101;
+    bits.to_le_bytes().map(|bit| bit != 0)
 }

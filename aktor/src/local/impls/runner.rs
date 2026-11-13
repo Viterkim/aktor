@@ -4,12 +4,14 @@ use core::{future::poll_fn, ops::AsyncFnOnce};
 
 pub struct AktorRunner<'a, S, const N: usize = 0, E = ()> {
     pub state: &'a mut S,
-    hooks: &'a mut hooks::AktorHooks<S>,
+    hooks: &'a mut hooks::CallHooks<S>,
     inner: Rc<Inner<S, N, E>>,
     discarded: Rc<Cell<bool>>,
+    waiting: &'a Cell<bool>,
 }
 impl<S, const N: usize, E> AktorRunner<'_, S, N, E> {
     pub async fn next(&mut self) -> Option<AktorCustomCall<'_, S, N, E>> {
+        let _waiting = Waiting::new(self.waiting);
         let message = next(&self.inner).await?;
 
         Some(AktorCustomCall {
@@ -24,6 +26,19 @@ impl<S, const N: usize, E> AktorRunner<'_, S, N, E> {
     }
 }
 
+struct Waiting<'a>(&'a Cell<bool>);
+impl<'a> Waiting<'a> {
+    fn new(waiting: &'a Cell<bool>) -> Self {
+        waiting.set(true);
+        Self(waiting)
+    }
+}
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 #[must_use = "run the admitted call to deliver its reply"]
 pub struct AktorCustomCall<'a, S, const N: usize = 0, E = ()> {
     inner: Rc<Inner<S, N, E>>,
@@ -32,7 +47,7 @@ pub struct AktorCustomCall<'a, S, const N: usize = 0, E = ()> {
     pub operation: Operation,
     message: Message<S>,
     state: &'a mut S,
-    hooks: &'a mut hooks::AktorHooks<S>,
+    hooks: &'a mut hooks::CallHooks<S>,
 }
 impl<S, const N: usize, E> AktorCustomCall<'_, S, N, E> {
     pub async fn run(mut self) {
@@ -62,9 +77,24 @@ impl<S, const N: usize, E> Drop for AktorCustomCall<'_, S, N, E> {
 pub async fn serve<S, const N: usize, E>(
     mut runner: AktorRunner<'_, S, N, E>,
 ) -> Result<(), crate::AktorError> {
-    while let Some(call) = runner.next().await {
-        call.run().await;
+    let waiting = runner.waiting;
+    let mut remaining = 32;
 
+    loop {
+        let Some(call) = runner.next().await else {
+            return Ok(());
+        };
+        call.run().await;
+        remaining -= 1;
+        if remaining != 0 {
+            continue;
+        }
+
+        remaining = 32;
+        if !runner.inner.has_work() {
+            continue;
+        }
+        let _waiting = Waiting::new(waiting);
         let mut yielded = false;
 
         poll_fn(|cx| {
@@ -78,8 +108,6 @@ pub async fn serve<S, const N: usize, E>(
         })
         .await;
     }
-
-    Ok(())
 }
 
 pub async fn serve_on<Clock: clock::AktorGroupClock, S, const N: usize, E>(
@@ -107,53 +135,74 @@ pub async fn serve_on<Clock: clock::AktorGroupClock, S, const N: usize, E>(
 pub async fn serve_browser<S, const N: usize, E>(
     mut runner: AktorRunner<'_, S, N, E>,
 ) -> Result<(), crate::AktorError> {
+    let waiting = runner.waiting;
     let mut remaining = 32;
 
-    while let Some(call) = runner.next().await {
+    loop {
+        let Some(call) = runner.next().await else {
+            return Ok(());
+        };
         call.run().await;
         remaining -= 1;
 
         if remaining == 0 {
-            crate::timeout::browser_sleep(core::time::Duration::ZERO).await;
             remaining = 32;
+            if runner.inner.has_work() {
+                let _waiting = Waiting::new(waiting);
+                crate::timeout::browser_sleep(core::time::Duration::ZERO).await;
+            }
         }
     }
-
-    Ok(())
 }
 
 async fn next<S, const N: usize, E>(inner: &Inner<S, N, E>) -> Option<Message<S>> {
-    let changed = inner.closed.listen();
-
+    let waiting = OwnerWait(&inner.owner_waker);
     poll_fn(|cx| {
-        changed.register(cx);
-
-        if !inner.open.get()
-            && inner.queue.borrow().is_empty()
-            && inner.services.borrow().is_empty()
-        {
-            return Poll::Ready(None);
+        let next = try_next(inner);
+        if next.is_pending() && event::register(waiting.0, cx.waker()) {
+            // Waker callbacks can enqueue work or close the actor.
+            return try_next(inner);
         }
-
-        if (inner.prefer_service.get() || inner.queue.borrow().is_empty())
-            && let Some(message) = inner.services.borrow_mut().pop_front()
-        {
-            inner.prefer_service.set(false);
-            return Poll::Ready(Some(message));
-        }
-
-        let message = inner.queue.borrow_mut().pop_front();
-
-        match message {
-            Some(message) => {
-                inner.prefer_service.set(true);
-                inner.closed.notify();
-                Poll::Ready(Some(message))
-            }
-            None => Poll::Pending,
-        }
+        next
     })
     .await
+}
+
+struct OwnerWait<'a>(&'a RefCell<Option<Waker>>);
+impl Drop for OwnerWait<'_> {
+    fn drop(&mut self) {
+        drop(self.0.take());
+    }
+}
+
+fn try_next<S, const N: usize, E>(inner: &Inner<S, N, E>) -> Poll<Option<Message<S>>> {
+    if !inner.open.get() && !inner.has_work() {
+        return Poll::Ready(None);
+    }
+
+    if (inner.prefer_service.get() || inner.queue.borrow().is_empty())
+        && let Some(message) = inner.services.borrow_mut().pop_front()
+    {
+        inner.prefer_service.set(false);
+        return Poll::Ready(Some(message));
+    }
+
+    let (message, was_full) = {
+        let mut queue = inner.queue.borrow_mut();
+        let was_full = queue.len() == inner.capacity;
+        (queue.pop_front(), was_full)
+    };
+
+    match message {
+        Some(message) => {
+            inner.prefer_service.set(true);
+            if was_full {
+                inner.space.notify();
+            }
+            Poll::Ready(Some(message))
+        }
+        None => Poll::Pending,
+    }
 }
 
 impl<S, const N: usize, E> Owner<S, N, E> {
@@ -162,12 +211,12 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         setup: Setup,
         cleanup: Cleanup,
         runner: Runner,
-    ) -> Result<(), OwnerError>
+    ) -> Result<(), (OwnerError, String)>
     where
         Setup: FnOnce() -> SetupFuture,
-        SetupFuture: Future<Output = Result<S, AktorSetupError<E>>>,
+        SetupFuture: Future<Output = Result<S, AktorError<E>>>,
         Cleanup: FnOnce(S) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), AktorCleanupError<E>>>,
+        CleanupFuture: Future<Output = Result<(), AktorError<E>>>,
         Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S, N, E>) -> Result<(), crate::AktorError>,
     {
         self.run_prepared(setup, cleanup, runner).await
@@ -179,7 +228,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         setup: Setup,
         cleanup: Cleanup,
         runner: Runner,
-    ) -> Result<(), OwnerError>
+    ) -> Result<(), (OwnerError, String)>
     where
         Setup: FnOnce() -> SetupFuture,
         SetupFuture: Future,
@@ -189,21 +238,36 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         CleanupFuture::Output: LocalCleanupOutput<E>,
         Runner: for<'a> AsyncFnOnce(AktorRunner<'a, S, N, E>) -> Result<(), crate::AktorError>,
     {
-        #[cfg(feature = "std")]
-        let (initialized, mut primary) = match self
-            .inner
-            .capture_result("setup", async { setup().await.into_owner_setup() })
-            .await
-        {
-            Ok(result) => (result, None),
-            Err(payload) => {
-                let error = crate::AktorError::new(crate::panic::panic_message(&payload), ());
+        // Shutdown giving up on this actor cancels its calls, a `start` still running stops there too.
+        let inner = self.inner.clone();
+        let changed = inner.closed.listen();
+        let starting = async {
+            let mut starting = core::pin::pin!(async { setup().await.into_owner_setup() });
 
-                (Err(OwnerFailure::SetupPanic(error)), Some(payload))
-            }
+            poll_fn(|cx| {
+                changed.register(cx);
+
+                if inner.cancelled.get() {
+                    return Poll::Ready(Err(OwnerError::Cancelled));
+                }
+
+                starting.as_mut().poll(cx)
+            })
+            .await
         };
+
+        #[cfg(feature = "std")]
+        let (initialized, mut primary) =
+            match self.inner.capture_result("setup", Box::pin(starting)).await {
+                Ok(result) => (result, None),
+                Err(payload) => {
+                    let error = crate::AktorError::new(crate::panic::panic_message(&payload), ());
+
+                    (Err(OwnerError::SetupPanic(error)), Some(payload))
+                }
+            };
         #[cfg(not(feature = "std"))]
-        let initialized = setup().await.into_owner_setup();
+        let initialized = starting.await;
         #[cfg(feature = "std")]
         let setup_panicked = primary.is_some();
 
@@ -214,7 +278,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
 
                 if !self.inner.fail(&error)
                     && self.inner.group.borrow().is_some()
-                    && let OwnerFailure::Setup(error) = &*error
+                    && let OwnerError::Setup(error) = &*error
                 {
                     self.inner
                         .completion
@@ -261,12 +325,11 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                     drop((cleanup, runner));
                 }
 
-                #[cfg(feature = "std")]
-                if !setup_panicked {
+                if matches!(&*error, OwnerError::Cancelled) {
+                    self.inner.completion.cut_call.set(true);
+                } else if !matches!(&*error, OwnerError::SetupPanic(_)) {
                     self.inner.completion.cleanup_completed.set(true);
                 }
-                #[cfg(not(feature = "std"))]
-                self.inner.completion.cleanup_completed.set(true);
                 let result = Err(error);
 
                 #[cfg(feature = "std")]
@@ -292,8 +355,11 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 #[cfg(not(feature = "std"))]
                 self.inner.finish(result.clone());
                 result.map_err(|err| {
-                    SharedOwnerError::from_failure(err, &self.inner.completion.diagnostics.borrow())
-                        .without_data()
+                    let (error, report) = SharedOwnerError::from_failure(
+                        err,
+                        &self.inner.completion.diagnostics.borrow(),
+                    );
+                    (error.without_data(), report)
                 })
             }
         }
@@ -304,7 +370,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         mut state: S,
         cleanup: Cleanup,
         runner: Runner,
-    ) -> Result<(), OwnerError>
+    ) -> Result<(), (OwnerError, String)>
     where
         Cleanup: FnOnce(S) -> CleanupFuture,
         CleanupFuture: Future,
@@ -315,6 +381,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         self.inner.completion.changed.notify();
 
         let discarded = Rc::new(Cell::new(false));
+        let waiting = Cell::new(false);
         let inner = self.inner.clone();
         let changed = inner.closed.listen();
         let serving = async {
@@ -323,13 +390,21 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                 hooks: &mut self.hooks,
                 inner: inner.clone(),
                 discarded: discarded.clone(),
+                waiting: &waiting,
             });
 
             let mut serving = core::pin::pin!(serving);
+            let mut polled = false;
 
             poll_fn(|cx| {
                 changed.register(cx);
 
+                if inner.cancelled.get() {
+                    inner.completion.cut_call.set(polled && !waiting.get());
+                    return Poll::Ready(Ok(()));
+                }
+
+                polled = true;
                 let result = serving.as_mut().poll(cx);
 
                 if discarded.get() {
@@ -359,10 +434,12 @@ impl<S, const N: usize, E> Owner<S, N, E> {
 
         let result = served
             .and_then(|()| {
-                if self.inner.open.get()
+                let undrained = self.inner.open.get()
                     || !self.inner.queue.borrow().is_empty()
-                    || !self.inner.services.borrow().is_empty()
-                {
+                    || !self.inner.services.borrow().is_empty();
+
+                // Cancelled calls are dropped on purpose, only a runner that quit early failed.
+                if undrained && !self.inner.cancelled.get() {
                     Err(crate::AktorError::new(
                         "custom runner stopped before draining admission",
                         (),
@@ -371,9 +448,17 @@ impl<S, const N: usize, E> Owner<S, N, E> {
                     Ok(())
                 }
             })
-            .map_err(|error| Rc::new(OwnerFailure::Runner(error)));
+            .map_err(|error| Rc::new(OwnerError::Runner(error)));
 
-        if let Err(error) = &result {
+        // A panicking runner was reported when it panicked.
+        #[cfg(feature = "std")]
+        let panicked = primary.is_some();
+        #[cfg(not(feature = "std"))]
+        let panicked = false;
+
+        if let Err(error) = &result
+            && !panicked
+        {
             self.inner.fail(error);
         }
         #[cfg(feature = "std")]
@@ -402,32 +487,50 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         #[cfg(not(feature = "std"))]
         self.inner.discard_queued();
 
-        #[cfg(feature = "std")]
-        let mut cleaned = self
+        let group = self
             .inner
-            .settle(
-                "cleanup",
-                async {
-                    let result = cleanup(state).await.into_owner_cleanup();
-                    self.inner.completion.cleanup_completed.set(true);
-                    result
-                },
-                &mut primary,
-            )
-            .await
-            .map_err(|error| Rc::new(OwnerFailure::Runner(error)))
-            .and_then(|result| result.map_err(Rc::new));
-        #[cfg(not(feature = "std"))]
-        let mut cleaned = {
-            let result = cleanup(state).await.into_owner_cleanup().map_err(Rc::new);
+            .group
+            .borrow()
+            .as_ref()
+            .map(|(_, signal)| signal.clone());
+        let ending = async {
+            let end = cleanup(state);
+
+            // In a group `end` gets its own grace, so one parked on an await can't hang shutdown.
+            let output = match &group {
+                Some(signal) => signal.end_within(end).await,
+                None => Some(end.await),
+            };
+
+            let Some(output) = output else {
+                self.inner.completion.ran_out.set(true);
+                self.inner
+                    .completion
+                    .diagnostics
+                    .borrow_mut()
+                    .push(crate::AktorError::new("end ran out of its grace", ()));
+                return Err(OwnerError::CleanupUnconfirmed);
+            };
+
+            let result = output.into_owner_cleanup();
             self.inner.completion.cleanup_completed.set(true);
             result
         };
 
+        #[cfg(feature = "std")]
+        let mut cleaned = self
+            .inner
+            .settle("cleanup", ending, &mut primary)
+            .await
+            .map_err(|error| Rc::new(OwnerError::Runner(error)))
+            .and_then(|result| result.map_err(Rc::new));
+        #[cfg(not(feature = "std"))]
+        let mut cleaned = ending.await.map_err(Rc::new);
+
         if let Err(error) = &mut cleaned {
             let primary = self.inner.fail(error);
 
-            if let Some(OwnerFailure::CleanupFailure(failure)) = Rc::get_mut(error) {
+            if let Some(OwnerError::CleanupFailure(failure)) = Rc::get_mut(error) {
                 failure.primary = primary;
             }
         }
@@ -451,7 +554,8 @@ impl<S, const N: usize, E> Owner<S, N, E> {
 
         if retain_cleanup
             && let Err(error) = &cleaned
-            && !matches!(&**error, OwnerFailure::CleanupFailure(failure) if failure.primary)
+            && !matches!(&**error, OwnerError::CleanupFailure(failure) if failure.primary)
+            && !matches!(&**error, OwnerError::CleanupUnconfirmed)
         {
             self.inner
                 .completion
@@ -463,10 +567,17 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         let result = result.and(cleaned);
         #[cfg(feature = "std")]
         let result = if let Some(payload) = &primary {
-            Err(Rc::new(OwnerFailure::Runner(crate::AktorError::new(
+            let error = Rc::new(OwnerError::Runner(crate::AktorError::new(
                 crate::panic::panic_message(payload),
                 (),
-            ))))
+            )));
+
+            // When the panic is the group's failure, the outcome doesn't print it again.
+            if self.inner.fail(&error) {
+                self.inner.completion.panic_reported.set(true);
+            }
+
+            Err(error)
         } else {
             result
         };
@@ -495,41 +606,42 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         }
 
         result.map_err(|err| {
-            SharedOwnerError::from_failure(err, &self.inner.completion.diagnostics.borrow())
-                .without_data()
+            let (error, report) =
+                SharedOwnerError::from_failure(err, &self.inner.completion.diagnostics.borrow());
+            (error.without_data(), report)
         })
     }
 }
 
 pub trait LocalCleanupOutput<E> {
-    fn into_owner_cleanup(self) -> Result<(), OwnerFailure<E>>;
+    fn into_owner_cleanup(self) -> Result<(), OwnerError<E>>;
 }
-impl<E> LocalCleanupOutput<E> for Result<(), AktorCleanupError<E>> {
-    fn into_owner_cleanup(self) -> Result<(), OwnerFailure<E>> {
-        self.map_err(OwnerFailure::Cleanup)
+impl<E> LocalCleanupOutput<E> for Result<(), AktorError<E>> {
+    fn into_owner_cleanup(self) -> Result<(), OwnerError<E>> {
+        self.map_err(OwnerError::Cleanup)
     }
 }
 impl LocalCleanupOutput<()> for Result<(), crate::AktorFailure> {
-    fn into_owner_cleanup(self) -> Result<(), OwnerFailure<()>> {
-        self.map_err(OwnerFailure::CleanupFailure)
+    fn into_owner_cleanup(self) -> Result<(), OwnerError<()>> {
+        self.map_err(OwnerError::CleanupFailure)
     }
 }
 
 pub trait LocalSetupOutput<S, C> {
-    fn into_owner_setup(self) -> Result<S, OwnerFailure<C>>;
+    fn into_owner_setup(self) -> Result<S, OwnerError<C>>;
 }
-impl<S, C> LocalSetupOutput<S, C> for Result<S, AktorSetupError<C>> {
-    fn into_owner_setup(self) -> Result<S, OwnerFailure<C>> {
-        self.map_err(OwnerFailure::Setup)
+impl<S, C> LocalSetupOutput<S, C> for Result<S, AktorError<C>> {
+    fn into_owner_setup(self) -> Result<S, OwnerError<C>> {
+        self.map_err(OwnerError::Setup)
     }
 }
-impl<S, C> LocalSetupOutput<S, C>
+impl<S, C, E> LocalSetupOutput<S, C>
     for (
-        Result<S, crate::AktorFailure>,
-        crate::setup::ready::Sender<Result<(), crate::AktorStartError<crate::AktorFailure>>>,
+        Result<S, (E, crate::AktorFailure)>,
+        crate::setup::ready::Sender<Result<(), crate::AktorStartError<E>>>,
     )
 {
-    fn into_owner_setup(self) -> Result<S, OwnerFailure<C>> {
+    fn into_owner_setup(self) -> Result<S, OwnerError<C>> {
         let (result, ready) = self;
 
         match result {
@@ -537,11 +649,15 @@ impl<S, C> LocalSetupOutput<S, C>
                 ready.send(Ok(()));
                 Ok(state)
             }
-            Err(error) => {
+            Err((data, error)) => {
                 let diagnostic = AktorError::new(error.diagnostics.clone(), ());
                 let primary = error.primary;
-                ready.send(Err(crate::AktorStartError::Init(error)));
-                Err(OwnerFailure::SetupDiagnostic(diagnostic, primary))
+                ready.send(Err(crate::AktorStartError {
+                    init: crate::AktorInitOutcome::Failed(data),
+                    cause: crate::AktorStartCause::Init(error),
+                    report: None,
+                }));
+                Err(OwnerError::SetupDiagnostic(diagnostic, primary))
             }
         }
     }

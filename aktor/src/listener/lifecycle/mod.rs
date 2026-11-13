@@ -1,50 +1,34 @@
 use super::{Dedicated, DedicatedStartError, Handle, Listener, SpawnArgs, channel};
-use er::Er;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 
-pub mod answer;
 pub mod impls;
 pub mod run;
 pub mod spawn;
-use answer::{ReplaceReply, ResumeReply, SetupAnswer};
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use impls::control::wait_cleanup;
 
-pub struct AktorControl<S, E, C> {
+#[doc(hidden)]
+pub struct AktorControl<C> {
     admission: Arc<crate::queue::Admission>,
-    commands: mpsc::Sender<Command<S, E, C>>,
     force: watch::Sender<bool>,
     shutdown: watch::Sender<bool>,
     running: watch::Receiver<bool>,
-    abandoned_setup: Arc<Mutex<Vec<AbandonedSetup<E>>>>,
     failed_cleanup: Arc<Mutex<FailedCleanup<C>>>,
+    cleanup: CleanupReceipt<C>,
 }
 
+pub(crate) type CleanupReceipt<C> = watch::Receiver<Option<Result<(), Arc<C>>>>;
+
 pub struct FailedCleanup<C> {
-    completed: bool,
+    /// `end` used up its grace and got dropped.
+    ran_out: bool,
+    /// Shutdown's cancel dropped a call that was still running.
+    cut_call: bool,
     errors: Vec<Arc<C>>,
     diagnostics: Vec<crate::AktorError>,
     group_primary: bool,
-}
-
-#[derive(Debug)]
-pub enum AbandonedSetup<E> {
-    Resume(E),
-    Replace(E),
-}
-
-#[derive(Er)]
-pub enum LifecycleError<E = crate::AktorSetupError> {
-    Closed,
-    AlreadyRunning,
-    Failed(#[er(source, skip)] E),
-}
-
-#[derive(Er)]
-pub enum ReplaceError<E = crate::AktorSetupError, C = crate::AktorFailure> {
-    Closed,
-    Cleanup(#[er(source, skip)] Arc<C>),
-    Setup(#[er(source, skip)] E),
 }
 
 #[derive(Debug)]
@@ -53,24 +37,13 @@ pub struct CleanupErrors<C> {
     pub diagnostics: Vec<crate::AktorError>,
 }
 
-pub type Reply<E> = oneshot::Sender<Result<(), LifecycleError<E>>>;
-
-pub enum Command<S, E, C> {
-    Pause(Reply<Arc<C>>),
-    Resume {
-        setup: Box<dyn FnOnce() -> crate::message::LocalFuture<'static, Result<S, E>> + Send>,
-        reply: ResumeReply<E>,
-    },
-    Replace {
-        setup: Box<dyn FnOnce() -> crate::message::LocalFuture<'static, Result<S, E>> + Send>,
-        reply: ReplaceReply<E, C>,
-    },
-    Shutdown(Reply<Arc<C>>),
+#[derive(Debug)]
+pub enum CleanupError<C> {
+    Returned(Arc<C>),
+    Unconfirmed,
 }
 
-enum Event<S, E, C> {
+enum Event<S> {
     Shutdown,
-    Command(Option<Command<S, E, C>>),
     Message(Option<crate::message::Message<S>>),
-    NoHandles,
 }

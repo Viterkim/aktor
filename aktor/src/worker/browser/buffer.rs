@@ -56,23 +56,24 @@ impl Buffers {
     }
 
     pub fn write(&self, bytes: &[u8]) -> Result<ArrayBuffer, JsValue> {
-        let cached = self.cached.borrow_mut().take();
-
-        if cached.is_none() && bytes.len() < MIN_REUSE {
+        if bytes.len() < MIN_REUSE || bytes.len() > self.limit {
             return Ok(Uint8Array::from(bytes).buffer());
         }
 
-        let buffer = if let Some((buffer, _)) = cached
-            && resize_transfer_buffer(&buffer, bytes.len())?
-        {
+        let cached = {
+            let mut cached = self.cached.borrow_mut();
+            if let Some((buffer, _)) = cached.as_ref()
+                && resize_transfer_buffer(buffer, bytes.len())?
+            {
+                cached.take()
+            } else {
+                None
+            }
+        };
+        let buffer = if let Some((buffer, _)) = cached {
             buffer
         } else {
-            let capacity = if bytes.len() <= self.limit {
-                bytes.len().next_power_of_two().min(self.limit)
-            } else {
-                0
-            };
-
+            let capacity = bytes.len().next_power_of_two().min(self.limit);
             transfer_buffer(bytes.len(), capacity)?
         };
 

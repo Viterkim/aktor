@@ -28,7 +28,7 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock> TimeoutRequest
 where
     Clock: crate::local::clock::AktorClock,
 {
-    type Timed = crate::Timeout<Self>;
+    type Timed = crate::AktorTimeout<Self>;
 
     fn timeout(self, duration: Duration) -> Self::Timed {
         self.timeout(duration)

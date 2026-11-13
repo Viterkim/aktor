@@ -8,7 +8,7 @@ impl<Clock: AktorGroupClock> Drop for Driver<Clock> {
             return;
         }
 
-        let kill = KillSwitch {
+        let kill = AktorKillSwitch {
             control: self.control.clone(),
             startup_failure: None,
         };
@@ -29,21 +29,27 @@ impl<Clock: AktorGroupClock> Drop for Driver<Clock> {
                 self.control.report.borrow_mut().application.push(error);
             }
 
-            if !entry.finished {
-                self.control.report.borrow_mut().actors.push(AktorOutcome {
-                    retirement: crate::RetirementStatus::Unconfirmed,
-                    kind: Some(entry.kind),
-                    actor: entry.name,
-                    diagnostics: alloc::vec![AktorError::new(
-                        "actor owner cancelled before cleanup finished",
-                        ()
-                    )],
-                    timed_out: false,
-                });
-            }
-
             if let Some(error) = contain(|| drop(entry.owner)) {
                 self.control.report.borrow_mut().application.push(error);
+            }
+
+            if !entry.finished {
+                let status = (entry.status)();
+                let retirement = status.retirement(AktorRetireStatus::Unconfirmed);
+                let mut diagnostics = core::mem::take(&mut *entry.diagnostics.borrow_mut());
+                diagnostics.extend(status.cleanup_diagnostic);
+                diagnostics.push(AktorError::new(
+                    "actor owner cancelled before cleanup finished",
+                    (),
+                ));
+
+                self.control.report.borrow_mut().actors.push(AktorOutcome {
+                    retirement,
+                    kind: entry.kind,
+                    actor: entry.name,
+                    diagnostics,
+                    ran_past_grace: false,
+                });
             }
         }
 
@@ -58,6 +64,16 @@ impl<Clock: AktorGroupClock> Drop for Driver<Clock> {
         report.failure = self.control.failure.borrow().clone();
         *self.control.completed.borrow_mut() = Some(report);
         self.control.changed.notify();
+    }
+}
+
+impl OwnerStatus {
+    pub fn retirement(&self, fallback: AktorRetireStatus) -> AktorRetireStatus {
+        match self.cleanup_completed {
+            Some(true) => AktorRetireStatus::Confirmed,
+            Some(false) => AktorRetireStatus::Terminated,
+            None => fallback,
+        }
     }
 }
 
@@ -100,20 +116,31 @@ pub fn poll_owners<Clock: AktorGroupClock>(
             continue;
         }
 
-        let (error, fallback) = match capture(|| entry.owner.as_mut().poll(cx)) {
+        let result = match capture(|| entry.owner.as_mut().poll(cx)) {
             Ok(Poll::Pending) => continue,
-            Ok(Poll::Ready(error)) => (error, crate::RetirementStatus::Confirmed),
+            Ok(Poll::Ready(error)) => Ok(error),
+            Err(error) => Err(error),
+        };
+        let mut status = (entry.status)();
+
+        let (error, fallback) = match result {
+            Ok(error) => (
+                status.cleanup_diagnostic.take().or(error),
+                AktorRetireStatus::Confirmed,
+            ),
             Err(error) => {
-                KillSwitch {
-                    control: control.clone(),
-                    startup_failure: None,
-                }
-                .fail(AktorFailureReport {
-                    kind: Some(entry.kind),
-                    actor: entry.name.clone(),
-                    phase: "owner".into(),
-                    message: error.diagnostics.clone(),
-                });
+                // The owner reports its own panic before passing it on, don't print it twice.
+                let reported = status.panic_reported
+                    || AktorKillSwitch {
+                        control: control.clone(),
+                        startup_failure: None,
+                    }
+                    .fail(AktorFailureReport {
+                        kind: Some(entry.kind),
+                        actor: entry.name.clone(),
+                        phase: "owner".into(),
+                        message: error.diagnostics.clone(),
+                    });
 
                 let owner = core::mem::replace(&mut entry.owner, Box::pin(async { None }));
 
@@ -121,7 +148,7 @@ pub fn poll_owners<Clock: AktorGroupClock>(
                     control.report.borrow_mut().application.push(secondary);
                 }
 
-                (Some(error), crate::RetirementStatus::Unconfirmed)
+                ((!reported).then_some(error), AktorRetireStatus::Unconfirmed)
             }
         };
 
@@ -129,22 +156,18 @@ pub fn poll_owners<Clock: AktorGroupClock>(
 
         let mut diagnostics = core::mem::take(&mut *entry.diagnostics.borrow_mut());
 
+        let retirement = status.retirement(fallback);
+        diagnostics.extend(status.cleanup_diagnostic);
         diagnostics.extend(error);
-        control.report.borrow_mut().actors.push(AktorOutcome {
-            retirement: entry
-                .cleanup_completed
-                .as_ref()
-                .map_or(fallback, |receipt| {
-                    if receipt.get() {
-                        crate::RetirementStatus::Confirmed
-                    } else {
-                        crate::RetirementStatus::Unconfirmed
-                    }
-                }),
-            kind: Some(entry.kind),
+
+        let mut report = control.report.borrow_mut();
+        report.ran_past_grace |= status.ran_past_grace;
+        report.actors.push(AktorOutcome {
+            retirement,
+            kind: entry.kind,
             actor: entry.name.clone(),
             diagnostics,
-            timed_out: false,
+            ran_past_grace: status.ran_past_grace,
         });
     }
 
@@ -168,34 +191,29 @@ fn poll_callers<Clock: AktorGroupClock>(
     control: &Rc<Control<Clock>>,
     cx: &mut core::task::Context<'_>,
 ) {
-    let callers = core::mem::take(&mut *control.callers.borrow_mut());
-    let mut waiting = Vec::new();
+    let mut callers = core::mem::take(&mut *control.callers.borrow_mut());
 
-    for mut caller in callers {
-        let pending = if control.stopping.get() {
-            false
-        } else {
-            match capture(|| caller.as_mut().poll(cx)) {
-                Ok(Poll::Pending) => true,
-                Ok(Poll::Ready(())) => false,
-                Err(error) => {
-                    task_failure(control, "task", error);
-                    false
-                }
+    for caller in callers.extract_if(.., |caller| {
+        if control.stopping.get() {
+            return true;
+        }
+
+        match capture(|| caller.as_mut().poll(cx)) {
+            Ok(Poll::Pending) => control.stopping.get(),
+            Ok(Poll::Ready(())) => true,
+            Err(error) => {
+                task_failure(control, "task", error);
+                true
             }
-        };
-
-        if pending && !control.stopping.get() {
-            waiting.push(caller);
-        } else if let Some(error) = contain(|| drop(caller)) {
+        }
+    }) {
+        if let Some(error) = contain(|| drop(caller)) {
             task_failure(control, "task drop", error);
         }
     }
 
-    let registered = core::mem::take(&mut *control.callers.borrow_mut());
-
-    waiting.extend(registered);
-    *control.callers.borrow_mut() = waiting;
+    callers.append(&mut control.callers.borrow_mut());
+    *control.callers.borrow_mut() = callers;
 
     if control.stopping.get() {
         cancel_callers(control);
@@ -207,7 +225,7 @@ fn task_failure<Clock: AktorGroupClock>(
     phase: &str,
     error: AktorError,
 ) {
-    let kill = KillSwitch {
+    let kill = AktorKillSwitch {
         control: control.clone(),
         startup_failure: None,
     };

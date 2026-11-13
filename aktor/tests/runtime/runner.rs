@@ -104,13 +104,14 @@ async fn error() {
         } else {
             release.send(()).unwrap();
             assert!(
-                matches!(stopping.await, Err(LifecycleError::Failed(error)) if *error == "save failed")
+                matches!(stopping.await, Err(listener::CleanupError::Returned(error)) if *error == "save failed")
             );
         }
 
-        assert_eq!(
-            *thread.join_async().await.unwrap().unwrap_err().errors[0],
-            "save failed"
-        );
+        let joined = thread.join_async().await.unwrap().unwrap_err();
+        let Err(listener::CleanupError::Returned(error)) = actor.shutdown().await else {
+            panic!("shutdown lost the cleanup error");
+        };
+        assert!(std::sync::Arc::ptr_eq(&joined.errors[0], &error));
     }
 }

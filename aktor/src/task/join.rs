@@ -1,7 +1,7 @@
 #[cfg(feature = "bevy")]
 use crate::group::shutdown::panic_message;
 use crate::{
-    AktorError, AktorFailureReport, AktorOutcome, KillSwitch, group::shutdown::contain_drop,
+    AktorError, AktorFailureReport, AktorKillSwitch, AktorOutcome, group::shutdown::contain_drop,
 };
 #[cfg(feature = "bevy")]
 use futures_util::FutureExt;
@@ -13,7 +13,7 @@ pub enum TaskJoin {
     Bevy(bevy_tasks::Task<()>),
 }
 impl TaskJoin {
-    pub async fn wait(self, kill: &KillSwitch, report: &mut AktorOutcome) {
+    pub async fn wait(self, kill: &AktorKillSwitch, report: &mut AktorOutcome) {
         match self {
             #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
             Self::Tokio(join) => match join.await {
@@ -39,13 +39,15 @@ impl TaskJoin {
     }
 }
 
-fn record(kill: &KillSwitch, report: &mut AktorOutcome, message: String) {
-    kill.fail(AktorFailureReport {
+fn record(kill: &AktorKillSwitch, report: &mut AktorOutcome, message: String) {
+    let primary = kill.fail(AktorFailureReport {
         actor: report.actor.clone(),
-        kind: report.kind,
+        kind: Some(report.kind),
         phase: "owner".into(),
         message: message.clone(),
     });
 
-    report.diagnostics.push(AktorError::new(message, ()));
+    if !primary {
+        report.diagnostics.push(AktorError::new(message, ()));
+    }
 }

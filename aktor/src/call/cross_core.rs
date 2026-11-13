@@ -14,7 +14,7 @@ impl<'a, S: 'static, Args: Send + 'static, O: Send + 'static, Role> SendRequest
 impl<'a, S: 'static, Args: Send + 'static, O: Send + 'static, Role> TimeoutRequest
     for Request<'a, S, Args, O, Role>
 {
-    type Timed = crate::Timeout<Self>;
+    type Timed = crate::AktorTimeout<Self>;
 
     fn timeout(self, duration: Duration) -> Self::Timed {
         self.timeout(duration)

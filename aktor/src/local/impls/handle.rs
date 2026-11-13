@@ -2,6 +2,40 @@ use super::super::*;
 use core::future::poll_fn;
 
 impl<S, const N: usize, E, Role, Clock> Handle<S, N, E, Role, Clock> {
+    /// Stop serving calls, `end` still runs. Shutdown does this once an actor's grace is up.
+    #[doc(hidden)]
+    pub fn cancel_calls(&self) {
+        self.inner.cancelled.set(true);
+        self.inner.closed.notify();
+    }
+
+    /// Wrap the outermost future that needs to stop with this actor's group.
+    /// If the group starts closing first, `run` drops that future and returns `None`.
+    pub async fn run<F: Future>(&self, work: F) -> Option<F::Output> {
+        let signal = self
+            .inner
+            .group
+            .borrow()
+            .as_ref()
+            .map(|(_, signal)| signal.clone());
+
+        let Some(signal) = signal else {
+            return Some(work.await);
+        };
+
+        let mut stopping = core::pin::pin!(signal.wait_stopping());
+        let mut work = core::pin::pin!(work);
+
+        poll_fn(|cx| {
+            if stopping.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+
+            work.as_mut().poll(cx).map(Some)
+        })
+        .await
+    }
+
     #[doc(hidden)]
     pub async fn wait_closing(&self) {
         let changed = self.inner.closed.listen();
@@ -25,8 +59,23 @@ impl<S, const N: usize, E, Role, Clock> Handle<S, N, E, Role, Clock> {
         all(feature = "browser_local", target_family = "wasm")
     ))]
     #[doc(hidden)]
-    pub fn manage(&self, name: alloc::string::String, kill: crate::KillSwitch) {
-        *self.inner.group.borrow_mut() = Some((name, kill.into()));
+    pub fn manage(&self, name: alloc::string::String, kill: crate::AktorKillSwitch) {
+        self.manage_on(name, kill, false);
+    }
+
+    #[cfg(any(
+        feature = "tokio",
+        all(feature = "std_thread", not(target_family = "wasm")),
+        feature = "wasm_browser_workers",
+        all(feature = "browser_local", target_family = "wasm")
+    ))]
+    pub(crate) fn manage_on(
+        &self,
+        name: alloc::string::String,
+        kill: crate::AktorKillSwitch,
+        standard: bool,
+    ) {
+        *self.inner.group.borrow_mut() = Some((name.into(), StopSignal::Native { kill, standard }));
     }
 
     pub fn downgrade(&self) -> WeakHandle<S, N, E, Role, Clock> {
@@ -37,14 +86,14 @@ impl<S, const N: usize, E, Role, Clock> Handle<S, N, E, Role, Clock> {
     }
 
     /// Wait for setup, returning a diagnostic on failure.
-    pub async fn ready(&self) -> Result<(), OwnerError> {
+    pub async fn ready(&self) -> Result<(), (OwnerError, String)> {
         self.ready_with_data()
             .await
-            .map_err(SharedOwnerError::without_data)
+            .map_err(|(error, report)| (error.without_data(), report))
     }
 
     /// Wait for setup and get the error with its application data.
-    pub async fn ready_with_data(&self) -> Result<(), SharedOwnerError<E>> {
+    pub async fn ready_with_data(&self) -> Result<(), (SharedOwnerError<E>, String)> {
         let changed = self.inner.completion.changed.listen();
 
         poll_fn(|context| {
@@ -63,7 +112,7 @@ impl<S, const N: usize, E, Role, Clock> Handle<S, N, E, Role, Clock> {
         .await
     }
 
-    pub fn new_handle(&self) -> Self {
+    fn new_handle(&self) -> Self {
         self.inner.handles.set(self.inner.handles.get() + 1);
 
         Self {
@@ -82,15 +131,22 @@ impl<S, const N: usize, E, Role, Clock> Handle<S, N, E, Role, Clock> {
     }
 
     /// Start closing now, queued calls finish before cleanup.
+    #[doc(hidden)]
     pub fn shutdown(&self) -> Completion<E> {
         self.inner.close();
         self.completion()
     }
 
+    #[doc(hidden)]
     pub fn completion(&self) -> Completion<E> {
         Completion {
             inner: self.inner.completion.clone(),
         }
+    }
+}
+impl<S, const N: usize, E, Role, Clock> Clone for Handle<S, N, E, Role, Clock> {
+    fn clone(&self) -> Self {
+        self.new_handle()
     }
 }
 impl<S, const N: usize, E, Role, Clock> Drop for Handle<S, N, E, Role, Clock> {

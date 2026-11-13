@@ -2,11 +2,14 @@
 //!
 //! Derive [`AktorData`] on transported structs and enums. `#[aktor(skip)]` leaves
 //! a field local and restores its default when receiving the value.
+//!
+//! A nested type with the same name as yours can look like a recursive reference.
+//! If the derive misses a bound on `wire::Packet<T>`, import it as `WirePacket`.
 
 mod bits;
 mod decode;
 mod encode;
-mod floats;
+mod fixed;
 mod impls;
 mod types;
 

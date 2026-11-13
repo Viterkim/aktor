@@ -1,29 +1,43 @@
 use super::start_local;
 use crate::{
-    AktorNew, AktorNoRole, AktorSetupError,
+    AktorNew,
     local::{self, Handle},
     message::LocalFuture,
-    setup::{AktorStart, AktorStartContext, AktorStartError, kind::TokioLocal},
+    setup::{
+        AktorStart, AktorStartCause, AktorStartContext, AktorStartError, initial::InitError,
+        kind::TokioLocal,
+    },
 };
 use core::ops::AsyncFnOnce;
 
-impl<'a, S, Start, Role, End, CM> AktorStart<CM> for AktorNew<S, Start, TokioLocal<'a>, Role, End>
+impl<'a, S, Start, End, CM: 'static, E, M: 'static> AktorStart
+    for AktorNew<S, Start, TokioLocal<'a>, End, (CM, E, M)>
 where
     S: 'static,
-    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    Start: AsyncFnOnce() -> Result<S, E> + 'static,
+    E: InitError<M> + 'static,
+    E::Error: 'static,
     End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
 {
     type Group = crate::AktorGroup;
-    type Handles = Handle<S, 0, (), Role, local::clock::Tokio>;
-    type Startup = LocalFuture<'a, Result<Self::Handles, AktorStartError>>;
+    type Error = E::Error;
+    type Handles = Handle<S, 0, (), (), local::clock::Tokio>;
+    type Startup = LocalFuture<'a, Result<Self::Handles, AktorStartError<Self::Error>>>;
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        group.start().map(|_| ()).map_err(Into::into)
+    fn needs_tokio_group(&self) -> bool {
+        true
+    }
+
+    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorStartCause> {
+        group
+            .start()
+            .map(|_| ())
+            .map_err(AktorStartCause::group_error)
     }
 
     fn start_in(self, context: AktorStartContext<crate::AktorGroup>) -> Self::Startup {
         let executor = self.kind.executor;
-        let setup = self.with_role(AktorNoRole);
+        let setup = self;
 
         Box::pin(async move {
             start_local(
@@ -35,7 +49,6 @@ where
                 |duration| Box::pin(::tokio::time::sleep(duration)),
             )
             .await
-            .map(Handle::with_role)
         })
     }
 }

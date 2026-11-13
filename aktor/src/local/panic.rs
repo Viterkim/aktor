@@ -1,6 +1,6 @@
 use super::*;
 use crate::panic::{dispose_secondary, panic_message};
-use core::{future::poll_fn, task::Poll};
+use core::{future::poll_fn, pin::Pin, task::Poll};
 use std::{
     any::Any,
     panic::{self, AssertUnwindSafe},
@@ -13,32 +13,34 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         future: F,
         primary: &mut Option<Box<dyn Any + Send>>,
     ) -> Result<F::Output, crate::AktorError> {
-        self.capture_result(phase, future).await.map_err(|payload| {
-            let error = crate::AktorError::new(panic_message(&payload), ());
+        self.capture_result(phase, Box::pin(future))
+            .await
+            .map_err(|payload| {
+                let error = crate::AktorError::new(panic_message(&payload), ());
 
-            if primary.is_none() {
-                *primary = Some(payload);
-            } else {
-                dispose_secondary(payload);
-            }
+                if primary.is_none() {
+                    *primary = Some(payload);
+                } else {
+                    dispose_secondary(payload);
+                }
 
-            error
-        })
+                error
+            })
     }
 
-    pub async fn capture<F: Future>(&self, phase: &str, future: F) -> F::Output {
+    pub async fn capture<F: Future + ?Sized>(&self, phase: &str, future: Pin<Box<F>>) -> F::Output {
         match self.capture_result(phase, future).await {
             Ok(output) => output,
             Err(payload) => panic::resume_unwind(payload),
         }
     }
 
-    pub async fn capture_result<F: Future>(
+    pub async fn capture_result<F: Future + ?Sized>(
         &self,
         phase: &str,
-        future: F,
+        future: Pin<Box<F>>,
     ) -> Result<F::Output, Box<dyn Any + Send>> {
-        catch(future, |dropping, payload| {
+        catch_pinned(future, |dropping, payload| {
             self.report_panic(if dropping { "future drop" } else { phase }, payload);
         })
         .await
@@ -55,7 +57,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
             let message = panic_message(payload);
             let failure = crate::AktorFailureReport {
                 kind: None,
-                actor: name,
+                actor: name.as_ref().into(),
                 phase: phase.into(),
                 message: message.clone(),
             };
@@ -83,7 +85,13 @@ pub async fn catch<F: Future>(
     future: F,
     report: impl Fn(bool, &Box<dyn Any + Send>),
 ) -> Result<F::Output, Box<dyn Any + Send>> {
-    let mut future = Box::pin(future);
+    catch_pinned(Box::pin(future), report).await
+}
+
+async fn catch_pinned<F: Future + ?Sized>(
+    mut future: Pin<Box<F>>,
+    report: impl Fn(bool, &Box<dyn Any + Send>),
+) -> Result<F::Output, Box<dyn Any + Send>> {
     let result =
         poll_fn(
             |cx| match panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
@@ -149,7 +157,7 @@ pub fn capture_each<T>(
 }
 
 pub fn discard_hooks<S>(
-    hooks: super::hooks::AktorHooks<S>,
+    hooks: super::hooks::CallHooks<S>,
     mut secondary: impl FnMut(&Box<dyn Any + Send>),
 ) -> Option<Box<dyn Any + Send>> {
     let mut primary = discard([hooks.before_each, hooks.after_each], &mut secondary);

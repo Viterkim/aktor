@@ -1,5 +1,4 @@
 use super::*;
-use std::convert::Infallible;
 
 #[tokio::test]
 async fn registrations() {
@@ -66,7 +65,6 @@ async fn registrations() {
         assert_eq!(wake.0.load(Ordering::Relaxed), 1);
     }
 }
-use aktor::message::call_async;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -203,117 +201,6 @@ async fn idle_close() {
     drop(input);
 }
 
-#[tokio::test]
-async fn pause_and_shutdown() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let observed = calls.clone();
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let entered = started.clone();
-    let finish = release.clone();
-    let (handle, actor, owner) = spawn(SpawnArgs {
-        name: "latest search".into(),
-        capacity: 1,
-        failure: FailurePolicy::Unwind,
-        setup: move || {
-            Ok::<_, Infallible>(Database {
-                started: entered,
-                release: finish,
-                calls: observed,
-            })
-        },
-        cleanup: |_| Ok::<_, ()>(()),
-    })
-    .await
-    .unwrap();
-
-    let ordinary = call_async(
-        &handle,
-        async |state, ()| {
-            state.calls.lock().unwrap().push(1);
-            state.started.notify_one();
-            state.release.notified().await;
-        },
-        (),
-    )
-    .send()
-    .await;
-
-    started.notified().await;
-
-    let (input, mut output) = search::latest(&handle);
-
-    input.send(2);
-
-    let pause = actor.pause();
-
-    tokio::pin!(pause);
-
-    let waiting = pause.as_mut().now_or_never().is_none();
-
-    release.notify_one();
-    assert!(waiting);
-    ordinary.await;
-    pause.await.unwrap();
-    assert_eq!(*calls.lock().unwrap(), [1]);
-    assert!(output.next().now_or_never().is_none());
-
-    let observed = calls.clone();
-
-    actor
-        .resume(move || {
-            Ok(Database {
-                started: Arc::new(Notify::new()),
-                release: Arc::new(Notify::new()),
-                calls: observed,
-            })
-        })
-        .await
-        .unwrap();
-
-    let Some(Ok(rows)) = output.next().await else {
-        panic!("queued latest input missing after resume");
-    };
-
-    assert_eq!(rows.0, 2);
-
-    actor.pause().await.unwrap();
-    input.send(2);
-    input.send(3);
-    assert!(output.next().now_or_never().is_none());
-
-    let observed = calls.clone();
-
-    actor
-        .resume(move || {
-            Ok(Database {
-                started: Arc::new(Notify::new()),
-                release: Arc::new(Notify::new()),
-                calls: observed,
-            })
-        })
-        .await
-        .unwrap();
-
-    let Some(Ok(rows)) = output.next().await else {
-        panic!("resumed output missing");
-    };
-
-    assert_eq!(rows.0, 3);
-
-    input.send(4);
-    actor.shutdown().await.unwrap();
-
-    let Some(Ok(rows)) = output.next().await else {
-        panic!("shutdown lost its accepted input");
-    };
-
-    assert_eq!(rows.0, 4);
-    assert!(output.next().await.is_none());
-    assert_eq!(*calls.lock().unwrap(), [1, 2, 3, 4]);
-    owner.join_async().await.unwrap().unwrap();
-}
-
 struct LatestWake {
     sender: aktor::message::LatestSender<usize>,
     entered: std::sync::atomic::AtomicBool,
@@ -328,7 +215,7 @@ impl std::task::Wake for LatestWake {
 
 #[test]
 fn callbacks_can_reenter() {
-    if std::env::var_os("AKTOR_CHILD").is_some() {
+    if std::env::var_os("AKTOR_TEST_CASE").is_some() {
         use aktor::latest::{SendLatest, Session};
         use std::{
             future::Future,
@@ -406,7 +293,7 @@ fn callbacks_can_reenter() {
         return;
     }
 
-    let output = support::child("latest::callbacks_can_reenter", "latest");
+    let output = support::run_test("latest::callbacks_can_reenter", "latest");
 
     assert!(
         output.status.success(),

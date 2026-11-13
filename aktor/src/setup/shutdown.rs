@@ -10,11 +10,11 @@
     )
 ))]
 use crate::AktorGroup;
-use crate::{AktorError, AktorShutdownOutput, ShutdownReport};
+use crate::{AktorGroupError, AktorShutdownOutput, AktorShutdownReport};
 
 #[doc(hidden)]
 pub trait AktorShutdown<Cleanup, CleanupOutput, Mode> {
-    fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorError>;
+    fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorGroupError>;
 }
 
 #[cfg(all(
@@ -23,12 +23,12 @@ pub trait AktorShutdown<Cleanup, CleanupOutput, Mode> {
 ))]
 impl<Cleanup, Output, Mode> AktorShutdown<Cleanup, Output, Mode> for AktorGroup
 where
-    Cleanup: FnOnce(ShutdownReport) -> Output + Send + 'static,
+    Cleanup: FnOnce(AktorShutdownReport) -> Output + Send + 'static,
     Output: AktorShutdownOutput<Mode>,
     Output::Future: Send + 'static,
 {
-    fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorError> {
-        AktorGroup::on_shutdown(self, cleanup).map_err(Into::into)
+    fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorGroupError> {
+        AktorGroup::on_shutdown(self, cleanup)
     }
 }
 #[cfg(all(
@@ -38,12 +38,12 @@ where
 ))]
 impl<Cleanup, Output, Mode> AktorShutdown<Cleanup, Output, Mode> for AktorGroup
 where
-    Cleanup: FnOnce(ShutdownReport) -> Output + 'static,
+    Cleanup: FnOnce(AktorShutdownReport) -> Output + 'static,
     Output: AktorShutdownOutput<Mode>,
     Output::Future: 'static,
 {
-    fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorError> {
-        AktorGroup::on_shutdown(self, cleanup).map_err(Into::into)
+    fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorGroupError> {
+        AktorGroup::on_shutdown(self, cleanup)
     }
 }
 
@@ -52,11 +52,11 @@ impl<Clock, Cleanup, Output, Mode> AktorShutdown<Cleanup, Output, Mode>
     for crate::local::AktorGroup<Clock>
 where
     Clock: crate::local::clock::AktorGroupClock,
-    Cleanup: FnOnce(ShutdownReport) -> Output + 'static,
+    Cleanup: FnOnce(AktorShutdownReport) -> Output + 'static,
     Output: AktorShutdownOutput<Mode>,
     Output::Future: 'static,
 {
-    fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorError> {
-        crate::local::AktorGroup::on_shutdown(self, cleanup).map_err(Into::into)
+    fn on_shutdown(&self, cleanup: Cleanup) -> Result<(), AktorGroupError> {
+        crate::local::AktorGroup::on_shutdown(self, cleanup)
     }
 }

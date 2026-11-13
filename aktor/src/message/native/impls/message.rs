@@ -11,14 +11,14 @@ impl<S> Message<S> {
     }
 
     pub async fn run(self, state: &mut S) {
-        self.run_with(state, &mut crate::listener::hooks::AktorHooks::default())
+        self.run_with(state, &mut crate::listener::hooks::CallHooks::default())
             .await;
     }
 
     pub async fn run_with(
         mut self,
         state: &mut S,
-        hooks: &mut crate::listener::hooks::AktorHooks<S>,
+        hooks: &mut crate::listener::hooks::CallHooks<S>,
     ) {
         let outcome = std::panic::AssertUnwindSafe(async {
             self.job.run(state, hooks, self.operation).await

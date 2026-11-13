@@ -36,7 +36,7 @@ where
     fn run<'a>(
         &'a self,
         state: &'a mut S,
-        hooks: &'a mut crate::listener::hooks::AktorHooks<S>,
+        hooks: &'a mut crate::listener::hooks::CallHooks<S>,
         operation: crate::operation::Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
@@ -84,26 +84,33 @@ impl<F: Send, I: Send, O: Send> Answer<O> for Packet<F, I, O> {
     }
 
     fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<O, CallError>> {
-        let next = cx.waker().clone();
-        let mut data = self.data.lock();
-        let old = std::mem::replace(&mut data.completion, Completion::Consumed);
+        let mut next = None;
 
-        match old {
-            Completion::Ready(output) => {
+        loop {
+            let mut data = self.data.lock();
+            if let Completion::Waiting(previous) = &mut data.completion {
+                if previous
+                    .as_ref()
+                    .is_some_and(|wake| wake.will_wake(cx.waker()))
+                {
+                    return Poll::Pending;
+                }
+                if let Some(next) = next {
+                    let previous = previous.replace(next);
+                    drop(data);
+                    drop(previous);
+                    return Poll::Pending;
+                }
                 drop(data);
-                drop(next);
-                Poll::Ready(output)
+                next = Some(cx.waker().clone());
+                continue;
             }
-            Completion::Waiting(previous) => {
-                data.completion = Completion::Waiting(Some(next));
-                drop(data);
-                drop(previous);
-                Poll::Pending
-            }
-            _ => {
-                drop(data);
-                drop(next);
-                consumed()
+
+            let old = std::mem::replace(&mut data.completion, Completion::Consumed);
+            drop(data);
+            match old {
+                Completion::Ready(output) => return Poll::Ready(output),
+                Completion::Waiting(_) | Completion::Abandoned | Completion::Consumed => consumed(),
             }
         }
     }
@@ -127,7 +134,7 @@ where
     fn run<'a>(
         &'a self,
         state: &'a mut S,
-        hooks: &'a mut crate::listener::hooks::AktorHooks<S>,
+        hooks: &'a mut crate::listener::hooks::CallHooks<S>,
         operation: crate::operation::Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {

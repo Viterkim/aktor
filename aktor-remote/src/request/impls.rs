@@ -1,8 +1,31 @@
 use super::*;
 use aktor::call::{CastRequest, RetryRequest, SendRequest, TimeoutRequest};
 
+impl AktorRetryOpts {
+    pub(crate) fn deadline(
+        self,
+        started: tokio::time::Instant,
+    ) -> Result<tokio::time::Instant, Failure> {
+        if self.attempts == 0 || self.timeout.is_zero() {
+            return Err(Failure::new(
+                CallError::NotAdmitted,
+                Cause::Protocol,
+                "retry attempts and timeout must be positive",
+            ));
+        }
+
+        started.checked_add(self.timeout).ok_or_else(|| {
+            Failure::new(
+                CallError::NotAdmitted,
+                Cause::Protocol,
+                "remote timeout is too large",
+            )
+        })
+    }
+}
+
 impl<I, O, C> Request<I, O, C> {
-    pub fn new(inner: Arc<Inner>, operation: Operation, input: I) -> Self {
+    pub(crate) fn new(inner: Arc<Inner>, operation: Operation, input: I) -> Self {
         let timeout = inner.options.timeout;
         Self {
             inner,
@@ -47,7 +70,7 @@ impl<I: Send, O: 'static, C: Codec<I> + Codec<O>> Request<I, O, C> {
 
         let answer: Answer<O> = Box::pin(async move {
             let input = input.ok_or_else(|| {
-                Error::new(
+                Failure::new(
                     CallError::NotAdmitted,
                     Cause::Protocol,
                     "remote request already consumed",
@@ -57,7 +80,7 @@ impl<I: Send, O: 'static, C: Codec<I> + Codec<O>> Request<I, O, C> {
                 .call(operation.name, input, options, Some(admitted))
                 .await?;
             C::decode_output(&bytes).map_err(|error| {
-                let mut error = Error::from(error);
+                let mut error = Failure::from(error);
                 error.outcome = CallError::OutcomeUnknown;
                 error
             })
@@ -68,25 +91,26 @@ impl<I: Send, O: 'static, C: Codec<I> + Codec<O>> Request<I, O, C> {
         });
     }
 
-    pub async fn send(mut self) -> Result<Reply<O>, Error>
+    pub async fn send(mut self) -> Result<Reply<O>, (Error, String)>
     where
         O: Send,
     {
         self.begin();
         let Some(Execution {
             mut answer,
-            admitted: received,
+            admitted: mut received,
         }) = self.running.take()
         else {
-            return Err(Error::new(
+            return Err(Failure::new(
                 CallError::NotAdmitted,
                 Cause::Protocol,
                 "remote request has no answer",
-            ));
+            )
+            .into());
         };
         tokio::select! {
             biased;
-            result = received => {
+            result = &mut received => {
                 if result.is_err() {
                     let output = answer.await?;
                     return Ok(Reply::start(async move { Ok(output) }));
@@ -94,6 +118,11 @@ impl<I: Send, O: 'static, C: Codec<I> + Codec<O>> Request<I, O, C> {
                 Ok(Reply::start(answer))
             }
             result = &mut answer => {
+                // One read can deliver both admission and a failed reply.
+                if received.try_recv().is_ok() {
+                    return Ok(Reply::start(async move { result }));
+                }
+
                 let output = result?;
                 Ok(Reply::start(async move { Ok(output) }))
             }
@@ -102,41 +131,44 @@ impl<I: Send, O: 'static, C: Codec<I> + Codec<O>> Request<I, O, C> {
 }
 
 impl<I: Send, O: 'static, C: Codec<I> + Codec<O>> Future for Request<I, O, C> {
-    type Output = Result<O, Error>;
+    type Output = Result<O, (Error, String)>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.begin();
 
         match &mut this.running {
-            Some(running) => running.answer.as_mut().poll(cx),
-            None => Poll::Ready(Err(Error::new(
+            Some(running) => running.answer.as_mut().poll(cx).map_err(Into::into),
+            None => Poll::Ready(Err(Failure::new(
                 CallError::NotAdmitted,
                 Cause::Protocol,
                 "remote request has no answer",
-            ))),
+            )
+            .into())),
         }
     }
 }
 impl<O: Send + 'static> Reply<O> {
-    fn start(answer: impl Future<Output = Result<O, Error>> + Send + 'static) -> Self {
+    fn start(answer: impl Future<Output = Result<O, Failure>> + Send + 'static) -> Self {
         Self {
             answer: tokio::spawn(answer),
         }
     }
 }
 impl<O> Future for Reply<O> {
-    type Output = Result<O, Error>;
+    type Output = Result<O, (Error, String)>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.answer).poll(cx).map(|result| {
-            result.unwrap_or_else(|error| {
-                Err(Error::new(
+            let output = result.unwrap_or_else(|error| {
+                Err(Failure::new(
                     CallError::OutcomeUnknown,
                     Cause::Closed,
                     error.to_string(),
                 ))
-            })
+            });
+
+            output.map_err(Into::into)
         })
     }
 }
@@ -161,14 +193,14 @@ impl<I, O, C> TimeoutRequest for Request<I, O, C> {
     }
 }
 impl<I: Send, O: Send + 'static, C: Codec<I> + Codec<O>> SendRequest for Request<I, O, C> {
-    type Reply = Result<Reply<O>, Error>;
+    type Reply = Result<Reply<O>, (Error, String)>;
 
     async fn send(self) -> Self::Reply {
         self.send().await
     }
 }
 impl<I: Send, C: Codec<I> + Codec<()>> CastRequest for Request<I, (), C> {
-    type Output = Result<(), Error>;
+    type Output = Result<(), (Error, String)>;
 
     async fn cast(self) -> Self::Output {
         drop(self.send().await?);

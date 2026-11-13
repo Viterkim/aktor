@@ -10,6 +10,20 @@ use std::{
 
 type TestPacket = Packet<fn(&mut (), ()), (), ()>;
 
+#[tokio::test]
+async fn admit_during_shutdown() {
+    let (handle, _listener) = crate::listener::channel::<()>(1).unwrap();
+    let request = call(&handle, |_, ()| (), ());
+    handle.inner.admission.shutdown();
+
+    assert!(matches!(
+        core::pin::pin!(request.admit())
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(CallError::NotAdmitted))
+    ));
+}
+
 std::thread_local! {
     static SERVICE_GATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }

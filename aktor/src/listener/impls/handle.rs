@@ -2,6 +2,21 @@ use super::super::*;
 use crate::message::AktorStateError;
 
 impl<S, Role> Handle<S, Role> {
+    /// Wrap the outermost future that needs to stop with this actor's group.
+    /// If the group starts closing first, `run` drops that future and returns `None`.
+    pub async fn run<F: Future>(&self, work: F) -> Option<F::Output> {
+        match self.inner.admission.group() {
+            Some(kill) => kill.run(work).await,
+            None => Some(work.await),
+        }
+    }
+
+    /// Use the group's completion to wait for the shutdown report or confirm that every actor
+    /// has stopped. Returns `None` if the actor has no group.
+    pub fn group_completion(&self) -> Option<crate::AktorGroupCompletion> {
+        self.inner.admission.group().map(|kill| kill.completion())
+    }
+
     pub fn is_closed(&self) -> bool {
         self.inner.sender.is_closed()
     }
@@ -11,7 +26,7 @@ impl<S, Role> Handle<S, Role> {
     }
 
     /// Another handle to the same actor.
-    pub fn new_handle(&self) -> Self {
+    fn new_handle(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             role: PhantomData,
@@ -45,11 +60,7 @@ impl<S, Role> Handle<S, Role> {
         let mut finished = self.inner.finished.clone();
 
         loop {
-            if matches!(
-                self.inner.admission.phase(),
-                crate::queue::Phase::Closing { .. }
-            ) || self.inner.sender.is_closed()
-            {
+            if self.inner.admission.phase().is_closing() || self.inner.sender.is_closed() {
                 return;
             }
 
@@ -79,6 +90,11 @@ impl<S, Role> WeakHandle<S, Role> {
             inner,
             role: PhantomData,
         })
+    }
+}
+impl<S, Role> Clone for Handle<S, Role> {
+    fn clone(&self) -> Self {
+        self.new_handle()
     }
 }
 impl<S, Role> Clone for WeakHandle<S, Role> {

@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn lifecycle() {
-    for command in ["serve", "pause", "shutdown"] {
+    for command in ["serve", "shutdown"] {
         let cleaned = Arc::new(Mutex::new(None));
         let record = cleaned.clone();
         let (handle, actor, thread) = spawn(SpawnArgs {
@@ -39,7 +39,6 @@ async fn lifecycle() {
 
         let stopping = async {
             match command {
-                "pause" => actor.pause().await,
                 "shutdown" => actor.shutdown().await,
                 _ => {
                     actor.closed().await;

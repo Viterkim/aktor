@@ -30,7 +30,7 @@ impl Wake for ReenterAdmission {
 async fn reentrant_wake() {
     let (handle, mut listener) = spawn::channel::<usize>(2).unwrap();
     let wake = Arc::new(ReenterAdmission {
-        handle: handle.new_handle(),
+        handle: handle.clone(),
         called: AtomicBool::new(false),
     });
     let waker = Waker::from(wake.clone());

@@ -5,10 +5,10 @@ use tokio::sync::mpsc;
 
 pub type Pending = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-pub fn drive<F: Future<Output = ShutdownReport>>(
+pub fn drive<F: Future<Output = AktorShutdownReport>>(
     control: Arc<Control>,
     closing: F,
-) -> impl Future<Output = ShutdownReport> {
+) -> impl Future<Output = AktorShutdownReport> {
     let (sender, mut receiver) = mpsc::unbounded_channel();
 
     *control

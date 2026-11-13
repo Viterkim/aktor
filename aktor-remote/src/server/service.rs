@@ -1,6 +1,6 @@
 use aktor::{
     message::LocalFuture,
-    worker::{Registry, WorkerError},
+    worker::{Operations, Registry, WorkerFailure},
 };
 
 type Run<S> = for<'a> fn(
@@ -8,10 +8,11 @@ type Run<S> = for<'a> fn(
     &'a mut S,
     String,
     Vec<u8>,
-) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>;
+) -> LocalFuture<'a, Result<Vec<u8>, WorkerFailure>>;
 
 pub struct Service<S> {
     pub registry: Registry,
+    pub operations: Operations,
     pub run: Run<S>,
     #[cfg(test)]
     pub pending: std::sync::Arc<tokio::sync::Notify>,
@@ -32,7 +33,7 @@ impl<S> Service<S> {
         state: &mut S,
         name: String,
         input: Vec<u8>,
-    ) -> Result<Vec<u8>, WorkerError> {
+    ) -> Result<Vec<u8>, WorkerFailure> {
         (self.run)(&self.registry, state, name, input).await
     }
 }

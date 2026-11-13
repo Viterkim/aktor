@@ -6,6 +6,9 @@ extras_dir=${AKTOR_EXTRAS:-"$PWD/../aktor-extras"}
 current_toolchain=$(rustup show active-toolchain | cut -d ' ' -f 1)
 
 for toolchain in 1.95.0 "$current_toolchain"; do
+    cargo +"$toolchain" check -p aktor --target wasm32-unknown-unknown --no-default-features \
+        --features macros,wasm_browser_workers
+
     cargo +"$toolchain" test --manifest-path integrations/Cargo.toml -p aktor-wasm-proof
     cargo +"$toolchain" test --manifest-path integrations/Cargo.toml -p aktor-wasm-proof --release
 

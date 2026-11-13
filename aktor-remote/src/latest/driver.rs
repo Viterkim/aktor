@@ -1,12 +1,13 @@
 use super::*;
 use crate::packet;
 use aktor::worker::WorkerError;
+use std::borrow::Cow;
 
 pub async fn drive<I: Send + 'static, O: Send + 'static>(
     inner: Arc<Inner>,
     shared: Arc<Shared<I, O>>,
     operation: Operation,
-    encode: fn(&I) -> Result<Vec<u8>, Error>,
+    encode: fn(&I) -> Result<Vec<u8>, Failure>,
     decode: fn(&[u8]) -> Result<O, WorkerError>,
 ) {
     tokio::select! {
@@ -20,7 +21,7 @@ async fn run<I: Send, O: Send>(
     inner: &Inner,
     shared: &Shared<I, O>,
     operation: Operation,
-    encode: fn(&I) -> Result<Vec<u8>, Error>,
+    encode: fn(&I) -> Result<Vec<u8>, Failure>,
     decode: fn(&[u8]) -> Result<O, WorkerError>,
 ) {
     let mut generation = 0_u64;
@@ -29,19 +30,8 @@ async fn run<I: Send, O: Send>(
         if shared.closing() {
             break;
         }
-        let Some(update) = shared.pending() else {
+        if shared.pending().is_none() {
             shared.changed.notified().await;
-            continue;
-        };
-        if update.options.attempts == 0 || update.options.timeout.is_zero() {
-            shared.publish(
-                update.revision,
-                Err(Error::new(
-                    CallError::NotAdmitted,
-                    Cause::Protocol,
-                    "retry attempts and timeout must be positive",
-                )),
-            );
             continue;
         }
 
@@ -53,7 +43,7 @@ async fn run<I: Send, O: Send>(
         let result = match opened {
             Ok(mut active) => {
                 let Some(next) = generation.checked_add(1) else {
-                    shared.fail(Error::new(
+                    shared.fail(Failure::new(
                         CallError::NotAdmitted,
                         Cause::Closed,
                         "latest connection generations exhausted",
@@ -74,7 +64,11 @@ async fn run<I: Send, O: Send>(
                             active.max_frame.min(inner.options.max_frame),
                         )
                         .await?;
-                        match wire::read(&mut active.stream, inner.options.max_frame).await? {
+                        match inner
+                            .frames
+                            .read(&mut active.stream, inner.options.max_frame)
+                            .await?
+                        {
                             Message::LatestReady { session: ready } => {
                                 session = Some(ready);
                                 return Ok(ready);
@@ -82,7 +76,7 @@ async fn run<I: Send, O: Send>(
                             Message::LatestExpired if session.is_some() => session = None,
                             Message::Reject(error) => return Err(error),
                             _ => {
-                                return Err(Error::new(
+                                return Err(Failure::new(
                                     CallError::NotAdmitted,
                                     Cause::Protocol,
                                     "expected latest session acknowledgement",
@@ -92,17 +86,7 @@ async fn run<I: Send, O: Send>(
                     }
                 };
                 match budget(shared, opening, operation).await {
-                    Ok(session) => {
-                        connected(
-                            active,
-                            shared,
-                            inner.options.max_frame,
-                            encode,
-                            decode,
-                            session,
-                        )
-                        .await
-                    }
+                    Ok(session) => connected(active, shared, inner, encode, decode, session).await,
                     Err(error) => Err(error),
                 }
             }
@@ -136,7 +120,9 @@ async fn run<I: Send, O: Send>(
 }
 
 async fn backoff<I, O>(shared: &Shared<I, O>, revision: u64, delay: std::time::Duration) -> bool {
-    let due = Instant::now() + delay;
+    let waiting = tokio::time::sleep(delay);
+    tokio::pin!(waiting);
+
     loop {
         if shared.closing()
             || !shared
@@ -147,7 +133,7 @@ async fn backoff<I, O>(shared: &Shared<I, O>, revision: u64, delay: std::time::D
         }
 
         tokio::select! {
-            _ = sleep_until(due) => return true,
+            _ = &mut waiting => return true,
             _ = shared.changed.notified() => {},
         }
     }
@@ -155,13 +141,13 @@ async fn backoff<I, O>(shared: &Shared<I, O>, revision: u64, delay: std::time::D
 
 async fn budget<I, O, T>(
     shared: &Shared<I, O>,
-    future: impl Future<Output = Result<T, Error>>,
+    future: impl Future<Output = Result<T, Failure>>,
     operation: Operation,
-) -> Result<T, Error> {
+) -> Result<T, Failure> {
     tokio::pin!(future);
     loop {
         let Some(update) = shared.pending() else {
-            return Err(Error::new(
+            return Err(Failure::new(
                 CallError::NotAdmitted,
                 Cause::Closed,
                 "latest receiver closed",
@@ -177,33 +163,47 @@ async fn budget<I, O, T>(
     }
 }
 
-fn expired(update: &Update, operation: Operation) -> Error {
-    Error::new(
+fn expired(update: &Update, operation: Operation) -> Failure {
+    Failure::new(
         update.outcome,
         Cause::Timeout,
         format!("{} latest update timed out", operation.name),
     )
 }
 
+fn acknowledge<I, O>(shared: &Shared<I, O>, revision: u64) {
+    if shared.seen.send_if_modified(|seen| {
+        if revision <= *seen {
+            return false;
+        }
+
+        *seen = revision;
+        true
+    }) {
+        shared.changed.notify_one();
+    }
+}
+
 async fn connected<I: Send, O: Send>(
     active: Active,
     shared: &Shared<I, O>,
-    limit: usize,
-    encode: fn(&I) -> Result<Vec<u8>, Error>,
+    inner: &Inner,
+    encode: fn(&I) -> Result<Vec<u8>, Failure>,
     decode: fn(&[u8]) -> Result<O, WorkerError>,
     session: [u8; 16],
-) -> Result<(), Error> {
-    let compress = active.stream.compresses();
+) -> Result<(), Failure> {
+    let limit = inner.options.max_frame;
+    let compress = active.compress;
     let (mut reader, mut writer) = tokio::io::split(active.stream);
     shared.seen.send_replace(0);
     let reading = async {
         loop {
-            match wire::read(&mut reader, limit).await? {
+            match inner.frames.read(&mut reader, limit).await? {
                 Message::LatestSeen { revision } => {
-                    shared.seen.send_replace(revision);
-                    shared.changed.notify_one();
+                    acknowledge(shared, revision);
                 }
                 Message::LatestAnswer { revision, output } => {
+                    acknowledge(shared, revision);
                     if !shared
                         .pending()
                         .is_some_and(|update| update.revision == revision)
@@ -215,7 +215,7 @@ async fn connected<I: Send, O: Send>(
                 }
                 Message::Reject(error) => return Err(error),
                 _ => {
-                    return Err(Error::new(
+                    return Err(Failure::new(
                         CallError::OutcomeUnknown,
                         Cause::Protocol,
                         "expected latest reply",
@@ -239,23 +239,24 @@ async fn connected<I: Send, O: Send>(
             {
                 tokio::select! {
                     _ = shared.changed.notified() => continue,
-                    _ = sleep_until(update.deadline) => return Err(Error::new(update.outcome, Cause::Timeout, "remote latest update timed out")),
+                    _ = sleep_until(update.deadline) => return Err(Failure::new(update.outcome, Cause::Timeout, "remote latest update timed out")),
                 }
             }
 
             let Some(update) = shared.encode(update.revision, encode) else {
                 continue;
             };
-            shared.attempt(update.revision);
-            let Some(input) = update.input.clone() else {
+            let Some(input) = update.input else {
                 continue;
             };
+            shared.attempt(update.revision);
+
             let bytes = input.and_then(|input| {
                 wire::encode(
                     &Message::Update {
                         session,
                         revision: update.revision,
-                        input: input.to_vec(),
+                        input: Cow::Borrowed(&input),
                     },
                     active.max_frame.min(limit),
                 )
@@ -275,7 +276,7 @@ async fn connected<I: Send, O: Send>(
             timeout_at(update.deadline, wire::write_bytes(&mut writer, &bytes))
                 .await
                 .map_err(|_| {
-                    Error::new(
+                    Failure::new(
                         update.outcome,
                         Cause::Timeout,
                         "remote latest write timed out",

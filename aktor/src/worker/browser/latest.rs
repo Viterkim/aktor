@@ -163,23 +163,29 @@ impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
             input
         };
 
-        (self.0.encoder)(&input)
-            .map(Some)
-            .map_err(|error| error.without_data())
+        (self.0.encoder)(&input).map(Some).map_err(WireError::from)
     }
 
     fn answer(&self, output: Result<Vec<u8>, WireError>) -> Option<WireError> {
-        let output =
-            output.and_then(|bytes| (self.0.decoder)(&bytes).map_err(|error| error.without_data()));
+        let output = output.and_then(|bytes| {
+            {
+                let slot = self.0.slot.borrow();
+                if !slot.receiver || slot.running != Some(slot.revision) {
+                    return Ok(None);
+                }
+            }
+
+            (self.0.decoder)(&bytes).map(Some).map_err(WireError::from)
+        });
         let (discarded, pending) = {
             let mut slot = self.0.slot.borrow_mut();
             let revision = slot.running.take();
 
             match output {
-                Ok(output) if slot.receiver && revision == Some(slot.revision) => {
+                Ok(Some(output)) if slot.receiver && revision == Some(slot.revision) => {
                     (slot.output.replace(output), None)
                 }
-                Ok(output) => (Some(output), None),
+                Ok(output) => (output, None),
                 Err(error) => {
                     slot.failed = Some(error);
                     slot.scheduled = None;

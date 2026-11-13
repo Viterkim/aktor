@@ -1,6 +1,6 @@
 use crate::{
-    AktorRetryOpts, CallError, Cause, Error, Request,
-    connection::{Address, Stream},
+    AktorRetryOpts, CallError, Cause, Error, Failure, Request,
+    connection::{Address, BufferedStream, Stream, idle},
     wire::{self, Message},
 };
 use aktor::{
@@ -18,23 +18,24 @@ mod impls;
 
 #[derive(Clone, Debug)]
 pub struct ClientOptions {
-    /// Change on both sides when a transported type changes its wire layout.
+    /// Change this on both sides when a type's wire layout changes.
     pub build: String,
-    /// Includes queueing, reconnecting and waiting for the reply.
+    /// Time for queueing, reconnecting and waiting for the reply.
     pub timeout: Duration,
     pub retry_delay: Duration,
     pub max_frame: usize,
 }
 
 pub struct Client<S, Role = ()> {
-    pub inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
     state: PhantomData<fn() -> (S, Role)>,
 }
 
-pub struct Inner {
+pub(crate) struct Inner {
     address: Address,
     pub options: ClientOptions,
     operations: Operations,
+    pub frames: crate::wire::FrameReader,
     #[cfg(feature = "udp")]
     udp: tokio::sync::OnceCell<crate::udp::Socket>,
     connection: Mutex<Connection>,
@@ -45,11 +46,14 @@ struct Connection {
     next: u64,
 }
 
-pub struct Active {
-    pub stream: Stream,
+pub(crate) struct Active {
+    pub stream: BufferedStream,
     pub max_frame: usize,
+    pub compress: bool,
 }
 
-pub async fn connect<S: 'static>(address: impl Into<Address>) -> Result<Client<S>, Error> {
+pub async fn connect<S: 'static>(
+    address: impl Into<Address>,
+) -> Result<Client<S>, (Error, String)> {
     Client::connect_with(address, ClientOptions::default()).await
 }

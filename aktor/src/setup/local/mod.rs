@@ -1,5 +1,5 @@
 use super::AktorExecution;
-use crate::{AktorOutcome, KillSwitch};
+use crate::{AktorKillSwitch, AktorOutcome};
 use tokio::sync::oneshot;
 
 #[cfg(all(
@@ -17,6 +17,6 @@ pub use impls::start_local;
 struct Completion {
     name: String,
     kind: AktorExecution,
-    kill: KillSwitch,
+    kill: AktorKillSwitch,
     completed: Option<oneshot::Sender<AktorOutcome>>,
 }

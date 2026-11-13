@@ -1,6 +1,10 @@
 use super::super::*;
 
 impl<S, const N: usize, E> Inner<S, N, E> {
+    pub fn has_work(&self) -> bool {
+        !self.queue.borrow().is_empty() || !self.services.borrow().is_empty()
+    }
+
     pub fn cancel_service(&self, id: *const ()) {
         let message = {
             let mut services = self.services.borrow_mut();
@@ -15,17 +19,19 @@ impl<S, const N: usize, E> Inner<S, N, E> {
 
     pub fn close(&self) {
         if self.open.replace(false) {
-            self.notify(&self.closed);
+            let owner = || self.wake_owner();
+            let space = || self.space.notify();
+            let closed = || self.closed.notify();
+            self.notify(&[&owner, &space, &closed]);
         }
     }
 
-    fn notify(&self, event: &Event) {
-        let notify = || event.notify();
-        let sessions = || self.wake_sessions();
+    fn notify(&self, actions: &[&dyn Fn()]) {
+        let sessions: &dyn Fn() = &|| self.wake_sessions();
+        let actions = actions.iter().copied().chain(core::iter::once(sessions));
 
         #[cfg(feature = "std")]
         {
-            let actions: [&dyn Fn(); 2] = [&notify, &sessions];
             let primary = crate::local::panic::capture_each(
                 actions,
                 |action| action(),
@@ -45,9 +51,8 @@ impl<S, const N: usize, E> Inner<S, N, E> {
             }
         }
         #[cfg(not(feature = "std"))]
-        {
-            notify();
-            sessions();
+        for action in actions {
+            action();
         }
     }
 
@@ -104,12 +109,15 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         let supervisor = self.group.borrow().clone();
 
         if let Some((name, group)) = supervisor {
-            group.fail(crate::AktorFailureReport {
-                kind: None,
-                actor: name,
-                phase: "call".into(),
-                message: "actor stopped without an output".into(),
-            });
+            // During shutdown a lost reply is a call shutdown cancelled, a crash reports itself.
+            if !group.is_stopping() {
+                group.fail(crate::AktorFailureReport {
+                    kind: None,
+                    actor: name.as_ref().into(),
+                    phase: "call".into(),
+                    message: "actor stopped without an output".into(),
+                });
+            }
 
             true
         } else {
@@ -132,7 +140,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
 
     pub fn service(&self, message: Message<S>) {
         self.services.borrow_mut().push_back(message);
-        self.closed.notify();
+        self.wake_owner();
     }
 
     pub fn enqueue(&self, message: Message<S>) -> Result<(), Message<S>> {
@@ -144,13 +152,20 @@ impl<S, const N: usize, E> Inner<S, N, E> {
 
         queue.push_back(message);
         drop(queue);
-        self.closed.notify();
+        self.wake_owner();
         Ok(())
     }
 
-    pub fn fail(&self, error: &OwnerFailure<E>) -> bool {
-        if matches!(error, OwnerFailure::SetupDiagnostic(_, true))
-            || matches!(error, OwnerFailure::CleanupFailure(failure) if failure.primary)
+    fn wake_owner(&self) {
+        let wake = self.owner_waker.take();
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+
+    pub fn fail(&self, error: &OwnerError<E>) -> bool {
+        if matches!(error, OwnerError::SetupDiagnostic(_, true))
+            || matches!(error, OwnerError::CleanupFailure(failure) if failure.primary)
         {
             return true;
         }
@@ -158,18 +173,21 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         let supervisor = self.group.borrow().clone();
 
         if let Some((name, group)) = supervisor
-            && !(matches!(error, OwnerFailure::Cancelled) && group.is_stopping())
+            && !(matches!(error, OwnerError::Cancelled) && group.is_stopping())
+            && !matches!(error, OwnerError::CleanupUnconfirmed)
         {
             let failure = crate::AktorFailureReport {
                 kind: None,
-                actor: name,
+                actor: name.as_ref().into(),
                 phase: match error {
-                    OwnerFailure::Setup(_)
-                    | OwnerFailure::SetupDiagnostic(_, _)
-                    | OwnerFailure::SetupPanic(_) => "setup",
-                    OwnerFailure::Cleanup(_) | OwnerFailure::CleanupFailure(_) => "cleanup",
-                    OwnerFailure::Runner(_) => "runner",
-                    OwnerFailure::Cancelled => "owner",
+                    OwnerError::Setup(_)
+                    | OwnerError::SetupDiagnostic(_, _)
+                    | OwnerError::SetupPanic(_) => "setup",
+                    OwnerError::Cleanup(_)
+                    | OwnerError::CleanupFailure(_)
+                    | OwnerError::CleanupUnconfirmed => "cleanup",
+                    OwnerError::Runner(_) => "runner",
+                    OwnerError::Cancelled => "owner",
                 }
                 .into(),
                 message: alloc::format!("{error:#}"),
@@ -177,9 +195,9 @@ impl<S, const N: usize, E> Inner<S, N, E> {
 
             if matches!(
                 error,
-                OwnerFailure::Setup(_)
-                    | OwnerFailure::SetupDiagnostic(_, _)
-                    | OwnerFailure::SetupPanic(_)
+                OwnerError::Setup(_)
+                    | OwnerError::SetupDiagnostic(_, _)
+                    | OwnerError::SetupPanic(_)
             ) {
                 return group.fail_startup(failure);
             } else {
@@ -214,7 +232,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         }
     }
 
-    pub fn finish(&self, result: Result<(), Rc<OwnerFailure<E>>>) {
+    pub fn finish(&self, result: Result<(), Rc<OwnerError<E>>>) {
         if let Err(error) = &result {
             self.fail(error);
         }
@@ -228,7 +246,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         let mut completion = CompletionGuard {
             inner: self,
             failure: result.as_ref().err().cloned().unwrap_or_else(|| {
-                Rc::new(OwnerFailure::Runner(crate::AktorError::new(
+                Rc::new(OwnerError::Runner(crate::AktorError::new(
                     "actor work destruction failed",
                     (),
                 )))
@@ -257,7 +275,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         }
     }
 
-    fn complete(&self, result: Result<(), Rc<OwnerFailure<E>>>) {
+    fn complete(&self, result: Result<(), Rc<OwnerError<E>>>) {
         if self.completion.result.borrow().is_some() {
             return;
         }
@@ -267,7 +285,7 @@ impl<S, const N: usize, E> Inner<S, N, E> {
         }
 
         *self.completion.result.borrow_mut() = Some(result);
-        self.notify(&self.completion.changed);
+        self.notify(&[&|| self.completion.changed.notify()]);
     }
 }
 

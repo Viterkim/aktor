@@ -63,13 +63,7 @@ impl Inner {
     }
 
     pub fn reject(self: &Rc<Self>, error: WireError) {
-        if self.finished.borrow().is_some()
-            || self
-                .group
-                .borrow()
-                .as_ref()
-                .is_some_and(|(_, group)| group.is_finished())
-        {
+        if self.finished.borrow().is_some() {
             fatal(error);
         }
 
@@ -81,10 +75,7 @@ impl Inner {
     fn record(&self, error: &WireError) {
         let primary = self.notify(error);
         let message = match &error.cause {
-            WorkerCause::Cleanup => error
-                .diagnostics
-                .as_ref()
-                .map(|diagnostics| diagnostics.report.clone()),
+            WorkerCause::Cleanup => error.diagnostics.clone(),
             _ if !primary => Some(format!("{error:#}")),
             _ => None,
         };
@@ -116,7 +107,9 @@ impl Inner {
             message,
         };
 
-        if matches!(&*self.ready.borrow(), Some(Ok(()))) {
+        if matches!(error.cause, WorkerCause::Cleanup)
+            || matches!(&*self.ready.borrow(), Some(Ok(())))
+        {
             group.fail(failure)
         } else {
             group.fail_startup(failure)
@@ -128,22 +121,151 @@ impl Inner {
     }
 
     pub fn retain_failure(self: &Rc<Self>, error: WireError) {
-        if self.retired.get() {
+        if *self.retirement.borrow() != AktorRetireStatus::Unconfirmed {
             return;
         }
 
         self.accepted.set(true);
-        self.retain_unconfirmed.set(true);
+        self.end_unconfirmed(error.diagnostics.as_deref());
+
+        // A worker's retention request keeps a standalone owner alive. Its group chooses Kill or Leave.
+        if self.group.borrow().is_none() {
+            self.retain_unconfirmed.set(true);
+        }
+
         *self.retained.borrow_mut() = Some(self.clone());
 
-        if self.finished.borrow().is_some() {
+        if matches!(error.cause, WorkerCause::Setup)
+            && self.ready.borrow().is_some()
+            && self.setup_failure_pending.replace(false)
+        {
+            self.update_setup_failure(error.into());
+        } else if self.finished.borrow().is_some() {
             self.record(&error);
         } else {
             self.fail_error(error);
         }
     }
 
+    pub fn setup_pending(self: &Rc<Self>, report: String) {
+        if self.ready.borrow().is_some()
+            || *self.retirement.borrow() != AktorRetireStatus::Unconfirmed
+        {
+            return;
+        }
+
+        self.setup_failure_pending.set(true);
+        self.retain_failure(WireError::setup(CallError::OutcomeUnknown, report));
+    }
+
+    pub fn setup_failed(self: &Rc<Self>, failure: ReadyFailure) {
+        if matches!(*self.ready.borrow(), Some(Ok(()))) {
+            self.fail(WorkerCause::Protocol);
+            return;
+        }
+
+        self.accepted.set(true);
+        self.initialize.borrow_mut().take();
+
+        if !self.setup_failure_pending.replace(false) {
+            self.fail_start(failure);
+            return;
+        }
+
+        self.update_setup_failure(failure);
+    }
+
+    pub fn script_failed(self: &Rc<Self>, message: String) {
+        if *self.retirement.borrow() != AktorRetireStatus::Unconfirmed {
+            return;
+        }
+
+        let error = if matches!(*self.ready.borrow(), Some(Ok(()))) {
+            if self.shutdown_sent.get() {
+                self.end_unconfirmed(Some(&message));
+                if self.finished.borrow().is_some() {
+                    self.add_diagnostic(message);
+                    return;
+                }
+            }
+            WireError::new(CallError::OutcomeUnknown, WorkerCause::Crashed(message))
+        } else {
+            if self.ready.borrow().is_none() {
+                self.end_unconfirmed(Some(&message));
+            }
+            WireError::setup(CallError::OutcomeUnknown, message)
+        };
+
+        if self.setup_failure_pending.get() {
+            self.update_setup_failure(error.into());
+        } else {
+            self.setup_failure_pending
+                .set(self.ready.borrow().is_none());
+            self.fail_error(error);
+        }
+    }
+
+    fn update_setup_failure(&self, mut failure: ReadyFailure) {
+        if *self.retirement.borrow() != AktorRetireStatus::Unconfirmed {
+            return;
+        }
+
+        self.add_diagnostic(format!("{:#}", failure.error));
+
+        self.end
+            .send_replace(End::Unconfirmed(failure.error.diagnostics.clone()));
+        self.finished.send_replace(Some(Err(failure.error.clone())));
+
+        failure.error.outcome = CallError::NotAdmitted;
+        self.ready.send_replace(Some(Err(failure)));
+    }
+
+    fn add_diagnostic(&self, report: String) {
+        let mut diagnostics = self.diagnostics.borrow_mut();
+        if !diagnostics.iter().any(|entry| entry.diagnostics == report) {
+            diagnostics.push(crate::AktorError::new(report, ()));
+        }
+    }
+
+    pub fn setup_retired(self: &Rc<Self>) {
+        if *self.retirement.borrow() != AktorRetireStatus::Unconfirmed {
+            return;
+        }
+
+        if matches!(*self.ready.borrow(), Some(Ok(())))
+            || !self.failed.get()
+            || !self.outstanding.borrow().is_empty()
+            || self.initialize.borrow().is_some()
+            || self.setup_failure_pending.get()
+        {
+            self.fail(WorkerCause::Protocol);
+            return;
+        }
+
+        self.finish(Ok(()));
+    }
+
+    pub fn fail_start(self: &Rc<Self>, failure: ReadyFailure) {
+        if !matches!(&*self.ready.borrow(), Some(Ok(()))) {
+            self.end_unconfirmed(failure.error.diagnostics.as_deref());
+        }
+
+        // A JavaScript catch can report the same error again with only its text.
+        if self.ready.borrow().is_some() {
+            self.fail(WorkerCause::Protocol);
+            return;
+        }
+
+        let error = failure.error.clone();
+        self.ready.send_replace(Some(Err(failure)));
+        self.fail_error(error);
+    }
+
     pub fn fail_error(self: &Rc<Self>, error: WireError) {
+        self.close_with_error(error, true);
+    }
+
+    fn close_with_error(self: &Rc<Self>, error: WireError, report: bool) {
         if self.finished.borrow().is_some() || self.failed.replace(true) {
             return;
         }
@@ -152,7 +274,9 @@ impl Inner {
             *self.retained.borrow_mut() = Some(self.clone());
         }
 
-        self.record(&error);
+        if report {
+            self.record(&error);
+        }
         self.closed.set(true);
         self.count.close();
         self.bytes.close();
@@ -160,7 +284,7 @@ impl Inner {
         if self.ready.borrow().is_none() {
             let mut startup = error.clone();
             startup.outcome = CallError::NotAdmitted;
-            self.ready.send_replace(Some(Err(startup)));
+            self.ready.send_replace(Some(Err(startup.into())));
         }
 
         let active = self.active.get();
@@ -195,14 +319,17 @@ impl Inner {
         self.queue.borrow_mut().clear();
         self.active.set(None);
         self.executing.set(false);
-        *self.failure.borrow_mut() = Some(error.clone());
-        self.finished.send_replace(Some(Err(error)));
+        self.publish(Err(error));
         self.wake_sessions();
 
         self.continue_shutdown(false);
     }
 
     pub fn finish(self: &Rc<Self>, result: Result<(), WireError>) {
+        if *self.retirement.borrow() != AktorRetireStatus::Unconfirmed {
+            return;
+        }
+
         if !self.join_ready() {
             *self.pending_finish.borrow_mut() = Some(result);
             self.continue_shutdown(false);
@@ -213,23 +340,19 @@ impl Inner {
             self.record(error);
         }
 
-        let failure = self.failure.borrow_mut().take();
-        let result = result.and(match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        });
-
-        self.retired.set(true);
-        self.complete(result);
-    }
-
-    fn complete(&self, result: Result<(), WireError>) {
-        self.finished.send_replace(Some(result));
+        self.kill_worker(AktorRetireStatus::Confirmed);
+        self.publish(result);
         self.uncertain.borrow_mut().clear();
         self.wake_sessions();
         self.buffers.clear();
-        self.worker.terminate();
         self.retained.borrow_mut().take();
+    }
+
+    fn publish(&self, result: Result<(), WireError>) {
+        let first = self.failure.borrow_mut().take();
+        if self.finished.borrow().is_none() {
+            self.finished.send_replace(Some(first.map_or(result, Err)));
+        }
     }
 
     pub fn pump(self: &Rc<Self>) {
@@ -291,7 +414,9 @@ impl Inner {
             if let Some(input) = input {
                 self.outstanding.borrow_mut().insert(id, work);
 
-                if let Err(error) = post(&self.worker, &self.buffers, &input) {
+                if let Err(mut error) = post(&self.worker, &self.buffers, &input) {
+                    self.active.set(None);
+                    error.outcome = CallError::Discarded;
                     self.fail_error(error);
                 }
 
@@ -314,6 +439,17 @@ impl Inner {
     }
 
     pub fn shutdown(self: &Rc<Self>) {
+        if !self.accepted.get() && self.ready.borrow().is_none() {
+            let error = WireError::new(CallError::NotAdmitted, WorkerCause::Closed);
+            self.initialize.borrow_mut().take();
+            self.end_unconfirmed(None);
+            self.ready
+                .send_replace(Some(Err(ReadyFailure::not_run(error.clone()))));
+            *self.pending_finish.borrow_mut() = Some(Ok(()));
+            self.close_with_error(error, false);
+            return;
+        }
+
         if self.group.borrow().is_none() && self.ready.borrow().is_none() {
             self.fail_error(WireError::new(CallError::NotAdmitted, WorkerCause::Closed));
             return;
@@ -331,6 +467,33 @@ impl Inner {
         *self.retained.borrow_mut() = Some(self.clone());
 
         self.continue_shutdown(false);
+    }
+
+    fn end_unconfirmed(&self, report: Option<&str>) {
+        self.end.send_if_modified(|end| match end {
+            End::Returned(_) => false,
+            End::Unconfirmed(_) if report.is_none() => false,
+            End::Unconfirmed(Some(previous)) if let Some(report) = report => {
+                if previous.ends_with(report) {
+                    return false;
+                }
+                previous.push('\n');
+                previous.push_str(report);
+                true
+            }
+            End::Waiting | End::Unconfirmed(_) => {
+                *end = End::Unconfirmed(report.map(str::to_owned));
+                true
+            }
+        });
+    }
+
+    fn kill_worker(&self, status: AktorRetireStatus) {
+        if *self.retirement.borrow() == AktorRetireStatus::Unconfirmed {
+            self.end_unconfirmed(None);
+            self.worker.terminate();
+            self.retirement.send_replace(status);
+        }
     }
 
     fn join_ready(&self) -> bool {
@@ -383,42 +546,47 @@ impl Inner {
             return;
         }
 
-        if self.retired.get() {
+        if *self.retirement.borrow() != AktorRetireStatus::Unconfirmed {
             return;
         }
 
-        if force {
-            if self.retain_unconfirmed.get() {
-                if self.accepted.get() {
-                    *self.retained.borrow_mut() = Some(self.clone());
-                } else {
-                    self.finish(Ok(()));
-                }
-                return;
-            }
-
-            self.worker.terminate();
-
-            if !self.accepted.get() {
-                self.buffers.clear();
-                self.retained.borrow_mut().take();
-            }
+        if force && !self.retain_unconfirmed.get() {
+            self.kill_worker(AktorRetireStatus::Terminated);
+            self.uncertain.borrow_mut().clear();
+            self.buffers.clear();
+            self.retained.borrow_mut().take();
 
             return;
         }
 
         if self.failed.get() {
             if !self.accepted.get() {
-                if self.retain_unconfirmed.get() {
-                    self.finish(Ok(()));
-                } else {
-                    self.worker.terminate();
-                    self.buffers.clear();
-                    self.retained.borrow_mut().take();
-                }
-            } else {
+                self.kill_worker(AktorRetireStatus::Terminated);
+                self.buffers.clear();
+                self.retained.borrow_mut().take();
+            } else if !(force && self.shutdown_sent.get()) {
                 self.shutdown_sent.set(true);
                 let _result = post(&self.worker, &self.buffers, &Incoming::Shutdown);
+
+                if self.group.borrow().is_none()
+                    && !self.retain_unconfirmed.get()
+                    && !self.waiting_to_terminate.replace(true)
+                {
+                    let worker = Rc::downgrade(self);
+                    let mut retirement = self.retirement.subscribe();
+
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let grace = core::time::Duration::from_secs(5);
+                        tokio::select! {
+                            _ = retirement.wait_for(|status| *status != AktorRetireStatus::Unconfirmed) => {},
+                            _ = crate::timeout::browser_sleep(grace) => {
+                                if let Some(worker) = worker.upgrade() {
+                                    worker.continue_shutdown(true);
+                                }
+                            }
+                        }
+                    });
+                }
             }
 
             return;
@@ -429,7 +597,7 @@ impl Inner {
         wasm_bindgen_futures::spawn_local(async move {
             match observe(inner.ready.subscribe()).await {
                 Ok(()) => inner.pump(),
-                Err(error) => inner.fail_error(error),
+                Err(failure) => inner.fail_error(failure.error),
             }
         });
     }
@@ -438,7 +606,7 @@ impl Drop for Inner {
     fn drop(&mut self) {
         self.worker.set_onmessage(None);
         self.worker.set_onerror(None);
-        self.worker.terminate();
+        self.kill_worker(AktorRetireStatus::Terminated);
     }
 }
 
@@ -459,7 +627,7 @@ pub fn post(
         buffers.write(&input).map_err(|error| {
             WireError::new(
                 CallError::NotAdmitted,
-                WorkerCause::Codec(format!("{error:?}")),
+                WorkerCause::Transport(format!("{error:?}")),
             )
         })?
     } else {
@@ -477,7 +645,7 @@ pub fn post(
     sent.map_err(|error| {
         WireError::new(
             CallError::NotAdmitted,
-            WorkerCause::Codec(format!("{error:?}")),
+            WorkerCause::Transport(format!("{error:?}")),
         )
     })
 }

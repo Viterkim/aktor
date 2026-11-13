@@ -1,10 +1,11 @@
 use crate::{
-    CallError, Cause, Error,
-    connection::{Address, Listener, Stream},
+    CallError, Cause, Error, Failure,
+    connection::{Address, BufferedStream, Listener, Stream},
     wire::{self, Message},
 };
 use aktor::{Aktor, listener::Handle, message::call_async, operation::Operation, worker::Registry};
 use std::{
+    borrow::Cow,
     fs::File,
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -31,7 +32,8 @@ pub struct ServerOptions {
     pub max_frame: usize,
     pub max_connections: usize,
     pub shutdown_timeout: Duration,
-    /// Bounds handshakes, started frames and reply writes. Quiet connections stay open.
+    /// Time limit for handshakes, frames already started and reply writes.
+    /// Quiet connections stay open.
     pub io_timeout: Duration,
     pub permissions: u32,
 }
@@ -40,8 +42,8 @@ pub struct ServerOptions {
 pub struct Server {
     pub address: Address,
     stop: watch::Sender<bool>,
-    finished: watch::Receiver<Option<Result<(), Error>>>,
-    errors: broadcast::Sender<Error>,
+    finished: watch::Receiver<Option<Result<(), Failure>>>,
+    errors: broadcast::Sender<(Error, String)>,
     #[cfg(test)]
     pub pending: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -55,9 +57,19 @@ struct SocketPath {
     _lock: File,
 }
 
+fn preview(value: &str) -> Cow<'_, str> {
+    const LIMIT: usize = 128;
+    if value.len() <= LIMIT {
+        return Cow::Borrowed(value);
+    }
+
+    let end = value.floor_char_boundary(LIMIT);
+    Cow::Owned(format!("{}...", &value[..end]))
+}
+
 pub async fn listen<S: 'static, Role: 'static>(
     address: impl Into<Address>,
     actor: &Aktor<S, Role>,
-) -> Result<Server, Error> {
+) -> Result<Server, (Error, String)> {
     Server::listen_with(address, actor, ServerOptions::default()).await
 }

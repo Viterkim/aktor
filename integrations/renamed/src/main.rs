@@ -31,11 +31,8 @@ pub async fn update(state: &mut State, input: Update) -> Update {
     }
 }
 
-#[derive(Er)]
-struct MainError;
-
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), ErReport<MainError>> {
+async fn main() -> ErMain {
     let operations = actor::worker::Operations::for_actor::<State, ()>();
 
     assert_eq!(operations.0.len(), 2);
@@ -55,10 +52,9 @@ async fn main() -> Result<(), ErReport<MainError>> {
     let bytes = actor::data::encode(&Update {
         by: 7,
         cached: "local".into(),
-    })
-    .er(())?;
+    })?;
     assert_eq!(
-        actor::data::decode::<Update>(&bytes).er(())?,
+        actor::data::decode::<Update>(&bytes)?,
         Update {
             by: 7,
             cached: String::new()
@@ -69,53 +65,44 @@ async fn main() -> Result<(), ErReport<MainError>> {
 
     executor
         .run_until(async {
-            let (state, actor) = spawn_local(&executor, State::default(), 8).er(())?;
+            let (state, actor) = spawn_local(&executor, State::default(), 8)?;
 
             assert_eq!(add(&state, 2).await, 2);
 
             drop(state);
-            actor.await.er(())?;
+            actor.await?;
 
             let actors = actor::aktor_start(AktorSetup {
-                actors: aktor_setups! {
-                    counter: AktorNew {
-                        name: AktorName::new("named counter"),
-                        role: AktorNoRole,
-                        kind: AktorKind::TokioTask,
-                        closures: AktorClosures {
-                            start: async || Ok::<_, AktorSetupError>(State::default()),
-
-                            end: (),
-                            intervals: vec![],
-                            before_each: None,
-                            after_each: None,
-                        },
-                        options: AktorNewOptions { capacity: 32 },
-                    },
+                actors: AktorNew {
+                    name: "named counter".into(),
+                    kind: AktorKind::TokioTask,
+                    start: async || aktor_ready(State::default()),
+                    end: (),
+                    hooks: Default::default(),
+                    capacity: 32,
+                    stuck: AktorStuck::Kill,
                 },
                 shutdown: |_| {},
-                options: AktorOptions {
-                    shutdown_grace: Duration::from_secs(5),
-                },
+                grace: Duration::from_secs(5),
             })
             .await
-            .er(())?;
+            .er_report()?;
 
-            assert_eq!(add(&actors.handles.counter, 85).await, 85);
+            assert_eq!(add(&actors.handles, 85).await, 85);
 
             let input = Update {
                 by: 1,
                 cached: "kept locally".into(),
             };
             assert_eq!(
-                update(&actors.handles.counter, input.clone()).await,
+                update(&actors.handles, input.clone()).await,
                 Update {
                     by: 86,
                     cached: input.cached.clone()
                 }
             );
 
-            let (sender, mut results) = update(&actors.handles.counter, input).latest();
+            let (sender, mut results) = update(&actors.handles, input).latest();
             assert_eq!(results.next().await.unwrap().by, 87);
             drop((sender, results));
 

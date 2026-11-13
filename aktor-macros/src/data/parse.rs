@@ -71,3 +71,34 @@ pub fn check_variant(variant: &syn::Variant) -> syn::Result<()> {
 
     Ok(())
 }
+
+pub fn check_serde_attrs(input: &syn::DeriveInput) -> syn::Result<()> {
+    fn check(attrs: &[syn::Attribute]) -> syn::Result<()> {
+        if let Some(attr) = attrs.iter().find(|attr| attr.path().is_ident("aktor")) {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "put this rule in the type's Serde implementation when using #[aktor(serde)]",
+            ));
+        }
+
+        Ok(())
+    }
+
+    match &input.data {
+        syn::Data::Struct(data) => data.fields.iter().try_for_each(|field| check(&field.attrs)),
+        syn::Data::Enum(data) => {
+            for variant in &data.variants {
+                check(&variant.attrs)?;
+                for field in &variant.fields {
+                    check(&field.attrs)?;
+                }
+            }
+
+            Ok(())
+        }
+        syn::Data::Union(_) => Err(syn::Error::new_spanned(
+            &input.ident,
+            "AktorData supports structs and enums",
+        )),
+    }
+}

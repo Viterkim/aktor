@@ -43,7 +43,7 @@ async fn settle_before_cleanup() {
     let owner = group
         .spawn_async(AktorArgs::new(
             "settlement",
-            async || Ok::<_, AktorSetupError>(()),
+            async || Ok::<_, String>(()),
             move |_| {
                 let cleanup = cleanup.clone();
 
@@ -51,9 +51,9 @@ async fn settle_before_cleanup() {
                     let _permit =
                         tokio::time::timeout(Duration::from_secs(1), cleanup.acquire_many(2))
                             .await
-                            .map_err(|_| AktorCleanupError::new("queued calls still alive", ()))?;
+                            .map_err(|_| String::from("queued calls still alive"))?;
 
-                    Ok::<_, AktorCleanupError>(())
+                    Ok::<_, String>(())
                 }
             },
         ))

@@ -1,33 +1,21 @@
-use crate::{
-    AktorDiagnostic, AktorError, AktorFailure, AktorGroupError, AktorRunError, ShutdownReport,
-};
-use alloc::{boxed::Box, string::String};
+use crate::{AktorError, AktorFailure, AktorGroupError};
+use alloc::string::{String, ToString};
 use core::fmt;
 
-impl AktorGroupError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            diagnostics: None,
-        }
-    }
+impl From<AktorGroupError> for (AktorGroupError, String) {
+    fn from(error: AktorGroupError) -> Self {
+        let report = error.diagnostics();
 
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.diagnostics {
-            Some(diagnostics) => f.write_str(&diagnostics.report),
-            None => f.write_str(&self.message),
-        }
+        (error, report)
     }
 }
-impl From<AktorGroupError> for AktorError {
-    fn from(error: AktorGroupError) -> Self {
-        let diagnostics = match error.diagnostics {
-            Some(diagnostics) => diagnostics.report,
-            None => error.message,
-        };
 
-        Self::new(diagnostics, ())
+impl AktorGroupError {
+    pub(crate) fn diagnostics(&self) -> String {
+        match self {
+            Self::StartFailed { report } => report.to_string(),
+            error => error.to_string(),
+        }
     }
 }
 
@@ -40,21 +28,72 @@ impl From<AktorError> for AktorFailure {
     }
 }
 
-impl From<ShutdownReport> for AktorRunError {
-    fn from(report: ShutdownReport) -> Self {
-        let diagnostics =
-            AktorDiagnostic::new("actor group shutdown failed", alloc::format!("{report}"));
-
-        Self {
-            report: Box::new(report),
-            diagnostics,
-        }
+impl<T> AktorError<T> {
+    #[doc(hidden)]
+    pub fn fmt_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        with_top(f, "actor lifecycle failed", &self.diagnostics)
     }
 }
 
-impl AktorRunError {
+impl AktorFailure {
     #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.diagnostics.report)
+    pub fn fmt_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        with_top(f, "actor lifecycle failed", &self.diagnostics)
+    }
+}
+
+pub fn with_top(f: &mut fmt::Formatter<'_>, message: &str, diagnostics: &str) -> fmt::Result {
+    match diagnostics.lines().next() {
+        Some(top) if !top.is_empty() => write!(f, "{message}: {top}"),
+        _ => f.write_str(message),
+    }
+}
+
+pub fn diagnostics(error: &(dyn core::error::Error + 'static)) -> String {
+    render_diagnostic(|| {
+        let mut output = String::new();
+        let mut source = Some(error);
+
+        for _ in 0..64 {
+            let Some(error) = source else {
+                return output;
+            };
+            if !output.is_empty() {
+                output.push_str("\ncaused by: ");
+            }
+            output.push_str(&alloc::format!("{error:#}"));
+            source = error.source();
+        }
+
+        if source.is_some() {
+            output.push_str("\ncaused by: ... (source chain truncated)");
+        }
+        output
+    })
+}
+
+pub(crate) fn tree_report<E: core::error::Error + 'static>(tree: &er::ErTree<E>) -> String {
+    render_diagnostic(|| tree.er_report())
+}
+
+pub fn render_diagnostic(render: impl FnOnce() -> String) -> String {
+    #[cfg(feature = "std")]
+    {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)) {
+            Ok(diagnostics) => diagnostics,
+            Err(payload) => {
+                let message = alloc::format!(
+                    "error formatter panicked: {}",
+                    crate::panic::panic_message(&payload)
+                );
+
+                crate::panic::dispose_secondary(payload);
+                message
+            }
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        render()
     }
 }

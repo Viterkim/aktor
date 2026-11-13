@@ -4,7 +4,7 @@ impl<'a, S> Permit<'a, S> {
     pub fn commit(self, message: Message<S>) -> Result<&'a Notify, (Self, Message<S>)> {
         let mut entries = self.queue.entries.lock();
 
-        if self.is_closed() {
+        if !entries.receiving || self.is_closed() {
             drop(entries);
             return Err((self, message));
         }
@@ -21,6 +21,13 @@ impl<'a, S> Permit<'a, S> {
 }
 
 impl<S> Sender<S> {
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn retire(&self) {
+        self.0.entries.lock().receiving = false;
+        self.0.permits.close();
+        self.0.ready.notify_one();
+    }
+
     pub fn cancel_service(&self, id: *const ()) {
         let message = {
             let mut entries = self.0.entries.lock();
@@ -105,7 +112,9 @@ impl<S> Receiver<S> {
         let result = {
             let mut entries = self.0.entries.lock();
 
-            if let Some(entry) = entries.messages.pop_front() {
+            if !entries.receiving {
+                Err(mpsc::error::TryRecvError::Disconnected)
+            } else if let Some(entry) = entries.messages.pop_front() {
                 Ok(entry)
             } else if self.0.permits.is_closed() || self.0.senders_closed.load(Ordering::Acquire) {
                 Err(mpsc::error::TryRecvError::Disconnected)
@@ -128,6 +137,18 @@ impl<S> Receiver<S> {
         Ok(entry)
     }
 
+    pub(crate) fn take_queued(&mut self) -> VecDeque<Message<S>> {
+        let messages = {
+            let mut entries = self.0.entries.lock();
+            entries.receiving = false;
+            std::mem::take(&mut entries.messages)
+        };
+
+        let counted = messages.iter().filter(|message| message.counted()).count();
+        self.0.permits.add_permits(counted);
+        messages
+    }
+
     pub fn close(&mut self) {
         self.0.permits.close();
         self.0.ready.notify_one();
@@ -136,22 +157,12 @@ impl<S> Receiver<S> {
     pub fn capacity(&self) -> usize {
         self.0.permits.available_permits()
     }
-
-    pub fn len(&self) -> usize {
-        self.0.entries.lock().messages.len()
-    }
 }
 impl<S> Drop for Receiver<S> {
     fn drop(&mut self) {
         self.close();
 
-        let messages = {
-            let mut entries = self.0.entries.lock();
-            entries.receiving = false;
-            std::mem::take(&mut entries.messages)
-        };
-
-        drop(messages);
+        drop(self.take_queued());
     }
 }
 

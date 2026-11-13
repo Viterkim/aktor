@@ -2,18 +2,16 @@ use super::*;
 use core::task::{Context, Poll};
 
 #[doc(hidden)]
-pub struct AktorPairStartup<A: AktorStart<MA>, B: AktorStart<MB, Group = A::Group>, MA, MB> {
-    mode: core::marker::PhantomData<fn() -> (MA, MB)>,
+pub struct AktorPairStartup<A: AktorStart, B: AktorStart<Group = A::Group>> {
     context: AktorStartContext<A::Group>,
     first: Option<Pin<Box<A::Startup>>>,
     remaining: Option<Box<B>>,
     second: Option<Pin<Box<B::Startup>>>,
     handle: Option<Box<A::Handles>>,
 }
-impl<A: AktorStart<MA>, B: AktorStart<MB, Group = A::Group>, MA, MB> Future
-    for AktorPairStartup<A, B, MA, MB>
-{
-    type Output = Result<(A::Handles, B::Handles), AktorStartError>;
+impl<A: AktorStart, B: AktorStart<Group = A::Group>> Future for AktorPairStartup<A, B> {
+    type Output =
+        Result<(A::Handles, B::Handles), AktorStartError<AktorBranch<A::Error, B::Error>>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -22,7 +20,7 @@ impl<A: AktorStart<MA>, B: AktorStart<MB, Group = A::Group>, MA, MB> Future
             let handle = match first.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => {
-                    return Poll::Ready(Err(error));
+                    return Poll::Ready(Err(error.map_init(AktorBranch::First)));
                 }
                 Poll::Ready(Ok(handle)) => handle,
             };
@@ -38,8 +36,12 @@ impl<A: AktorStart<MA>, B: AktorStart<MB, Group = A::Group>, MA, MB> Future
         if let Some(second) = &mut this.second {
             let handle = match second.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => {
-                    return Poll::Ready(Err(error));
+                Poll::Ready(Err(mut error)) => {
+                    if matches!(error.init, AktorInitOutcome::NotRun) {
+                        error.init = AktorInitOutcome::Unconfirmed;
+                    }
+
+                    return Poll::Ready(Err(error.map_init(AktorBranch::Second)));
                 }
                 Poll::Ready(Ok(handle)) => handle,
             };
@@ -51,27 +53,34 @@ impl<A: AktorStart<MA>, B: AktorStart<MB, Group = A::Group>, MA, MB> Future
             }
         }
 
-        Poll::Ready(Err(AktorStartError::Setup(AktorSetupError::new(
+        Poll::Ready(Err(AktorStartCause::Setup(AktorError::new(
             "actor startup was polled after completion",
             (),
-        ))))
+        ))
+        .into()))
     }
 }
 
-impl<A: AktorStart<MA>, B: AktorStart<MB, Group = A::Group>, MA, MB> AktorStart<(MA, MB)>
-    for (A, B)
-{
+impl<A: AktorStart, B: AktorStart<Group = A::Group>> AktorStart for (A, B) {
     type Group = A::Group;
+    type Error = AktorBranch<A::Error, B::Error>;
     type Handles = (A::Handles, B::Handles);
-    type Startup = AktorPairStartup<A, B, MA, MB>;
+    type Startup = AktorPairStartup<A, B>;
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        self.0.begin(group)
+    fn needs_tokio_group(&self) -> bool {
+        self.0.needs_tokio_group() || self.1.needs_tokio_group()
+    }
+
+    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorStartCause> {
+        if self.1.needs_tokio_group() {
+            self.1.begin(group)
+        } else {
+            self.0.begin(group)
+        }
     }
 
     fn start_in(self, context: AktorStartContext<Self::Group>) -> Self::Startup {
         AktorPairStartup {
-            mode: core::marker::PhantomData,
             first: Some(Box::pin(self.0.start_in(context.clone()))),
             context,
             remaining: Some(Box::new(self.1)),
@@ -82,7 +91,7 @@ impl<A: AktorStart<MA>, B: AktorStart<MB, Group = A::Group>, MA, MB> AktorStart<
 }
 
 #[doc(hidden)]
-pub struct AktorTupleStartup<Starting: Future, Handles, Error = AktorStartError> {
+pub struct AktorTupleStartup<Starting: Future, Handles, Error = AktorStartCause> {
     starting: Pin<Box<Starting>>,
     flatten: fn(Starting::Output) -> Result<Handles, Error>,
 }
@@ -111,37 +120,66 @@ macro_rules! nested {
     ($first:ident, $($rest:ident),+) => { ($first, nested!($($rest),+)) };
 }
 
+// Pairs drive startup recursively. Give the caller the same flat positions as the handles.
+macro_rules! branch {
+    ($error:expr, $first:ident, $last:ident) => {
+        match $error {
+            AktorBranch::First(error) => AktorBranch::$first(error),
+            AktorBranch::Second(error) => AktorBranch::$last(error),
+        }
+    };
+    ($error:expr, $first:ident, $($rest:ident),+) => {
+        match $error {
+            AktorBranch::First(error) => AktorBranch::$first(error),
+            AktorBranch::Second(error) => branch!(error, $($rest),+),
+        }
+    };
+}
+
 macro_rules! tuple {
-    ($first:ident: $first_mode:ident: $first_value:ident: $first_index:tt, $($type:ident: $mode:ident: $value:ident: $index:tt),+) => {
-        impl<$first: AktorStart<$first_mode>, $first_mode, $($type: AktorStart<$mode, Group = $first::Group>, $mode),+>
-            AktorStart<($first_mode, $($mode,)+)> for ($first, $($type,)+)
+    ($first:ident: $first_value:ident: $first_case:ident, $($type:ident: $value:ident: $case:ident),+) => {
+        impl<$first: AktorStart, $($type: AktorStart<Group = $first::Group>),+>
+            AktorStart for ($first, $($type,)+)
         {
             type Group = $first::Group;
+            type Error = AktorBranch<$first::Error, $($type::Error),+>;
             type Handles = ($first::Handles, $($type::Handles,)+);
             type Startup = AktorTupleStartup<
-                <nested!($first, $($type),+) as AktorStart<nested!($first_mode, $($mode),+)>>::Startup,
+                <nested!($first, $($type),+) as AktorStart>::Startup,
                 Self::Handles,
-                AktorStartError,
+                AktorStartError<Self::Error>,
             >;
 
-            fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-                self.$first_index.begin(group)
+            fn needs_tokio_group(&self) -> bool {
+                let ($first_value, $($value,)+) = self;
+                $first_value.needs_tokio_group() $(|| $value.needs_tokio_group())+
+            }
+
+            fn begin(&self, group: &mut Self::Group) -> Result<(), AktorStartCause> {
+                let ($first_value, $($value,)+) = self;
+
+                $(if $value.needs_tokio_group() {
+                    return $value.begin(group);
+                })+
+
+                $first_value.begin(group)
             }
 
             fn start_in(self, context: AktorStartContext<Self::Group>) -> Self::Startup {
                 let ($first_value, $($value,)+) = self;
                 AktorTupleStartup {
                     starting: Box::pin(nested!($first_value, $($value),+).start_in(context)),
-                    flatten: |result| result.map(|nested!($first_value, $($value),+)| ($first_value, $($value,)+)),
+                    flatten: |result| result.map(|nested!($first_value, $($value),+)| ($first_value, $($value,)+))
+                        .map_err(|error| error.map_init(|error| branch!(error, $first_case, $($case),+))),
                 }
             }
         }
     };
 }
 
-tuple!(A: M0: a: 0, B: M1: b: 1, C: M2: c: 2);
-tuple!(A: M0: a: 0, B: M1: b: 1, C: M2: c: 2, D: M3: d: 3);
-tuple!(A: M0: a: 0, B: M1: b: 1, C: M2: c: 2, D: M3: d: 3, E: M4: e: 4);
-tuple!(A: M0: a: 0, B: M1: b: 1, C: M2: c: 2, D: M3: d: 3, E: M4: e: 4, F: M5: f: 5);
-tuple!(A: M0: a: 0, B: M1: b: 1, C: M2: c: 2, D: M3: d: 3, E: M4: e: 4, F: M5: f: 5, G: M6: g: 6);
-tuple!(A: M0: a: 0, B: M1: b: 1, C: M2: c: 2, D: M3: d: 3, E: M4: e: 4, F: M5: f: 5, G: M6: g: 6, H: M7: h: 7);
+tuple!(A: a: First, B: b: Second, C: c: Third);
+tuple!(A: a: First, B: b: Second, C: c: Third, D: d: Fourth);
+tuple!(A: a: First, B: b: Second, C: c: Third, D: d: Fourth, E: e: Fifth);
+tuple!(A: a: First, B: b: Second, C: c: Third, D: d: Fourth, E: e: Fifth, F: f: Sixth);
+tuple!(A: a: First, B: b: Second, C: c: Third, D: d: Fourth, E: e: Fifth, F: f: Sixth, G: g: Seventh);
+tuple!(A: a: First, B: b: Second, C: c: Third, D: d: Fourth, E: e: Fifth, F: f: Sixth, G: g: Seventh, H: h: Eighth);

@@ -14,9 +14,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
     )
-    .await?;
+    .await
+    .map_err(|(_, report)| report)?;
     power_cycle_gnss(&power, 1)
-        .await?
+        .await
+        .map_err(|(_, report)| report)?
         .map_err(|_| "cycle refused")?;
     let (updates, mut results) = set_target(&power, 2)
         .retry(AktorRetryOpts {
@@ -24,7 +26,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             timeout: std::time::Duration::from_secs(1),
         })
         .latest();
-    results.next().await.ok_or("latest stream ended")??;
+    results
+        .next()
+        .await
+        .ok_or("latest stream ended")?
+        .map_err(|(_, report)| report)?;
     println!("ready");
     io::stdout().flush()?;
 
@@ -37,15 +43,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("updated");
     io::stdout().flush()?;
     drop(updates);
-    let target = results.next().await.ok_or("latest stream ended")??;
+    let target = results
+        .next()
+        .await
+        .ok_or("latest stream ended")?
+        .map_err(|(_, report)| report)?;
     if target != 4 || results.next().await.is_some() {
         return Err("latest session did not drain its final revision".into());
     }
 
     power_cycle_gnss(&power, 1)
-        .await?
+        .await
+        .map_err(|(_, report)| report)?
         .map_err(|_| "cycle refused")?;
-    let state = get_state(&power).await?;
+    let state = get_state(&power).await.map_err(|(_, report)| report)?;
 
     if state.cycles != 1 || state.target != 4 {
         return Err("replacement service did not start with fresh state".into());

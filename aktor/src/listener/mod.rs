@@ -23,7 +23,7 @@ mod tests;
 use failure::Failures;
 pub use failure::{Failure, FailureKind, FailurePolicy, Operation, RunError};
 pub use lifecycle::spawn::{spawn, spawn_async, spawn_async_with_hooks};
-pub use lifecycle::{AbandonedSetup, AktorControl, CleanupErrors, LifecycleError, ReplaceError};
+pub use lifecycle::{AktorControl, CleanupError, CleanupErrors};
 pub use spawn::channel;
 #[cfg(feature = "tokio")]
 pub use spawn::{
@@ -33,6 +33,7 @@ pub use spawn::{
 use spawn::{startup_cause, startup_join};
 
 /// Setup and cleanup run on the actor thread.
+#[doc(hidden)]
 pub struct SpawnArgs<Setup, Cleanup> {
     pub name: String,
     pub capacity: usize,
@@ -51,9 +52,10 @@ pub struct WeakHandle<S, Role = ()> {
     role: PhantomData<fn() -> Role>,
 }
 
+#[doc(hidden)]
 pub struct Listener<S> {
     pub name: String,
-    pub hooks: hooks::AktorHooks<S>,
+    pub hooks: hooks::CallHooks<S>,
     receiver: mailbox::Receiver<S>,
     pub failure: FailurePolicy,
     admission: Arc<Admission>,
@@ -62,6 +64,7 @@ pub struct Listener<S> {
     _finished: watch::Sender<()>,
 }
 
+#[doc(hidden)]
 pub struct Dedicated<S> {
     thread: thread::JoinHandle<Option<S>>,
     finished: watch::Receiver<()>,
@@ -73,7 +76,7 @@ pub struct CompletionObserver {
 }
 
 #[derive(Er)]
-#[er(display = Self::fmt_display)]
+#[er(no_constructors, display = Self::fmt_display)]
 pub struct DedicatedJoinError {
     /// The OS join completed, including a thread that panicked.
     pub physically_joined: bool,
@@ -81,6 +84,7 @@ pub struct DedicatedJoinError {
 }
 
 #[derive(Clone, Er)]
+#[er(no_constructors)]
 pub enum StartupJoin {
     /// The OS join returned normally.
     Joined,
@@ -89,6 +93,7 @@ pub enum StartupJoin {
 }
 
 #[derive(Er)]
+#[er(no_constructors)]
 pub enum DedicatedStartError<E> {
     /// Setup failed after the thread started. Includes the thread's join result.
     Startup {

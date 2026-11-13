@@ -1,65 +1,26 @@
-use aktor::{AktorDiagnostic, AktorError, AktorFailure};
+use aktor::{AktorError, AktorFailure};
 
 #[test]
 fn diagnostics() {
     struct Payload;
 
-    let text = "database refused connection";
+    let text = "open database\n`- refused connection";
     let err = AktorError::new(text, Payload);
 
-    assert_eq!(err.to_string(), "actor lifecycle failed");
+    assert_eq!(err.to_string(), "actor lifecycle failed: open database");
     assert_eq!(format!("{err:#}"), text);
-    assert_eq!(format!("{err:?}"), err.to_string());
 
     let tree = er::ErTree::new(std::fmt::Error, [err]);
-    assert!(!tree.er_report_string().contains(text));
+    assert!(!tree.er_report().contains("refused"));
 
     let failure = AktorFailure::from(AktorError::new(text, ()));
-    assert_eq!(failure.to_string(), "actor lifecycle failed");
-    assert_eq!(format!("{failure:#}"), text);
-    assert!(!er::ErTree::from(failure).er_report_string().contains(text));
-
-    fn saved(message: &str) -> Result<(), AktorDiagnostic> {
-        use er::*;
-
-        Err::<(), _>(ErTree::from(std::io::Error::other(message.to_owned())))
-            .er_into(|report| (report, "open database"))
-    }
+    assert_eq!(failure.to_string(), "actor lifecycle failed: open database");
 
     fn with_data() -> Result<(), AktorError<Payload>> {
         use er::*;
 
-        Err::<(), _>(ErTree::from(std::io::Error::other("payload sentinel")))
-            .er_into(|report| (report, Payload))
-    }
-
-    use er::*;
-
-    #[derive(Er)]
-    struct OpenErr;
-
-    #[derive(Er)]
-    struct PreferencesErr;
-
-    let first = saved("first sentinel")
-        .er::<OpenErr>(())
-        .er::<PreferencesErr>(());
-    let second = saved("second sentinel")
-        .er::<OpenErr>(())
-        .er::<PreferencesErr>(());
-    let combined: ErResult<(), PreferencesErr> = er_all!((), [first, second]);
-    let err = combined.unwrap_err();
-
-    assert!(!err.er_report_string().contains("sentinel"));
-
-    let mut reports = String::new();
-
-    for diagnostic in err.er_find_all::<AktorDiagnostic>() {
-        reports.push_str(&diagnostic.report);
-    }
-
-    for message in ["first sentinel", "second sentinel"] {
-        assert_eq!(reports.matches(message).count(), 1);
+        let tree = ErTree::from(std::io::Error::other("payload sentinel"));
+        Err(tree.er_split_with(|(_, report)| AktorError::new(report, Payload)))
     }
 
     let err = with_data().unwrap_err();
@@ -69,22 +30,20 @@ fn diagnostics() {
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 #[test]
 fn group_rejections() {
+    use aktor::AktorGroupError;
+
     let mut group = aktor::AktorGroup::new();
     group.on_shutdown(|_| ()).unwrap();
 
-    for (error, reason) in [
-        (
-            group.on_shutdown(|_| ()).err().unwrap(),
-            "already has a shutdown closure",
-        ),
-        (group.start().err().unwrap(), "needs a Tokio runtime"),
-        (
-            group.spawn_task(async {}).err().unwrap(),
-            "need a Tokio runtime",
-        ),
-    ] {
-        assert!(er::ErTree::from(error).er_report_string().contains(reason));
-    }
+    assert!(matches!(
+        group.on_shutdown(|_| ()),
+        Err(AktorGroupError::ShutdownTaken)
+    ));
+    assert!(matches!(group.start(), Err((AktorGroupError::NoTokio, _))));
+    assert!(matches!(
+        group.spawn_task(async {}),
+        Err(AktorGroupError::NoTokio)
+    ));
 }
 
 #[cfg(all(
@@ -93,67 +52,46 @@ fn group_rejections() {
 ))]
 #[test]
 fn thread() {
-    use aktor::{
-        AktorSetupError,
-        listener::{CleanupErrors, ReplaceError},
-        owner::{OwnerError, OwnerFailure},
-    };
+    use aktor::{listener::CleanupErrors, owner::OwnerError};
     use std::sync::Arc;
 
     let failure = Arc::new(AktorFailure::from(AktorError::new("cleanup sentinel", ())));
-    let wrapped = ReplaceError::<AktorSetupError, AktorFailure>::Cleanup(Arc::clone(&failure));
-
-    assert!(
-        !er::ErTree::from(wrapped)
-            .er_report_string()
-            .contains("cleanup sentinel")
-    );
-
     let errors = CleanupErrors {
         errors: vec![failure],
         diagnostics: vec![AktorError::new("cleanup drop sentinel", ())],
     };
 
-    let err = OwnerError::from(OwnerFailure::Cleanup(errors));
+    let err = OwnerError::Cleanup(errors);
     assert_eq!(err.to_string(), "actor cleanup failed 2 time(s)");
 
-    let output = format!("{err:#}");
-    assert_eq!(output.matches("cleanup sentinel").count(), 1);
-    assert_eq!(output.matches("cleanup drop sentinel").count(), 1);
     assert!(!format!("{err:?}").contains("sentinel"));
-
-    assert!(
-        !er::ErTree::from(err)
-            .er_report_string()
-            .contains("sentinel")
-    );
 }
 
 #[cfg(feature = "local")]
 #[test]
 fn local() {
-    use aktor::local::{OwnerFailure, SharedOwnerError};
+    use aktor::local::{OwnerError, SharedOwnerError};
     use std::rc::Rc;
 
     struct Payload;
 
     for (err, message) in [
         (
-            OwnerFailure::Setup(AktorError::new("setup sentinel", Payload)),
+            OwnerError::Setup(AktorError::new("setup sentinel", Payload)),
             "actor setup failed",
         ),
         (
-            OwnerFailure::Cleanup(AktorError::new("cleanup sentinel", Payload)),
+            OwnerError::Cleanup(AktorError::new("cleanup sentinel", Payload)),
             "actor cleanup failed",
         ),
     ] {
         let diagnostic = format!("{err:#}");
         assert_eq!(err.to_string(), message);
 
-        let shared = SharedOwnerError::from_failure(Rc::new(err), &[]);
-        let copy = shared.error.without_data();
+        let (shared, report) = SharedOwnerError::from_failure(Rc::new(err), &[]);
+        let copy = shared.cause.without_data();
         assert_eq!(format!("{copy:#}"), diagnostic);
-        assert_eq!(format!("{shared:#}"), diagnostic);
+        assert_eq!(report, diagnostic);
     }
 }
 
@@ -162,16 +100,23 @@ fn local() {
 fn worker() {
     use aktor::{
         message::CallError,
-        worker::{WorkerCause, WorkerError},
+        worker::{WorkerCause, WorkerFailure},
     };
+    use er::*;
 
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Payload;
 
     for mut err in [
-        WorkerError::setup(CallError::NotAdmitted, "saved report sentinel"),
-        WorkerError::cleanup(CallError::OutcomeUnknown, "saved report sentinel"),
-        WorkerError::new(
+        WorkerFailure::setup(
+            CallError::NotAdmitted,
+            "worker lifecycle failed\n`- saved report sentinel",
+        ),
+        WorkerFailure::cleanup(
+            CallError::OutcomeUnknown,
+            "worker lifecycle failed\n`- saved report sentinel",
+        ),
+        WorkerFailure::new(
             CallError::NotAdmitted,
             WorkerCause::Operations {
                 expected: vec![],
@@ -181,24 +126,14 @@ fn worker() {
     ] {
         err.data = Some(Payload);
         let bytes = aktor::worker::encode(&err).unwrap();
-        let err: WorkerError<Payload> = aktor::worker::decode(&bytes).unwrap();
+        let err: WorkerFailure<Payload> = aktor::worker::decode(&bytes).unwrap();
 
-        assert!(
-            err.diagnostics
-                .as_ref()
-                .unwrap()
-                .report
-                .contains("saved report sentinel")
-        );
-        assert!(!err.to_string().contains("sentinel"));
-        assert_eq!(
-            format!("{err:#}").matches("saved report sentinel").count(),
-            1
-        );
-        assert!(
-            !er::ErTree::from(err)
-                .er_report_string()
-                .contains("sentinel")
-        );
+        let failure: (aktor::worker::WorkerError<Payload>, String) = err.into();
+        let report = Err::<(), _>(failure)
+            .er(|| std::fmt::Error)
+            .unwrap_err()
+            .er_report();
+
+        assert!(report.contains("saved report sentinel"));
     }
 }

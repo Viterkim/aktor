@@ -1,35 +1,29 @@
 use super::*;
 use crate::{
     AktorGroup, AktorOutcome,
-    worker::{OptionalWorker, Options, ShutdownDependency, Worker},
+    worker::{
+        OptionalWorker, Options, Worker, WorkerFailure, WorkerJoin, WorkerStartError,
+        browser::ReadyFailure,
+    },
 };
 use alloc::rc::Rc;
 use core::cell::Cell;
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 
-pub struct AktorWorkerNew<S, Config, Role = AktorNoRole> {
-    pub name: AktorName,
-    pub role: Role,
-    pub kind: kind::BrowserWebWorker<S>,
+pub struct AktorWorkerNew<S, Config, E = ()> {
+    pub name: String,
+    pub kind: kind::BrowserWebWorker<S, E>,
     pub config: Config,
     pub options: AktorWorkerOptions,
-}
-impl<S, Config, Role> Drop for AktorWorkerNew<S, Config, Role> {
-    fn drop(&mut self) {
-        if let Some(joining) = self.options.before_shutdown.take() {
-            // Keep the join alive even when setup never starts.
-            drop(ShutdownDependency::new(Some(joining)));
-        }
-    }
+    /// `Leave` keeps accepted work running when shutdown gives up on it, so cleanup can finish.
+    pub stuck: crate::AktorStuck,
 }
 
-/// An optional worker remains owned by its group, while calls report failures locally.
-pub struct AktorOptionalWorkerNew<S, Config, Role = AktorNoRole>(
-    pub AktorWorkerNew<S, Config, Role>,
-);
+/// The group still owns an optional worker. Its calls return delivery errors to the caller.
+pub struct AktorOptionalWorkerNew<S, Config, E = ()>(pub AktorWorkerNew<S, Config, E>);
 
-impl<S, Config, Role> AktorWorkerNew<S, Config, Role> {
-    pub fn optional(self) -> AktorOptionalWorkerNew<S, Config, Role> {
+impl<S, Config, E> AktorWorkerNew<S, Config, E> {
+    pub fn optional(self) -> AktorOptionalWorkerNew<S, Config, E> {
         AktorOptionalWorkerNew(self)
     }
 }
@@ -37,26 +31,25 @@ impl<S, Config, Role> AktorWorkerNew<S, Config, Role> {
 #[derive(Default)]
 pub struct AktorWorkerOptions {
     pub transport: Options,
-    /// Join external work before normal or forced worker shutdown.
-    /// Returning Ok or Err confirms that the external work has stopped.
-    /// Keep unfinished work owned by this future.
-    pub before_shutdown:
-        Option<crate::message::LocalFuture<'static, Result<(), crate::AktorError>>>,
-    /// Keep accepted work running when shutdown is forced so cleanup can finish.
-    pub retain_unconfirmed: bool,
-    /// Keep a completion observer when worker startup fails.
-    pub observe_retirement: Option<Box<dyn FnOnce(crate::worker::Completion)>>,
+    /// Use `Some(worker::join(future))` when external work must finish before the worker stops.
+    /// A returned error confirms the work stopped and keeps the diagnostic in the group report.
+    pub before_shutdown: Option<WorkerJoin>,
 }
 
-impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
-    for AktorWorkerNew<S, Config, Role>
+impl<S: 'static, Config: Serialize + 'static, E: DeserializeOwned + 'static> AktorStart
+    for AktorWorkerNew<S, Config, E>
 {
     type Group = AktorGroup;
-    type Handles = Worker<S, Role>;
-    type Startup = crate::message::LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
+    type Handles = Worker<S, (), E>;
+    type Error = E;
+    type Startup =
+        crate::message::LocalFuture<'static, Result<Self::Handles, AktorStartError<Self::Error>>>;
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        group.start().map(|_| ()).map_err(Into::into)
+    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorStartCause> {
+        group
+            .start()
+            .map(|_| ())
+            .map_err(AktorStartCause::group_error)
     }
 
     fn start_in(self, context: AktorStartContext<Self::Group>) -> Self::Startup {
@@ -64,55 +57,48 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
     }
 }
 
-impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
-    for AktorOptionalWorkerNew<S, Config, Role>
+impl<S: 'static, Config: Serialize + 'static, E: DeserializeOwned + 'static> AktorStart
+    for AktorOptionalWorkerNew<S, Config, E>
 {
     type Group = AktorGroup;
-    type Handles = OptionalWorker<S, Role>;
-    type Startup = crate::message::LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
+    type Handles = OptionalWorker<S, (), E>;
+    type Error = core::convert::Infallible;
+    type Startup =
+        crate::message::LocalFuture<'static, Result<Self::Handles, AktorStartError<Self::Error>>>;
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        group.start().map(|_| ()).map_err(Into::into)
+    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorStartCause> {
+        group
+            .start()
+            .map(|_| ())
+            .map_err(AktorStartCause::group_error)
     }
 
     fn start_in(self, mut context: AktorStartContext<Self::Group>) -> Self::Startup {
-        let mut setup = self.0;
-        let joining = ShutdownDependency::new(setup.options.before_shutdown.take());
+        let setup = self.0;
+        let joining = setup.options.before_shutdown.unwrap_or_default();
 
         Box::pin(async move {
-            let mut observer = setup.options.observe_retirement.take();
             let dependency = joining.completion();
-            match OptionalWorker::<S, Role>::with_config(
+            match Worker::<S, (), E>::configured(
                 &setup.kind.program,
-                core::mem::take(&mut setup.options.transport),
+                setup.options.transport,
                 &setup.config,
+                true,
             )
-            .and_then(OptionalWorker::into_worker)
-            .map(|worker| {
-                let worker = worker.retain_unconfirmed(setup.options.retain_unconfirmed);
-                if let Some(observer) = observer.take() {
-                    observer(worker.completion());
-                }
-
-                worker
-            })
-            .and_then(|worker| joining.attach(worker))
-            {
+            .map_err(ReadyFailure::not_run)
+            .and_then(|worker| {
+                joining
+                    .attach(worker.retain_unconfirmed(setup.stuck == crate::AktorStuck::Leave))
+                    .map_err(ReadyFailure::from)
+            }) {
                 Ok(worker) => {
-                    register_worker(&worker, core::mem::take(&mut setup.name.name), context)?;
+                    register_worker(&worker, setup.name, setup.stuck, context)?;
                     Ok(OptionalWorker::from_worker(worker))
                 }
-                Err(error) => {
-                    let worker = OptionalWorker::unavailable(error, dependency);
-                    if let Some(observer) = observer {
-                        observer(worker.completion());
-                    }
+                Err(failure) => {
+                    let worker = OptionalWorker::unavailable(failure, dependency);
 
-                    register_unavailable(
-                        &worker,
-                        core::mem::take(&mut setup.name.name),
-                        &mut context,
-                    )?;
+                    register_unavailable(&worker, setup.name, &mut context)?;
                     Ok(worker)
                 }
             }
@@ -120,66 +106,77 @@ impl<S: 'static, Config: Serialize + 'static, Role: 'static> AktorStart
     }
 }
 
-fn start_worker<S: 'static, Config: Serialize + 'static, Role: 'static>(
-    mut setup: AktorWorkerNew<S, Config, Role>,
+fn start_worker<S: 'static, Config: Serialize + 'static, E: DeserializeOwned + 'static>(
+    setup: AktorWorkerNew<S, Config, E>,
     mut context: AktorStartContext<AktorGroup>,
-) -> crate::message::LocalFuture<'static, Result<Worker<S, Role>, AktorStartError>> {
-    let joining = ShutdownDependency::new(setup.options.before_shutdown.take());
+) -> crate::message::LocalFuture<'static, Result<Worker<S, (), E>, AktorStartError<E>>> {
+    let joining = setup.options.before_shutdown.unwrap_or_default();
 
     Box::pin(async move {
-        let mut observer = setup.options.observe_retirement.take();
         let dependency = joining.completion();
-        let worker = Worker::<S, Role>::with_config(
+        let worker = Worker::<S, (), E>::configured(
             &setup.kind.program,
-            core::mem::take(&mut setup.options.transport),
+            setup.options.transport,
             &setup.config,
+            false,
         )
-        .map(|worker| {
-            let worker = worker.retain_unconfirmed(setup.options.retain_unconfirmed);
-            if let Some(observer) = observer.take() {
-                observer(worker.completion());
-            }
-
-            worker
-        })
-        .and_then(|worker| joining.attach(worker));
+        .map_err(ReadyFailure::not_run)
+        .and_then(|worker| {
+            joining
+                .attach(worker.retain_unconfirmed(setup.stuck == crate::AktorStuck::Leave))
+                .map_err(ReadyFailure::from)
+        });
         let worker = match worker {
             Ok(worker) => worker,
-            Err(error) => {
-                let message = alloc::format!("{error:#}");
-                let worker = OptionalWorker::<S, Role>::unavailable(error, dependency);
-                if let Some(observer) = observer {
-                    observer(worker.completion());
-                }
+            Err(failure) => {
+                let mut error =
+                    start_error(failure.clone().report(WorkerFailure::report_without_data));
+                let worker = OptionalWorker::<S, (), E>::unavailable(failure, dependency);
 
-                register_unavailable(&worker, setup.name.name.clone(), &mut context)?;
-                return Err(validation_error(
-                    &context.group,
-                    &setup.name.name,
-                    AktorExecution::BrowserWebWorker,
-                    AktorStartError::Setup(AktorSetupError::new(message, ())),
-                ));
+                error.cause = match register_unavailable(&worker, setup.name.clone(), &mut context)
+                {
+                    Ok(()) => validation_error(
+                        &context.group,
+                        &setup.name,
+                        AktorExecution::BrowserWebWorker,
+                        error.cause,
+                    ),
+                    Err(cause) => cause,
+                };
+                return Err(error);
             }
         };
 
-        register_worker(&worker, core::mem::take(&mut setup.name.name), context)?;
+        register_worker(&worker, setup.name, setup.stuck, context)?;
 
-        worker.ready().await.map_err(|error| {
-            AktorStartError::Init(crate::AktorFailure::from(AktorSetupError::new(
-                alloc::format!("{error:#}"),
-                (),
-            )))
-        })?;
+        worker.ready().await.map_err(start_error)?;
         Ok(worker)
     })
 }
 
-fn register_unavailable<S: 'static, Role: 'static>(
-    worker: &OptionalWorker<S, Role>,
+fn start_error<E>((error, report): (WorkerStartError<E>, String)) -> AktorStartError<E> {
+    let cause = crate::worker::WorkerError {
+        outcome: error.outcome,
+        cause: error.cause,
+        data: None,
+    };
+
+    AktorStartError {
+        init: error.init,
+        cause: AktorStartCause::Worker(cause, report),
+        report: None,
+    }
+}
+
+fn register_unavailable<S: 'static, Role: 'static, E: DeserializeOwned + 'static>(
+    worker: &OptionalWorker<S, Role, E>,
     name: String,
     context: &mut AktorStartContext<AktorGroup>,
-) -> Result<(), AktorStartError> {
+) -> Result<(), AktorStartCause> {
+    worker.manage_unavailable(context.group.killswitch());
+
     let completion = worker.completion();
+    let confirming = completion.clone();
     let label = name.clone();
 
     context
@@ -189,71 +186,81 @@ fn register_unavailable<S: 'static, Role: 'static>(
             AktorExecution::BrowserWebWorker,
             Box::new(|| {}),
             Box::new(|| {}),
+            None,
+            Some(Box::pin(retirement(confirming))),
             Box::pin(async move {
-                let retirement = match completion.wait().await {
-                    crate::worker::Retirement::Confirmed(_) => crate::RetirementStatus::Confirmed,
-                    crate::worker::Retirement::Unconfirmed(_) => {
-                        crate::RetirementStatus::Unconfirmed
-                    }
-                };
-
                 AktorOutcome {
-                    retirement,
+                    retirement: completion.retirement_status().await,
                     actor: label,
-                    kind: Some(AktorExecution::BrowserWebWorker),
+                    kind: AktorExecution::BrowserWebWorker,
                     diagnostics: completion.wait_diagnostics().await,
-                    timed_out: false,
+                    ran_past_grace: false,
                 }
             }),
         )
-        .map_err(AktorStartError::Setup)
+        .map_err(AktorStartCause::Group)
 }
 
-fn register_worker<S: 'static, Role: 'static>(
-    worker: &Worker<S, Role>,
+fn register_worker<S: 'static, Role: 'static, E: DeserializeOwned + 'static>(
+    worker: &Worker<S, Role, E>,
     name: String,
+    stuck: crate::AktorStuck,
     mut context: AktorStartContext<AktorGroup>,
-) -> Result<(), AktorStartError> {
+) -> Result<(), AktorStartCause> {
     let kill = context.group.killswitch();
 
-    worker.manage(name.clone(), kill);
-
-    let shutdown = worker.new_handle();
-    let cancel = worker.new_handle();
-    let completion = worker.completion();
+    let shutdown = worker.clone();
+    let cancel = worker.clone();
+    let owner = worker.clone();
+    let confirming = worker.completion();
+    let killing = stuck == crate::AktorStuck::Kill;
     let label = name.clone();
     let timed_out = Rc::new(Cell::new(false));
     let forced = timed_out.clone();
 
     if let Err(error) = context.group.register_owner(
-        name,
+        name.clone(),
         AktorExecution::BrowserWebWorker,
         Box::new(move || {
             shutdown.shutdown();
         }),
-        Box::new(move || {
+        // A worker's `end` runs inside it, terminating early would cut it off.
+        Box::new(|| {}),
+        Some(Box::new(move || {
             forced.set(true);
-            cancel.terminate();
-        }),
+            cancel.give_up(stuck)
+        })),
+        // A left worker's retained work can still confirm after the report went out.
+        (!killing).then(|| Box::pin(retirement(confirming)) as Pin<Box<dyn Future<Output = _>>>),
         Box::pin(async move {
-            let retirement = match completion.wait().await {
-                crate::worker::Retirement::Confirmed(_) => crate::RetirementStatus::Confirmed,
-                crate::worker::Retirement::Unconfirmed(_) => crate::RetirementStatus::Unconfirmed,
-            };
-            let diagnostics = completion.wait_diagnostics().await;
+            let (retirement, diagnostics) = owner.group_outcome(stuck).await;
 
             AktorOutcome {
                 retirement,
                 actor: label,
-                kind: Some(AktorExecution::BrowserWebWorker),
+                kind: AktorExecution::BrowserWebWorker,
                 diagnostics,
-                timed_out: timed_out.get(),
+                ran_past_grace: timed_out.get(),
             }
         }),
     ) {
-        worker.terminate();
-        return Err(AktorStartError::Setup(error));
+        worker.shutdown();
+        return Err(AktorStartCause::Group(error));
     }
 
+    worker.manage(name, kill);
     Ok(())
+}
+
+async fn retirement<E>(
+    completion: crate::worker::Completion<E>,
+) -> Option<(crate::AktorRetireStatus, Vec<AktorError>)> {
+    use crate::AktorRetireStatus::*;
+
+    let retirement = completion.await_retirement().await;
+
+    match retirement {
+        Confirmed | Terminated => Some((retirement, completion.wait_diagnostics().await)),
+        Unconfirmed => None,
+    }
 }

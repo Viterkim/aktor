@@ -35,16 +35,22 @@ pub struct Failure {
 pub enum FailurePolicy {
     Abort,
     #[doc(hidden)]
-    Group(crate::group::KillSwitch),
-    Shutdown(Arc<dyn Fn(&Failure) + Send + Sync>),
+    Group(crate::group::AktorKillSwitch),
+    /// Notify the host before unwinding. The join keeps the actor's original panic.
+    Shutdown(ShutdownHook),
     #[default]
     Unwind,
 }
 
+type Action = dyn Fn(&Failure) + Send + Sync;
+
+#[derive(Clone)]
+pub struct ShutdownHook(Option<Arc<Action>>);
+
 pub struct Failures {
     pub actor: String,
     pub first: Option<Failure>,
-    pub group: Option<crate::group::KillSwitch>,
+    pub group: Option<crate::group::AktorKillSwitch>,
 }
 
 pub struct FailurePanic {
@@ -53,6 +59,7 @@ pub struct FailurePanic {
 }
 
 #[derive(Er, PartialEq, Eq)]
+#[er(no_constructors)]
 pub enum RunError<E> {
     Failed(#[er(source, skip)] E),
     Panicked,

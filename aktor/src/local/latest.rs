@@ -284,7 +284,7 @@ where
     fn run<'a>(
         &'a mut self,
         state: &'a mut S,
-        hooks: &'a mut hooks::AktorHooks<S>,
+        hooks: &'a mut hooks::CallHooks<S>,
         operation: Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
@@ -354,7 +354,7 @@ impl<S: 'static, I: 'static, O: 'static, Role: 'static, const N: usize, E: 'stat
     {
         let shared = Rc::new_cyclic(
             |this: &Weak<Shared<S, I, O, F, Role, N, E, Clock>>| Shared {
-                handle: self.new_handle(),
+                handle: self.clone(),
                 state: RefCell::new(Slot {
                     revision: 0,
                     pending: None,

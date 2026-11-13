@@ -29,9 +29,9 @@ impl std::task::Wake for QueueWake {
 
 #[test]
 fn runtime() {
-    let Ok(case) = std::env::var("AKTOR_CHILD") else {
+    let Ok(case) = std::env::var("AKTOR_TEST_CASE") else {
         for case in ["queue", "hooks", "intervals", "unpolled", "wake"] {
-            let output = support::child("task::runtime", case);
+            let output = support::run_test("task::runtime", case);
             assert!(
                 output.status.success(),
                 "{case}: {}",
@@ -54,30 +54,22 @@ fn runtime() {
         let starting = unpolled.then(|| InputDrop);
         let start = async move || {
             std::hint::black_box(&starting);
-            Ok::<_, AktorSetupError>(0_u32)
+            Ok::<_, String>(0_u32)
         };
         let ending = unpolled.then(|| InputDrop);
-        let mut closures: AktorClosures<u32, _, AktorKind::TokioTask, _> = AktorClosures {
-            start,
-            end: async move |_: u32| {
-                std::hint::black_box(&ending);
-            },
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
-        };
+        let mut hooks: AktorHooks<u32, AktorKind::TokioTask> = Default::default();
 
         if case == "hooks" {
             let before = InputDrop;
             let after = InputDrop;
 
-            closures.before_each = Some(
+            hooks.before_each = Some(
                 (move |_: &mut u32, _| {
                     std::hint::black_box(&before);
                 })
                 .into(),
             );
-            closures.after_each = Some(
+            hooks.after_each = Some(
                 (move |_: &mut u32, _| {
                     std::hint::black_box(&after);
                 })
@@ -89,7 +81,7 @@ fn runtime() {
             for _ in 0..2 {
                 let capture = InputDrop;
 
-                closures.intervals.push(AktorInterval {
+                hooks.intervals.push(AktorInterval {
                     every: Duration::from_secs(60),
                     run: (move |_: AktorTaskState<u32>| {
                         std::hint::black_box(&capture);
@@ -103,11 +95,15 @@ fn runtime() {
         let mut starting = Box::pin(aktor_start_in(
             &group,
             AktorNew {
-                name: AktorName::new("cancelled queue"),
-                role: AktorNoRole,
+                name: "cancelled queue".into(),
                 kind: AktorKind::TokioTask,
-                closures,
-                options: AktorNewOptions { capacity: 2 },
+                start,
+                end: async move |_: u32| {
+                    std::hint::black_box(&ending);
+                },
+                hooks,
+                capacity: 2,
+                stuck: AktorStuck::Kill,
             },
         ));
 
@@ -152,7 +148,7 @@ fn runtime() {
 
     let report = executor::block_on(complete.wait());
     assert!(report.failed(), "{report}");
-    assert!(!report.timed_out, "{report}");
+    assert!(!report.ran_past_grace, "{report}");
     let text = report.to_string();
     assert_eq!(text.matches("input drop failed").count(), 2, "{text}");
     if case == "wake" {
@@ -164,8 +160,8 @@ fn runtime() {
 
 #[tokio::test]
 async fn cancellation() {
-    if std::env::var("AKTOR_CHILD").is_err() {
-        let output = support::child("task::cancellation", "task");
+    if std::env::var("AKTOR_TEST_CASE").is_err() {
+        let output = support::run_test("task::cancellation", "task");
 
         assert!(
             output.status.success(),
@@ -179,25 +175,19 @@ async fn cancellation() {
     let saved = cleaned.clone();
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("cancelled task"),
-            role: AktorNoRole,
+            name: "cancelled task".into(),
             kind: AktorKind::TokioTask,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(0_u32),
-                end: async move |state: u32| {
-                    *saved.lock().unwrap() = Some(state);
-                    Ok::<_, AktorCleanupError>(())
-                },
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
+            start: async || Ok::<_, String>(0_u32),
+            end: async move |state: u32| {
+                *saved.lock().unwrap() = Some(state);
+                Ok::<_, String>(())
             },
-            options: AktorNewOptions { capacity: 32 },
+            hooks: Default::default(),
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_millis(400),
-        },
+        grace: Duration::from_millis(400),
     })
     .await
     .unwrap();
@@ -209,10 +199,10 @@ async fn cancellation() {
 
     let report = actors.shutdown().await;
 
-    assert!(report.timed_out);
+    assert!(report.ran_past_grace);
     assert_eq!(cleaned.lock().unwrap().take(), Some(85));
     assert_eq!(
         actors.completion().wait().await.actors[0].kind,
-        Some(AktorExecution::TokioTask)
+        AktorExecution::TokioTask
     );
 }

@@ -24,8 +24,7 @@ struct Shared<S, I, O, Fut> {
     factory: fn(AktorTaskState<S>, I) -> Fut,
     operation: Operation,
     services: Arc<service::Services<S>>,
-    kill: KillSwitch,
-    _alive: mpsc::Sender<Message<S>>,
+    sender: mpsc::UnboundedSender<Message<S>>,
 }
 
 struct SlotOutput<S, I, O> {
@@ -152,29 +151,32 @@ where
             .lock()
             .unwrap_or_else(|error| error.into_inner());
 
-        if !slot.receiver || self.shared.kill.is_stopping() {
+        if !slot.receiver
+            || self.shared.sender.is_closed()
+            || ((slot.scheduled || slot.running) && !self.shared.services.is_open())
+        {
+            return;
+        }
+
+        let previous = slot.input.replace(input);
+        let scheduled = self.shared.schedule(&mut slot, false);
+        if scheduled.is_err() {
+            let rejected = std::mem::replace(&mut slot.input, previous);
+            drop(slot);
+            drop((rejected, scheduled));
             return;
         }
 
         slot.revision = slot.revision.wrapping_add(1);
-
-        let previous = slot.input.replace(input);
         let output = slot.output.take();
         let wake = slot.wake.take();
-        let scheduled = self.shared.schedule(&mut slot, false);
-        let rejected = if scheduled.is_err() {
-            slot.input.take()
-        } else {
-            None
-        };
-
         drop(slot);
 
         if matches!(scheduled, Ok(true)) {
             self.shared.services.wake.notify_one();
         }
 
-        drop((previous, output, rejected, scheduled));
+        drop((previous, output));
 
         if let Some(wake) = wake {
             wake.wake();
@@ -291,9 +293,10 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         state: Option<AktorTaskState<S>>,
-        hooks: &mut crate::operation::hooks::AktorHooks<S>,
+        owner: &Arc<Mutex<Option<S>>>,
+        hooks: &mut crate::operation::hooks::CallHooks<S>,
         operation: Operation,
-    ) -> Poll<()> {
+    ) -> Poll<Option<AktorTaskState<S>>> {
         let mut this = self.project();
 
         if let Some(mut state) = state {
@@ -308,12 +311,12 @@ where
 
                 if !slot.receiver {
                     *this.finished = true;
-                    return Poll::Ready(());
+                    return Poll::Ready(Some(state));
                 }
 
                 let Some(input) = slot.input.take() else {
                     *this.finished = true;
-                    return Poll::Ready(());
+                    return Poll::Ready(Some(state));
                 };
 
                 slot.running = true;
@@ -332,12 +335,14 @@ where
         }
 
         let Some(future) = this.future.as_mut().as_pin_mut() else {
-            return Poll::Ready(());
+            return Poll::Ready(None);
         };
         let (mut state, output) = core::task::ready!(future.poll(cx));
 
         this.future.set(None);
-        hooks.after(&mut state, operation);
+        if Arc::ptr_eq(OwnedMutexGuard::mutex(&state.guard), owner) {
+            hooks.after(&mut state, operation);
+        }
 
         let (discarded, wake, scheduled) = {
             let mut slot = this
@@ -372,7 +377,7 @@ where
             wake.wake();
         }
 
-        Poll::Ready(())
+        Poll::Ready(Some(state))
     }
 }
 
@@ -406,8 +411,7 @@ impl<S: Send + 'static, I: Send + 'static, O: Send + 'static, Role, Wire>
             factory,
             operation,
             services: self.services.clone(),
-            kill: self.kill.clone(),
-            _alive: self.sender.clone(),
+            sender: self.sender.clone(),
         });
 
         let mut finished = self.finished.clone();
@@ -452,11 +456,12 @@ mod tests {
             (state, input)
         }
 
-        let (sender, _receiver) = mpsc::channel(1);
+        let (sender, _receiver) = mpsc::unbounded_channel();
         let task = AktorTask::<()> {
             cleanup: Arc::new(parking_lot::Mutex::new(Vec::new())),
             name: Arc::new("cancelled".into()),
             sender,
+            slots: Arc::new(Semaphore::new(1)),
             services: Arc::new(service::Services::new()),
             kill: crate::AktorGroup::new().killswitch(),
             finished: watch::channel(AktorTaskStatus::Running).1,
@@ -479,6 +484,44 @@ mod tests {
         }
 
         assert!(task.services.discard().is_empty());
+    }
+
+    #[test]
+    fn closed_service_keeps_unread_output() {
+        async fn identity(state: AktorTaskState<()>, input: u32) -> (AktorTaskState<()>, u32) {
+            (state, input)
+        }
+
+        let services = Arc::new(service::Services::new());
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            slot: Arc::new(SlotMutex::new(Slot {
+                input: None,
+                output: Some(7),
+                revision: 1,
+                scheduled: false,
+                running: false,
+                receiver: true,
+                senders: 1,
+                wake: None,
+            })),
+            factory: identity,
+            operation: Operation {
+                name: "identity",
+                caller: core::panic::Location::caller(),
+            },
+            services: services.clone(),
+            sender,
+        });
+        services.close();
+        let latest = AktorTaskLatest { shared };
+
+        latest.send(9);
+
+        let slot = latest.shared.slot.lock().unwrap();
+        assert_eq!(slot.output, Some(7));
+        assert_eq!(slot.revision, 1);
+        assert!(slot.input.is_none());
     }
 
     struct Publish {

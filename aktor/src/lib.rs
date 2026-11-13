@@ -6,10 +6,7 @@ extern crate alloc;
 extern crate self as aktor;
 
 mod impls;
-#[cfg(all(
-    feature = "std",
-    any(feature = "tokio", feature = "std_thread", feature = "local")
-))]
+#[cfg(feature = "std")]
 mod panic;
 mod report;
 pub mod types;
@@ -30,7 +27,7 @@ pub mod timeout;
     feature = "wasm_browser_workers",
     feature = "browser_local"
 ))]
-pub use timeout::{AktorTimeoutError, Timeout};
+pub use timeout::{AktorTimeout, AktorTimeoutError};
 
 #[cfg(any(
     feature = "tokio",
@@ -45,7 +42,7 @@ pub mod group;
     feature = "wasm_browser_workers",
     all(feature = "browser_local", target_family = "wasm")
 ))]
-pub use group::{AktorGroup, GroupCompletion, KillSwitch};
+pub use group::{AktorGroup, AktorGroupCompletion, AktorKillSwitch};
 
 pub mod call;
 #[cfg(any(
@@ -115,11 +112,23 @@ pub mod setup;
 pub mod task;
 #[cfg(feature = "testing")]
 pub mod testing;
+#[cfg(any(
+    all(
+        any(feature = "tokio", feature = "std_thread"),
+        not(target_family = "wasm")
+    ),
+    all(
+        any(feature = "browser_local", feature = "wasm_browser_workers"),
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
+pub use setup::AktorDefinition;
 #[cfg(all(
     any(feature = "tokio", feature = "std_thread"),
     not(target_family = "wasm")
 ))]
-pub use setup::AktorDefinition;
+pub use setup::aktor_start_with_policy;
 #[cfg(any(
     feature = "local",
     all(
@@ -161,13 +170,7 @@ macro_rules! __aktor_register {
 
 #[cfg(feature = "macros")]
 #[doc(inline)]
-pub use aktor_macros::{AktorData, aktor, aktor_setups};
-#[doc(inline)]
-#[cfg(any(
-    feature = "tokio",
-    all(feature = "std_thread", not(target_family = "wasm"))
-))]
-pub use listener::{FailurePolicy, SpawnArgs};
+pub use aktor_macros::{AktorData, aktor};
 #[cfg(all(
     any(feature = "tokio", feature = "std_thread"),
     not(target_family = "wasm")
@@ -181,3 +184,9 @@ pub use owner::Aktor;
     target_os = "unknown"
 ))]
 pub use setup::{AktorOptionalWorkerNew, AktorWorkerNew, AktorWorkerOptions};
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+pub use worker::AktorServe;

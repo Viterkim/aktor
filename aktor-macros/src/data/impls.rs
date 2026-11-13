@@ -1,29 +1,34 @@
-use super::{Member, Shape, parse::skipped};
+use super::{Member, Shape, Style, parse::skipped};
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::Fields;
 
 impl Shape {
     pub fn parse(fields: Fields) -> syn::Result<Self> {
+        let style = match &fields {
+            Fields::Named(_) => Style::Named,
+            Fields::Unnamed(_) => Style::Tuple,
+            Fields::Unit => Style::Unit,
+        };
         let members = fields
-            .iter()
+            .into_iter()
             .enumerate()
             .map(|(index, field)| {
+                let skip = skipped(&field)?;
                 Ok(Member {
                     name: field
                         .ident
-                        .clone()
                         .map_or_else(|| syn::Member::Unnamed(index.into()), syn::Member::Named),
-                    ty: field.ty.clone(),
-                    skip: skipped(field)?,
+                    ty: field.ty,
+                    skip,
                 })
             })
             .collect::<syn::Result<Vec<_>>>()?;
 
-        Ok(Self { fields, members })
+        Ok(Self { style, members })
     }
 
-    pub fn helper(&self, aktor: &TokenStream, lifetime: Option<&syn::Lifetime>) -> TokenStream {
+    pub fn helper(&self, wrapper: &TokenStream, lifetime: Option<&syn::Lifetime>) -> TokenStream {
         let fields = self
             .members
             .iter()
@@ -31,23 +36,23 @@ impl Shape {
             .map(|field| {
                 let ty = &field.ty;
                 let ty = if let Some(lifetime) = lifetime {
-                    quote!(#aktor::data::Ref<#lifetime, #ty>)
+                    quote!(#wrapper<#lifetime, #ty>)
                 } else {
-                    quote!(#aktor::data::Owned<#ty>)
+                    quote!(#wrapper<#ty>)
                 };
 
                 let name = &field.name;
 
-                match &self.fields {
-                    Fields::Named(_) => quote!(#name: #ty),
-                    _ => ty,
+                match self.style {
+                    Style::Named => quote!(#name: #ty),
+                    Style::Tuple | Style::Unit => ty,
                 }
             });
 
-        match &self.fields {
-            Fields::Named(_) => quote!({ #(#fields,)* }),
-            Fields::Unnamed(_) => quote!((#(#fields,)*)),
-            Fields::Unit => quote!(),
+        match self.style {
+            Style::Named => quote!({ #(#fields,)* }),
+            Style::Tuple => quote!((#(#fields,)*)),
+            Style::Unit => quote!(),
         }
     }
 
@@ -62,8 +67,8 @@ impl Shape {
             .iter()
             .filter(|field| include_skipped || !field.skip);
 
-        match &self.fields {
-            Fields::Named(_) => {
+        match self.style {
+            Style::Named => {
                 let fields = members.zip(values).map(|(member, value)| {
                     let name = &member.name;
                     quote!(#name: #value)
@@ -71,8 +76,8 @@ impl Shape {
 
                 quote!(#prefix { #(#fields,)* })
             }
-            Fields::Unnamed(_) => quote!(#prefix(#(#values,)*)),
-            Fields::Unit => prefix,
+            Style::Tuple => quote!(#prefix(#(#values,)*)),
+            Style::Unit => prefix,
         }
     }
 }

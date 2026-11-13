@@ -48,16 +48,21 @@ impl Names {
     }
 }
 
-pub fn collect(tokens: TokenStream, reserved: &mut HashSet<String>) {
+pub fn collect(tokens: TokenStream, reserved: &mut HashSet<String>) -> bool {
+    let mut macro_syntax = false;
+
     for token in tokens {
         match token {
             TokenTree::Ident(ident) => {
                 reserved.insert(ident.to_string().trim_start_matches("r#").to_owned());
             }
-            TokenTree::Group(group) => collect(group.stream(), reserved),
+            TokenTree::Group(group) => macro_syntax |= collect(group.stream(), reserved),
+            TokenTree::Punct(punct) => macro_syntax |= punct.as_char() == '!',
             _ => {}
         }
     }
+
+    macro_syntax
 }
 
 pub fn binding(reserved: &mut HashSet<String>, base: &str) -> Ident {

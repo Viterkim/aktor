@@ -2,10 +2,10 @@ use super::super::*;
 use core::{future::poll_fn, task::ready};
 
 impl<'a, S: 'static, O> Request<'a, S, O> {
-    pub fn timeout(self, duration: core::time::Duration) -> crate::Timeout<Self> {
+    pub fn timeout(self, duration: core::time::Duration) -> crate::AktorTimeout<Self> {
         let standard = self.admission.is_standard();
 
-        crate::Timeout::queued(
+        crate::AktorTimeout::queued(
             self,
             duration,
             |request| crate::timeout::WaitStatus {
@@ -31,7 +31,7 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
 
     /// Queue the call and keep its reply for later.
     pub async fn send(mut self) -> Reply<O> {
-        if !poll_fn(|cx| self.poll_submit(cx)).await {
+        if !poll_fn(|cx| self.poll_submit(cx, true)).await {
             if self.admission.group().is_some() {
                 self.admission.rejected();
                 core::future::pending::<()>().await;
@@ -47,44 +47,44 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
         self.reply
     }
 
-    /// Wait for admission, returning a reply whose outcome can be observed before cleanup.
+    /// Wait for the call to enter the queue and return a reply to await later. If
+    /// admission fails, return the error. Use `receive_settled()` on the reply to
+    /// get the outcome during cleanup.
     pub async fn admit(mut self) -> Result<Reply<O>, CallError> {
-        if poll_fn(|cx| self.poll_submit(cx)).await {
+        if poll_fn(|cx| self.poll_submit(cx, false)).await {
             Ok(self.reply)
         } else {
             Err(CallError::NotAdmitted)
         }
     }
 
-    fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+    fn poll_submit(&mut self, cx: &mut Context<'_>, wait_for_listener: bool) -> Poll<bool> {
         loop {
-            if let Some(available) = &mut self.available {
-                ready!(available.as_mut().poll(cx));
-                self.available = None;
-            }
-
             if matches!(self.submission, Submission::Unsent(_)) {
                 let old = std::mem::replace(&mut self.submission, Submission::Consumed);
 
                 if let Submission::Unsent(message) = old {
                     let sender = self.sender;
                     let Some(epoch) = self.admission.epoch() else {
-                        if sender.is_closed() {
+                        if !wait_for_listener || sender.is_closed() {
                             self.submission = Submission::Closed;
                             drop(message);
                             return Poll::Ready(false);
                         }
 
-                        let mut changed = self.admission.watch();
-                        let mut finished = self.reply.finished.clone();
-                        let admission = self.admission;
-
                         self.submission = Submission::Unsent(message);
-                        self.available = Some(Box::pin(async move {
-                            if admission.epoch().is_none() && !sender.is_closed() {
-                                tokio::select! { _ = changed.changed() => (), _ = finished.changed() => () }
-                            }
-                        }));
+                        let waiting = self.available.get_or_insert_with(|| {
+                            let admission = self.admission;
+                            let mut changed = admission.watch();
+                            let mut finished = self.reply.finished.clone();
+                            Box::pin(async move {
+                                if !sender.is_closed() {
+                                    tokio::select! { _ = changed.changed() => (), _ = finished.changed() => () }
+                                }
+                            })
+                        });
+                        ready!(waiting.as_mut().poll(cx));
+                        self.available = None;
                         continue;
                     };
 
@@ -168,7 +168,7 @@ impl<S: 'static, O> Future for Request<'_, S, O> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
         let this = self.get_mut();
 
-        if !ready!(this.poll_submit(cx)) && this.admission.group().is_some() {
+        if !ready!(this.poll_submit(cx, true)) && this.admission.group().is_some() {
             this.admission.rejected();
             return Poll::Pending;
         }
@@ -183,13 +183,11 @@ impl<S: 'static> Request<'_, S, ()> {
     #[doc(hidden)]
     pub async fn run_interval(mut self) -> bool {
         let admitted = poll_fn(|cx| {
-            if matches!(self.admission.phase(), crate::queue::Phase::Closing { .. })
-                || self.sender.is_closed()
-            {
+            if self.admission.phase().is_closing() || self.sender.is_closed() {
                 return Poll::Ready(false);
             }
 
-            self.poll_submit(cx)
+            self.poll_submit(cx, false)
         })
         .await;
 

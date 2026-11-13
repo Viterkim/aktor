@@ -29,14 +29,15 @@ impl<S: 'static, Role: 'static> Client<S, Role> {
     pub fn with_options(
         address: impl Into<Address>,
         options: ClientOptions,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, (Error, String)> {
         wire::validate(options.max_frame)?;
         if options.timeout.is_zero() || options.retry_delay.is_zero() {
-            return Err(Error::new(
+            return Err(Failure::new(
                 CallError::NotAdmitted,
                 Cause::Protocol,
                 "call timeout and retry delay must be positive",
-            ));
+            )
+            .into());
         }
         Ok(Self::build(address.into(), options))
     }
@@ -51,6 +52,7 @@ impl<S: 'static, Role: 'static> Client<S, Role> {
                     next: 1,
                 }),
                 options,
+                frames: wire::FrameReader::default(),
                 #[cfg(feature = "udp")]
                 udp: tokio::sync::OnceCell::new(),
             }),
@@ -61,12 +63,12 @@ impl<S: 'static, Role: 'static> Client<S, Role> {
     pub async fn connect_with(
         address: impl Into<Address>,
         options: ClientOptions,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, (Error, String)> {
         let client = Self::with_options(address, options)?;
         let stream = timeout(client.inner.options.timeout, client.inner.open())
             .await
             .map_err(|_| {
-                Error::new(
+                Failure::new(
                     CallError::NotAdmitted,
                     Cause::Timeout,
                     format!("connecting to {} timed out", client.inner.address),
@@ -97,22 +99,15 @@ where
 }
 
 impl Inner {
-    pub fn take_idle(&self) -> Result<Option<Active>, Error> {
+    pub fn take_idle(&self) -> Result<Option<Active>, Failure> {
         let Ok(mut connection) = self.connection.try_lock() else {
             return Ok(None);
         };
-        let Some(mut active) = connection.stream.take() else {
-            return Ok(None);
-        };
-        if active.stream.idle()? {
-            Ok(Some(active))
-        } else {
-            Ok(None)
-        }
+        connection.take_idle()
     }
 
-    pub async fn open(&self) -> Result<Active, Error> {
-        let mut stream = self.connect().await?;
+    pub async fn open(&self) -> Result<Active, Failure> {
+        let mut stream = self.connect().await?.buffered();
         wire::write(
             &mut stream,
             &Message::Hello {
@@ -125,16 +120,17 @@ impl Inner {
         )
         .await?;
 
-        match wire::read(&mut stream, wire::MAX_HANDSHAKE).await? {
+        match self.frames.read_handshake(&mut stream).await? {
             Message::Ready { max_frame } => {
                 wire::validate(max_frame as usize)?;
                 Ok(Active {
+                    compress: stream.get_ref().compresses(),
                     stream,
                     max_frame: max_frame as usize,
                 })
             }
             Message::Reject(error) => Err(error),
-            _ => Err(Error::new(
+            _ => Err(Failure::new(
                 CallError::NotAdmitted,
                 Cause::Protocol,
                 "expected remote handshake",
@@ -142,7 +138,7 @@ impl Inner {
         }
     }
 
-    async fn connect(&self) -> Result<Stream, Error> {
+    async fn connect(&self) -> Result<Stream, Failure> {
         match &self.address {
             Address::Unix(path) => Ok(Stream::Unix(tokio::net::UnixStream::connect(path).await?)),
             Address::Tcp(address) => {
@@ -176,7 +172,7 @@ impl Inner {
         input: Vec<u8>,
         mut options: watch::Receiver<AktorRetryOpts>,
         mut admitted: Option<oneshot::Sender<()>>,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Vec<u8>, Failure> {
         let mut outcome = CallError::NotAdmitted;
         let mut attempt = 0;
         let mut updating = true;
@@ -188,19 +184,9 @@ impl Inner {
 
                 loop {
                     let current = *options.borrow_and_update();
-                    if current.attempts == 0 || current.timeout.is_zero() {
-                        break Ok(Err(Error::new(
-                            CallError::NotAdmitted,
-                            Cause::Protocol,
-                            "retry attempts and timeout must be positive",
-                        )));
-                    }
-                    let Some(deadline) = started.checked_add(current.timeout) else {
-                        break Ok(Err(Error::new(
-                            CallError::NotAdmitted,
-                            Cause::Protocol,
-                            "remote timeout is too large",
-                        )));
+                    let deadline = match current.deadline(started) {
+                        Ok(deadline) => deadline,
+                        Err(error) => break Ok(Err(error)),
                     };
 
                     tokio::select! {
@@ -217,7 +203,7 @@ impl Inner {
                     error.outcome = outcome;
                     error
                 }
-                Err(_) => Error::new(
+                Err(_) => Failure::new(
                     outcome,
                     Cause::Timeout,
                     format!("{operation} at {} timed out", self.address),
@@ -249,48 +235,50 @@ impl Inner {
         input: &[u8],
         outcome: &mut CallError,
         admitted: &mut Option<oneshot::Sender<()>>,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Vec<u8>, Failure> {
         let mut connection = self.connection.lock().await;
         let id = connection.next;
         connection.next = id.checked_add(1).ok_or_else(|| {
-            Error::new(
+            Failure::new(
                 *outcome,
                 Cause::Closed,
                 "remote request identities exhausted",
             )
         })?;
-        let bytes = wire::encode(
+
+        // A cancelled call owns and closes its stream, leaving no stale reply for the next call.
+        let cached = connection.take_idle()?;
+        let local_limit = self.options.max_frame;
+        let limit = cached
+            .as_ref()
+            .map_or(local_limit, |active| active.max_frame.min(local_limit));
+        let bytes = match wire::encode(
             &Message::Call {
                 id,
                 operation: operation.into(),
-                input: input.to_vec(),
+                input: input.into(),
             },
-            self.options.max_frame,
-        )?;
-
-        // A cancelled call owns and closes its stream, leaving no stale reply for the next call.
-        let cached = match connection.stream.take() {
-            Some(mut active) => {
-                if active.stream.idle()? {
-                    Some(active)
-                } else {
-                    None
-                }
+            limit,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                connection.stream = cached;
+                return Err(error);
             }
-            None => None,
         };
         let mut active = match cached {
             Some(stream) => stream,
             None => self.open().await?,
         };
         if bytes.len() > active.max_frame {
-            return Err(Error::new(
+            connection.stream = Some(active);
+            return Err(Failure::new(
                 *outcome,
                 Cause::Codec,
                 "request exceeds the server's frame limit",
             ));
         }
-        let bytes = if active.stream.compresses() {
+        let bytes = if active.compress {
             packet::encode(bytes)
         } else {
             bytes
@@ -300,7 +288,11 @@ impl Inner {
         *outcome = CallError::OutcomeUnknown;
         let mut accepted = false;
         loop {
-            match wire::read(&mut active.stream, self.options.max_frame).await? {
+            match self
+                .frames
+                .read(&mut active.stream, self.options.max_frame)
+                .await?
+            {
                 Message::Admitted { id: answer } if answer == id && !accepted => {
                     accepted = true;
                     if let Some(admitted) = admitted.take() {
@@ -315,7 +307,7 @@ impl Inner {
                         *outcome = error.outcome;
                     }
                     if !accepted && output.is_ok() {
-                        return Err(Error::new(
+                        return Err(Failure::new(
                             *outcome,
                             Cause::Protocol,
                             "remote answer arrived before admission",
@@ -324,7 +316,7 @@ impl Inner {
                     if output
                         .as_ref()
                         .err()
-                        .is_some_and(|error| error.cause == Cause::Closed)
+                        .is_some_and(|error| matches!(error.cause, Cause::Closed | Cause::Protocol))
                     {
                         return output;
                     }
@@ -332,13 +324,27 @@ impl Inner {
                     return output;
                 }
                 _ => {
-                    return Err(Error::new(
+                    return Err(Failure::new(
                         *outcome,
                         Cause::Protocol,
                         "expected matching remote reply",
                     ));
                 }
             }
+        }
+    }
+}
+
+impl Connection {
+    fn take_idle(&mut self) -> Result<Option<Active>, Failure> {
+        let Some(mut active) = self.stream.take() else {
+            return Ok(None);
+        };
+
+        if idle(&mut active.stream)? {
+            Ok(Some(active))
+        } else {
+            Ok(None)
         }
     }
 }

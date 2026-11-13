@@ -73,6 +73,7 @@ impl<S> Drop for Running<S> {
         if let Some(failure) = failures.first {
             if std::thread::panicking() {
                 policy.report(&failure);
+                super::failure::dispose_secondary(failure.payload);
             } else {
                 policy.fail(failure);
             }

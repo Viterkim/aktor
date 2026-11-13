@@ -4,25 +4,25 @@ use super::*;
 use crate::setup::kind::TokioTask;
 use crate::{AktorClosure, operation::Operation};
 use crate::{
-    AktorClosures, AktorError, AktorFailureReport, AktorGroup, AktorNew, AktorOutcome,
-    AktorStartError,
+    AktorError, AktorFailureReport, AktorGroup, AktorGroupError, AktorHooks, AktorNew,
+    AktorOutcome, AktorStartCause, AktorStartError,
     group::shutdown::{contain_drop, panic_message},
-    operation::hooks::AktorHooks,
+    operation::hooks::CallHooks,
+    setup::initial::InitError,
     setup::kind::AktorMode,
 };
 use core::task::{Context, Poll};
 use futures_util::{FutureExt, future::Either};
 use hooks::{AktorTaskEnd, AktorTaskInterval};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use tokio::sync::OwnedMutexGuard;
 
 struct TaskLogic<S: 'static, Start> {
     start: Option<Start>,
     end: Option<AktorClosure<dyn AktorTaskEnd<S> + Send>>,
     intervals: Vec<TaskInterval<S>>,
-    hooks: AktorHooks<S>,
+    hooks: CallHooks<S>,
     clock: TaskClock,
-    kill: KillSwitch,
+    kill: AktorKillSwitch,
 }
 impl<S: 'static, Start> Drop for TaskLogic<S, Start> {
     fn drop(&mut self) {
@@ -45,17 +45,18 @@ struct TaskInterval<S: 'static> {
 struct Completion {
     cleanup: Arc<parking_lot::Mutex<Vec<Arc<crate::AktorFailure>>>>,
     report: AktorOutcome,
-    kill: KillSwitch,
-    completed: Option<oneshot::Sender<AktorOutcome>>,
+    kill: AktorKillSwitch,
+    completed: Option<oneshot::Sender<(AktorOutcome, bool)>>,
     finished: watch::Sender<AktorTaskStatus>,
     failed: bool,
+    state_leased: bool,
 }
 impl Completion {
     fn fail(&mut self, phase: &str, message: String) -> bool {
         self.failed = true;
         self.kill.fail(AktorFailureReport {
             actor: self.report.actor.clone(),
-            kind: self.report.kind,
+            kind: Some(self.report.kind),
             phase: phase.into(),
             message,
         })
@@ -65,7 +66,7 @@ impl Completion {
         self.failed = true;
         self.kill.fail_startup(AktorFailureReport {
             actor: self.report.actor.clone(),
-            kind: self.report.kind,
+            kind: Some(self.report.kind),
             phase: "setup".into(),
             message,
         })
@@ -84,7 +85,7 @@ impl Completion {
         }
     }
 
-    fn dispose_hooks<S>(&mut self, hooks: AktorHooks<S>) {
+    fn dispose_hooks<S>(&mut self, hooks: CallHooks<S>) {
         self.dispose(hooks.before_each, "task hook drop");
         self.dispose(hooks.after_each, "task hook drop");
     }
@@ -107,21 +108,21 @@ impl Completion {
 
     fn publish(&mut self) {
         self.finished
-            .send_replace(if self.failed || self.report.timed_out {
+            .send_replace(if self.failed || self.report.ran_past_grace {
                 AktorTaskStatus::Failed
             } else {
                 AktorTaskStatus::Finished
             });
 
         if let Some(completed) = self.completed.take() {
-            let _sent = completed.send(self.report.clone());
+            let _sent = completed.send((self.report.clone(), self.state_leased));
         }
     }
 }
 impl Drop for Completion {
     fn drop(&mut self) {
         if self.completed.is_some() {
-            self.report.retirement = crate::RetirementStatus::Unconfirmed;
+            self.report.retirement = crate::AktorRetireStatus::Unconfirmed;
             let message = "actor task cancelled before cleanup completed";
 
             if !self.fail("owner", message.into()) {
@@ -134,14 +135,16 @@ impl Drop for Completion {
 
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 #[doc(hidden)]
-pub async fn start<S, Start, Fut, End, CM>(
-    setup: AktorNew<S, Start, TokioTask, crate::AktorNoRole, End>,
+pub async fn start<S, Start, Fut, End, CM, E, M>(
+    setup: AktorNew<S, Start, TokioTask, End, (CM, E, M)>,
     group: &mut AktorGroup,
-) -> Result<AktorTask<S, crate::AktorNoRole>, AktorStartError>
+) -> Result<AktorTask<S>, AktorStartError<E::Error>>
 where
     S: Send + 'static,
     Start: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<S, crate::AktorSetupError>> + Send + 'static,
+    Fut: Future<Output = Result<S, E>> + Send + 'static,
+    E: InitError<M> + 'static,
+    E::Error: Send + 'static,
     End: crate::setup::closures::AktorSendEnd<S, CM>,
 {
     start_on(setup, group, TaskClock::Tokio, |future| {
@@ -151,16 +154,18 @@ where
 }
 
 #[doc(hidden)]
-pub async fn start_on<S, Start, Fut, Kind, End, CM>(
-    setup: AktorNew<S, Start, Kind, crate::AktorNoRole, End>,
+pub async fn start_on<S, Start, Fut, Kind, End, CM, E, M>(
+    setup: AktorNew<S, Start, Kind, End, (CM, E, M)>,
     group: &mut AktorGroup,
     clock: TaskClock,
     spawn: impl FnOnce(TaskOwnerFuture) -> TaskJoin,
-) -> Result<AktorTask<S, crate::AktorNoRole>, AktorStartError>
+) -> Result<AktorTask<S>, AktorStartError<E::Error>>
 where
     S: Send + 'static,
     Start: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<S, crate::AktorSetupError>> + Send + 'static,
+    Fut: Future<Output = Result<S, E>> + Send + 'static,
+    E: InitError<M> + 'static,
+    E::Error: Send + 'static,
     End: crate::setup::closures::AktorSendEnd<S, CM>,
     Kind: AktorMode<
             Each<S> = dyn FnMut(&mut S, Operation) + Send,
@@ -168,13 +173,12 @@ where
         >,
 {
     let kind = Kind::EXECUTION;
-    let options = setup.options;
+    let capacity = setup.capacity;
 
-    let invalid = if options.capacity == 0 || options.capacity > tokio::sync::Semaphore::MAX_PERMITS
-    {
+    let invalid = if capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS {
         Some("queue capacity must be positive and fit the semaphore")
     } else if setup
-        .closures
+        .hooks
         .intervals
         .iter()
         .any(|interval| interval.every.is_zero())
@@ -185,17 +189,20 @@ where
     };
 
     if let Some(reason) = invalid {
-        return Err(crate::setup::validation_error(
+        return Err(AktorStartError::not_run(crate::setup::validation_error(
             group,
-            &setup.name.name,
+            &setup.name,
             kind,
-            AktorStartError::Setup(AktorError::new(reason, ())),
-        ));
+            AktorStartCause::Setup(AktorError::new(reason, ())),
+        )));
     }
 
-    let name = Arc::new(setup.name.name);
+    #[cfg(not(target_family = "wasm"))]
+    let stuck = setup.stuck;
+    let name = Arc::new(setup.name);
     let kill = group.killswitch();
-    let (sender, receiver) = mpsc::channel(options.capacity);
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let slots = Arc::new(Semaphore::new(capacity));
     let (closing, closed) = oneshot::channel();
     let (forcing, forced) = oneshot::channel();
     let (completed, outcome) = oneshot::channel();
@@ -220,63 +227,66 @@ where
             Box::new(move || {
                 let _sent = forcing.send(());
             }),
+            None,
+            None,
             Box::pin(async move {
-                let mut report = outcome.await.unwrap_or_else(|_| AktorOutcome {
-                    retirement: crate::RetirementStatus::Unconfirmed,
-                    actor: label,
-                    kind: Some(kind),
-                    diagnostics: vec![AktorError::new("actor task observer stopped", ())],
-                    timed_out: false,
+                let (mut report, state_leased) = outcome.await.unwrap_or_else(|_| {
+                    (
+                        AktorOutcome {
+                            retirement: crate::AktorRetireStatus::Unconfirmed,
+                            actor: label,
+                            kind,
+                            diagnostics: vec![AktorError::new("actor task observer stopped", ())],
+                            ran_past_grace: false,
+                        },
+                        false,
+                    )
                 });
 
                 if let Ok(join) = joined.await {
                     join.wait(&observer_kill, &mut report).await;
+                    if !state_leased && report.retirement == crate::AktorRetireStatus::Unconfirmed {
+                        report.retirement = crate::AktorRetireStatus::Terminated;
+                    }
                 }
 
                 report
             }),
         )
-        .map_err(AktorStartError::Setup)?;
+        .map_err(|error| AktorStartError::not_run(AktorStartCause::Group(error)))?;
 
     let cleanup_errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let completion = Completion {
         cleanup: cleanup_errors.clone(),
         report: AktorOutcome {
-            retirement: crate::RetirementStatus::Unconfirmed,
+            retirement: crate::AktorRetireStatus::Unconfirmed,
             actor: (*name).clone(),
-            kind: Some(kind),
+            kind,
             diagnostics: Vec::new(),
-            timed_out: false,
+            ran_past_grace: false,
         },
         kill: kill.clone(),
         completed: Some(completed),
         failed: false,
+        state_leased: false,
         finished,
     };
 
     #[cfg(not(target_family = "wasm"))]
-    let life = kill.track_thread((*name).clone());
+    let life = kill.track_thread((*name).clone(), stuck);
     let (ready, started) = oneshot::channel();
-    let AktorClosures {
-        start,
-        end,
+    let start = setup.start;
+    let end = setup.end;
+    let AktorHooks {
         intervals,
         before_each,
         after_each,
-    } = setup.closures;
+    } = setup.hooks;
 
-    let startup_kill = kill.clone();
-    let startup_name = (*name).clone();
-    let startup_kind = kind;
     let logic = TaskLogic {
-        start: Some(move || async move {
-            match start().await {
-                Ok(state) => Ok(state),
-                Err(error) => Err(startup_kill.startup_error(startup_name, startup_kind, error)),
-            }
-        }),
+        start: Some(move || async move { start().await.map_err(|error| error.split()) }),
         end: Some(AktorClosure(Box::new(move |state| end.finish(state)))),
-        hooks: AktorHooks {
+        hooks: CallHooks {
             before_each: before_each.map(|hook| hook.0),
             after_each: after_each.map(|hook| hook.0),
         },
@@ -292,6 +302,7 @@ where
     };
     let receiver = service::CallDriver {
         receiver,
+        slots: slots.clone(),
         kill: kill.clone(),
     };
 
@@ -313,24 +324,28 @@ where
 
     let _sent = joining.send(join);
 
-    started.await.unwrap_or_else(|_| {
-        Err(AktorStartError::Setup(AktorError::new(
-            "actor task cancelled during setup",
-            (),
-        )))
-    })?;
+    let completion = group.completion();
+    tokio::select! {
+        biased;
+        result = started => result.map_err(|_| {
+            if kill.is_stopping() {
+                AktorStartCause::Group(AktorGroupError::Stopping)
+            } else {
+                AktorStartCause::Setup(AktorError::new("actor task cancelled during setup", ()))
+            }
+        })?,
+        _ = completion.wait() => Err(AktorGroupError::Stopping.into()),
+    }?;
 
     if kill.is_stopping() {
-        return Err(AktorStartError::Setup(AktorError::new(
-            "actor task closed during startup",
-            (),
-        )));
+        return Err(AktorGroupError::Stopping.into());
     }
 
     Ok(AktorTask {
         cleanup: cleanup_errors,
         name,
         sender,
+        slots,
         services,
         kill,
         finished: observed,
@@ -341,29 +356,36 @@ where
 
 struct Running<'a, S> {
     job: Pin<Box<dyn Job<S> + Send>>,
-    guard: Option<OwnedMutexGuard<Option<S>>>,
+    lease: Option<AktorTaskState<S>>,
+    state: &'a Arc<Mutex<Option<S>>>,
     waiting: Option<AktorTaskFuture<'static, OwnedMutexGuard<Option<S>>>>,
-    hooks: &'a mut AktorHooks<S>,
+    hooks: &'a mut CallHooks<S>,
     operation: Operation,
 }
 impl<'a, S: Send + 'static> Running<'a, S> {
     fn new(
         job: Box<dyn Job<S> + Send>,
-        state: &Arc<Mutex<Option<S>>>,
-        hooks: &'a mut AktorHooks<S>,
+        state: &'a Arc<Mutex<Option<S>>>,
+        lease: Option<AktorTaskState<S>>,
+        hooks: &'a mut CallHooks<S>,
         operation: Operation,
     ) -> Self {
-        let (guard, waiting) = match state.clone().try_lock_owned() {
-            Ok(guard) => (Some(guard), None),
-            Err(_) => (
-                None,
-                Some(Box::pin(state.clone().lock_owned()) as AktorTaskFuture<'static, _>),
-            ),
+        let (lease, waiting) = if lease.is_some() {
+            (lease, None)
+        } else {
+            match state.clone().try_lock_owned() {
+                Ok(guard) => (Some(AktorTaskState { guard }), None),
+                Err(_) => (
+                    None,
+                    Some(Box::pin(state.clone().lock_owned()) as AktorTaskFuture<'static, _>),
+                ),
+            }
         };
 
         Self {
             job: Box::into_pin(job),
-            guard,
+            lease,
+            state,
             waiting,
             hooks,
             operation,
@@ -371,63 +393,54 @@ impl<'a, S: Send + 'static> Running<'a, S> {
     }
 }
 impl<S: Send + 'static> Future for Running<'_, S> {
-    type Output = ();
+    type Output = Option<AktorTaskState<S>>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let guard = if this.guard.is_some() {
+
+        if this.lease.is_some() {
             #[cfg(feature = "tokio")]
             core::task::ready!(core::pin::pin!(tokio::task::coop::consume_budget()).poll(cx));
-            this.guard.take()
         } else if let Some(waiting) = &mut this.waiting {
             let guard = core::task::ready!(waiting.as_mut().poll(cx));
             this.waiting = None;
-            Some(guard)
-        } else {
-            None
-        };
+            this.lease = Some(AktorTaskState { guard });
+        }
 
-        let state = if let Some(guard) = guard {
-            let Ok(guard) = OwnedMutexGuard::try_map(guard, Option::as_mut) else {
-                return Poll::Ready(());
-            };
-
-            Some(AktorTaskState { guard })
-        } else {
-            None
-        };
-
-        this.job
-            .as_mut()
-            .poll(cx, state, this.hooks, this.operation)
+        let lease = core::task::ready!(this.job.as_mut().poll(
+            cx,
+            this.lease.take(),
+            this.state,
+            this.hooks,
+            this.operation
+        ));
+        // A manually built request can return another actor's state.
+        Poll::Ready(
+            lease.filter(|lease| Arc::ptr_eq(OwnedMutexGuard::mutex(&lease.guard), this.state)),
+        )
     }
 }
 
-async fn drive<S, Start, Fut>(
+async fn drive<S, Start, Fut, E>(
     mut closures: TaskLogic<S, Start>,
     mut receiver: service::CallDriver<S>,
     service_driver: service::ServiceDriver<S>,
     closed: oneshot::Receiver<()>,
     mut forced: oneshot::Receiver<()>,
-    ready: oneshot::Sender<Result<(), AktorStartError>>,
+    ready: oneshot::Sender<Result<(), AktorStartError<E>>>,
     mut completion: Completion,
 ) where
     S: Send + 'static,
     Start: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<S, crate::AktorFailure>> + Send + 'static,
+    E: Send + 'static,
+    Fut: Future<Output = Result<S, (E, String)>> + Send + 'static,
 {
     let clock = closures.clock;
 
     let mut setup = Box::pin(
         AssertUnwindSafe(async {
-            let Some(start) = closures.start.take() else {
-                return Err(AktorStartError::Setup(AktorError::new(
-                    "actor task setup already consumed",
-                    (),
-                )));
-            };
-
-            start().await.map_err(AktorStartError::Init)
+            let start = closures.start.take()?;
+            Some(start().await)
         })
         .catch_unwind(),
     );
@@ -438,11 +451,7 @@ async fn drive<S, Start, Fut>(
     };
 
     let primary = match &result {
-        Some(Ok(Err(AktorStartError::Init(error)))) => {
-            completion.failed = true;
-            error.primary
-        }
-        Some(Ok(Err(error))) => completion.fail_startup(crate::setup::start_diagnostics(error)),
+        Some(Ok(None)) => completion.fail_startup("actor task setup already consumed".into()),
         Some(Err(payload)) => completion.fail_startup(panic_message(payload)),
         _ => false,
     };
@@ -450,20 +459,50 @@ async fn drive<S, Start, Fut>(
     completion.dispose(setup, "task setup drop");
 
     let state = match result {
-        Some(Ok(Ok(state))) => state,
-        Some(Ok(Err(error))) => {
-            completion.report.retirement = crate::RetirementStatus::Confirmed;
-            if let AktorStartError::Init(error) = &error
-                && !error.primary
-            {
+        Some(Ok(Some(Ok(state)))) => state,
+        Some(Ok(Some(Err((data, diagnostics))))) => {
+            completion.failed = true;
+            completion.report.retirement = crate::AktorRetireStatus::Confirmed;
+            let mut unsent = None;
+            let error = completion.kill.startup_error_with(
+                completion.report.actor.clone(),
+                completion.report.kind,
+                AktorError::new(diagnostics, ()),
+                |primary, diagnostics| {
+                    unsent = ready
+                        .send(Err(AktorStartError {
+                            init: crate::AktorInitOutcome::Failed(data),
+                            cause: AktorStartCause::Init(crate::AktorFailure {
+                                diagnostics: diagnostics.into(),
+                                primary,
+                            }),
+                            report: None,
+                        }))
+                        .err();
+                },
+            );
+            if !error.primary {
                 completion
                     .report
                     .diagnostics
-                    .push(AktorError::new(error.diagnostics.clone(), ()));
+                    .push(AktorError::new(error.diagnostics, ()));
             }
 
-            let sent = ready.send(Err(error));
-            completion.dispose(sent, "startup reply drop");
+            completion.dispose(unsent, "startup reply drop");
+
+            completion.dispose_hooks(std::mem::take(&mut closures.hooks));
+            completion.dispose_intervals(std::mem::take(&mut closures.intervals));
+            completion.dispose(closures.end.take(), "task end drop");
+            completion.dispose_receiver(receiver);
+            completion.publish();
+            return;
+        }
+        Some(Ok(None)) => {
+            let _sent = ready.send(Err(AktorError::new(
+                "actor task setup already consumed",
+                (),
+            )
+            .into()));
 
             completion.dispose_hooks(std::mem::take(&mut closures.hooks));
             completion.dispose_intervals(std::mem::take(&mut closures.intervals));
@@ -483,7 +522,7 @@ async fn drive<S, Start, Fut>(
             }
             completion.dispose(payload, "task setup panic drop");
 
-            let _sent = ready.send(Err(AktorStartError::Setup(AktorError::new(message, ()))));
+            let _sent = ready.send(Err(AktorError::new(message, ()).into()));
 
             completion.dispose_hooks(std::mem::take(&mut closures.hooks));
             completion.dispose_intervals(std::mem::take(&mut closures.intervals));
@@ -493,12 +532,9 @@ async fn drive<S, Start, Fut>(
             return;
         }
         None => {
-            completion.report.timed_out = true;
+            completion.report.ran_past_grace = true;
 
-            let _sent = ready.send(Err(AktorStartError::Setup(AktorError::new(
-                "actor task setup cancelled",
-                (),
-            ))));
+            let _sent = ready.send(Err(AktorGroupError::Stopping.into()));
 
             completion.dispose_hooks(std::mem::take(&mut closures.hooks));
             completion.dispose_intervals(std::mem::take(&mut closures.intervals));
@@ -521,6 +557,7 @@ async fn drive<S, Start, Fut>(
 
     tokio::pin!(closing, forcing);
 
+    let mut lease = None;
     let mut stopping = false;
     let mut ordinary_done = false;
     let mut services_done = false;
@@ -555,12 +592,6 @@ async fn drive<S, Start, Fut>(
             break;
         }
 
-        if completion.kill.is_stopping() && !stopping {
-            stopping = true;
-            receiver.close();
-            services.close();
-        }
-
         let work = {
             #[cfg(target_family = "wasm")]
             let timer = wait_interval(due);
@@ -574,8 +605,8 @@ async fn drive<S, Start, Fut>(
                     services.close();
                     continue;
                 },
-                _ = &mut forcing => { completion.report.timed_out = true; break; },
-                message = receiver.receiver.recv(), if !ordinary_done => match message {
+                _ = &mut forcing => break,
+                message = receiver.recv(), if !ordinary_done => match message {
                     Some(message) => Some(message),
                     None => { ordinary_done = true; stopping = true; services.close(); continue; }
                 },
@@ -603,6 +634,7 @@ async fn drive<S, Start, Fut>(
             Some(message) => Either::Left(Running::new(
                 message.job,
                 &state,
+                lease.take(),
                 &mut closures.hooks,
                 operation,
             )),
@@ -610,6 +642,7 @@ async fn drive<S, Start, Fut>(
                 let Some((index, _)) = due else {
                     continue;
                 };
+                drop(lease.take());
                 let state = state.clone();
                 let interval = &mut closures.intervals[index];
                 let hooks = &mut closures.hooks;
@@ -618,20 +651,19 @@ async fn drive<S, Start, Fut>(
                 Either::Right(Box::pin(async move {
                     let guard = state.clone().lock_owned().await;
 
-                    if let Ok(guard) = OwnedMutexGuard::try_map(guard, Option::as_mut) {
-                        let mut lease = AktorTaskState { guard };
+                    let mut lease = AktorTaskState { guard };
 
-                        hooks.before(&mut lease, operation);
-                        interval.run.0.run(lease).await;
+                    hooks.before(&mut lease, operation);
+                    interval.run.0.run(lease).await;
 
-                        let mut state = state.lock().await;
+                    let mut state = state.lock().await;
 
-                        if let Some(state) = &mut *state {
-                            hooks.after(state, operation);
-                        }
+                    if let Some(state) = &mut *state {
+                        hooks.after(state, operation);
                     }
 
                     *next = clock.deadline(interval.every);
+                    None
                 }))
             }
         };
@@ -664,13 +696,13 @@ async fn drive<S, Start, Fut>(
         completion.dispose(run, "task operation drop");
 
         match outcome {
-            Some(Ok(())) => {}
+            Some(Ok(returned)) => lease = returned,
             Some(Err(payload)) => {
                 completion.dispose(payload, "task operation panic drop");
                 break;
             }
             None => {
-                completion.report.timed_out = true;
+                completion.report.ran_past_grace = true;
                 break;
             }
         }
@@ -700,74 +732,84 @@ async fn drive<S, Start, Fut>(
     completion.dispose(service_driver, "task latest driver drop");
     completion.dispose_receiver(receiver);
 
-    let state = state.lock().await.take();
+    let mut recovered = false;
+    let mut cleanup = Box::pin(
+        AssertUnwindSafe(async {
+            let state = match lease {
+                Some(mut lease) => lease.guard.take(),
+                None => state.lock().await.take(),
+            };
+            recovered = true;
+            let Some(state) = state else {
+                return Ok(());
+            };
 
-    if let Some(state) = state {
-        let end = closures.end.take();
-        let mut cleanup = Box::pin(
-            AssertUnwindSafe(async move {
-                if let Some(end) = end {
-                    end.0.run(state).await
-                } else {
-                    drop(state);
-                    Ok(())
-                }
-            })
-            .catch_unwind(),
-        );
-
-        let result = tokio::select! {
-            biased;
-            result = &mut cleanup => Some(result),
-            _ = clock.wait_for_force(&completion.kill) => None,
-        };
-
-        let primary = match &result {
-            Some(Ok(Err(error))) => completion.fail("cleanup", error.diagnostics.clone()),
-            Some(Err(payload)) => completion.fail("cleanup", panic_message(payload)),
-            _ => false,
-        };
-
-        completion.dispose(cleanup, "task cleanup drop");
-
-        match result {
-            Some(Ok(Ok(()))) => {
-                completion.report.retirement = crate::RetirementStatus::Confirmed;
+            if let Some(end) = closures.end.take() {
+                end.0.run(state).await
+            } else {
+                drop(state);
+                Ok(())
             }
-            Some(Ok(Err(mut error))) => {
-                completion.report.retirement = crate::RetirementStatus::Confirmed;
-                error.primary = primary;
+        })
+        .catch_unwind(),
+    );
 
-                if !primary {
-                    completion
-                        .report
-                        .diagnostics
-                        .push(AktorError::new(error.diagnostics.clone(), ()));
-                }
-                completion.cleanup.lock().push(Arc::new(error));
-            }
-            Some(Err(payload)) => {
-                if !primary {
-                    completion
-                        .report
-                        .diagnostics
-                        .push(AktorError::new(panic_message(&payload), ()));
-                }
-                completion.dispose(payload, "task cleanup panic drop");
-            }
-            None => {
-                completion.report.timed_out = true;
-                completion.report.retirement = crate::RetirementStatus::Unconfirmed;
+    let result = tokio::select! {
+        biased;
+        result = clock.end_within(&completion.kill, &mut cleanup) => result,
+        _ = clock.wait_for_force(&completion.kill) => None,
+    };
+
+    let primary = match &result {
+        Some(Ok(Err(error))) => completion.fail("cleanup", error.diagnostics.clone()),
+        Some(Err(payload)) => completion.fail("cleanup", panic_message(payload)),
+        _ => false,
+    };
+
+    completion.dispose(cleanup, "task cleanup drop");
+
+    match result {
+        Some(Ok(Ok(()))) => {
+            completion.report.retirement = crate::AktorRetireStatus::Confirmed;
+        }
+        Some(Ok(Err(mut error))) => {
+            completion.report.retirement = crate::AktorRetireStatus::Confirmed;
+            error.primary = primary;
+
+            if !primary {
                 completion
                     .report
                     .diagnostics
-                    .push(AktorError::new("actor task cleanup cancelled", ()));
+                    .push(AktorError::new(error.diagnostics.clone(), ()));
             }
+            completion.cleanup.lock().push(Arc::new(error));
+        }
+        Some(Err(payload)) => {
+            if !primary {
+                completion
+                    .report
+                    .diagnostics
+                    .push(AktorError::new(panic_message(&payload), ()));
+            }
+            completion.dispose(payload, "task cleanup panic drop");
+        }
+        None => {
+            completion.report.ran_past_grace = true;
+            completion.state_leased = !recovered;
+            completion.report.diagnostics.push(AktorError::new(
+                if recovered {
+                    "end ran out of its grace"
+                } else {
+                    "actor state still leased during shutdown"
+                },
+                (),
+            ));
         }
     }
 
     completion.dispose_hooks(std::mem::take(&mut closures.hooks));
     completion.dispose_intervals(std::mem::take(&mut closures.intervals));
+    completion.dispose(closures.end.take(), "task end drop");
     completion.publish();
 }
 
@@ -800,7 +842,8 @@ mod tests {
     }
 
     struct Chain {
-        sender: mpsc::Sender<Message<()>>,
+        sender: mpsc::UnboundedSender<Message<()>>,
+        slots: Arc<Semaphore>,
         services: Option<Arc<service::Services<()>>>,
         count: Arc<AtomicUsize>,
         remaining: usize,
@@ -808,6 +851,7 @@ mod tests {
     impl Chain {
         fn enqueue(self) {
             let sender = self.sender.clone();
+            let slots = self.slots.clone();
             let services = self.services.clone();
             let message = Message {
                 operation: Operation {
@@ -821,7 +865,8 @@ mod tests {
                 assert!(services.push(message, false).is_ok());
                 services.wake.notify_one();
             } else {
-                assert!(sender.try_send(message).is_ok());
+                slots.try_acquire().unwrap().forget();
+                assert!(sender.send(message).is_ok());
             }
         }
     }
@@ -830,16 +875,17 @@ mod tests {
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
             state: Option<AktorTaskState<()>>,
-            _: &mut AktorHooks<()>,
+            _: &Arc<Mutex<Option<()>>>,
+            _: &mut CallHooks<()>,
             _: Operation,
-        ) -> Poll<()> {
+        ) -> Poll<Option<AktorTaskState<()>>> {
             let this = self.get_mut();
-            drop(state);
             this.count.fetch_add(1, Ordering::Relaxed);
 
             if this.remaining > 1 {
                 Chain {
                     sender: this.sender.clone(),
+                    slots: this.slots.clone(),
                     services: this.services.clone(),
                     count: this.count.clone(),
                     remaining: this.remaining - 1,
@@ -847,7 +893,7 @@ mod tests {
                 .enqueue();
             }
 
-            Poll::Ready(())
+            Poll::Ready(state)
         }
     }
 
@@ -856,7 +902,8 @@ mod tests {
         for latest in [false, true] {
             let group = AktorGroup::new();
             let kill = group.killswitch();
-            let (sender, receiver) = mpsc::channel(1);
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let slots = Arc::new(Semaphore::new(1));
             let services = Arc::new(service::Services::new());
             let count = Arc::new(AtomicUsize::new(0));
             let cleaned = Arc::new(AtomicBool::new(false));
@@ -870,26 +917,27 @@ mod tests {
             let completion = Completion {
                 cleanup: Arc::new(parking_lot::Mutex::new(Vec::new())),
                 report: AktorOutcome {
-                    retirement: crate::RetirementStatus::Confirmed,
+                    retirement: crate::AktorRetireStatus::Confirmed,
                     actor: "chain".into(),
-                    kind: Some(crate::AktorExecution::BevyTask),
+                    kind: crate::AktorExecution::BevyTask,
                     diagnostics: vec![],
-                    timed_out: false,
+                    ran_past_grace: false,
                 },
                 kill: kill.clone(),
                 completed: Some(completed),
                 finished,
                 failed: false,
+                state_leased: false,
             };
 
             let logic = TaskLogic {
-                start: Some(async || Ok::<_, crate::AktorFailure>(())),
+                start: Some(async || Ok::<_, ((), String)>(())),
                 end: Some(AktorClosure(Box::new(async move |_: ()| {
                     cleanup.store(true, Ordering::Relaxed);
                     Ok::<_, crate::AktorFailure>(())
                 }))),
                 intervals: vec![],
-                hooks: AktorHooks {
+                hooks: CallHooks {
                     before_each: None,
                     after_each: None,
                 },
@@ -899,6 +947,7 @@ mod tests {
 
             Chain {
                 sender,
+                slots: slots.clone(),
                 services: latest.then(|| services.clone()),
                 count: count.clone(),
                 remaining: 256,
@@ -909,6 +958,7 @@ mod tests {
                 logic,
                 service::CallDriver {
                     receiver,
+                    slots,
                     kill: kill.clone(),
                 },
                 service::ServiceDriver {
@@ -939,9 +989,9 @@ mod tests {
             if polled.is_pending() {
                 crate::executor::block_on(owner);
             }
-            let report = crate::executor::block_on(outcome).unwrap();
+            let (report, _) = crate::executor::block_on(outcome).unwrap();
 
-            assert!(!report.timed_out && report.diagnostics.is_empty());
+            assert!(!report.ran_past_grace && report.diagnostics.is_empty());
             assert!(cleaned.load(Ordering::Relaxed));
             assert_eq!(count.load(Ordering::Relaxed), 256);
             assert!(

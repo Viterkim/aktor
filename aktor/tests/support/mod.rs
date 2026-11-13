@@ -7,7 +7,24 @@ use std::{
     vec::Vec,
 };
 
-pub fn child_command(test: &str) -> Command {
+pub fn test_command(test: &str) -> Command {
+    // Tests that abort on purpose don't need a core dump, and on a busy disk writing one
+    // takes longer than the test waits. A limit of 1 makes the kernel skip it, also when
+    // systemd-coredump is the handler. Each test process inherits it.
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+        let limit = getrlimit(Resource::Core);
+        let _ = setrlimit(
+            Resource::Core,
+            Rlimit {
+                current: Some(1),
+                maximum: limit.maximum,
+            },
+        );
+    }
+
     let executable = std::env::current_exe().unwrap();
     let listed = Command::new(&executable)
         .args(["--list", "--exact", test])
@@ -18,7 +35,7 @@ pub fn child_command(test: &str) -> Command {
 
     assert!(
         listed.status.success() && names.lines().any(|name| name == expected),
-        "unknown child test: {test}\n{names}\n{}",
+        "unknown test: {test}\n{names}\n{}",
         String::from_utf8_lossy(&listed.stderr)
     );
 
@@ -34,18 +51,18 @@ pub fn child_command(test: &str) -> Command {
     command
 }
 
-pub fn child(test: &str, case: &str) -> Output {
+pub fn run_test(test: &str, case: &str) -> Output {
     use std::io::Read;
 
-    let mut child = child_command(test)
-        .env("AKTOR_CHILD", case)
+    let mut process = test_command(test)
+        .env("AKTOR_TEST_CASE", case)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
 
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
+    let mut stdout = process.stdout.take().unwrap();
+    let mut stderr = process.stderr.take().unwrap();
     let output = thread::spawn(move || {
         let mut bytes = Vec::new();
         stdout.read_to_end(&mut bytes).unwrap();
@@ -61,14 +78,14 @@ pub fn child(test: &str, case: &str) -> Output {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut timed_out = false;
     let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = process.try_wait().unwrap() {
             break status;
         }
 
         if Instant::now() >= deadline {
-            child.kill().unwrap();
+            process.kill().unwrap();
             timed_out = true;
-            break child.wait().unwrap();
+            break process.wait().unwrap();
         }
 
         thread::sleep(Duration::from_millis(10));
@@ -82,7 +99,7 @@ pub fn child(test: &str, case: &str) -> Output {
 
     assert!(
         !timed_out,
-        "child timed out: {}",
+        "process timed out: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -91,7 +108,7 @@ pub fn child(test: &str, case: &str) -> Output {
             String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
-            "child test did not finish: {test} ({case})\n{}\n{}",
+            "test process did not finish: {test} ({case})\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

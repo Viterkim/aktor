@@ -105,11 +105,11 @@ impl CastRequest for Request<'_, ()> {
     }
 }
 impl<O> TimeoutRequest for Request<'_, O> {
-    type Timed = crate::Timeout<Self>;
+    type Timed = crate::AktorTimeout<Self>;
 
     fn timeout(self, duration: Duration) -> Self::Timed {
         let standard = self.standard;
-        crate::Timeout::queued(
+        crate::AktorTimeout::queued(
             self,
             duration,
             |request| WaitStatus {
@@ -121,9 +121,9 @@ impl<O> TimeoutRequest for Request<'_, O> {
 }
 
 impl<O> Reply<O> {
-    pub fn timeout(&mut self, duration: Duration) -> crate::Timeout<&mut Self> {
+    pub fn timeout(&mut self, duration: Duration) -> crate::AktorTimeout<&mut Self> {
         let standard = self.standard;
-        crate::Timeout::queued(self, duration, |_| WaitStatus { admitted: true }, standard)
+        crate::AktorTimeout::queued(self, duration, |_| WaitStatus { admitted: true }, standard)
     }
 }
 

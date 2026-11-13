@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
     target_family = "wasm",
     target_os = "unknown"
 ))]
-mod browser;
+pub(crate) mod browser;
 pub mod bytes;
 mod codec;
 mod impls;
@@ -18,16 +18,11 @@ mod wire;
     target_family = "wasm",
     target_os = "unknown"
 ))]
-pub(crate) use browser::ShutdownDependency;
-#[cfg(all(
-    feature = "wasm_browser_workers",
-    target_family = "wasm",
-    target_os = "unknown"
-))]
 pub use browser::{
-    Completion, LatestResults, LatestSender, OptionalReply, OptionalRequest, OptionalWorker,
-    Server, Worker, WorkerReply, WorkerRequest, retain_cleanup, retain_setup, serve, serve_for,
-    serve_setup, serve_with, setup_failed,
+    AktorServe, Completion, LatestResults, LatestSender, OptionalReply, OptionalRequest,
+    OptionalWorker, Server, Worker, WorkerCleanupError, WorkerJoin, WorkerReply, WorkerRequest,
+    WorkerStartError, join, report_cleanup_pending, report_setup_pending, retain_cleanup,
+    retain_setup, serve, serve_for, serve_setup, serve_with, setup_failed,
 };
 pub use codec::{decode, encode};
 #[doc(hidden)]
@@ -40,14 +35,14 @@ pub use wire::Codec;
 
 pub use crate::dispatch::{Native, Remote};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 4;
 
 #[cfg(all(
     feature = "wasm_browser_workers",
     target_family = "wasm",
     target_os = "unknown"
 ))]
-type WireError = WorkerError<Vec<u8>>;
+type WireError = WorkerFailure<Vec<u8>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
@@ -60,22 +55,37 @@ pub struct Options {
     pub max_outstanding_bytes: usize,
 }
 
-/// Whether the worker's managed resources have retired.
-/// Unconfirmed retirement keeps Aktor's ownership retained automatically.
+/// What happened to the worker when it stopped or lost contact with the page.
 #[must_use = "check retirement before releasing or replacing the owner"]
 #[derive(Debug, Clone)]
 pub enum Retirement<E = ()> {
-    Confirmed(Result<(), WorkerError<E>>),
-    Unconfirmed(WorkerError<E>),
+    /// The worker reported back, or startup ended before it was created.
+    /// An earlier startup or call failure stays in the result.
+    Confirmed(Result<(), (WorkerError<E>, String)>),
+    /// The worker may still be using its resources.
+    Unconfirmed((WorkerError<E>, String)),
+    /// The page stopped the worker. Its cleanup may have been cut short.
+    Terminated((WorkerError<E>, String)),
 }
 
+/// What went wrong with a worker. Fallible calls return it with the report as `(WorkerError, String)`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, er::Er)]
-#[er(no_constructors, display = Self::fmt_display, display_alt = Self::fmt_details, debug = Self::fmt_display)]
+#[er(no_constructors, format = Self::fmt_display)]
+#[non_exhaustive]
 pub struct WorkerError<T = ()> {
     pub outcome: CallError,
     pub cause: WorkerCause,
-    #[er(source, skip)]
-    pub diagnostics: Option<crate::AktorDiagnostic>,
+    pub data: Option<T>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, er::Er)]
+#[er(no_constructors, display = Self::fmt_display, display_alt = "{diagnostics}", debug = Self::fmt_display)]
+#[non_exhaustive]
+pub struct WorkerFailure<T = ()> {
+    pub outcome: CallError,
+    pub cause: WorkerCause,
+    pub diagnostics: Option<String>,
     pub data: Option<T>,
 }
 
@@ -93,6 +103,8 @@ pub enum WorkerCause {
         expected: Vec<String>,
         actual: Vec<String>,
     },
+    /// The browser couldn't prepare a transfer buffer or post the message.
+    Transport(String),
 }
 
 #[cfg(all(
@@ -144,6 +156,11 @@ enum Outgoing {
     Finished(Result<(), WireError>),
     SetupRetired,
     Unconfirmed(WireError),
+    InitNotRun {
+        version: u32,
+        error: WireError,
+    },
+    SetupPending(String),
 }
 
 #[doc(hidden)]
@@ -151,7 +168,7 @@ pub async fn run_export<E, C>(
     export: E,
     state: &mut E::State,
     input: &[u8],
-) -> Result<Vec<u8>, WorkerError>
+) -> Result<Vec<u8>, WorkerFailure>
 where
     E: crate::dispatch::Export<C>,
     C: Codec<E::Input> + Codec<E::Output>,
@@ -165,6 +182,6 @@ where
 
     <C as Codec<E::Output>>::encode(&output).map_err(|mut error| {
         error.outcome = CallError::OutcomeUnknown;
-        error
+        error.into()
     })
 }

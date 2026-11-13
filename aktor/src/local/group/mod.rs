@@ -1,6 +1,6 @@
 use super::*;
-pub use crate::{AktorArgs, ShutdownReport};
-use crate::{AktorError, AktorFailureReport, AktorOutcome};
+pub use crate::{AktorArgs, AktorShutdownReport};
+use crate::{AktorError, AktorFailureReport, AktorOutcome, AktorRetireStatus};
 use alloc::{string::String, vec::Vec};
 use clock::AktorGroupClock;
 use core::{future::poll_fn, ops::AsyncFnOnce, time::Duration};
@@ -11,7 +11,6 @@ use portable_atomic_util::Arc as Shared;
 
 mod driver;
 mod impls;
-mod run;
 mod shutdown;
 
 pub struct AktorGroup<Clock: AktorGroupClock> {
@@ -21,11 +20,11 @@ pub struct AktorGroup<Clock: AktorGroupClock> {
     owners: Rc<RefCell<Vec<Entry>>>,
 }
 
-pub struct GroupCompletion<Clock: AktorGroupClock> {
+pub struct AktorGroupCompletion<Clock: AktorGroupClock> {
     control: Rc<Control<Clock>>,
 }
 
-pub struct KillSwitch<Clock: AktorGroupClock> {
+pub struct AktorKillSwitch<Clock: AktorGroupClock> {
     control: Rc<Control<Clock>>,
     startup_failure: Option<Rc<Cell<bool>>>,
 }
@@ -42,25 +41,35 @@ struct Control<Clock: AktorGroupClock> {
     deadline: Cell<Option<Clock::Deadline>>,
     kinds: RefCell<Vec<(String, crate::AktorExecution)>>,
     failure: RefCell<Option<AktorFailureReport>>,
-    completed: RefCell<Option<ShutdownReport>>,
-    report: RefCell<ShutdownReport>,
+    completed: RefCell<Option<AktorShutdownReport>>,
+    report: RefCell<AktorShutdownReport>,
     changed: Event,
 }
 
 type ShutdownHook =
-    Box<dyn FnOnce(ShutdownReport) -> LocalFuture<'static, Result<(), AktorCleanupError>>>;
+    Box<dyn FnOnce(AktorShutdownReport) -> LocalFuture<'static, Result<(), AktorError>>>;
 
 struct Driver<Clock: AktorGroupClock> {
     control: Rc<Control<Clock>>,
     owners: Rc<RefCell<Vec<Entry>>>,
 }
 
+#[derive(Default)]
+pub(crate) struct OwnerStatus {
+    pub cleanup_completed: Option<bool>,
+    pub ran_past_grace: bool,
+    pub panic_reported: bool,
+    pub cleanup_diagnostic: Option<AktorError>,
+}
+
 struct Entry {
-    cleanup_completed: Option<Rc<Cell<bool>>>,
+    status: Box<dyn Fn() -> OwnerStatus>,
     name: String,
     kind: crate::AktorExecution,
     shutdown: Box<dyn Fn()>,
-    owner: LocalFuture<'static, Option<AktorCleanupError>>,
+    /// Drops the running calls once the actor's grace is up, `end` still runs.
+    cancel: Option<Box<dyn Fn()>>,
+    owner: LocalFuture<'static, Option<AktorError>>,
     diagnostics: Rc<RefCell<Vec<AktorError>>>,
     finished: bool,
 }

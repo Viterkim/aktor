@@ -62,12 +62,12 @@ impl Drop for BrokenState {
 async fn state() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            if let Ok(case) = std::env::var("AKTOR_CHILD") {
+            if let Ok(case) = std::env::var("AKTOR_TEST_CASE") {
                 let cancelled = matches!(case.as_str(), "cancel" | "unpolled" | "cancel-wake");
                 let (handle, mut listener) = channel::<BrokenState>(1).unwrap();
                 let closed = Arc::new(AtomicBool::new(false));
                 let state = BrokenState {
-                    handle: handle.new_handle(),
+                    handle: handle.clone(),
                     closed: closed.clone(),
                 };
 
@@ -125,7 +125,7 @@ async fn state() {
             }
 
             for case in ["task", "blocking", "cancel", "unpolled", "cancel-wake"] {
-                let output = support::child("drop::state", case);
+                let output = support::run_test("drop::state", case);
                 let stderr = String::from_utf8_lossy(&output.stderr);
 
                 assert!(output.status.success(), "{case}: {stderr}");

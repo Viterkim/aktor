@@ -1,5 +1,5 @@
 use crate::{
-    AktorRetryOpts, CallError, Cause, Error,
+    AktorRetryOpts, CallError, Cause, Error, Failure,
     client::{Active, Client, Inner},
     wire::{self, Message},
 };
@@ -53,7 +53,7 @@ struct Shared<I, O> {
 struct Slot<I, O> {
     revision: u64,
     pending: Option<Pending<I>>,
-    output: Option<Result<O, Error>>,
+    output: Option<Result<O, Failure>>,
     senders: usize,
     receiver: bool,
     finished: bool,
@@ -69,7 +69,7 @@ struct Pending<I> {
 #[derive(Clone)]
 struct Update {
     revision: u64,
-    input: Option<Result<Arc<[u8]>, Error>>,
+    input: Option<Result<Arc<[u8]>, Failure>>,
     deadline: Instant,
     outcome: CallError,
     uncertain: bool,

@@ -2,6 +2,8 @@
 mod browser;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod group;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod panic;
 pub mod preferences;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod remote;
@@ -11,8 +13,7 @@ mod setup;
 #[cfg(test)]
 mod tests {
     use super::preferences::{StorageError, read::read, write::write};
-    use aktor::listener::spawn_async;
-    use aktor::*;
+    use aktor::listener::{FailurePolicy, SpawnArgs, spawn_async};
     use rusqlite::Connection;
 
     #[tokio::test]
@@ -55,7 +56,7 @@ mod wrong_role {
     struct Database;
     struct Session;
 
-    #[aktor(actor = Database)]
+    #[aktor(role = Database)]
     async fn read(state: &u32) -> u32 {
         *state
     }

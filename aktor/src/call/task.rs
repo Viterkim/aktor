@@ -22,7 +22,7 @@ where
     O: Send + 'static,
     Fut: Future<Output = (AktorTaskState<S>, O)> + Send + 'static,
 {
-    type Timed = crate::Timeout<Self>;
+    type Timed = crate::AktorTimeout<Self>;
 
     fn timeout(self, duration: Duration) -> Self::Timed {
         self.timeout(duration)
@@ -37,6 +37,6 @@ where
     type Output = ();
 
     async fn cast(self) {
-        drop(self.send().await);
+        self.cast().await;
     }
 }

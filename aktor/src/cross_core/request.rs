@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    Timeout,
+    AktorTimeout,
     message::{consumed, stopped},
 };
 use core::{
@@ -35,14 +35,15 @@ where
     }
 }
 
-pub type Pending<S, I, O> = Box<(I, Box<dyn Body<S, I, O> + Send>)>;
-
 pub enum Unsent<S, I, O> {
-    Body(Pending<S, I, O>),
+    // Opaque dispatch builds the call before it can apply the job's Send bounds.
+    Call(Box<Call<S, I, O>>),
     Job(Box<dyn Job<S>>),
 }
 
-struct Call<S, I, O> {
+type Pending<S, I, O> = (I, Box<dyn Body<S, I, O> + Send>);
+
+pub struct Call<S, I, O> {
     pending: Option<Pending<S, I, O>>,
     answer: Arc<Answer<O>>,
 }
@@ -50,14 +51,13 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static> Job<S> for Call<S, I, O> 
     fn run<'a>(
         &'a mut self,
         state: &'a mut S,
-        hooks: &'a mut AktorHooks<S>,
+        hooks: &'a mut CallHooks<S>,
         operation: Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
-            let Some(pending) = self.pending.take() else {
+            let Some((input, body)) = self.pending.take() else {
                 consumed()
             };
-            let (input, body) = *pending;
 
             hooks.before(state, operation);
 
@@ -80,22 +80,18 @@ impl<S, I, O> Drop for Call<S, I, O> {
 
 impl<O> Answer<O> {
     pub fn finish(&self, output: Result<O, CallError>) {
-        let mut output = Some(output);
         let previous = self.result.lock(|result| {
             let mut result = result.borrow_mut();
-
-            if matches!(*result, AnswerState::Waiting) {
-                output
-                    .take()
-                    .map(|output| core::mem::replace(&mut *result, AnswerState::Ready(output)))
+            if matches!(*result, AnswerState::Waiting(_)) {
+                Ok(core::mem::replace(&mut *result, AnswerState::Ready(output)))
             } else {
-                None
+                Err(output)
             }
         });
 
-        drop(previous);
-        drop(output);
-        self.changed.notify();
+        if let Ok(AnswerState::Waiting(Some(waker))) = previous {
+            waker.wake();
+        }
     }
 }
 
@@ -107,17 +103,18 @@ impl<'a, S, I, O, Role> Request<'a, S, I, O, Role> {
         input: I,
     ) -> Self {
         let answer = Arc::new(Answer {
-            result: Mutex::new(RefCell::new(AnswerState::Waiting)),
-            changed: Arc::new(Event::default()),
+            result: Mutex::new(RefCell::new(AnswerState::Waiting(None))),
         });
 
         Self {
             handle,
             operation,
-            pending: Some(Unsent::Body(Box::new((input, body)))),
-            changed: Event::listen(&handle.inner.changed),
+            pending: Some(Unsent::Call(Box::new(Call {
+                pending: Some((input, body)),
+                answer: answer.clone(),
+            }))),
+            changed: None,
             reply: Reply {
-                changed: Event::listen(&answer.changed),
                 answer,
                 status: handle.inner.status.clone(),
                 parked: false,
@@ -134,10 +131,7 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Request<'a, S, 
             consumed()
         };
         let job = match pending {
-            Unsent::Body(pending) => Box::new(Call {
-                pending: Some(pending),
-                answer: self.reply.answer.clone(),
-            }) as Box<dyn Job<S>>,
+            Unsent::Call(call) => call,
             Unsent::Job(job) => job,
         };
 
@@ -159,31 +153,44 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Request<'a, S, 
             return Poll::Ready(());
         }
 
-        self.changed.register(cx);
+        if self.changed.is_none() {
+            let admitted = self.try_submit();
+            if admitted.is_ready() || self.parked {
+                return admitted;
+            }
+        }
 
+        self.changed
+            .get_or_insert_with(|| Event::listen(&self.handle.inner.changed))
+            .register(cx);
+        // The owner may have freed a slot before we registered.
+        self.try_submit()
+    }
+
+    fn try_submit(&mut self) -> Poll<()> {
         let message = self.take_message();
 
-        match self.handle.inner.commit(message, false) {
+        match self.handle.inner.commit(message) {
             Ok(()) => {
                 self.submitted = true;
                 self.handle.inner.changed.notify();
+                self.changed = None;
                 Poll::Ready(())
             }
-            Err(message) => {
+            Err(Refused::Full(message)) => {
                 self.pending = Some(Unsent::Job(message.job));
+                Poll::Pending
+            }
+            Err(Refused::Closed(message)) => {
+                self.pending = Some(Unsent::Job(message.job));
+                self.changed = None;
 
-                let open = self.handle.inner.queue.lock(|queue| queue.borrow().open);
-
-                if !open {
-                    if self.handle.inner.status.managed() {
-                        self.parked = true;
-                        return Poll::Pending;
-                    }
-
-                    stopped();
+                if self.handle.inner.status.managed() {
+                    self.parked = true;
+                    return Poll::Pending;
                 }
 
-                Poll::Pending
+                stopped();
             }
         }
     }
@@ -197,7 +204,7 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Request<'a, S, 
         self.reply
     }
 
-    pub fn timeout(self, duration: Duration) -> Timeout<Self> {
+    pub fn timeout(self, duration: Duration) -> AktorTimeout<Self> {
         clock_timeout(self, duration, |request| crate::timeout::WaitStatus {
             admitted: request.submitted,
         })
@@ -224,14 +231,17 @@ impl<O> Reply<O> {
             return None;
         }
 
-        self.take()
+        self.take(None)
     }
 
-    fn take(&mut self) -> Option<O> {
+    fn take(&mut self, mut waker: Option<Waker>) -> Option<O> {
         let result = self.answer.result.lock(|result| {
             let mut result = result.borrow_mut();
 
-            if matches!(*result, AnswerState::Waiting) {
+            if let AnswerState::Waiting(waiter) = &mut *result {
+                if waker.is_some() {
+                    core::mem::swap(waiter, &mut waker);
+                }
                 return None;
             }
 
@@ -255,7 +265,7 @@ impl<O> Reply<O> {
         }
     }
 
-    pub fn timeout(&mut self, duration: Duration) -> Timeout<&mut Self> {
+    pub fn timeout(&mut self, duration: Duration) -> AktorTimeout<&mut Self> {
         clock_timeout(self, duration, |_| crate::timeout::WaitStatus {
             admitted: true,
         })
@@ -271,9 +281,7 @@ impl<O> Future for Reply<O> {
             return Poll::Pending;
         }
 
-        this.changed.register(cx);
-
-        match this.take() {
+        match this.take(Some(cx.waker().clone())) {
             Some(output) => Poll::Ready(output),
             None => Poll::Pending,
         }
@@ -294,14 +302,14 @@ fn clock_timeout<F>(
     future: F,
     duration: Duration,
     status: fn(&F) -> crate::timeout::WaitStatus,
-) -> Timeout<F> {
+) -> AktorTimeout<F> {
     #[cfg(all(
         feature = "wasm_threads",
         target_family = "wasm",
         target_feature = "atomics"
     ))]
     {
-        Timeout::browser(future, duration, status)
+        AktorTimeout::browser(future, duration, status)
     }
     #[cfg(not(all(
         feature = "wasm_threads",
@@ -309,6 +317,6 @@ fn clock_timeout<F>(
         target_feature = "atomics"
     )))]
     {
-        Timeout::local(future, duration, status)
+        AktorTimeout::local(future, duration, status)
     }
 }

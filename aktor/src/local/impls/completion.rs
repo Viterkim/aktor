@@ -19,26 +19,26 @@ impl<E> Completion<E> {
         self.inner.panic_reported.get()
     }
 
+    /// Shutdown cut its calls or its `end`, so it ran past its grace.
+    #[doc(hidden)]
+    pub fn ran_past_grace(&self) -> bool {
+        self.inner.cut_call.get() || self.inner.ran_out.get()
+    }
+
     #[doc(hidden)]
     pub fn diagnostics(&self) -> alloc::vec::Vec<crate::AktorError> {
         self.inner.diagnostics.borrow().clone()
     }
 
-    pub fn new_observer(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-
     /// Wait for the owner to finish, returning a diagnostic on failure.
-    pub async fn wait(&self) -> Result<(), OwnerError> {
+    pub async fn wait(&self) -> Result<(), (OwnerError, String)> {
         self.wait_with_data()
             .await
-            .map_err(SharedOwnerError::without_data)
+            .map_err(|(error, report)| (error.without_data(), report))
     }
 
     /// Wait for the owner to finish and get the error with its application data.
-    pub async fn wait_with_data(&self) -> Result<(), SharedOwnerError<E>> {
+    pub async fn wait_with_data(&self) -> Result<(), (SharedOwnerError<E>, String)> {
         let changed = self.inner.changed.listen();
 
         poll_fn(|context| {
@@ -55,7 +55,7 @@ impl<E> Completion<E> {
     }
 }
 impl<E: 'static> IntoFuture for Completion<E> {
-    type Output = Result<(), OwnerError>;
+    type Output = Result<(), (OwnerError, String)>;
     type IntoFuture = LocalFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -63,10 +63,17 @@ impl<E: 'static> IntoFuture for Completion<E> {
     }
 }
 impl<'a, E: 'a> IntoFuture for &'a Completion<E> {
-    type Output = Result<(), OwnerError>;
+    type Output = Result<(), (OwnerError, String)>;
     type IntoFuture = LocalFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.wait())
+    }
+}
+impl<E> Clone for Completion<E> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }

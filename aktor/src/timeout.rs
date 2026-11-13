@@ -6,8 +6,9 @@ use core::{
     time::Duration,
 };
 
-/// Timing out after admission stops waiting, the operation still belongs to Aktor.
+/// After admission, a timeout stops the caller from waiting. Aktor still owns the operation.
 #[derive(er::Er, Clone, Copy, PartialEq, Eq)]
+#[er(no_constructors)]
 pub struct AktorTimeoutError {
     pub duration: Duration,
     pub admitted: bool,
@@ -23,15 +24,15 @@ pub struct WaitStatus {
     pub admitted: bool,
 }
 
-/// The duration starts when you begin awaiting it.
-pub struct Timeout<F> {
+/// The timer starts when you begin awaiting this future.
+pub struct AktorTimeout<F> {
     future: Pin<Box<F>>,
     duration: Duration,
     timer: Option<Timer>,
     clock: fn(Duration) -> Timer,
     status: fn(&F) -> WaitStatus,
 }
-impl<F> Timeout<F> {
+impl<F> AktorTimeout<F> {
     #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
     #[doc(hidden)]
     pub fn standard(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Self {
@@ -133,7 +134,7 @@ impl<F> Timeout<F> {
         }
     }
 }
-impl<F: Future> Future for Timeout<F> {
+impl<F: Future> Future for AktorTimeout<F> {
     type Output = Result<F::Output, AktorTimeoutError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

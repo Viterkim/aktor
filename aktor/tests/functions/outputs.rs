@@ -74,9 +74,47 @@ async fn precise<'a>(state: &'a usize) -> impl Iterator<Item = usize> + Send + u
 }
 
 #[aktor]
+#[track_caller]
+async fn precise_borrowed(
+    _: &usize,
+    text: impl AsRef<str>,
+) -> impl Iterator<Item = usize> + Send + use<> {
+    0..text.as_ref().len()
+}
+
+#[aktor]
+async fn precise_input<T>(
+    _: &usize,
+    text: impl AsRef<str>,
+) -> impl Iterator<Item = usize> + Send + use<T> {
+    0..text.as_ref().len() + core::mem::size_of::<T>()
+}
+
+#[aktor]
 async fn named<'a>(state: &'a usize) -> impl Iterator<Item = usize> + Send {
     let count: &'a usize = state;
     0..*count
+}
+
+#[tokio::test]
+async fn direct_output() {
+    let items = {
+        let values = [1, 2];
+        supplied::direct(&values.len(), values.iter().copied()).await
+    };
+
+    assert!(items.eq([1, 2]));
+    let items = {
+        let text = String::from("hi");
+        precise_borrowed::direct(&0, text.as_str()).await
+    };
+    assert!(items.eq([0, 1]));
+
+    let items = {
+        let text = String::from("hi");
+        precise_input::direct::<u8>(&0, text.as_str()).await
+    };
+    assert!(items.eq([0, 1, 2]));
 }
 
 #[tokio::test]

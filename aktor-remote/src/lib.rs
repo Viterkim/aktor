@@ -18,6 +18,7 @@ mod tests;
 
 pub use client::{Client, ClientOptions, connect};
 pub use connection::Address;
+use error::Failure;
 pub use error::{Cause, Error};
 pub use latest::{LatestResults, LatestSender};
 pub use request::{AktorRetryOpts, Reply, Request};

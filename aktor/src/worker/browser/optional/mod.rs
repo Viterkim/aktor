@@ -10,7 +10,7 @@ pub struct OptionalWorker<S, Role = (), E = ()> {
 
 #[must_use = "await the request or send it"]
 pub struct OptionalRequest<'a, S, O, Role = ()> {
-    request: Result<WorkerRequest<'a, S, O, Role>, WorkerError>,
+    request: Result<WorkerRequest<'a, S, O, Role>, WorkerFailure>,
 }
 
 #[must_use = "await the reply to observe its outcome"]
@@ -19,6 +19,8 @@ pub struct OptionalReply<O> {
 }
 
 struct Unavailable<E> {
-    error: WorkerError,
+    failure: ReadyFailure<()>,
     completion: Completion<E>,
+    /// Keep the group so `run` stops when the group starts closing, even if the worker failed.
+    group: alloc::rc::Rc<core::cell::RefCell<Option<crate::group::AktorKillSwitch>>>,
 }

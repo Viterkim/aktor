@@ -51,7 +51,6 @@ pub struct Reply<O> {
     finished: watch::Receiver<()>,
     closing: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     error: Option<CallError>,
-    group: Option<crate::group::KillSwitch>,
     parked: bool,
     taken: bool,
 }
@@ -77,7 +76,7 @@ trait Job<S>: Send + Sync {
     fn run<'a>(
         &'a self,
         state: &'a mut S,
-        hooks: &'a mut crate::listener::hooks::AktorHooks<S>,
+        hooks: &'a mut crate::listener::hooks::CallHooks<S>,
         operation: crate::operation::Operation,
     ) -> LocalFuture<'a, ()>;
     fn close(&self);

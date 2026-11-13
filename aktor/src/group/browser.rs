@@ -1,29 +1,32 @@
 use super::*;
-use crate::worker::{Options, Worker, WorkerCause, WorkerError};
+use crate::worker::{Options, Worker, WorkerCause, WorkerFailure, WorkerStartError};
 use core::cell::Cell;
 
 impl AktorGroup {
+    #[doc(hidden)]
     /// Open a worker and keep it with the group.
     pub async fn worker<S: 'static>(
         &mut self,
         name: impl Into<String>,
         url: &str,
         options: Options,
-    ) -> Result<Worker<S>, WorkerError> {
+    ) -> Result<Worker<S>, (WorkerStartError, String)> {
         self.worker_for::<(), S>(name, url, options).await
     }
 
-    /// Use the marker from #[aktor(actor = ...)].
+    #[doc(hidden)]
+    /// Use the marker from #[aktor(role = ...)].
     pub async fn worker_for<Role: 'static, S: 'static>(
         &mut self,
         name: impl Into<String>,
         url: &str,
         options: Options,
-    ) -> Result<Worker<S, Role>, WorkerError> {
+    ) -> Result<Worker<S, Role>, (WorkerStartError, String)> {
         self.worker_for_data::<Role, S, ()>(name, url, options)
             .await
     }
 
+    #[doc(hidden)]
     pub async fn worker_for_data<
         Role: 'static,
         S: 'static,
@@ -33,22 +36,22 @@ impl AktorGroup {
         name: impl Into<String>,
         url: &str,
         options: Options,
-    ) -> Result<Worker<S, Role, E>, WorkerError<E>> {
+    ) -> Result<Worker<S, Role, E>, (WorkerStartError<E>, String)> {
         let name = name.into();
 
         if !self.control.lock().listening {
-            return Err(WorkerError::setup(
+            return Err(WorkerStartError::not_run(WorkerFailure::setup(
                 crate::message::CallError::NotAdmitted,
                 "start the actor group before opening workers",
-            ));
+            )));
         }
 
         if self.killswitch().is_stopping() {
             self.completion().wait().await;
-            return Err(WorkerError::new(
+            return Err(WorkerStartError::not_run(WorkerFailure::new(
                 crate::message::CallError::NotAdmitted,
                 WorkerCause::Closed,
-            ));
+            )));
         }
 
         self.control
@@ -56,7 +59,7 @@ impl AktorGroup {
             .kinds
             .push((name.clone(), AktorExecution::BrowserWebWorker));
 
-        let opened = Worker::<S, Role, E>::with_options(url, options);
+        let opened = Worker::<S, Role, E>::with_policy(url, options, false);
         let worker = match opened {
             Ok(worker) => worker,
             Err(error) => {
@@ -68,7 +71,7 @@ impl AktorGroup {
                 });
 
                 self.completion().wait().await;
-                return Err(error.without_data());
+                return Err(WorkerStartError::not_run(error));
             }
         };
 
@@ -77,9 +80,9 @@ impl AktorGroup {
 
             worker.manage(name.clone(), self.killswitch());
 
-            let shutdown = worker.new_handle();
-            let cancel = worker.new_handle();
-            let completion = worker.completion();
+            let shutdown = worker.clone();
+            let cancel = worker.clone();
+            let owner = worker.clone();
             let label = name.clone();
             let timed_out = Rc::new(Cell::new(false));
             let forced = timed_out.clone();
@@ -90,27 +93,23 @@ impl AktorGroup {
                 start: Box::new(move || {
                     shutdown.shutdown();
                 }),
-                cancel: Box::new(move || {
+                // A worker's `end` runs inside it, terminating early would cut it off.
+                cancel: Box::new(|| {}),
+                give_up: Some(Box::new(move || {
                     forced.set(true);
-                    cancel.terminate();
-                }),
+                    cancel.give_up(crate::AktorStuck::Kill)
+                })),
+                confirm_later: None,
                 outcome: Box::pin(async move {
-                    let retirement = match completion.wait().await {
-                        crate::worker::Retirement::Confirmed(_) => {
-                            crate::RetirementStatus::Confirmed
-                        }
-                        crate::worker::Retirement::Unconfirmed(_) => {
-                            crate::RetirementStatus::Unconfirmed
-                        }
-                    };
-                    let diagnostics = completion.wait_diagnostics().await;
+                    let (retirement, diagnostics) =
+                        owner.group_outcome(crate::AktorStuck::Kill).await;
 
                     AktorOutcome {
                         retirement,
-                        kind: None,
+                        kind: AktorExecution::BrowserWebWorker,
                         actor: label,
                         diagnostics,
-                        timed_out: timed_out.get(),
+                        ran_past_grace: timed_out.get(),
                     }
                 }),
             });

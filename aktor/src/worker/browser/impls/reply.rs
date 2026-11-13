@@ -5,18 +5,18 @@ use core::{
 };
 
 impl<O> WorkerReply<O> {
-    /// Receive this call's outcome without waiting for worker cleanup.
-    pub async fn receive_settled(mut self) -> Result<O, WorkerError> {
+    /// Receive this call's outcome without waiting for worker cleanup. The worker can still be retiring.
+    pub async fn receive_settled(mut self) -> Result<O, (WorkerError, String)> {
         core::future::poll_fn(|cx| self.poll_outcome(cx)).await
     }
 
     pub(in crate::worker::browser) fn poll_outcome(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<O, WorkerError>> {
+    ) -> Poll<Result<O, (WorkerError, String)>> {
         if let Some(error) = self.error.take() {
             self.taken = true;
-            return Poll::Ready(Err(error.without_data()));
+            return Poll::Ready(Err(error.report_without_data()));
         }
 
         if self.taken {
@@ -34,7 +34,7 @@ impl<O> WorkerReply<O> {
                                 WorkerCause::Closed,
                             ))
                         })
-                        .map_err(WireError::without_data),
+                        .map_err(WireError::report_without_data),
                 )
             }
             Poll::Pending => Poll::Pending,
@@ -106,8 +106,8 @@ impl<O> WorkerReply<O> {
         }
     }
 
-    pub fn timeout(&mut self, duration: core::time::Duration) -> crate::Timeout<&mut Self> {
-        crate::Timeout::browser(self, duration, |_| crate::timeout::WaitStatus {
+    pub fn timeout(&mut self, duration: core::time::Duration) -> crate::AktorTimeout<&mut Self> {
+        crate::AktorTimeout::browser(self, duration, |_| crate::timeout::WaitStatus {
             admitted: true,
         })
     }

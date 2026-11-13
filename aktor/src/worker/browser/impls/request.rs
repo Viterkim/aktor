@@ -27,7 +27,7 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
             inner: &worker.inner,
             state: PhantomData,
             operation: operation.into(),
-            input: Some(input.map_err(|error| error.without_data())),
+            input: Some(input.map_err(WireError::from)),
             encoder: None,
             decoder,
             admission: None,
@@ -82,8 +82,7 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
                 return output.err();
             }
 
-            let output =
-                output.and_then(|bytes| decoder(&bytes).map_err(|error| error.without_data()));
+            let output = output.and_then(|bytes| decoder(&bytes).map_err(WireError::from));
             let failure = output.as_ref().err().cloned();
 
             let _sent = answer.send(output);
@@ -137,7 +136,9 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
             let inner = self.inner;
 
             self.admission = Some(Box::pin(async move {
-                observe(inner.ready.subscribe()).await?;
+                observe(inner.ready.subscribe())
+                    .await
+                    .map_err(|failure| failure.error)?;
 
                 let closed = || WireError::new(CallError::NotAdmitted, WorkerCause::Closed);
                 let count = inner
@@ -217,21 +218,23 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
         }
     }
 
-    pub fn timeout(self, duration: core::time::Duration) -> crate::Timeout<Self> {
-        crate::Timeout::browser(self, duration, |request| crate::timeout::WaitStatus {
+    pub fn timeout(self, duration: core::time::Duration) -> crate::AktorTimeout<Self> {
+        crate::AktorTimeout::browser(self, duration, |request| crate::timeout::WaitStatus {
             admitted: request.reply.is_some(),
         })
     }
 
-    /// Wait for admission and return a refusal without waiting for cleanup.
-    pub async fn admit(mut self) -> Result<WorkerReply<O>, WorkerError> {
+    /// Wait for the call to enter the queue and return a reply to await later. If
+    /// admission fails, return the error. Use `receive_settled()` on the reply to
+    /// get the outcome during cleanup.
+    pub async fn admit(mut self) -> Result<WorkerReply<O>, (WorkerError, String)> {
         poll_fn(|cx| self.poll_submit(cx))
             .await
-            .map_err(WireError::without_data)?;
+            .map_err(WireError::report_without_data)?;
 
         self.reply
             .take()
-            .ok_or_else(|| WorkerError::new(CallError::NotAdmitted, WorkerCause::Closed))
+            .ok_or_else(|| WorkerFailure::new(CallError::NotAdmitted, WorkerCause::Closed).into())
     }
 
     pub async fn send(mut self) -> WorkerReply<O> {

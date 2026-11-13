@@ -2,9 +2,9 @@ use super::super::*;
 use super::Completion;
 use crate::setup::intervals::{LocalInterval, LocalIntervals};
 use crate::{
-    AktorError, AktorFailureReport, AktorOutcome, KillSwitch,
+    AktorError, AktorFailureReport, AktorOutcome,
     group::shutdown::{contain_drop, panic_message},
-    local::{self, Handle, hooks::AktorHooks},
+    local::{self, Handle, hooks::CallHooks},
     message::LocalFuture,
     operation::Operation,
     setup::closures::AktorEndCall,
@@ -33,80 +33,86 @@ impl Drop for Completion {
             });
 
             self.publish(AktorOutcome {
-                retirement: crate::RetirementStatus::Unconfirmed,
-                kind: Some(self.kind),
+                retirement: crate::AktorRetireStatus::Unconfirmed,
+                kind: self.kind,
                 actor: self.name.clone(),
                 diagnostics: if primary {
                     Vec::new()
                 } else {
                     vec![AktorError::new("local actor task cancelled", ())]
                 },
-                timed_out: false,
+                ran_past_grace: false,
             });
         }
     }
 }
 
-pub async fn start_local<S, Start, Kind, Clock, End, CM>(
-    setup: AktorNew<S, Start, Kind, AktorNoRole, End>,
+pub async fn start_local<S, Start, Kind, Clock, End, CM, E, M>(
+    setup: AktorNew<S, Start, Kind, End, (CM, E, M)>,
     mut context: AktorStartContext<crate::AktorGroup>,
     spawn: impl Fn(LocalFuture<'static, ()>),
     sleep: fn(Duration) -> LocalFuture<'static, ()>,
-) -> Result<Handle<S, 0, (), (), Clock>, AktorStartError>
+) -> Result<Handle<S, 0, (), (), Clock>, AktorStartError<E::Error>>
 where
     S: 'static,
     Clock: 'static,
     Kind:
         AktorMode<Each<S> = dyn FnMut(&mut S, Operation), Interval<S> = dyn AktorIntervalLogic<S>>,
-    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    Start: AsyncFnOnce() -> Result<S, E> + 'static,
+    E: InitError<M> + 'static,
+    E::Error: 'static,
     End: AktorEndCall<S, CM> + 'static,
 {
     let AktorNew {
         name,
-        role: _,
         kind: _,
-        closures,
-        options,
-    } = setup;
-
-    let name = name.name;
-    let AktorClosures {
         start,
-        mut end,
+        end,
+        hooks,
+        capacity,
+        // It runs on your own thread, there's nothing to kill it separately from.
+        stuck: _,
+    } = setup;
+    let AktorHooks {
         intervals,
         before_each,
         after_each,
-    } = closures;
+    } = hooks;
 
     if intervals.iter().any(|interval| interval.every.is_zero()) {
-        return Err(validation_error(
+        return Err(AktorStartError::not_run(validation_error(
             &context.group,
             &name,
             Kind::EXECUTION,
-            AktorStartError::Setup(AktorError::new("interval duration must be positive", ())),
-        ));
+            AktorStartCause::Setup(AktorError::new("interval duration must be positive", ())),
+        )));
     }
 
-    if options.capacity == 0 {
-        return Err(validation_error(
+    if capacity == 0 {
+        return Err(AktorStartError::not_run(validation_error(
             &context.group,
             &name,
             Kind::EXECUTION,
-            AktorStartError::Setup(AktorError::new(
+            AktorStartCause::Setup(AktorError::new(
                 crate::message::AktorStateError::InvalidCapacity.to_string(),
                 (),
             )),
-        ));
+        )));
     }
 
     let LocalIntervals {
         scheduled: intervals,
         retained,
     } = LocalIntervals::new(intervals);
-    let (handle, mut owner) = local::channel_with_clock::<S, 0, (), Clock>(options.capacity)
-        .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string(), ())))?;
+    let (handle, mut owner) =
+        local::channel_with_clock::<S, 0, (), Clock>(capacity).map_err(|error| {
+            AktorStartError::not_run(AktorStartCause::Setup(AktorError::new(
+                error.to_string(),
+                (),
+            )))
+        })?;
 
-    owner.hooks = AktorHooks {
+    owner.hooks = CallHooks {
         before_each: before_each.map(|hook| hook.0),
         after_each: after_each.map(|hook| hook.0),
         intervals: retained,
@@ -114,9 +120,13 @@ where
 
     let kill = context.group.killswitch();
 
-    handle.manage(name.clone(), kill.clone());
+    handle.manage_on(
+        name.clone(),
+        kill.clone(),
+        Kind::EXECUTION == crate::AktorExecution::BevyLocal,
+    );
 
-    let alive = handle.new_handle();
+    let alive = handle.clone();
     let (closing, mut closed) = watch::channel(false);
     let (forcing, mut forced) = watch::channel(false);
     let (completed, outcome) = oneshot::channel();
@@ -133,17 +143,19 @@ where
             Box::new(move || {
                 forcing.send_replace(true);
             }),
+            None,
+            None,
             Box::pin(async move {
                 outcome.await.unwrap_or_else(|_| AktorOutcome {
-                    retirement: crate::RetirementStatus::Unconfirmed,
-                    kind: Some(Kind::EXECUTION),
+                    retirement: crate::AktorRetireStatus::Unconfirmed,
+                    kind: Kind::EXECUTION,
                     actor: label,
                     diagnostics: vec![AktorError::new("local actor observer stopped", ())],
-                    timed_out: false,
+                    ran_past_grace: false,
                 })
             }),
         )
-        .map_err(AktorStartError::Setup)?;
+        .map_err(|error| AktorStartError::not_run(AktorStartCause::Group(error)))?;
 
     let mut completion = Completion {
         name,
@@ -164,7 +176,13 @@ where
                     let result = match start().await {
                         Ok(state) => Ok(state),
                         Err(error) => {
-                            Err(startup_kill.startup_error(startup_name, Kind::EXECUTION, error))
+                            let (data, report) = error.split();
+                            let failure = startup_kill.startup_error(
+                                startup_name,
+                                Kind::EXECUTION,
+                                crate::AktorError::new(report, ()),
+                            );
+                            Err((data, failure))
                         }
                     };
 
@@ -186,12 +204,13 @@ where
         );
 
         let mut stopping = false;
+        let mut cancelling = false;
         let mut report = AktorOutcome {
-            retirement: crate::RetirementStatus::Unconfirmed,
-            kind: Some(Kind::EXECUTION),
+            retirement: crate::AktorRetireStatus::Unconfirmed,
+            kind: Kind::EXECUTION,
             actor: completion.name.clone(),
             diagnostics: Vec::new(),
-            timed_out: false,
+            ran_past_grace: false,
         };
 
         loop {
@@ -200,16 +219,17 @@ where
                 result = &mut driver => {
                     match result {
                         Ok(Ok(())) => {},
-                        Ok(Err(error)) => {
-                            match error.error {
-                                local::OwnerFailure::SetupDiagnostic(_, true) => {},
-                                local::OwnerFailure::SetupDiagnostic(error, false) => report.diagnostics.push(error),
-                                local::OwnerFailure::CleanupFailure(error) => {
+                        Ok(Err((error, _))) => {
+                            match error {
+                                local::OwnerError::SetupDiagnostic(_, true) => {},
+                                local::OwnerError::SetupDiagnostic(error, false) => report.diagnostics.push(error),
+                                local::OwnerError::CleanupFailure(error) => {
                                     if !error.primary {
                                         report.diagnostics.push(AktorError::new(error.diagnostics, ()));
                                     }
                                 },
-                                error => report.diagnostics.push(AktorError::new(format!("{error:#}"), ())),
+                                local::OwnerError::CleanupUnconfirmed => {},
+                                _ => report.diagnostics.push(AktorError::new(format!("{error:#}"), ())),
                             }
                         },
                         Err(payload) => {
@@ -235,20 +255,21 @@ where
                         alive.shutdown();
                     }
                 },
-                changed = forced.changed() => {
+                // Its grace is up, the calls go and `end` still gets its own grace.
+                changed = forced.changed(), if !cancelling => {
                     if changed.is_err() || *forced.borrow_and_update() {
-                        report.timed_out = true;
-                        report.retirement = crate::RetirementStatus::Unconfirmed;
-                        break;
+                        cancelling = true;
+                        alive.cancel_calls();
                     }
                 },
             }
         }
 
+        report.ran_past_grace = retained.ran_past_grace();
         report.retirement = if retained.cleanup_completed() {
-            crate::RetirementStatus::Confirmed
+            crate::AktorRetireStatus::Confirmed
         } else {
-            crate::RetirementStatus::Unconfirmed
+            crate::AktorRetireStatus::Terminated
         };
         report.diagnostics.extend(retained.diagnostics());
         contain_drop(driver, &completion.kill, "local owner drop");
@@ -259,20 +280,17 @@ where
     match initialized.await {
         Some(result) => result?,
         None => {
-            let error = handle.completion().wait().await.err().unwrap_or_else(|| {
-                local::OwnerFailure::Runner(AktorError::new(
-                    "local actor stopped during startup",
-                    (),
-                ))
-                .into()
+            let (error, report) = handle.completion().wait().await.err().unwrap_or_else(|| {
+                local::OwnerError::Runner(AktorError::new("local actor stopped during startup", ()))
+                    .into()
             });
 
-            return Err(AktorStartError::Local(error));
+            return Err(AktorStartCause::Local(error, report).into());
         }
     }
 
     for interval in intervals {
-        spawn(schedule(interval, handle.new_handle(), kill.clone(), sleep));
+        spawn(schedule(interval, handle.clone(), sleep));
     }
 
     Ok(handle)
@@ -281,7 +299,6 @@ where
 fn schedule<S: 'static, Clock: 'static, C: 'static>(
     interval: LocalInterval<S>,
     handle: Handle<S, 0, C, (), Clock>,
-    kill: KillSwitch,
     sleep: fn(Duration) -> LocalFuture<'static, ()>,
 ) -> LocalFuture<'static, ()> {
     let every = interval.every;
@@ -291,7 +308,6 @@ fn schedule<S: 'static, Clock: 'static, C: 'static>(
         loop {
             tokio::select! {
                 biased;
-                _ = kill.wait_stopping() => break,
                 _ = handle.wait_closing() => break,
                 _ = sleep(every) => {},
             }
@@ -320,7 +336,6 @@ fn schedule<S: 'static, Clock: 'static, C: 'static>(
 
             tokio::select! {
                 biased;
-                _ = kill.wait_stopping() => break,
                 _ = handle.wait_closing() => break,
                 admitted = request.run_interval() => {
                     if !admitted { break; }

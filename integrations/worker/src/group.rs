@@ -1,5 +1,5 @@
 use aktor::{
-    AktorCleanupError, AktorClosures, AktorError, AktorGroup, AktorSetupError,
+    AktorError, AktorGroup, AktorServe,
     dispatch::SerdeCodec,
     worker::{self, Options, Server, WorkerCause},
 };
@@ -16,6 +16,10 @@ thread_local! { static SERVER: RefCell<Option<Server>> = const { RefCell::new(No
 thread_local! { static CLOSING: RefCell<Option<worker::Worker<u32>>> = const { RefCell::new(None) }; }
 
 #[wasm_bindgen(inline_js = r#"
+export function crash_initializer() {
+    setTimeout(() => { throw new Error('entered worker initializer'); }, 0);
+}
+
 export function gate() {
     return globalThis.aktorGate;
 }
@@ -73,23 +77,32 @@ export function release_worker() {
 let originalPost;
 export function break_post() {
     originalPost = Worker.prototype.postMessage;
-    Worker.prototype.postMessage = function() {
-        throw new Error('admission posting probe');
+    Worker.prototype.postMessage = function(buffer) {
+        originalPost.call(this, buffer, [buffer, buffer]);
     };
 }
 
 export function restore_post() {
     Worker.prototype.postMessage = originalPost;
 }
+
+export function break_worker_post_once() {
+    const post = globalThis.postMessage;
+    globalThis.postMessage = function() {
+        globalThis.postMessage = post;
+        throw new Error('cleanup notification send failed');
+    };
+}
 "#)]
 extern "C" {
+    fn crash_initializer();
     fn gate() -> js_sys::Promise;
     fn fail_gate() -> js_sys::Promise;
     fn release_gate();
     fn cleanup_gate() -> js_sys::Promise;
     fn note_cleanup();
-    fn note_configured();
-    fn configured() -> js_sys::Promise;
+    pub fn note_configured();
+    pub fn configured() -> js_sys::Promise;
     fn fail_transport();
     fn release_worker();
     fn retained_owner() -> bool;
@@ -97,6 +110,7 @@ extern "C" {
     fn shutdown_started() -> bool;
     fn break_post();
     fn restore_post();
+    fn break_worker_post_once();
 }
 
 #[derive(Deserialize)]
@@ -119,10 +133,10 @@ pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> 
     let worker = actors
         .worker::<u32>("serialization shutdown", &url, options())
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     assert_eq!(worker.outstanding(), (0, 0));
-    CLOSING.with(|stored| *stored.borrow_mut() = Some(worker.new_handle()));
+    CLOSING.with(|stored| *stored.borrow_mut() = Some(worker.clone()));
 
     let request = <&worker::Worker<u32> as Transport<
         u32,
@@ -142,7 +156,7 @@ pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> 
     let closed = request.send().now_or_never().is_none();
 
     assert_eq!(worker.outstanding(), (0, 0));
-    let failed = worker
+    let (failed, _) = worker
         .completion()
         .report()
         .await
@@ -151,25 +165,28 @@ pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> 
     assert_eq!(failed.cause, worker::WorkerCause::Closed);
     let report = actors.completion().wait().await;
     assert!(report.failed());
-    assert!(!report.timed_out);
-    assert!(report.actors.iter().all(|actor| !actor.timed_out));
+    assert!(!report.ran_past_grace);
+    assert!(report.actors.iter().all(|actor| !actor.ran_past_grace));
 
     let mut actors = AktorGroup::new();
     actors.start().unwrap();
     let worker = actors
         .worker::<u32>("posting failure", &url, options())
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
     break_post();
     let committed = operation(&worker, 0).send().now_or_never();
     restore_post();
-    drop(committed.expect("posting failure happens after admission"));
-    let failed = worker
+    let reply = committed.expect("posting failure happens after admission");
+    let (failure, _) = reply.receive_settled().await.unwrap_err();
+    assert_eq!(failure.outcome, aktor::message::CallError::Discarded);
+
+    let (failed, _) = worker
         .completion()
         .report()
         .await
         .expect_err("posting failure");
-    assert!(matches!(failed.cause, worker::WorkerCause::Codec(_)));
+    assert!(matches!(failed.cause, worker::WorkerCause::Transport(_)));
     assert!(actors.completion().wait().await.failed());
 
     let mut actors = AktorGroup::new();
@@ -177,13 +194,13 @@ pub async fn serialization_shutdown_check(url: String) -> Result<bool, JsValue> 
     let worker = actors
         .worker::<u32>("explicit termination", &url, options())
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
     worker.terminate();
 
     let report = actors.completion().wait().await;
     assert!(report.failed());
-    assert!(!report.timed_out);
-    assert!(report.actors.iter().all(|actor| !actor.timed_out));
+    assert!(!report.ran_past_grace);
+    assert!(report.actors.iter().all(|actor| !actor.ran_past_grace));
 
     Ok(closed)
 }
@@ -276,7 +293,7 @@ struct CleanupData {
 
 struct Other;
 
-#[aktor::aktor(actor = Other)]
+#[aktor::aktor(role = Other)]
 async fn other_operation(state: &u32) -> u32 {
     *state
 }
@@ -371,10 +388,7 @@ pub async fn closure_check(
         return Err(JsValue::from_str("blocked admission terminated the worker"));
     }
 
-    let retired = match result {
-        worker::Retirement::Confirmed(Ok(())) => true,
-        worker::Retirement::Confirmed(Err(_)) | worker::Retirement::Unconfirmed(_) => false,
-    };
+    let retired = matches!(result, worker::Retirement::Confirmed(Ok(())));
     assert_eq!(retired, !crash);
     assert_eq!(report.failed(), crash);
     Ok(true)
@@ -397,18 +411,16 @@ pub async fn start_unready_worker() -> Result<(), JsValue> {
         let start = async move || {
             note_configured();
             wasm_bindgen_futures::JsFuture::from(gate()).await.unwrap();
-            Ok::<_, AktorSetupError>(state)
+            Ok::<_, String>(state)
         };
-        AktorClosures {
+        AktorServe {
             start,
             end: (),
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
+            hooks: Default::default(),
         }
     })
     .await
-    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     SERVER.with(|slot| *slot.borrow_mut() = Some(server));
     Ok(())
@@ -419,7 +431,7 @@ pub async fn cancel_configured_check(url: String) -> Result<bool, JsValue> {
     use futures_util::FutureExt;
 
     let worker = worker::Worker::<u32>::with_config(&url, options(), &7u32)
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
     let mut ready = Box::pin(worker.ready());
 
     assert!(ready.as_mut().now_or_never().is_none());
@@ -450,7 +462,7 @@ pub async fn live_sessions_check(url: String) -> Result<bool, JsValue> {
 
     let worker = worker::Worker::<u32>::open(&url, options())
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
     let wake = Arc::new(CountWake(AtomicUsize::new(0)));
     let waker = Waker::from(wake.clone());
     let (_input, mut output) = operation::latest(&worker);
@@ -472,7 +484,7 @@ pub async fn live_sessions_check(url: String) -> Result<bool, JsValue> {
         .shutdown()
         .report()
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
     Ok(wake.0.load(Ordering::Relaxed) > 0)
 }
 
@@ -486,7 +498,7 @@ pub fn start_group_worker(
         worker::serve_with(
             0u32,
             async |_| {
-                Err(AktorCleanupError {
+                Err(AktorError {
                     diagnostics: "backup folder is read only".into(),
                     data: BrokenData,
                 })
@@ -497,7 +509,7 @@ pub fn start_group_worker(
         worker::serve_with(
             0u32,
             async |_| {
-                Err(AktorCleanupError {
+                Err(AktorError {
                     diagnostics: "backup folder is read only".into(),
                     data: String::from("unexpected data type"),
                 })
@@ -514,7 +526,7 @@ pub fn start_group_worker(
                     .unwrap();
 
                 if fail_cleanup {
-                    Err(AktorCleanupError {
+                    Err(AktorError {
                         diagnostics: "Flush settings\n  backup folder is read only".into(),
                         data: CleanupData {
                             code: 17,
@@ -528,7 +540,7 @@ pub fn start_group_worker(
             options(),
         )
     }
-    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     SERVER.with(|slot| *slot.borrow_mut() = Some(server));
     Ok(())
@@ -537,7 +549,7 @@ pub fn start_group_worker(
 #[wasm_bindgen]
 pub fn start_role_worker() -> Result<(), JsValue> {
     let server = worker::serve_for::<Other, _, _, _, ()>(17u32, async |_| Ok(()), options())
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     SERVER.with(|slot| *slot.borrow_mut() = Some(server));
     Ok(())
@@ -548,20 +560,23 @@ pub async fn registration_check(url: String, other: bool) -> Result<String, JsVa
     if other {
         let actor = worker::Worker::<u32, Other>::open(&url, options())
             .await
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let output = other_operation(&actor).await;
+            .map_err(|(_, report)| JsValue::from_str(&report))?;
+        let output = other_operation(&actor)
+            .settle()
+            .await
+            .map_err(|(_, report)| JsValue::from_str(&report))?;
 
         actor
             .shutdown()
             .report()
             .await
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+            .map_err(|(_, report)| JsValue::from_str(&report))?;
         return serde_json::to_string(&output)
             .map_err(|error| JsValue::from_str(&error.to_string()));
     }
 
     let actor = worker::Worker::<u32>::with_options(&url, options())
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
     let result = actor.ready().await;
 
     actor.terminate();
@@ -584,8 +599,7 @@ struct Check {
 
 #[wasm_bindgen]
 pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
-    let group = AktorGroup::with_grace(Duration::from_millis(300));
-    let completed = group.completion();
+    let mut group = AktorGroup::with_grace(Duration::from_millis(300));
     let kill = group.killswitch();
     let hooks = Rc::new(Cell::new(0));
     let hook_count = hooks.clone();
@@ -595,90 +609,92 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
     let capture = retained.clone();
     let deferred = Rc::new(RefCell::new(None));
     let saved_reply = deferred.clone();
-    let _result = group
-        .run(
-            async move |app| {
-                let storage_url = match mode {
-                    4 => format!("{url}?fail_cleanup=true"),
-                    6 => format!("{url}?wrong_data=true"),
-                    7 => format!("{url}?fail_data=true"),
-                    _ => url.clone(),
-                };
+    let completed = group
+        .start_with(move |_| hook_count.set(hook_count.get() + 1))
+        .unwrap();
+    let killswitch = group.killswitch();
+    let app = &mut group;
 
-                let storage = app
-                    .worker_for_data::<(), u32, CleanupData>("storage", &storage_url, options())
-                    .await
-                    .unwrap();
+    killswitch
+        .run(async move {
+            let storage_url = match mode {
+                4 => format!("{url}?fail_cleanup=true"),
+                6 => format!("{url}?wrong_data=true"),
+                7 => format!("{url}?fail_data=true"),
+                _ => url.clone(),
+            };
 
-                *capture.borrow_mut() = Some(storage.completion());
+            let storage = app
+                .worker_for_data::<(), u32, CleanupData>("storage", &storage_url, options())
+                .await
+                .unwrap();
 
-                let audio = app
-                    .worker_for::<Other, u32>("audio", &format!("{url}?other"), options())
-                    .await
-                    .unwrap();
+            *capture.borrow_mut() = Some(storage.completion());
 
-                assert_eq!(other_operation(&audio).await, 17);
+            let audio = app
+                .worker_for::<Other, u32>("audio", &format!("{url}?other"), options())
+                .await
+                .unwrap();
 
-                match mode {
-                    0 => {
-                        let value = Portable {
-                            options: vec![None, Some(None), Some(Some(7))],
-                            map: std::collections::BTreeMap::from([((7, "key".into()), u128::MAX)]),
-                            choice: vec![
-                                Choice::Text { text: "cat".into() },
-                                Choice::Number(u64::MAX),
-                            ],
-                            limits: (i128::MIN, u128::MAX),
-                            invalid: None,
-                        };
+            assert_eq!(other_operation(&audio).await, 17);
 
-                        assert_eq!(roundtrip(&storage, value.clone()).await, value);
-                        query_error.set(operation(&storage, 0).await.is_err());
-                    }
-                    1 => {
-                        *saved_reply.borrow_mut() = Some(operation(&storage, 1).send().await);
-                        core::future::pending::<()>().await;
-                    }
-                    2 | 3 => {
-                        let reply = operation::request(&storage, mode).send().await;
+            match mode {
+                0 => {
+                    let value = Portable {
+                        options: vec![None, Some(None), Some(Some(7))],
+                        map: std::collections::BTreeMap::from([((7, "key".into()), u128::MAX)]),
+                        choice: vec![
+                            Choice::Text { text: "cat".into() },
+                            Choice::Number(u64::MAX),
+                        ],
+                        limits: (i128::MIN, u128::MAX),
+                        invalid: None,
+                    };
 
-                        while !storage.executing() {
-                            gloo_timers::future::TimeoutFuture::new(1).await;
-                        }
-
-                        kill.stop();
-                        kill.stop();
-                        reply.await.unwrap();
-                    }
-                    8 => {
-                        let mut reply = bad_output(&storage).send().await;
-
-                        let error = storage.shutdown().report().await.unwrap_err();
-                        assert!(matches!(error.cause, WorkerCause::Codec(_)));
-                        assert!(kill.is_stopping());
-                        assert!(reply.try_take().is_none());
-                        core::future::pending::<()>().await;
-                    }
-                    5 => {
-                        let value = Portable {
-                            options: Vec::new(),
-                            map: Default::default(),
-                            choice: Vec::new(),
-                            limits: (0, 0),
-                            invalid: Some(RejectedInput),
-                        };
-
-                        drop(roundtrip(&storage, value).send().await);
-                        core::future::pending::<()>().await;
-                    }
-                    _ => {}
+                    assert_eq!(roundtrip(&storage, value.clone()).await, value);
+                    query_error.set(operation(&storage, 0).await.is_err());
                 }
+                1 => {
+                    *saved_reply.borrow_mut() = Some(operation(&storage, 1).send().await);
+                    core::future::pending::<()>().await;
+                }
+                2 | 3 => {
+                    let reply = operation::request(&storage, mode).send().await;
 
-                Ok::<_, AktorError>(())
-            },
-            move |_| hook_count.set(hook_count.get() + 1),
-        )
+                    while !storage.executing() {
+                        gloo_timers::future::TimeoutFuture::new(1).await;
+                    }
+
+                    kill.stop();
+                    kill.stop();
+                    reply.await.unwrap();
+                }
+                8 => {
+                    let mut reply = bad_output(&storage).send().await;
+
+                    let (error, _) = storage.shutdown().report().await.unwrap_err();
+                    assert!(matches!(error.cause, WorkerCause::Codec(_)));
+                    assert!(kill.is_stopping());
+                    assert!(reply.try_take().is_none());
+                    core::future::pending::<()>().await;
+                }
+                5 => {
+                    let value = Portable {
+                        options: Vec::new(),
+                        map: Default::default(),
+                        choice: Vec::new(),
+                        limits: (0, 0),
+                        invalid: Some(RejectedInput),
+                    };
+
+                    drop(roundtrip(&storage, value).send().await);
+                    core::future::pending::<()>().await;
+                }
+                _ => {}
+            }
+        })
         .await;
+    killswitch.stop();
 
     let report = completed.wait().await;
     assert_eq!(
@@ -690,18 +706,22 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
     );
     let typed_cleanup = if mode == 4 {
         let completion = retained.borrow_mut().take().unwrap();
-        let error = completion.report().await.unwrap_err();
+        let (end, _) = completion.wait_cleanup().await.unwrap_err();
+        assert!(matches!(end, worker::WorkerCleanupError::Failed(Some(data)) if data.code == 17));
+        assert_eq!(
+            completion.cleanup_status(),
+            aktor::AktorCleanupStatus::Failed
+        );
 
-        assert!(!error.to_string().contains("backup folder is read only"));
-        assert!(format!("{error:#}").contains("backup folder is read only"));
+        let (error, report) = completion.report().await.unwrap_err();
+        assert!(report.contains("backup folder is read only"));
 
         error
             .data
             .is_some_and(|data| data.code == 17 && data.option == Some(None))
     } else if mode == 6 || mode == 7 {
         let completion = retained.borrow_mut().take().unwrap();
-        let error = completion.report().await.unwrap_err();
-        let diagnostic = format!("{error:#}");
+        let (error, diagnostic) = completion.report().await.unwrap_err();
 
         error.data.is_none()
             && diagnostic.contains("backup folder is read only")
@@ -729,7 +749,7 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
         timed_out_actors: report
             .actors
             .iter()
-            .filter(|actor| actor.timed_out)
+            .filter(|actor| actor.ran_past_grace)
             .map(|actor| actor.actor.clone())
             .collect(),
         actors: report.actors.len(),
@@ -751,7 +771,7 @@ pub async fn group_check(url: String, mode: u32) -> Result<String, JsValue> {
         typed_cleanup,
         deferred_reply_safe,
         ordinary_error: ordinary_error.get(),
-        timed_out: report.timed_out,
+        timed_out: report.ran_past_grace,
     })
     .map_err(|error| JsValue::from_str(&error.to_string()))
 }
@@ -766,9 +786,9 @@ pub async fn group_listener_check(url: String) -> Result<bool, JsValue> {
     let closing = actors
         .start_with(async move |_| {
             hook_count.set(hook_count.get() + 1);
-            Ok::<_, AktorError>(())
+            Ok::<_, String>(())
         })
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     let _closing = closing;
 
@@ -782,12 +802,12 @@ pub async fn group_listener_check(url: String) -> Result<bool, JsValue> {
             },
         )
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     let audio = actors
         .worker_for::<Other, u32>("audio", &format!("{url}?other"), options())
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
     let mut reply = operation(&storage, 0).send().await;
     let ordinary_error = loop {
         if let Some(result) = reply.try_take() {
@@ -853,58 +873,16 @@ pub async fn group_listener_check(url: String) -> Result<bool, JsValue> {
     let mut plain = AktorGroup::new();
     let closing = plain
         .start()
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
     let _audio = plain
         .worker_for::<Other, u32>("audio", &format!("{url}?other"), options())
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
     let shutdown = plain.shutdown();
 
     assert!(plain.killswitch().is_stopping());
     assert!(!(&closing).await.failed());
     assert_eq!(closing.await.actors.len(), shutdown.await.actors.len());
-
-    let cancelled = AktorGroup::new();
-    let observed = cancelled.completion();
-    let ready = Rc::new(Cell::new(false));
-    let started = ready.clone();
-    let driver = cancelled.run(
-        async |group| -> Result<(), AktorError> {
-            let _worker = group
-                .worker::<u32>("cancelled driver", &url, options())
-                .await
-                .unwrap();
-
-            started.set(true);
-            core::future::pending().await
-        },
-        |_| {},
-    );
-
-    let mut driver = Box::pin(driver);
-
-    futures_util::future::poll_fn(|context| {
-        assert!(driver.as_mut().poll(context).is_pending());
-
-        if ready.get() {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
-    drop(driver);
-
-    let cancelled = observed.wait().await;
-
-    assert_eq!(cancelled.actors.len(), 1);
-    assert!(!cancelled.timed_out);
-    assert!(
-        cancelled
-            .application
-            .iter()
-            .any(|error| error.diagnostics.contains("cancelled"))
-    );
 
     Ok(ordinary_error
         && hooks.get() == 1
@@ -916,7 +894,7 @@ pub async fn group_listener_check(url: String) -> Result<bool, JsValue> {
         && report
             .actors
             .iter()
-            .any(|actor| actor.actor == "audio" && !actor.timed_out))
+            .any(|actor| actor.actor == "audio" && !actor.ran_past_grace))
 }
 
 #[wasm_bindgen]
@@ -927,14 +905,14 @@ pub async fn group_startup_check(url: String, mode: u32) -> Result<bool, JsValue
     let closing = actors
         .start_with(async move |_| {
             hook_count.set(hook_count.get() + 1);
-            Ok::<_, AktorError>(())
+            Ok::<_, String>(())
         })
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     let audio = actors
         .worker_for::<Other, u32>("audio", &format!("{url}?other"), options())
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
     let mut storage_options = options();
 
     if mode == 0 {
@@ -949,7 +927,7 @@ pub async fn group_startup_check(url: String, mode: u32) -> Result<bool, JsValue
         url
     };
 
-    let failed = actors
+    let (failed, _) = actors
         .worker_for_data::<(), u32, CleanupData>("storage", &storage_url, storage_options)
         .await
         .err()
@@ -957,7 +935,8 @@ pub async fn group_startup_check(url: String, mode: u32) -> Result<bool, JsValue
 
     assert_eq!(hooks.get(), 1);
 
-    let typed_data = mode != 1 || failed.data.is_some_and(|data| data.code == 23);
+    let typed_data = mode != 1
+        || matches!(failed.init, aktor::AktorInitOutcome::Failed(data) if data.code == 23);
     let report = closing.wait().await;
 
     Ok(typed_data
@@ -970,12 +949,12 @@ pub async fn group_startup_check(url: String, mode: u32) -> Result<bool, JsValue
         && report
             .actors
             .iter()
-            .any(|actor| actor.actor == "audio" && !actor.timed_out))
+            .any(|actor| actor.actor == "audio" && !actor.ran_past_grace))
 }
 
 struct Empty;
 struct Signature;
-#[aktor::aktor(actor=Signature)]
+#[aktor::aktor(role = Signature)]
 async fn signature(_: &u32, _: u64) -> u32 {
     17
 }
@@ -987,7 +966,7 @@ pub fn start_registration_worker(signature: bool) -> Result<(), JsValue> {
     } else {
         worker::serve_for::<Empty, _, _, _, ()>(0u32, async |_| Ok(()), options())
     }
-    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     SERVER.with(|slot| *slot.borrow_mut() = Some(server));
     Ok(())
@@ -995,47 +974,39 @@ pub fn start_registration_worker(signature: bool) -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn typed_setup_failed() -> Result<(), JsValue> {
-    worker::setup_failed(aktor::AktorSetupError {
+    worker::setup_failed(aktor::AktorError {
         diagnostics: "could not open storage".into(),
         data: CleanupData {
             code: 23,
             option: Some(None),
         },
     })
-    .map_err(|error| JsValue::from_str(&error.to_string()))
+    .map_err(|(_, report)| JsValue::from_str(&report))
 }
 
 #[wasm_bindgen]
 pub async fn typed_setup_check(url: String) -> Result<bool, JsValue> {
     let actor = worker::Worker::<u32, (), CleanupData>::with_options(&url, options())
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let error = actor.ready().await.unwrap_err();
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
+    let (error, report) = actor.ready().await.unwrap_err();
 
-    assert!(!error.to_string().contains("could not open storage"));
+    assert!(report.contains("could not open storage"));
     assert!(
-        error
-            .diagnostics
-            .as_ref()
-            .unwrap()
-            .report
-            .contains("could not open storage")
-    );
-    assert!(
-        error
-            .data
-            .is_some_and(|data| data.code == 23 && data.option == Some(None))
+        matches!(error.init, aktor::AktorInitOutcome::Failed(data) if data.code == 23 && data.option == Some(None))
     );
 
-    let error = actor.completion().report().await.unwrap_err();
-    assert!(!error.to_string().contains("could not open storage"));
-    assert!(
-        error
-            .diagnostics
-            .as_ref()
-            .unwrap()
-            .report
-            .contains("could not open storage")
+    let completion = actor.completion();
+    assert!(matches!(
+        completion.wait_cleanup().await,
+        Err((worker::WorkerCleanupError::Unconfirmed, _))
+    ));
+    assert_eq!(
+        completion.cleanup_status(),
+        aktor::AktorCleanupStatus::Unconfirmed
     );
+
+    let (error, report) = completion.report().await.unwrap_err();
+    assert!(report.contains("could not open storage"));
 
     Ok(error
         .data
@@ -1052,16 +1023,35 @@ impl std::task::Wake for ReplyWake {
 }
 
 #[wasm_bindgen]
-pub async fn start_group_setup_worker() -> Result<(), JsValue> {
-    let server = worker::serve_setup((), options(), |()| AktorClosures {
-        start: async || Ok::<_, aktor::AktorSetupError>(0_u32),
-        end: (),
-        intervals: vec![],
-        before_each: None,
-        after_each: None,
+pub async fn start_group_setup_worker(mode: String) -> Result<(), JsValue> {
+    let mut transport = options();
+    if mode == "limits" {
+        transport.capacity = 0;
+    }
+
+    let server = worker::serve_setup((), transport, move |()| {
+        let mut hooks = aktor::AktorHooks::default();
+        if mode == "interval" {
+            hooks.intervals.push(aktor::AktorInterval {
+                every: Duration::ZERO,
+                run: (async |_: &mut u32| {}).into(),
+            });
+        }
+
+        AktorServe {
+            start: async move || {
+                if mode == "crash" {
+                    crash_initializer();
+                    core::future::pending::<()>().await;
+                }
+                aktor::aktor_ready(0_u32)
+            },
+            end: (),
+            hooks,
+        }
     })
     .await
-    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     SERVER.with(|slot| *slot.borrow_mut() = Some(server));
     Ok(())
@@ -1077,14 +1067,14 @@ async fn managed_worker(
         aktor::aktor_start_in(
             group,
             aktor::AktorWorkerNew {
-                name: aktor::AktorName::new(name),
-                role: aktor::AktorNoRole,
+                name: name.into(),
                 kind: aktor::AktorKind::BrowserWebWorker(format!("{url}?configured")),
                 config: (),
                 options: aktor::AktorWorkerOptions {
                     transport: options(),
                     ..Default::default()
                 },
+                stuck: aktor::AktorStuck::Kill,
             },
         )
         .await
@@ -1102,7 +1092,7 @@ pub async fn worker_failure_check(
 ) -> Result<bool, JsValue> {
     use futures_util::FutureExt;
 
-    let mut group = AktorGroup::with_grace(Duration::from_secs(2));
+    let mut group = AktorGroup::with_grace(Duration::from_millis(100));
     group.start().unwrap();
     let primary = managed_worker(&mut group, "primary", &url, prepared).await;
     let secondary = if same_worker {
@@ -1129,7 +1119,6 @@ pub async fn worker_failure_check(
     release_gate();
 
     let report = group.shutdown().await;
-    assert!(!report.timed_out, "{report}");
     assert_eq!(report.failure.as_ref().unwrap().actor, "primary");
     assert_eq!(
         report
@@ -1144,7 +1133,6 @@ pub async fn worker_failure_check(
         .iter()
         .find(|actor| actor.actor == label)
         .unwrap();
-    assert!(!outcome.timed_out);
     if outcome.diagnostics.len() != 1 {
         return Err(JsValue::from_str(&format!(
             "secondary worker failure was lost: {report}"
@@ -1213,7 +1201,7 @@ pub async fn deferred_reply_check(url: String, drop_worker: bool) -> Result<bool
     let retained = if drop_worker {
         None
     } else {
-        Some(worker.new_handle())
+        Some(worker.clone())
     };
     drop(worker);
 
@@ -1225,7 +1213,7 @@ pub async fn deferred_reply_check(url: String, drop_worker: bool) -> Result<bool
             "deferred decode escaped group completion: {published}"
         )));
     }
-    assert!(!published.timed_out);
+    assert!(!published.ran_past_grace);
     assert!(
         published
             .failure
@@ -1248,26 +1236,25 @@ pub async fn optional_worker_check(url: String, crash: bool) -> Result<bool, JsV
     use worker::{OptionalWorker, Retirement};
 
     let worker = OptionalWorker::<u32>::with_options(&url, options())
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     worker
         .ready()
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     if crash {
         let result = operation(&worker, 1).await;
 
         assert_eq!(
-            result.unwrap_err().outcome,
+            result.unwrap_err().0.outcome,
             aktor::message::CallError::OutcomeUnknown
         );
-        let unconfirmed = match worker.completion().wait().await {
-            Retirement::Confirmed(_) => false,
-            Retirement::Unconfirmed(_) => true,
-        };
-
-        assert!(unconfirmed);
+        worker.terminate();
+        assert!(matches!(
+            worker.completion().wait_retired().await,
+            Retirement::Terminated(_)
+        ));
     } else {
         assert_eq!(
             operation(&worker, 0).await.unwrap(),
@@ -1275,7 +1262,7 @@ pub async fn optional_worker_check(url: String, crash: bool) -> Result<bool, JsV
         );
         let confirmed = match worker.shutdown().await {
             Retirement::Confirmed(result) => result.is_err() == url.contains("fail_cleanup=true"),
-            Retirement::Unconfirmed(_) => false,
+            Retirement::Unconfirmed(_) | Retirement::Terminated(_) => false,
         };
 
         assert!(confirmed);
@@ -1291,49 +1278,62 @@ impl Drop for RetainedGuard {
     }
 }
 
+const ROLLBACK_REPORT: &str = "Setup rollback finished\n`- storage rollback diagnostic";
+
 #[wasm_bindgen]
 pub async fn start_unconfirmed_worker(mode: u8) -> Result<(), JsValue> {
     if mode == 0 {
         let guard = RetainedGuard;
         let result =
-            worker::retain_setup::<(), _>(AktorSetupError::new("early setup still owns work", ()))
+            worker::retain_setup((u32::from(mode), String::from("early setup still owns work")))
                 .await;
         drop(guard);
-        return result.map_err(|error| JsValue::from_str(&error.to_string()));
+        return result.map_err(|(_, report)| JsValue::from_str(&report));
     }
-    let server = worker::serve_setup((), options(), move |(): ()| AktorClosures {
+    let server = worker::serve_setup((), options(), move |(): ()| AktorServe {
         start: async move || {
+            if mode == 5 {
+                worker::report_setup_pending("rollback pending").unwrap();
+                wasm_bindgen_futures::JsFuture::from(gate()).await.unwrap();
+
+                return Err((85_u32, ROLLBACK_REPORT.to_owned()));
+            }
+
             if mode != 1 {
                 Ok(0_u32)
             } else {
                 let guard = RetainedGuard;
                 let result =
-                    worker::retain_setup(AktorSetupError::new("setup still owns work", ())).await;
+                    worker::retain_setup((u32::from(mode), String::from("setup still owns work")))
+                        .await;
                 drop(guard);
                 result
             }
         },
         end: async move |_: u32| {
-            let guard = RetainedGuard;
-            if mode == 3 {
+            let _guard = RetainedGuard;
+            if mode == 4 {
+                break_worker_post_once();
+                let (error, _) =
+                    worker::report_cleanup_pending("cleanup still owns work").unwrap_err();
+                assert!(matches!(error.cause, WorkerCause::Transport(_)));
+
+                worker::report_cleanup_pending("cleanup still owns work").unwrap();
+            }
+
+            if mode >= 3 {
                 wasm_bindgen_futures::JsFuture::from(cleanup_gate())
                     .await
                     .unwrap();
-                drop(guard);
-                return Ok(());
+                return;
             }
 
-            let result =
-                worker::retain_cleanup(AktorCleanupError::new("cleanup still owns work", ())).await;
-            drop(guard);
-            result
+            worker::retain_cleanup((mode, String::from("cleanup still owns work"))).await
         },
-        intervals: vec![],
-        before_each: None,
-        after_each: None,
+        hooks: Default::default(),
     })
     .await
-    .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     SERVER.with(|slot| *slot.borrow_mut() = Some(server));
     Ok(())
@@ -1344,11 +1344,9 @@ async fn unconfirmed_owner(url: &str, mode: u8) {
 
     let mut group = AktorGroup::with_grace(Duration::from_millis(2));
     group.start().unwrap();
-    let observed = Rc::new(RefCell::new(None));
-    let observing = observed.clone();
-    let program = if mode == 3 {
+    let program = if mode >= 3 {
         format!(
-            "{}?unconfirmed=3&cleanup_gate",
+            "{}?unconfirmed={mode}&cleanup_gate",
             url.replace("group-worker.js", "gate-worker.js")
         )
     } else {
@@ -1356,22 +1354,39 @@ async fn unconfirmed_owner(url: &str, mode: u8) {
     };
     let starting = aktor_start_in(
         &group,
-        AktorWorkerNew::<u32, _> {
-            name: AktorName::new("unconfirmed owner"),
-            role: AktorNoRole,
-            kind: AktorKind::BrowserWebWorker(program),
+        AktorWorkerNew::<u32, _, u32> {
+            name: "unconfirmed owner".into(),
+            kind: AktorKind::BrowserWebWorker::new(program),
             config: (),
             options: AktorWorkerOptions {
                 transport: options(),
-                retain_unconfirmed: mode == 3,
-                observe_retirement: Some(Box::new(move |completion| {
-                    *observing.borrow_mut() = Some(completion);
-                })),
                 ..Default::default()
+            },
+            stuck: if mode >= 3 {
+                AktorStuck::Leave
+            } else {
+                AktorStuck::Kill
             },
         },
     )
     .await;
+
+    if mode == 4 {
+        let worker = starting.unwrap();
+        let completion = worker.completion();
+        assert!(matches!(
+            worker.shutdown().await,
+            worker::Retirement::Unconfirmed(_)
+        ));
+
+        release_worker();
+        assert!(matches!(
+            completion.wait_retired().await,
+            worker::Retirement::Confirmed(Err(_))
+        ));
+        completion.wait_cleanup().await.unwrap();
+        return;
+    }
 
     if mode == 3 {
         let worker = starting.unwrap();
@@ -1381,7 +1396,9 @@ async fn unconfirmed_owner(url: &str, mode: u8) {
         }
 
         fail_transport();
-        let _outcome = reply.receive_settled().await;
+        let (failure, _) = reply.receive_settled().await.unwrap_err();
+        assert_eq!(failure.outcome, message::CallError::OutcomeUnknown);
+
         worker.terminate();
         assert!(retained_owner());
         assert!(worker.outstanding().1 > 0);
@@ -1390,28 +1407,166 @@ async fn unconfirmed_owner(url: &str, mode: u8) {
             worker::Retirement::Confirmed(Err(_)) => {}
             other => panic!("late owner retirement: {other:?}"),
         }
+        worker.completion().wait_cleanup().await.unwrap();
         assert_eq!(worker.outstanding().1, 0);
         return;
     }
 
     if mode == 2 {
         let worker = starting.unwrap();
-        let _retirement = worker.shutdown().await;
+        let error = match worker.shutdown().await {
+            worker::Retirement::Unconfirmed((error, _))
+            | worker::Retirement::Terminated((error, _)) => error,
+            worker::Retirement::Confirmed(_) => panic!("cleanup did not finish"),
+        };
+        assert_eq!(error.cause, worker::WorkerCause::Cleanup);
+        assert!(error.data.is_none());
+        assert_eq!(
+            worker.completion().wait_cleanup().await.unwrap_err().0,
+            worker::WorkerCleanupError::Unconfirmed
+        );
+
         worker.terminate();
         let _report = group.shutdown().await;
+        assert!(matches!(
+            worker.completion().wait_retired().await,
+            worker::Retirement::Terminated(_)
+        ));
     } else {
-        assert!(starting.is_err());
+        let (failure, report) = starting.err().expect("unconfirmed setup returned a worker");
+        assert_eq!(
+            failure.init,
+            AktorInitOutcome::Failed(u32::from(mode)),
+            "{report}"
+        );
     }
 
-    let completion = observed.borrow_mut().take().unwrap();
-    match completion.wait().await {
-        worker::Retirement::Unconfirmed(error) => {
-            assert!(format!("{error:#}").contains("still owns work"))
-        }
-        other => panic!("unconfirmed owner retirement: {other:?}"),
-    }
-    assert!(retained_owner());
+    // The group's report says it, a `Kill` worker that still owned work got terminated.
+    let report = group.completion().wait().await;
+    let owner = report
+        .actors
+        .iter()
+        .find(|actor| actor.actor == "unconfirmed owner")
+        .unwrap();
+    assert_eq!(owner.retirement, AktorRetireStatus::Terminated, "{report}");
+    assert!(!retained_owner());
 }
+
+async fn pending_setup(url: &str) {
+    use aktor::{AktorInitOutcome, AktorKind, AktorRetireStatus, AktorStuck, AktorWorkerNew};
+    use worker::{Retirement, Worker};
+
+    let program = url.replace("group-worker.js", "gate-worker.js");
+    let failed = format!("{program}?unconfirmed=5");
+    let worker = Worker::<u32, (), u32>::with_config(&failed, options(), &()).unwrap();
+    let completion = worker.completion();
+    let (early, report) = worker.ready().await.unwrap_err();
+    assert_eq!(
+        (early.init, report.as_str()),
+        (AktorInitOutcome::Unconfirmed, "rollback pending")
+    );
+    assert!(matches!(
+        completion.wait().await,
+        Retirement::Unconfirmed(_)
+    ));
+
+    release_worker();
+    let Retirement::Confirmed(Err((error, report))) = completion.wait_retired().await else {
+        panic!("rollback did not confirm retirement");
+    };
+    assert_eq!((error.data, report.as_str()), (Some(85), ROLLBACK_REPORT));
+    assert_eq!(
+        worker.ready().await.unwrap_err().0.init,
+        AktorInitOutcome::Failed(85)
+    );
+
+    let mut group = AktorGroup::with_grace(Duration::from_millis(2));
+    group.start().unwrap();
+    let completion = group.completion();
+    let start = AktorWorkerNew::<u32, _, u32> {
+        name: "pending setup".into(),
+        kind: AktorKind::BrowserWebWorker::new(failed),
+        config: (),
+        options: aktor::AktorWorkerOptions {
+            transport: options(),
+            ..Default::default()
+        },
+        stuck: AktorStuck::Leave,
+    };
+    aktor::aktor_start_in(&group, start).await.err().unwrap();
+    assert_eq!(
+        completion.wait().await.actors[0].retirement,
+        AktorRetireStatus::Unconfirmed
+    );
+
+    release_worker();
+    let retired = completion.wait_retired().await.unwrap();
+    let diagnostics = &retired.actors[0].diagnostics;
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|entry| entry.diagnostics == ROLLBACK_REPORT)
+            .count(),
+        1
+    );
+}
+
+async fn leave_queued(url: &str, fail_output: bool) {
+    use aktor::*;
+
+    let mut group = AktorGroup::with_grace(Duration::from_millis(5));
+    group.start().unwrap();
+    let (release, joining) = tokio::sync::oneshot::channel();
+
+    let worker = group
+        .spawn(AktorWorkerNew::<u32, _, ()> {
+            name: "storage".into(),
+            kind: AktorKind::BrowserWebWorker::new(format!(
+                "{}?configured",
+                url.replace("group-worker.js", "gate-worker.js")
+            )),
+            config: (),
+            options: AktorWorkerOptions {
+                transport: options(),
+                before_shutdown: Some(worker::join(async move { joining.await.unwrap() })),
+            },
+            stuck: AktorStuck::Leave,
+        })
+        .await
+        .unwrap();
+    let running = operation(&worker, 4).admit().await.unwrap();
+    let rejected = if fail_output {
+        Some(bad_output(&worker).admit().await.unwrap())
+    } else {
+        None
+    };
+    let queued = operation(&worker, 7).admit().await.unwrap();
+
+    let stopped = group.shutdown();
+    assert!(!stopped.wait().await.retired());
+    assert_eq!(
+        stopped.retirement_status(),
+        aktor::AktorGroupRetirement::Unconfirmed
+    );
+    release_worker();
+    release.send(()).unwrap();
+
+    assert_eq!(running.receive_settled().await.unwrap(), Ok(4));
+    if let Some(rejected) = rejected {
+        assert!(rejected.receive_settled().await.is_err());
+    }
+    assert_eq!(queued.receive_settled().await.unwrap(), Ok(7));
+
+    let report = stopped.wait_retired().await.unwrap();
+    assert_eq!(
+        stopped.retirement_status(),
+        aktor::AktorGroupRetirement::AllConfirmed
+    );
+    assert_eq!(report.to_string().contains("output refused"), fail_output);
+}
+
+#[derive(er::Er)]
+struct CloseErr;
 
 struct OwnedJoin(Rc<Cell<u32>>);
 impl Drop for OwnedJoin {
@@ -1423,21 +1578,55 @@ impl Drop for OwnedJoin {
 #[wasm_bindgen]
 pub async fn optional_group_check(url: String) -> Result<bool, JsValue> {
     use aktor::*;
+    use er::ErContextExt;
 
-    let mut group = AktorGroup::new();
+    let mut group = AktorGroup::with_grace(Duration::from_millis(100));
     group.start().unwrap();
 
     let setup = |name: &str, program: &str| AktorWorkerNew {
-        name: AktorName::new(name),
-        role: AktorNoRole,
+        name: name.into(),
         kind: AktorKind::BrowserWebWorker(program),
         config: (),
         options: AktorWorkerOptions {
             transport: options(),
             ..Default::default()
         },
+        stuck: AktorStuck::Kill,
     };
     let configured = format!("{url}?configured");
+    for (query, expected) in [
+        ("interval", AktorInitOutcome::NotRun),
+        ("limits", AktorInitOutcome::NotRun),
+        ("crash", AktorInitOutcome::Unconfirmed),
+    ] {
+        let program = format!("{configured}&mode={query}");
+        let optional = group
+            .spawn(setup(query, &program).optional())
+            .await
+            .unwrap();
+        let (error, _) = optional.ready().await.unwrap_err();
+        assert_eq!(error.init, expected);
+
+        let (failure, _) = aktor_start(AktorSetup {
+            actors: setup(query, &program),
+            shutdown: |_| {},
+            grace: Duration::from_millis(100),
+        })
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(failure.init, expected);
+    }
+
+    break_post();
+    let optional = group
+        .spawn(setup("initialize post", &configured).optional())
+        .await
+        .unwrap();
+    let error = optional.ready().await.unwrap_err().0;
+    restore_post();
+    assert_eq!(error.init, AktorInitOutcome::NotRun);
+
     let (preferences, unavailable) = aktor_start_in(
         &group,
         (
@@ -1449,7 +1638,7 @@ pub async fn optional_group_check(url: String) -> Result<bool, JsValue> {
     .unwrap();
 
     assert_eq!(
-        operation(&unavailable, 42).await.unwrap_err().outcome,
+        operation(&unavailable, 42).await.unwrap_err().0.outcome,
         aktor::message::CallError::NotAdmitted
     );
 
@@ -1458,10 +1647,9 @@ pub async fn optional_group_check(url: String) -> Result<bool, JsValue> {
     let guard = OwnedJoin(drops.clone());
     let (release, joining) = tokio::sync::oneshot::channel();
     invalid.options.transport.capacity = 0;
-    invalid.options.before_shutdown = Some(Box::pin(async move {
+    invalid.options.before_shutdown = Some(worker::join(async move {
         joining.await.unwrap();
         drop(guard);
-        Ok(())
     }));
 
     let invalid = aktor_start_in(&group, invalid.optional()).await.unwrap();
@@ -1470,10 +1658,10 @@ pub async fn optional_group_check(url: String) -> Result<bool, JsValue> {
     drop(invalid);
 
     assert_eq!(drops.get(), 0);
-    assert!(match completion.wait().await {
-        worker::Retirement::Confirmed(_) => false,
-        worker::Retirement::Unconfirmed(_) => true,
-    });
+    assert!(matches!(
+        completion.wait().await,
+        worker::Retirement::Unconfirmed(_)
+    ));
 
     release.send(()).unwrap();
     match completion.wait_retired().await {
@@ -1495,31 +1683,37 @@ pub async fn optional_group_check(url: String) -> Result<bool, JsValue> {
     let rejected = format!("{url}?rollback");
     let (release, joining) = tokio::sync::oneshot::channel();
     let mut rejected = setup("rejected", &rejected);
-    rejected.options.before_shutdown = Some(Box::pin(async move {
+    rejected.options.before_shutdown = Some(worker::join(async move {
         joining.await.unwrap();
-        Ok(())
     }));
     let rejected = aktor_start_in(&group, rejected.optional()).await.unwrap();
-    let error = operation(&rejected, 42).await.unwrap_err();
+    let error = operation(&rejected, 42)
+        .await
+        .er(|| std::fmt::Error)
+        .unwrap_err();
     let completion = rejected.completion();
 
-    assert!(match completion.wait().await {
-        worker::Retirement::Confirmed(_) => false,
-        worker::Retirement::Unconfirmed(_) => true,
-    });
+    assert!(matches!(
+        completion.wait().await,
+        worker::Retirement::Unconfirmed(_)
+    ));
+    assert_eq!(operation(&preferences, 42).await, Ok(42));
+    group.killswitch().stop();
+    gloo_timers::future::TimeoutFuture::new(0).await;
     release.send(()).unwrap();
 
     let retired = completion.wait_retired().await;
 
-    assert!(format!("{error:#}").contains("setup rollback finished"));
-    assert!(match retired {
-        worker::Retirement::Confirmed(result) => result.is_err(),
-        worker::Retirement::Unconfirmed(_) => false,
-    });
+    assert!(error.er_report().contains("storage rollback diagnostic"));
+    assert!(matches!(retired, worker::Retirement::Confirmed(Err(_))));
 
-    assert_eq!(operation(&preferences, 42).await, Ok(42));
-    group.killswitch().stop();
-    let _report = group.completion().await;
+    let report = group.completion().await;
+    let rejected = report
+        .actors
+        .iter()
+        .find(|actor| actor.actor == "rejected")
+        .unwrap();
+    assert_eq!(rejected.retirement, AktorRetireStatus::Confirmed);
 
     let mut required = AktorGroup::new();
     required.start().unwrap();
@@ -1528,29 +1722,40 @@ pub async fn optional_group_check(url: String) -> Result<bool, JsValue> {
     let (release, joining) = tokio::sync::oneshot::channel();
     let (finished, joined) = tokio::sync::oneshot::channel();
     invalid.options.transport.capacity = 0;
-    invalid.options.before_shutdown = Some(Box::pin(async move {
+    invalid.options.before_shutdown = Some(worker::join(async move {
         joining.await.unwrap();
         drop(guard);
         finished.send(()).unwrap();
-        Ok(())
+        Err(er::er_new!(CloseErr, [std::fmt::Error]))
     }));
 
-    let error = aktor_start_in(&required, invalid).await.err().unwrap();
+    let (error, _) = aktor_start_in(&required, invalid).await.err().unwrap();
 
     assert_eq!(
         error.report.unwrap().actors[0].retirement,
-        RetirementStatus::Unconfirmed
+        AktorRetireStatus::Unconfirmed
     );
     assert_eq!(drops.get(), 1);
     release.send(()).unwrap();
     joined.await.unwrap();
     assert_eq!(drops.get(), 2);
 
-    for mode in 0..4 {
+    let retired = required.completion().wait_retired().await.unwrap();
+    let failure = retired.actors[0]
+        .diagnostics
+        .iter()
+        .find(|error| error.diagnostics.contains("CloseErr"))
+        .unwrap();
+    assert!(failure.diagnostics.contains(&std::fmt::Error.to_string()));
+
+    for mode in 0..5 {
         unconfirmed_owner(&url, mode).await;
     }
+    pending_setup(&url).await;
+    leave_queued(&url, false).await;
+    leave_queued(&url, true).await;
 
-    for mode in 0..3 {
+    for mode in 0..4 {
         unstarted_join(&configured, mode).await;
     }
 
@@ -1572,7 +1777,6 @@ async fn refused_join(worker: worker::OptionalWorker<u32>, mode: u8) {
         worker
             .before_shutdown(async move {
                 first_join.await.unwrap();
-                Ok(())
             })
             .unwrap()
     } else {
@@ -1583,7 +1787,7 @@ async fn refused_join(worker: worker::OptionalWorker<u32>, mode: u8) {
         worker.ready().await.unwrap();
     }
 
-    let retained = (mode == 2).then(|| worker.new_handle());
+    let retained = (mode == 2).then(|| worker.clone());
     let completion = worker.completion();
     let drops = Rc::new(Cell::new(0));
     let guard = OwnedJoin(drops.clone());
@@ -1598,7 +1802,7 @@ async fn refused_join(worker: worker::OptionalWorker<u32>, mode: u8) {
                 joining.await.unwrap();
                 drop(guard);
                 finished.send(()).unwrap();
-                Err(AktorError::new("refused join finished with an error", ()))
+                Err(String::from("refused join finished with an error"))
             })
             .is_err()
     );
@@ -1653,16 +1857,17 @@ async fn refused_join(worker: worker::OptionalWorker<u32>, mode: u8) {
 
 async fn unstarted_join(url: &str, mode: u8) {
     use aktor::*;
+    use futures_util::FutureExt;
 
     let setup = |name: &str| AktorWorkerNew::<u32, _> {
-        name: AktorName::new(name),
-        role: AktorNoRole,
+        name: name.into(),
         kind: AktorKind::BrowserWebWorker(url),
         config: (),
         options: AktorWorkerOptions {
             transport: options(),
             ..Default::default()
         },
+        stuck: AktorStuck::Kill,
     };
 
     let mut group = AktorGroup::new();
@@ -1671,11 +1876,10 @@ async fn unstarted_join(url: &str, mode: u8) {
     let guard = OwnedJoin(drops.clone());
     let (release, joining) = tokio::sync::oneshot::channel();
     let (finished, joined) = tokio::sync::oneshot::channel();
-    unstarted.options.before_shutdown = Some(Box::pin(async move {
+    unstarted.options.before_shutdown = Some(worker::join(async move {
         joining.await.unwrap();
         drop(guard);
         finished.send(()).unwrap();
-        Ok(())
     }));
 
     match mode {
@@ -1687,13 +1891,19 @@ async fn unstarted_join(url: &str, mode: u8) {
             group.start().unwrap();
             drop(aktor_start_in(&group, unstarted.optional()));
         }
-        _ => {
+        2 => {
             group.start().unwrap();
             let mut invalid = setup("first setup fails");
             invalid.options.transport.capacity = 0;
 
             let entries = (invalid, (setup("skipped"), unstarted.optional()));
             assert!(aktor_start_in(&group, entries).await.is_err());
+        }
+        _ => {
+            group.start().unwrap();
+            let mut opening = Box::pin(aktor_start_in(&group, unstarted));
+            assert!(opening.as_mut().now_or_never().is_none());
+            drop(opening);
         }
     }
 
@@ -1703,13 +1913,16 @@ async fn unstarted_join(url: &str, mode: u8) {
     assert_eq!(drops.get(), 1);
 
     if mode != 0 {
-        let _report = group.shutdown().await;
+        let report = group.shutdown().await;
+        if mode == 3 {
+            assert!(!report.failed(), "{report}");
+        }
     }
 }
 
 #[wasm_bindgen]
 pub async fn late_retirement_check(url: String, startup: bool) -> Result<bool, JsValue> {
-    use worker::{OptionalWorker, Retirement};
+    use worker::OptionalWorker;
 
     let completion = if startup {
         let worker = OptionalWorker::<u32>::with_config(&url, options(), &7u32).unwrap();
@@ -1733,26 +1946,31 @@ pub async fn late_retirement_check(url: String, startup: bool) -> Result<bool, J
 
     release_worker();
 
-    Ok(match completion.wait_retired().await {
-        Retirement::Confirmed(result) => result.is_err(),
-        Retirement::Unconfirmed(_) => false,
-    })
+    Ok(matches!(
+        completion.wait_retired().await,
+        worker::Retirement::Confirmed(Err(_))
+    ))
 }
 
 #[wasm_bindgen]
 pub async fn shutdown_dependency_check(url: String, mode: u8) -> Result<bool, JsValue> {
-    use worker::{OptionalWorker, Retirement};
+    use worker::OptionalWorker;
 
     let (release, joining) = tokio::sync::oneshot::channel();
+    let url = if mode == 3 {
+        format!("{url}?fail_cleanup=true")
+    } else {
+        url
+    };
     let worker = OptionalWorker::<u32>::with_options(&url, options())
         .unwrap()
         .before_shutdown(async move {
             joining.await.unwrap();
 
             if mode == 2 {
-                Err(AktorError::new(
-                    "external cleanup finished with an error",
-                    (),
+                Err((
+                    mode,
+                    String::from("external cleanup finished with an error"),
                 ))
             } else {
                 Ok(())
@@ -1761,10 +1979,13 @@ pub async fn shutdown_dependency_check(url: String, mode: u8) -> Result<bool, Js
         .unwrap();
     worker.ready().await.unwrap();
 
+    let completion = worker.completion();
+    let mut first = None;
     if mode == 1 {
         worker.terminate();
     } else if mode == 3 {
         fail_transport();
+        first = Some(completion.report().await.unwrap_err());
     } else {
         drop(worker.shutdown());
     }
@@ -1777,11 +1998,50 @@ pub async fn shutdown_dependency_check(url: String, mode: u8) -> Result<bool, Js
         gloo_timers::future::TimeoutFuture::new(1).await;
     }
 
+    let retirement = completion.wait_retired().await;
+    let cleanup = completion.wait_cleanup().await;
+
+    match mode {
+        1 => assert_eq!(
+            cleanup.unwrap_err().0,
+            worker::WorkerCleanupError::Unconfirmed
+        ),
+        3 => {
+            let (failure, report) = cleanup.unwrap_err();
+            assert!(matches!(failure, worker::WorkerCleanupError::Failed(_)));
+            assert!(report.contains("backup folder is read only"));
+        }
+        _ => cleanup.unwrap(),
+    }
+
+    if let Some(first) = first {
+        let worker::Retirement::Confirmed(Err(late)) = &retirement else {
+            panic!("worker did not confirm cleanup: {retirement:?}");
+        };
+        assert_eq!(late, &first);
+        assert!(
+            completion
+                .wait_diagnostics()
+                .await
+                .iter()
+                .any(|error| error.diagnostics.contains("backup folder is read only"))
+        );
+    }
+
+    if mode == 2 {
+        let diagnostics = completion.wait_diagnostics().await;
+        assert_eq!(
+            diagnostics[0].diagnostics,
+            "external cleanup finished with an error"
+        );
+    }
+
     Ok(waited
-        && match worker.completion().await {
-            Retirement::Confirmed(Ok(())) => mode == 0,
-            Retirement::Confirmed(Err(_)) => mode == 2 || mode == 3,
-            Retirement::Unconfirmed(_) => mode == 1,
+        && match retirement {
+            worker::Retirement::Confirmed(Ok(())) => mode == 0,
+            worker::Retirement::Confirmed(Err(_)) => mode == 2 || mode == 3,
+            worker::Retirement::Terminated(_) => mode == 1,
+            worker::Retirement::Unconfirmed(_) => false,
         })
 }
 
@@ -1795,20 +2055,18 @@ pub async fn incompatible_owner_check(url: String, startup: bool) -> Result<bool
     if startup {
         wasm_bindgen_futures::JsFuture::from(configured()).await?;
     } else {
-        worker.ready().await.unwrap_err();
+        let error = worker.ready().await.unwrap_err().0;
+        assert_eq!(error.init, aktor::AktorInitOutcome::Unconfirmed);
     }
     let completion = worker.completion();
     drop(worker);
-    let uncertain = match completion.wait().await {
-        Retirement::Confirmed(_) => false,
-        Retirement::Unconfirmed(_) => true,
-    };
+    let uncertain = matches!(completion.wait().await, Retirement::Unconfirmed(_));
 
     release_worker();
 
     Ok(uncertain
         && match completion.wait_retired().await {
-            Retirement::Confirmed(Err(error)) => {
+            Retirement::Confirmed(Err((error, _))) => {
                 error.cause
                     == if startup {
                         WorkerCause::Closed
@@ -1816,18 +2074,20 @@ pub async fn incompatible_owner_check(url: String, startup: bool) -> Result<bool
                         WorkerCause::Protocol
                     }
             }
-            Retirement::Confirmed(Ok(())) | Retirement::Unconfirmed(_) => false,
+            _ => false,
         })
 }
 
 #[wasm_bindgen]
 pub async fn start_rejected_worker() -> Result<(), JsValue> {
-    let _result = worker::serve_setup((), options(), |_: ()| AktorClosures {
-        start: async || Err::<u32, _>(AktorSetupError::new("setup rollback finished", ())),
+    let _result = worker::serve_setup((), options(), |_: ()| AktorServe {
+        start: async || {
+            Err::<u32, _>(String::from(
+                "setup rollback finished\n`- storage rollback diagnostic",
+            ))
+        },
         end: (),
-        intervals: vec![],
-        before_each: None,
-        after_each: None,
+        hooks: Default::default(),
     })
     .await;
 

@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 #[tokio::test]
 async fn backup() {
@@ -7,18 +8,18 @@ async fn backup() {
     let mut destination = rusqlite::Connection::open_in_memory().unwrap();
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("SQLite backup"),
-            role: AktorNoRole,
+            name: "SQLite backup".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: async || {
-                    let db = rusqlite::Connection::open_in_memory()
-                        .map_err(|error| AktorSetupError::new(error.to_string(), ()))?;
+            start: async || {
+                let db =
+                    rusqlite::Connection::open_in_memory().map_err(|error| error.to_string())?;
 
-                    db.execute_batch("CREATE TABLE saved(value); INSERT INTO saved VALUES(85)")
-                        .map_err(|error| AktorSetupError::new(error.to_string(), ()))?;
-                    Ok::<_, AktorSetupError>(db)
-                },
+                db.execute_batch("CREATE TABLE saved(value); INSERT INTO saved VALUES(85)")
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(db)
+            },
+            end: (),
+            hooks: AktorHooks {
                 intervals: vec![AktorInterval {
                     every: Duration::from_millis(1),
                     run: (async move |db: &mut rusqlite::Connection| {
@@ -35,17 +36,14 @@ async fn backup() {
                     })
                     .into(),
                 }],
-
-                end: (),
                 before_each: None,
                 after_each: None,
             },
-            options: AktorNewOptions { capacity: 32 },
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await
     .unwrap();
@@ -64,12 +62,11 @@ async fn backup() {
     let notify = observed.clone();
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("Haandboldfuglen"),
-            role: AktorNoRole,
+            name: "Haandboldfuglen".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0)))),
-                end: (),
+            start: async || aktor_ready(Counter(Rc::new(Cell::new(0)))),
+            end: (),
+            hooks: AktorHooks {
                 intervals: vec![AktorInterval {
                     every: Duration::from_millis(1),
                     run: (async move |counter: &mut Counter| {
@@ -82,12 +79,11 @@ async fn backup() {
                 before_each: None,
                 after_each: None,
             },
-            options: AktorNewOptions { capacity: 32 },
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_millis(200),
-        },
+        grace: Duration::from_millis(200),
     })
     .await
     .unwrap();
@@ -96,7 +92,7 @@ async fn backup() {
 
     let report = actors.shutdown().await;
 
-    assert!(report.timed_out);
+    assert!(report.ran_past_grace);
 
     #[cfg(feature = "local")]
     {
@@ -108,12 +104,11 @@ async fn backup() {
                 let notify = observed.clone();
                 let actors = aktor_start(AktorSetup {
                     actors: AktorNew {
-                        name: AktorName::new("local interval"),
-                        role: AktorNoRole,
+                        name: "local interval".into(),
                         kind: AktorKind::TokioLocal(&executor),
-                        closures: AktorClosures {
-                            start: async || Ok::<_, AktorSetupError>(0_u32),
-                            end: (),
+                        start: async || aktor_ready(0_u32),
+                        end: (),
+                        hooks: AktorHooks {
                             intervals: vec![AktorInterval {
                                 every: Duration::from_millis(1),
                                 run: (async move |_: &mut u32| {
@@ -125,12 +120,11 @@ async fn backup() {
                             before_each: None,
                             after_each: None,
                         },
-                        options: AktorNewOptions { capacity: 32 },
+                        capacity: 32,
+                        stuck: AktorStuck::Kill,
                     },
                     shutdown: |_| {},
-                    options: AktorOptions {
-                        shutdown_grace: Duration::from_millis(200),
-                    },
+                    grace: Duration::from_millis(200),
                 })
                 .await
                 .unwrap();
@@ -139,20 +133,17 @@ async fn backup() {
 
                 let report = actors.shutdown().await;
 
-                assert!(report.timed_out);
+                assert!(report.ran_past_grace);
                 assert!(report.failure.is_none(), "{report}");
 
                 let interval = IntervalDrop;
                 let actors = aktor_start(AktorSetup {
                     actors: AktorNew {
-                        name: AktorName::new("local idle interval"),
-                        role: AktorNoRole,
+                        name: "local idle interval".into(),
                         kind: AktorKind::TokioLocal(&executor),
-                        closures: AktorClosures {
-                            start: async || {
-                                Ok::<_, AktorSetupError>(Counter(Rc::new(Cell::new(0))))
-                            },
-                            end: (),
+                        start: async || aktor_ready(Counter(Rc::new(Cell::new(0)))),
+                        end: (),
+                        hooks: AktorHooks {
                             intervals: vec![AktorInterval {
                                 every: Duration::from_secs(3600),
                                 run: (async move |_: &mut Counter| {
@@ -163,12 +154,11 @@ async fn backup() {
                             before_each: None,
                             after_each: None,
                         },
-                        options: AktorNewOptions { capacity: 32 },
+                        capacity: 32,
+                        stuck: AktorStuck::Kill,
                     },
                     shutdown: |_| {},
-                    options: AktorOptions {
-                        shutdown_grace: Duration::from_secs(5),
-                    },
+                    grace: Duration::from_secs(5),
                 })
                 .await
                 .unwrap();
@@ -187,12 +177,11 @@ async fn backup() {
     let interval = IntervalDrop;
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("idle interval"),
-            role: AktorNoRole,
+            name: "idle interval".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(0u32),
-                end: (),
+            start: async || aktor_ready(0u32),
+            end: (),
+            hooks: AktorHooks {
                 intervals: vec![AktorInterval {
                     every: Duration::from_secs(3600),
                     run: (async move |_: &mut u32| {
@@ -203,12 +192,11 @@ async fn backup() {
                 before_each: None,
                 after_each: None,
             },
-            options: AktorNewOptions { capacity: 32 },
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await
     .unwrap();
@@ -224,16 +212,15 @@ async fn close_interval(waiting: bool) {
     let performed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let end = cleaned.clone();
     let actors = aktor_start(AktorSetup {
-        actors: aktor_setups! {
-            timed: AktorNew {
-                name: AktorName::new("interval owner"),
-                role: AktorNoRole,
+        actors: (
+            AktorNew {
+                name: "interval owner".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: async move |_: u32| {
-                        end.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    },
+                start: async || aktor_ready(0_u32),
+                end: async move |_: u32| {
+                    end.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+                hooks: AktorHooks {
                     intervals: vec![AktorInterval {
                         every: Duration::from_secs(1),
                         run: (async |value: &mut u32| {
@@ -244,26 +231,21 @@ async fn close_interval(waiting: bool) {
                     before_each: None,
                     after_each: None,
                 },
-                options: AktorNewOptions { capacity: 1 },
+                capacity: 1,
+                stuck: AktorStuck::Kill,
             },
-            sibling: AktorNew {
-                name: AktorName::new("sibling"),
-                role: AktorNoRole,
+            AktorNew {
+                name: "sibling".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(0_u32),
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: AktorNewOptions { capacity: 32 },
+                start: async || aktor_ready(0_u32),
+                end: (),
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
-        },
+        ),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await
     .unwrap();
@@ -287,7 +269,7 @@ async fn close_interval(waiting: bool) {
 
         drop(
             message::call_async(
-                &actors.handles.timed.handle,
+                &actors.handles.0.handle,
                 async move |_: &mut u32, ()| {
                     signal.notify_one();
                     release.notified().await;
@@ -303,7 +285,7 @@ async fn close_interval(waiting: bool) {
 
         let count = performed.clone();
         let queued = message::call(
-            &actors.handles.timed.handle,
+            &actors.handles.0.handle,
             move |_: &mut u32, ()| {
                 count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
@@ -321,7 +303,7 @@ async fn close_interval(waiting: bool) {
         tokio::task::yield_now().await;
     }
 
-    let completed = actors.handles.timed.shutdown();
+    let completed = actors.handles.0.shutdown();
 
     gate.notify_one();
     completed.await.unwrap();
@@ -334,7 +316,7 @@ async fn close_interval(waiting: bool) {
         "interval outlived its actor"
     );
     assert_eq!(
-        message::call(&actors.handles.sibling.handle, |value, ()| *value, ()).await,
+        message::call(&actors.handles.1.handle, |value, ()| *value, ()).await,
         0
     );
     assert!(!actors.shutdown().await.failed());
@@ -357,16 +339,16 @@ async fn interval_admission() {
 
 #[cfg(feature = "local")]
 #[allow(clippy::type_complexity)]
-fn local_interval<Kind>(
+fn local_interval<Kind, Signature>(
     kind: Kind,
     timed: bool,
     cleaned: Arc<std::sync::atomic::AtomicUsize>,
 ) -> AktorNew<
     u32,
-    impl core::ops::AsyncFnOnce() -> Result<u32, AktorSetupError> + 'static,
+    impl core::ops::AsyncFnOnce() -> Result<u32, core::convert::Infallible> + 'static,
     Kind,
-    AktorNoRole,
-    impl core::ops::AsyncFnMut(u32) -> Result<(), AktorCleanupError> + 'static,
+    impl core::ops::AsyncFnMut(u32) -> Result<(), String> + 'static,
+    Signature,
 >
 where
     Kind: setup::kind::AktorMode<
@@ -375,15 +357,14 @@ where
         >,
 {
     AktorNew {
-        name: AktorName::new(if timed { "interval owner" } else { "sibling" }),
-        role: AktorNoRole,
+        name: if timed { "interval owner" } else { "sibling" }.into(),
         kind,
-        closures: AktorClosures {
-            start: async || Ok::<_, AktorSetupError>(0_u32),
-            end: async move |_: u32| {
-                cleaned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok::<_, AktorCleanupError>(())
-            },
+        start: async || aktor_ready(0_u32),
+        end: async move |_: u32| {
+            cleaned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok::<_, String>(())
+        },
+        hooks: AktorHooks {
             intervals: if timed {
                 vec![AktorInterval {
                     every: Duration::from_secs(1),
@@ -395,11 +376,11 @@ where
             } else {
                 vec![]
             },
-
             before_each: None,
             after_each: None,
         },
-        options: AktorNewOptions { capacity: 1 },
+        capacity: 1,
+        stuck: AktorStuck::Kill,
     }
 }
 
@@ -561,9 +542,7 @@ async fn local_close() {
                                 local_interval(make_kind(), false, sibling),
                             ),
                             shutdown: |_| {},
-                            options: AktorOptions {
-                                shutdown_grace: Duration::from_secs(5),
-                            },
+                            grace: Duration::from_secs(5),
                         })
                         .await
                         .unwrap();
@@ -580,9 +559,7 @@ async fn local_close() {
                                 local_interval(AktorKind::TokioLocal(&executor), false, sibling),
                             ),
                             shutdown: |_| {},
-                            options: AktorOptions {
-                                shutdown_grace: Duration::from_secs(5),
-                            },
+                            grace: Duration::from_secs(5),
                         })
                         .await
                         .unwrap();
@@ -593,97 +570,4 @@ async fn local_close() {
             }
         })
         .await;
-}
-
-#[tokio::test]
-async fn pause() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::oneshot;
-
-    let observed = Arc::new(Notify::new());
-    let notify = observed.clone();
-    let runs = Arc::new(AtomicUsize::new(0));
-    let count = runs.clone();
-    let cleaned = Arc::new(Mutex::new(Vec::new()));
-    let end = cleaned.clone();
-    let (release, gate) = oneshot::channel();
-    let mut gate = Some(gate);
-    let actors = aktor_start(AktorSetup {
-        actors: AktorNew {
-            name: AktorName::new("interval counter"),
-            role: AktorNoRole,
-            kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(0_u32),
-                end: async move |state: u32| {
-                    end.lock().unwrap().push(state);
-                },
-                intervals: vec![AktorInterval {
-                    every: Duration::from_secs(1),
-                    run: (async move |state: &mut u32| {
-                        *state += 1;
-                        count.fetch_add(1, Ordering::SeqCst);
-                        notify.notify_one();
-
-                        if let Some(gate) = gate.take() {
-                            let _released = gate.await;
-                        }
-                    })
-                    .into(),
-                }],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 32 },
-        },
-        shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
-    })
-    .await
-    .unwrap();
-
-    tokio::task::yield_now().await;
-    tokio::time::pause();
-
-    let awake = tokio::spawn(async {
-        loop {
-            tokio::task::yield_now().await;
-        }
-    });
-
-    tokio::time::advance(Duration::from_millis(1001)).await;
-    observed.notified().await;
-    tokio::time::advance(Duration::from_secs(3600)).await;
-    assert_eq!(runs.load(Ordering::SeqCst), 1);
-
-    release.send(()).unwrap();
-    assert_eq!(
-        message::call(&actors.handles.handle, |state, ()| *state, ()).await,
-        1
-    );
-    actors.handles.control.pause().await.unwrap();
-    tokio::time::advance(Duration::from_secs(3600)).await;
-    assert_eq!(runs.load(Ordering::SeqCst), 1);
-
-    actors
-        .handles
-        .control
-        .resume(|| Ok::<_, AktorSetupError>(100))
-        .await
-        .unwrap();
-    observed.notified().await;
-    assert_eq!(
-        message::call(&actors.handles.handle, |state, ()| *state, ()).await,
-        101
-    );
-    assert_eq!(runs.load(Ordering::SeqCst), 2);
-    tokio::time::advance(Duration::from_millis(100)).await;
-    assert_eq!(runs.load(Ordering::SeqCst), 2);
-    tokio::time::resume();
-    awake.abort();
-
-    assert!(!actors.shutdown().await.failed());
-    assert_eq!(*cleaned.lock().unwrap(), [1, 101]);
 }

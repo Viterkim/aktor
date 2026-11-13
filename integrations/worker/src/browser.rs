@@ -94,37 +94,49 @@ fn close_database(db: Connection, pool: &OpfsSAHPoolUtil) -> ErResult<(), CloseE
     pool.pause_vfs().er_val(CloseErr::storage)
 }
 
-#[wasm_bindgen]
-pub async fn start_worker() -> Result<(), JsValue> {
+async fn open_database() -> Result<(Connection, OpfsSAHPoolUtil), String> {
     let pool = sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
         &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
         true,
     )
     .await
     .map_err(|error| {
-        if let sqlite_wasm_vfs::sahpool::OpfsSAHError::CreateSyncAccessHandle(value) = &error {
+        if let OpfsSAHError::CreateSyncAccessHandle(value) = &error {
             let name = js_sys::Reflect::get(value, &JsValue::from_str("name"))
                 .ok()
                 .and_then(|name| name.as_string());
 
             if name.as_deref() == Some("NoModificationAllowedError") {
-                return JsValue::from_str("preferences storage is already open in another tab");
+                return "preferences storage is already open in another tab".to_owned();
             }
         }
 
-        js_error(error)
+        error.to_string()
     })?;
 
-    let db = Connection::open("preferences.sqlite").map_err(js_error)?;
+    let db = Connection::open("preferences.sqlite").map_err(|error| error.to_string())?;
 
     db.execute(
         "CREATE TABLE IF NOT EXISTS preferences(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         [],
     )
-    .map_err(js_error)?;
+    .map_err(|error| error.to_string())?;
 
-    let cleanup = async move |db: Connection| -> Result<(), AktorCleanupError> {
-        close_database(db, &pool).er_into(|report| report)
+    Ok((db, pool))
+}
+
+#[wasm_bindgen]
+pub async fn start_worker() -> Result<(), JsValue> {
+    let (db, pool) = match open_database().await {
+        Ok(state) => state,
+        Err(report) => {
+            return worker::setup_failed(AktorError::new(report, ()))
+                .map_err(|(_, report)| js_error(report));
+        }
+    };
+
+    let cleanup = async move |db: Connection| -> Result<(), AktorError> {
+        close_database(db, &pool).er_split_with(|(_, report)| AktorError::new(report, ()))
     };
 
     let options = Options {
@@ -133,10 +145,10 @@ pub async fn start_worker() -> Result<(), JsValue> {
     };
 
     worker::serve_with(db, cleanup, options)
-        .map_err(js_error)?
+        .map_err(|(_, report)| js_error(report))?
         .wait()
         .await
-        .map_err(js_error)?;
+        .map_err(|(_, report)| js_error(report))?;
 
     Ok(())
 }
@@ -145,8 +157,10 @@ pub async fn start_worker() -> Result<(), JsValue> {
 pub async fn sqlite_listener_check(url: String) -> Result<bool, JsValue> {
     let mut actors = AktorGroup::new();
     let kill = actors.killswitch();
-    let after = async |_| Ok::<_, AktorCleanupError>(());
-    let closing = actors.start_with(after).map_err(js_error)?;
+    let after = async |_| Ok::<_, String>(());
+    let closing = actors
+        .start_with(after)
+        .map_err(|(_, report)| js_error(report))?;
     let options = Options {
         build: "preferences-v1".into(),
         ..Options::default()
@@ -154,7 +168,7 @@ pub async fn sqlite_listener_check(url: String) -> Result<bool, JsValue> {
     let database = actors
         .worker::<Connection>("preferences", &url, options)
         .await
-        .map_err(js_error)?;
+        .map_err(|(_, report)| js_error(report))?;
 
     let saved = write(&database, "listener-proof".into(), "0.8".into()).await;
     let found = read(&database, "listener-proof".into()).await;
@@ -191,7 +205,7 @@ impl Client {
                     ..Options::default()
                 },
             )
-            .map_err(js_error)?,
+            .map_err(|(_, report)| js_error(report))?,
         })
     }
 
@@ -210,7 +224,7 @@ impl Client {
                     max_outstanding_bytes: bytes,
                 },
             )
-            .map_err(js_error)?,
+            .map_err(|(_, report)| js_error(report))?,
         })
     }
 
@@ -360,7 +374,7 @@ impl Client {
                 let _sent = closed.send(report);
             })
             .map_err(js_error)?;
-        group.start().map_err(js_error)?;
+        group.start().map_err(|(_, report)| js_error(report))?;
         let worker = group
             .worker::<u32>(
                 "codec failure",
@@ -371,7 +385,7 @@ impl Client {
                 },
             )
             .await
-            .map_err(js_error)?;
+            .map_err(|(_, report)| js_error(report))?;
         let completed = worker.completion();
         let continued = Rc::new(Cell::new(false));
         let after = continued.clone();
@@ -394,7 +408,7 @@ impl Client {
         };
         assert!(!continued.get());
         assert!(notified.get());
-        let codec = completed.report().await.unwrap_err();
+        let (codec, _) = completed.report().await.unwrap_err();
         assert!(report.failed());
         assert!(
             report
@@ -507,7 +521,11 @@ impl Client {
                 let reply = request.send().await;
                 let output = reply.await;
 
-                self.worker.completion().report().await.map_err(js_error)?;
+                self.worker
+                    .completion()
+                    .report()
+                    .await
+                    .map_err(|(_, report)| js_error(report))?;
                 Ok::<_, JsValue>(output)
             })
             .await;
@@ -534,11 +552,6 @@ impl Client {
     pub fn terminate(&self) {
         self.worker.terminate();
     }
-}
-
-#[wasm_bindgen]
-pub fn startup_failed(error: String) -> Result<(), JsValue> {
-    worker::setup_failed(aktor::AktorSetupError::new(error, ())).map_err(js_error)
 }
 
 #[wasm_bindgen]

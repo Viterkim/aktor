@@ -233,10 +233,36 @@ async fn budget() {
         .unwrap()
         .unwrap_err();
     assert_eq!(
-        (error.cause, error.outcome),
+        (error.0.cause, error.0.outcome),
         (Cause::Timeout, CallError::OutcomeUnknown)
     );
     release.notify_one();
+
+    drop((updates, results));
+    server.shutdown().await.unwrap();
+    actors.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_retry_after_connect() {
+    use aktor::call::RetryRequest;
+
+    let (actors, actor) = actor().await;
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("power.sock");
+    let server = listen(&socket, &actor).await.unwrap();
+    let client = connect::<State>(&socket).await.unwrap();
+    let (updates, mut results) = increment(&client, 1).latest();
+    results.next().await.unwrap().unwrap().unwrap();
+
+    let updates = updates.retry(AktorRetryOpts {
+        attempts: 0,
+        timeout: Duration::from_secs(2),
+    });
+    updates.send(10);
+    let (error, _) = results.next().await.unwrap().unwrap_err();
+    assert_eq!(error.outcome, CallError::NotAdmitted);
+    assert_eq!(read(&actor).await.0, 1);
 
     drop((updates, results));
     server.shutdown().await.unwrap();
@@ -298,7 +324,9 @@ async fn generation(address: Address) {
             &Message::Update {
                 session,
                 revision,
-                input: <DataCodec as Codec<(u32,)>>::encode(&(revision as u32,)).unwrap(),
+                input: <DataCodec as Codec<(u32,)>>::encode(&(revision as u32,))
+                    .unwrap()
+                    .into(),
             },
             wire::MAX_FRAME,
         )
@@ -347,7 +375,7 @@ async fn generation(address: Address) {
         &Message::Update {
             session,
             revision: 3,
-            input: <DataCodec as Codec<(u32,)>>::encode(&(3,)).unwrap(),
+            input: <DataCodec as Codec<(u32,)>>::encode(&(3,)).unwrap().into(),
         },
         wire::MAX_FRAME,
     )
@@ -409,7 +437,7 @@ async fn lost() {
                 .unwrap()
                 .unwrap()
                 .unwrap_err();
-            assert_eq!(error.outcome, CallError::OutcomeUnknown);
+            assert_eq!(error.0.outcome, CallError::OutcomeUnknown);
             assert_eq!(read(&actor).await.0, 1);
         }
 
@@ -467,7 +495,7 @@ async fn uncertain_retry() {
         .unwrap()
         .unwrap_err();
     assert_eq!(
-        (error.cause, error.outcome),
+        (error.0.cause, error.0.outcome),
         (Cause::Codec, CallError::OutcomeUnknown)
     );
 
@@ -597,7 +625,7 @@ async fn actor_shutdown() {
         .unwrap();
 
     let closing = actors.shutdown();
-    let handle = actor.new_handle();
+    let handle = actor.handle();
     timeout(Duration::from_secs(2), handle.wait_closing())
         .await
         .unwrap();
@@ -643,9 +671,9 @@ async fn shutdown() {
         tokio::pin!(closing);
 
         if overdue {
-            assert_eq!(closing.await.unwrap_err().cause, Cause::Timeout);
+            assert_eq!(closing.await.unwrap_err().0.cause, Cause::Timeout);
             assert_eq!(
-                results.next().await.unwrap().unwrap_err().outcome,
+                results.next().await.unwrap().unwrap_err().0.outcome,
                 CallError::OutcomeUnknown
             );
             release.notify_one();
@@ -687,7 +715,7 @@ async fn runtime() {
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert_eq!(error.cause, Cause::Closed);
+    assert_eq!(error.0.cause, Cause::Closed);
 
     drop(updates);
     server.shutdown().await.unwrap();
@@ -725,7 +753,7 @@ async fn rejected() {
     let overflow = connect::<State>(&socket).await.unwrap();
     let error = increment(&overflow, 100).await.unwrap_err();
     assert_eq!(
-        (error.cause, error.outcome),
+        (error.0.cause, error.0.outcome),
         (Cause::Closed, CallError::NotAdmitted)
     );
     updates.send(vec![2]);
@@ -735,7 +763,7 @@ async fn rejected() {
 
     updates.send(vec![0; 8192]);
     assert_eq!(
-        results.next().await.unwrap().unwrap_err().cause,
+        results.next().await.unwrap().unwrap_err().0.cause,
         Cause::Codec
     );
 

@@ -1,6 +1,7 @@
 use super::*;
-use crate::{AktorSetup, ShutdownReport, executor};
+use crate::{AktorSetup, AktorShutdownReport, executor};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 struct Reset;
 impl Drop for Reset {
@@ -16,7 +17,7 @@ fn interval_failure() {
         let _reset = Reset;
         let cleaned = Arc::new(AtomicUsize::new(0));
         let count = cleaned.clone();
-        let callback = Arc::new(Mutex::new(None::<ShutdownReport>));
+        let callback = Arc::new(Mutex::new(None::<AktorShutdownReport>));
         let report = callback.clone();
 
         executor::FAIL_SPAWN.with(|setting| setting.set(Some("aktor interval")));
@@ -24,14 +25,13 @@ fn interval_failure() {
 
         let startup = aktor_start(AktorSetup {
             actors: AktorNew {
-                name: AktorName::new("interval owner"),
-                role: AktorNoRole,
+                name: "interval owner".into(),
                 kind: kind::StdThread,
-                closures: AktorClosures {
-                    start: async || Ok(()),
-                    end: async move |()| {
-                        count.fetch_add(1, Ordering::SeqCst);
-                    },
+                start: async || aktor_ready(()),
+                end: async move |()| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                },
+                hooks: AktorHooks {
                     intervals: (0..=earlier)
                         .map(|_| AktorInterval {
                             every: Duration::from_secs(3600),
@@ -41,22 +41,18 @@ fn interval_failure() {
                     before_each: None,
                     after_each: None,
                 },
-                options: Default::default(),
+                capacity: 32,
+                stuck: crate::AktorStuck::Kill,
             },
             shutdown: move |finished| *report.lock() = Some(finished),
-            options: Default::default(),
+            grace: Duration::from_secs(5),
         });
         let completion = startup.completion.clone();
 
         executor::block_on(async {
-            let error = startup.await.err().unwrap();
+            let (_, error_report) = startup.await.err().unwrap();
 
-            assert!(
-                error
-                    .diagnostics
-                    .report
-                    .contains("injected scheduling failure")
-            );
+            assert!(error_report.contains("injected scheduling failure"));
             assert_eq!(cleaned.load(Ordering::SeqCst), 1);
 
             let completed = completion.wait().await;
@@ -64,7 +60,7 @@ fn interval_failure() {
 
             for report in [&completed, callback.as_ref().unwrap()] {
                 assert!(report.failed(), "interval launch failure looked successful");
-                assert!(!report.timed_out);
+                assert!(!report.ran_past_grace);
 
                 assert_eq!(
                     report

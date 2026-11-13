@@ -23,5 +23,8 @@ embassy-executor = { workspace = true, features = ["platform-cortex-m", "executo
 [dev-dependencies]
 futures-util = { workspace = true, features = ["alloc", "async-await", "std"] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1.1", default-features = false, features = ["process"] }
+
 [lints]
 workspace = true

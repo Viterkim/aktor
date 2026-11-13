@@ -4,7 +4,6 @@ use aktor::{
     operation::Operation,
     *,
 };
-use er::ErPresentationExt;
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::{cell::Cell, rc::Rc, time::Duration};
@@ -137,18 +136,20 @@ pub async fn start_legacy_setup_worker() -> Result<(), JsValue> {
         after: 0,
         interval: false,
     })
-    .map_err(error)?
+    .map_err(|(_, report)| error(report))?
     .wait()
     .await
-    .map_err(error)
+    .map_err(|(_, report)| error(report))
 }
 
+#[derive(er::Er, Serialize, Deserialize)]
+struct SetupErr {
+    count: u32,
+}
 #[derive(er::Er)]
-
-struct SetupErr;
-#[derive(er::Er)]
-
-struct CloseErr;
+struct CloseErr {
+    count: u32,
+}
 
 #[wasm_bindgen]
 pub async fn start_setup_worker(build: String) -> Result<(), JsValue> {
@@ -161,11 +162,16 @@ pub async fn start_setup_worker(build: String) -> Result<(), JsValue> {
         |config: Config| {
             note_setup();
             let start = async move || {
+                if config.setup_delay != 0 {
+                    crate::group::note_configured();
+                }
+
                 gloo_timers::future::TimeoutFuture::new(config.setup_delay).await;
 
                 if config.fail_start {
-                    let tree = er::ErTree::new(SetupErr, [] as [std::io::Error; 0]);
-                    return Err(tree).er_into(|report| report);
+                    return Err(er::er_new!(SetupErr {
+                        count: config.initial
+                    }));
                 }
 
                 Ok(Counter {
@@ -175,45 +181,51 @@ pub async fn start_setup_worker(build: String) -> Result<(), JsValue> {
                     interval: false,
                 })
             };
-            AktorClosures {
+            AktorServe {
                 start,
                 end: move |counter: Counter| {
                     note_end();
 
                     if counter.before != counter.after || config.fail_end {
-                        let tree = er::ErTree::new(CloseErr, [] as [std::io::Error; 0]);
-                        return Err(tree).er_into(|report| report);
+                        return Err(er::er_new!(
+                            CloseErr {
+                                count: counter.value.get()
+                            },
+                            [std::fmt::Error]
+                        ));
                     }
 
                     Ok(())
                 },
-                intervals: vec![AktorInterval {
-                    every: Duration::from_millis(5),
-                    run: (async |counter: &mut Counter| {
-                        counter.interval = true;
-                    })
-                    .into(),
-                }],
-                before_each: Some(
-                    (|counter: &mut Counter, _: operation::Operation| {
-                        counter.before += 1;
-                    })
-                    .into(),
-                ),
-                after_each: Some(
-                    (|counter: &mut Counter, _: operation::Operation| {
-                        counter.after += 1;
-                    })
-                    .into(),
-                ),
+                hooks: AktorHooks {
+                    intervals: vec![AktorInterval {
+                        every: Duration::from_millis(5),
+                        run: (async |counter: &mut Counter| {
+                            counter.interval = true;
+                        })
+                        .into(),
+                    }],
+                    before_each: Some(
+                        (|counter: &mut Counter, _: operation::Operation| {
+                            counter.before += 1;
+                        })
+                        .into(),
+                    ),
+                    after_each: Some(
+                        (|counter: &mut Counter, _: operation::Operation| {
+                            counter.after += 1;
+                        })
+                        .into(),
+                    ),
+                },
             }
         },
     )
     .await
-    .map_err(error)?
+    .map_err(|(_, report)| error(report))?
     .wait()
     .await
-    .map_err(error)
+    .map_err(|(_, report)| error(report))
 }
 
 #[wasm_bindgen]
@@ -239,8 +251,8 @@ pub async fn remote_preflight_check(program: String) -> Result<bool, JsValue> {
         }
 
         if mode == 3 {
-            let client =
-                worker::Worker::<u32>::with_config(&program, options, &config).map_err(error)?;
+            let client = worker::Worker::<u32>::with_config(&program, options, &config)
+                .map_err(|(_, report)| error(report))?;
 
             if client.ready().await.is_ok() {
                 return Err(error(format!(
@@ -254,7 +266,7 @@ pub async fn remote_preflight_check(program: String) -> Result<bool, JsValue> {
             }
         } else {
             let client = worker::Worker::<Counter>::with_config(&program, options, &config)
-                .map_err(error)?;
+                .map_err(|(_, report)| error(report))?;
 
             if client.ready().await.is_ok() {
                 return Err(error("mismatched worker passed preflight"));
@@ -270,11 +282,15 @@ pub async fn remote_preflight_check(program: String) -> Result<bool, JsValue> {
         },
         &config,
     )
-    .map_err(error)?;
+    .map_err(|(_, report)| error(report))?;
 
-    client.ready().await.map_err(error)?;
+    client.ready().await.map_err(|(_, report)| error(report))?;
     assert_eq!(add(&client, 1).await, Ok(8));
-    client.shutdown().report().await.map_err(error)?;
+    client
+        .shutdown()
+        .report()
+        .await
+        .map_err(|(_, report)| error(report))?;
     Ok(true)
 }
 
@@ -282,24 +298,24 @@ fn error(error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("{error:#}"))
 }
 
-fn setup(program: &str, config: Config) -> AktorWorkerNew<Counter, Config> {
+fn setup(program: &str, config: Config) -> AktorWorkerNew<Counter, Config, SetupErr> {
     AktorWorkerNew {
-        name: AktorName::new("remote counter"),
-        role: AktorNoRole,
-        kind: AktorKind::BrowserWebWorker(program),
+        name: "remote counter".into(),
+        kind: AktorKind::BrowserWebWorker::new(program),
         config,
         options: Default::default(),
+        stuck: AktorStuck::Kill,
     }
 }
 
 #[wasm_bindgen]
 pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     let mut group = AktorGroup::new();
-    let completed = group.start().map_err(error)?;
+    let completed = group.start().map_err(|(_, report)| error(report))?;
     let handles = aktor_start_in(
         &group,
-        aktor_setups! {
-            first: setup(
+        (
+            setup(
                 &program,
                 Config {
                     initial: 17,
@@ -308,7 +324,7 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
                     setup_delay: 0,
                 },
             ),
-            second: setup(
+            setup(
                 &program,
                 Config {
                     initial: 23,
@@ -317,14 +333,14 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
                     setup_delay: 0,
                 },
             ),
-        },
+        ),
     )
     .await
-    .map_err(error)?;
+    .map_err(|(_, report)| error(report))?;
 
     assert!(!group.killswitch().is_stopping());
-    assert_eq!(add(&handles.first, 3).await, Ok(20));
-    assert_eq!(add(&handles.second, 4).await, Ok(27));
+    assert_eq!(add(&handles.0, 3).await, Ok(20));
+    assert_eq!(add(&handles.1, 4).await, Ok(27));
 
     let report = group.shutdown().await;
 
@@ -343,18 +359,16 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
             },
         ),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await
-    .map_err(error)?;
+    .map_err(|(_, report)| error(report))?;
     terminated.handles.terminate();
     let report = terminated.completion().wait().await;
 
     assert!(!report.startup);
 
-    if !report.failed() || report.timed_out || report.actors[0].timed_out {
+    if !report.failed() || report.ran_past_grace || report.actors[0].ran_past_grace {
         return Err(error(format!(
             "explicit termination was marked as a timeout: {report}"
         )));
@@ -375,10 +389,10 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
                         },
                     ),
                     shutdown: |_| {},
-                    options: AktorOptions::default(),
+                    grace: Duration::from_secs(5),
                 })
                 .await
-                .map_err(error)?;
+                .map_err(|(_, report)| error(report))?;
                 let mut running = wait(&rejected.handles, 20).send().await;
                 let mut queued = add(&rejected.handles, 3).send().await;
                 let input = if remote {
@@ -391,20 +405,21 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
                 };
                 let request = async {
                     if latest {
-                        let (sender, mut output) = <&worker::Worker<Counter> as Session<
-                            Counter,
-                            RejectedInput,
-                            u32,
-                            (),
-                            SerdeCodec,
-                        >>::session(
-                            &rejected.handles,
-                            Operation {
-                                name: add::NAME,
-                                caller: std::panic::Location::caller(),
-                            },
-                            async |_: &mut Counter, _: RejectedInput| 0,
-                        );
+                        let (sender, mut output) =
+                            <&worker::Worker<Counter, (), SetupErr> as Session<
+                                Counter,
+                                RejectedInput,
+                                u32,
+                                (),
+                                SerdeCodec,
+                            >>::session(
+                                &rejected.handles,
+                                Operation {
+                                    name: add::NAME,
+                                    caller: std::panic::Location::caller(),
+                                },
+                                async |_: &mut Counter, _: RejectedInput| 0,
+                            );
 
                         sender.send(RejectedInput(remote));
                         output.next().await;
@@ -435,7 +450,7 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
                 assert_eq!(report.to_string().matches(&failure.message).count(), 1);
                 assert_eq!(running.try_take(), Some(1));
                 assert_eq!(queued.try_take(), Some(Ok(4)));
-                assert!(!report.timed_out);
+                assert!(!report.ran_past_grace);
                 assert_eq!(report.actors[0].diagnostics.len(), usize::from(fail_end));
 
                 if fail_end {
@@ -456,12 +471,10 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
             },
         ),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_millis(300),
-        },
+        grace: Duration::from_millis(300),
     })
     .await
-    .map_err(error)?;
+    .map_err(|(_, report)| error(report))?;
 
     if add(&actors.handles, 3).await != Ok(5) || add(&actors.handles, 0).await != Err(false) {
         return Err(error("remote calls changed their domain results"));
@@ -596,7 +609,7 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     let report = actors.shutdown().await;
 
     if report.failed()
-        || report.actors[0].kind != Some(AktorExecution::BrowserWebWorker)
+        || report.actors[0].kind != AktorExecution::BrowserWebWorker
         || output.next().await != Some(Ok(10))
         || output.next().await.is_some()
     {
@@ -616,14 +629,13 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
             },
         ),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_millis(300),
-        },
+        grace: Duration::from_millis(300),
     })
     .await
-    .map_err(error)?;
+    .map_err(|(_, report)| error(report))?;
 
     let completion = actors.completion();
+    let worker = actors.handles.completion();
     let (input, mut output) = add::latest(&actors.handles);
 
     input.send(3);
@@ -644,6 +656,11 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
     {
         return Err(error("remote cleanup report was lost"));
     }
+    let worker::Retirement::Confirmed(Err((failure, text))) = worker.wait().await else {
+        return Err(error("worker cleanup did not complete"));
+    };
+    assert!(failure.data.is_none());
+    assert!(text.contains(&std::fmt::Error.to_string()));
     assert_eq!(report.to_string().matches("CloseErr").count(), 1);
 
     let failed = aktor_start(AktorSetup {
@@ -668,19 +685,27 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
             ),
         ),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_millis(300),
-        },
+        grace: Duration::from_millis(300),
     })
     .await
     .err()
     .ok_or_else(|| error("remote setup failure was lost"))?;
 
+    if !matches!(
+        failed.0.init,
+        AktorInitOutcome::Failed(AktorBranch::Second(SetupErr { count: 0 }))
+    ) {
+        return Err(error("the second worker's startup error was lost"));
+    }
+
+    assert_eq!(failed.1.matches("SetupErr").count(), 1);
+
     let report = failed
+        .0
         .report
         .ok_or_else(|| error("remote rollback report was lost"))?;
 
-    if report.timed_out
+    if report.ran_past_grace
         || !report.to_string().contains("SetupErr")
         || !report.to_string().contains("CloseErr")
     {
@@ -700,15 +725,55 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
             },
         ),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_millis(300),
-        },
+        grace: Duration::from_millis(300),
     })
     .await
     .is_ok()
     {
         return Err(error(
             "configuration was silently ignored by a legacy worker",
+        ));
+    }
+
+    Ok(true)
+}
+
+#[wasm_bindgen]
+pub async fn remote_cancel_check(program: String) -> Result<bool, JsValue> {
+    let mut startup = Box::pin(aktor_start(AktorSetup {
+        actors: setup(
+            &program,
+            Config {
+                initial: 0,
+                fail_start: false,
+                fail_end: false,
+                setup_delay: 10_000,
+            },
+        ),
+        shutdown: |_| {},
+        grace: Duration::from_millis(300),
+    }));
+
+    let completion = startup.completion();
+
+    if startup.as_mut().now_or_never().is_some() {
+        return Err(error("remote setup finished before its delay"));
+    }
+
+    let kill = startup.killswitch();
+
+    kill.stop();
+
+    let (failed, _) = startup
+        .await
+        .err()
+        .ok_or_else(|| error("stopping remote startup returned a handle"))?;
+
+    let report = completion.wait().await;
+
+    if !matches!(failed.init, AktorInitOutcome::NotRun) || report.ran_past_grace {
+        return Err(error(
+            "stopping before configuration should skip initialization",
         ));
     }
 
@@ -723,58 +788,18 @@ pub async fn remote_setup_check(program: String) -> Result<bool, JsValue> {
             },
         ),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_millis(300),
-        },
-    }));
-
-    let completion = startup.completion();
-
-    if startup.as_mut().now_or_never().is_some() {
-        return Err(error("remote setup finished before its delay"));
-    }
-
-    let kill = startup.killswitch();
-
-    kill.stop();
-
-    if startup.await.is_ok() {
-        return Err(error("stopping remote startup returned a handle"));
-    }
-
-    let report = completion.wait().await;
-
-    if !report.timed_out
-        || !report.actors[0].timed_out
-        || report.actors[0].kind != Some(AktorExecution::BrowserWebWorker)
-    {
-        return Err(error("stopping remote startup lost its cleanup report"));
-    }
-
-    let mut startup = Box::pin(aktor_start(AktorSetup {
-        actors: setup(
-            &program,
-            Config {
-                initial: 0,
-                fail_start: false,
-                fail_end: false,
-                setup_delay: 10_000,
-            },
-        ),
-        shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_millis(300),
-        },
+        grace: Duration::from_millis(300),
     }));
 
     let completion = startup.completion();
 
     assert!(startup.as_mut().now_or_never().is_none());
+    wasm_bindgen_futures::JsFuture::from(crate::group::configured()).await?;
     drop(startup);
 
     let report = completion.wait().await;
 
-    Ok(report.timed_out
-        && report.actors[0].timed_out
-        && report.actors[0].kind == Some(AktorExecution::BrowserWebWorker))
+    Ok(report.ran_past_grace
+        && report.actors[0].ran_past_grace
+        && report.actors[0].kind == AktorExecution::BrowserWebWorker)
 }

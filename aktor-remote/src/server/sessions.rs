@@ -1,13 +1,18 @@
-use crate::{CallError, Cause, Error};
+use crate::{CallError, Cause, Failure};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, Weak},
 };
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, watch};
 
 #[derive(Default)]
 pub struct Sessions {
-    entries: Mutex<HashMap<[u8; 16], Weak<AsyncMutex<Generation>>>>,
+    entries: Mutex<HashMap<[u8; 16], Weak<Session>>>,
+}
+
+struct Session {
+    generation: AsyncMutex<Generation>,
+    _slot: OwnedSemaphorePermit,
 }
 
 struct Generation {
@@ -19,7 +24,7 @@ struct Generation {
 pub struct Claim {
     pub session: [u8; 16],
     pub cancel: watch::Receiver<bool>,
-    _record: Arc<AsyncMutex<Generation>>,
+    _record: Arc<Session>,
     _life: watch::Sender<()>,
 }
 
@@ -28,7 +33,8 @@ impl Sessions {
         &self,
         identity: Option<[u8; 16]>,
         number: u64,
-    ) -> Result<Option<Claim>, Error> {
+        slot: &mut Option<OwnedSemaphorePermit>,
+    ) -> Result<Option<Claim>, Failure> {
         let (identity, record) = {
             let mut entries = self
                 .entries
@@ -44,23 +50,34 @@ impl Sessions {
                     (identity, record)
                 }
                 None => {
+                    let Some(slot) = slot.take() else {
+                        return Err(Failure::new(
+                            CallError::NotAdmitted,
+                            Cause::Closed,
+                            "remote connection limit reached",
+                        ));
+                    };
                     let mut identity = [0; 16];
                     getrandom::fill(&mut identity).map_err(|error| {
-                        Error::new(CallError::NotAdmitted, Cause::Closed, error.to_string())
+                        Failure::new(CallError::NotAdmitted, Cause::Closed, error.to_string())
                     })?;
-                    let record = Arc::new(AsyncMutex::new(Generation {
-                        number: 0,
-                        cancel: watch::channel(false).0,
-                        finished: watch::channel(()).1,
-                    }));
+                    let record = Arc::new(Session {
+                        generation: AsyncMutex::new(Generation {
+                            number: 0,
+                            cancel: watch::channel(false).0,
+                            finished: watch::channel(()).1,
+                        }),
+                        _slot: slot,
+                    });
                     entries.insert(identity, Arc::downgrade(&record));
                     (identity, record)
                 }
             }
         };
-        let mut generation = record.lock().await;
+        drop(slot.take());
+        let mut generation = record.generation.lock().await;
         if number <= generation.number {
-            return Err(Error::new(
+            return Err(Failure::new(
                 CallError::NotAdmitted,
                 Cause::Protocol,
                 "latest connection generation did not advance",
@@ -95,10 +112,41 @@ mod tests {
     #[tokio::test]
     async fn retired() {
         let sessions = Sessions::default();
-        let claim = sessions.claim(None, 1).await.unwrap().unwrap();
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut slot = Some(capacity.clone().try_acquire_owned().unwrap());
+        let claim = sessions.claim(None, 1, &mut slot).await.unwrap().unwrap();
         let session = claim.session;
         drop(claim);
 
-        assert!(sessions.claim(Some(session), 2).await.unwrap().is_none());
+        assert!(
+            sessions
+                .claim(Some(session), 2, &mut None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_keeps_capacity_reserved() {
+        let sessions = Sessions::default();
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut slot = Some(capacity.clone().try_acquire_owned().unwrap());
+        let mut first = sessions.claim(None, 1, &mut slot).await.unwrap().unwrap();
+        let mut next_slot = None;
+        let replacement = sessions.claim(Some(first.session), 2, &mut next_slot);
+        tokio::pin!(replacement);
+        tokio::select! {
+            biased;
+            _ = &mut replacement => panic!("replacement took over before retirement"),
+            cancelled = first.cancel.changed() => cancelled.unwrap(),
+        }
+
+        drop(first);
+        assert_eq!(capacity.available_permits(), 0);
+        let replacement = replacement.await.unwrap().unwrap();
+        assert_eq!(capacity.available_permits(), 0);
+        drop(replacement);
+        assert_eq!(capacity.available_permits(), 1);
     }
 }

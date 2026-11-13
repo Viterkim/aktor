@@ -26,3 +26,5 @@ embassy-time-driver.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 embassy-time = { workspace = true, features = ["std", "generic-queue-8"] }
+
+[lints]

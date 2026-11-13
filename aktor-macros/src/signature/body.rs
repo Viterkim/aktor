@@ -2,7 +2,7 @@ use super::*;
 use crate::input::Function;
 use crate::names::Names;
 use quote::quote;
-use syn::{FnArg, GenericParam};
+use syn::{FnArg, GenericParam, visit::Visit};
 
 pub fn implementation(
     function: &Function,
@@ -43,7 +43,6 @@ pub fn implementation(
             quote!(#ident)
         })
         .collect();
-
     arguments.extend(added.iter().map(|_| quote!(_)));
 
     let state_borrow = signature.inputs.first().and_then(|input| match input {
@@ -96,4 +95,55 @@ pub fn implementation(
     };
 
     Ok((implementation, invoke))
+}
+
+pub fn direct(
+    mut signature: syn::Signature,
+    names: &Names,
+    invoke: &TokenStream,
+    attributes: &[syn::Attribute],
+    scope: &mut super::scope::NestedModule,
+) -> TokenStream {
+    signature.ident = parse_quote!(direct);
+    StaticOutput.visit_return_type_mut(&mut signature.output);
+
+    let mut anonymous_inputs = HasImplTrait(false);
+    for argument in &signature.inputs {
+        anonymous_inputs.visit_fn_arg(argument);
+    }
+    if anonymous_inputs.0 {
+        // The helper names these inputs. The public wrapper keeps `impl Trait` and returns a 'static value.
+        DispatchOutput.visit_return_type_mut(&mut signature.output);
+    }
+
+    let mut bindings = Vec::new();
+    let generated = std::iter::once(&names.state).chain(&names.arguments);
+
+    for (argument, fallback) in signature.inputs.iter_mut().zip(generated) {
+        if let FnArg::Typed(argument) = argument {
+            let mut binding = fallback;
+
+            if let syn::Pat::Ident(pattern) = &*argument.pat {
+                let name = pattern.ident.to_string();
+                if !scope.shadowed.contains(&name.trim_start_matches("r#")) {
+                    binding = &pattern.ident;
+                }
+            }
+
+            let binding = binding.clone();
+            argument.pat = parse_quote!(#binding);
+            bindings.push(binding);
+        }
+    }
+
+    scope.visit_signature_mut(&mut signature);
+
+    quote! {
+        /// Run the function directly on borrowed state.
+        #(#attributes)*
+        #[allow(clippy::extra_unused_lifetimes)]
+        pub #signature {
+            #invoke(#(#bindings),*).await
+        }
+    }
 }

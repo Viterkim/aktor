@@ -1,5 +1,5 @@
-use crate::{Timeout, timeout::WaitStatus};
-use core::time::Duration;
+use crate::{AktorTimeout, timeout::WaitStatus};
+use core::{future::Future, time::Duration};
 
 pub async fn yield_owner() {
     #[cfg(target_family = "wasm")]
@@ -32,7 +32,7 @@ pub enum TaskClock {
     Browser,
 }
 impl TaskClock {
-    pub async fn wait_for_force(self, kill: &crate::KillSwitch) {
+    pub async fn wait_for_force(self, kill: &crate::AktorKillSwitch) {
         #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
         if matches!(self, Self::Std) {
             kill.wait_for_force_on(true).await;
@@ -44,19 +44,33 @@ impl TaskClock {
         kill.wait_for_force().await;
     }
 
+    pub async fn end_within<F: Future>(
+        self,
+        kill: &crate::AktorKillSwitch,
+        end: F,
+    ) -> Option<F::Output> {
+        #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+        if matches!(self, Self::Std) {
+            return kill.end_within(end, true).await;
+        }
+
+        let _ = self;
+        kill.end_within(end, false).await
+    }
+
     pub fn timeout<F>(
         self,
         future: F,
         duration: Duration,
         status: fn(&F) -> WaitStatus,
-    ) -> Timeout<F> {
+    ) -> AktorTimeout<F> {
         match self {
             #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
-            Self::Tokio => Timeout::native(future, duration, status),
+            Self::Tokio => AktorTimeout::native(future, duration, status),
             #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
-            Self::Std => Timeout::standard(future, duration, status),
+            Self::Std => AktorTimeout::standard(future, duration, status),
             #[cfg(target_family = "wasm")]
-            Self::Browser => Timeout::browser(future, duration, status),
+            Self::Browser => AktorTimeout::browser(future, duration, status),
         }
     }
 

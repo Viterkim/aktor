@@ -1,55 +1,62 @@
 use super::*;
-use crate::AktorError;
+use crate::{AktorCleanupOutput, AktorError};
 
-impl ShutdownDependency {
-    pub fn new(joining: Option<LocalFuture<'static, Result<(), AktorError>>>) -> Self {
-        let initial = joining.is_none().then_some(Ok(()));
-        let (finished, _) = watch::channel(initial);
+/// Wait for the page's external work before stopping the worker, even if startup was cancelled.
+/// Return once the work has stopped. An error from the join lets shutdown continue too.
+pub fn join<Output: AktorCleanupOutput<Mode>, Mode>(
+    joining: impl Future<Output = Output> + 'static,
+) -> WorkerJoin {
+    let (finished, receipt) = watch::channel(None);
+    let joining = Box::pin(async move {
+        let result = joining.await.into_cleanup();
+        finished.send_replace(Some(result.clone()));
+        result
+    });
 
-        Self { joining, finished }
+    WorkerJoin {
+        joining: Some(joining),
+        receipt,
+    }
+}
+
+pub(super) fn reported<Output: AktorCleanupOutput<Mode>, Mode>(
+    joining: impl Future<Output = Output> + 'static,
+) -> LocalFuture<'static, Result<(), AktorError>> {
+    Box::pin(async move { joining.await.into_cleanup() })
+}
+
+impl WorkerJoin {
+    pub(crate) fn completion(&self) -> watch::Receiver<Option<Result<(), AktorError>>> {
+        self.receipt.clone()
     }
 
-    pub fn completion(&self) -> watch::Receiver<Option<Result<(), AktorError>>> {
-        self.finished.subscribe()
-    }
-
-    pub fn attach<S: 'static, Role: 'static, E: 'static>(
-        self,
+    pub(crate) fn attach<S: 'static, Role: 'static, E: 'static>(
+        mut self,
         worker: Worker<S, Role, E>,
-    ) -> Result<Worker<S, Role, E>, WorkerError> {
-        if self.joining.is_none() {
-            return Ok(worker);
-        }
-
-        worker.before_shutdown(self.wait())
-    }
-
-    async fn wait(self) -> Result<(), AktorError> {
-        let mut result = self.completion();
-        drop(self);
-
-        loop {
-            if let Some(result) = result.borrow_and_update().clone() {
-                return result;
-            }
-
-            result.changed().await.map_err(|_| {
-                AktorError::new("external shutdown join stopped without a receipt", ())
-            })?;
+    ) -> Result<Worker<S, Role, E>, WorkerFailure> {
+        match self.joining.take() {
+            Some(joining) => worker.attach_shutdown(joining),
+            None => Ok(worker),
         }
     }
 }
-impl Drop for ShutdownDependency {
+impl Default for WorkerJoin {
+    fn default() -> Self {
+        Self {
+            joining: None,
+            receipt: watch::channel(Some(Ok(()))).1,
+        }
+    }
+}
+impl Drop for WorkerJoin {
     fn drop(&mut self) {
         let Some(joining) = self.joining.take() else {
             return;
         };
-        let finished = self.finished.clone();
 
         // Construction can fail before a worker exists to own this join.
         wasm_bindgen_futures::spawn_local(async move {
-            let result = joining.await;
-            finished.send_replace(Some(result));
+            let _result = joining.await;
         });
     }
 }

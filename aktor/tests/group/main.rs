@@ -4,11 +4,11 @@ mod ownership;
 mod startup;
 mod watchdog;
 use aktor::{
-    AktorArgs, AktorCleanupError, AktorError, AktorGroup,
+    AktorArgs, AktorGroup, AktorShutdownPolicy,
     message::{call, call_async},
+    owner::{AktorStartInvalid, AktorStartKind},
 };
 use er::*;
-use futures_util::FutureExt;
 use std::{
     io,
     sync::{
@@ -28,146 +28,140 @@ struct FlushErr;
 
 #[tokio::test]
 async fn cleanup_timeout() {
-    let result = AktorGroup::new()
-        .run(
-            async |app| {
-                let actor = app
-                    .spawn(AktorArgs {
-                        name: "typed cleanup".into(),
-                        capacity: 1,
-                        setup: || Ok::<_, AktorError>(0usize),
-                        cleanup: |_| {
-                            Err(AktorError {
-                                diagnostics: "could not flush".into(),
-                                data: (),
-                            })
-                        },
-                    })
-                    .await
-                    .unwrap();
+    let mut group = AktorGroup::new();
+    let completed = group.start_with(async |_| Ok::<_, String>(())).unwrap();
+    let killswitch = group.killswitch();
+    let app = &mut group;
 
-                let started = Arc::new(Notify::new());
-                let release = Arc::new(Notify::new());
-                let inside = started.clone();
-                let finish = release.clone();
-                let mut running = call_async(
-                    &actor.handle,
-                    async move |state, ()| {
-                        inside.notify_one();
-                        finish.notified().await;
-                        *state += 1;
-                        *state
-                    },
-                    (),
-                )
-                .send()
-                .await;
+    killswitch
+        .run(async {
+            let actor = app
+                .spawn_args(AktorArgs {
+                    name: "typed cleanup".into(),
+                    capacity: 1,
+                    setup: || Ok::<_, String>(0usize),
+                    cleanup: |_| Err(String::from("could not flush")),
+                })
+                .await
+                .unwrap();
 
-                started.notified().await;
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let inside = started.clone();
+            let finish = release.clone();
+            let mut running = call_async(
+                &actor.handle,
+                async move |state, ()| {
+                    inside.notify_one();
+                    finish.notified().await;
+                    *state += 1;
+                    *state
+                },
+                (),
+            )
+            .send()
+            .await;
 
-                let timeout = running.timeout(Duration::from_millis(5)).await.unwrap_err();
+            started.notified().await;
 
-                assert!(timeout.admitted);
+            let timeout = running.timeout(Duration::from_millis(5)).await.unwrap_err();
 
-                let queued = call(&actor.handle, |state, ()| *state, ()).send().await;
-                let timeout = call(&actor.handle, |state, ()| *state += 100, ())
-                    .timeout(Duration::from_millis(5))
-                    .await
-                    .unwrap_err();
+            assert!(timeout.admitted);
 
-                assert!(!timeout.admitted);
+            let queued = call(&actor.handle, |state, ()| *state, ()).send().await;
+            let timeout = call(&actor.handle, |state, ()| *state += 100, ())
+                .timeout(Duration::from_millis(5))
+                .await
+                .unwrap_err();
 
-                release.notify_one();
-                assert_eq!(running.await, 1);
-                assert_eq!(queued.await, 1);
+            assert!(!timeout.admitted);
 
-                let completion = actor.shutdown();
+            release.notify_one();
+            assert_eq!(running.await, 1);
+            assert_eq!(queued.await, 1);
 
-                assert!(call(&actor.handle, |_, ()| (), ()).now_or_never().is_none());
+            let completion = actor.shutdown();
+            let (error, report) = (&completion).await.unwrap_err();
+            let aktor::owner::OwnerError::Cleanup(errors) = &*error else {
+                panic!("cleanup error was lost");
+            };
 
-                let error = (&completion).await.unwrap_err();
-                let aktor::owner::OwnerFailure::Cleanup(errors) = &error.error else {
-                    panic!("cleanup error was lost");
-                };
+            assert_eq!(errors.errors[0].diagnostics, "could not flush");
+            assert_eq!(completion.await.unwrap_err().1, report);
+        })
+        .await;
+    killswitch.stop();
 
-                assert_eq!(errors.errors[0].diagnostics, "could not flush");
-                assert_eq!(completion.await.unwrap_err().to_string(), error.to_string());
-                Ok::<_, AktorError>(())
-            },
-            async |_| Ok::<_, AktorError>(()),
-        )
-        .await
-        .unwrap_err();
+    let result = completed.wait().await;
 
-    assert_eq!(
-        result.report.actors[0].diagnostics[0].diagnostics,
-        "could not flush"
-    );
+    assert_eq!(result.failure.unwrap().message, "could not flush");
 }
 
 #[tokio::test]
 async fn failure_report() {
-    let group = AktorGroup::with_grace(Duration::from_secs(1));
-    let finished = group.completion();
     let hooks = Arc::new(AtomicUsize::new(0));
     let hook_count = hooks.clone();
     let after = Arc::new(AtomicBool::new(false));
     let continued = after.clone();
-    let result = group
-        .run(
-            async |app| {
-                let db = app
-                    .spawn(AktorArgs {
-                        name: "settings".into(),
-                        capacity: 2,
-                        setup: || Ok::<_, AktorError>(0usize),
-                        cleanup: |_| {
-                            let tree = io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "backup folder is read only",
-                            )
-                            .er::<FlushErr>(());
+    let mut group = AktorGroup::with_grace(Duration::from_secs(1));
+    let completed = group
+        .start_with(async move |_| {
+            hook_count.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(())
+        })
+        .unwrap();
+    let killswitch = group.killswitch();
+    let app = &mut group;
 
-                            Err(tree).er_into(|report| report)
-                        },
-                    })
-                    .await
-                    .unwrap();
+    killswitch
+        .run(async {
+            let db = app
+                .spawn_args(AktorArgs {
+                    name: "settings".into(),
+                    capacity: 2,
+                    setup: || Ok::<_, String>(0usize),
+                    cleanup: |_| {
+                        let tree = io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "backup folder is read only",
+                        )
+                        .er::<FlushErr>(());
 
-                let value: Result<(), io::Error> = call(
-                    &db.handle,
-                    |_, ()| Err(io::Error::other("ordinary query error")),
-                    (),
-                )
-                .await;
+                        Err(tree.er_report())
+                    },
+                })
+                .await
+                .unwrap();
 
-                assert!(value.is_err());
-                call(&db.handle, |_, ()| -> () { panic!("database died") }, ()).await;
-                continued.store(true, Ordering::SeqCst);
-                Ok::<_, AktorError>(())
-            },
-            async move |_| {
-                hook_count.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, AktorError>(())
-            },
-        )
-        .await
-        .unwrap_err();
+            let value: Result<(), io::Error> = call(
+                &db.handle,
+                |_, ()| Err(io::Error::other("ordinary query error")),
+                (),
+            )
+            .await;
 
-    assert_eq!(result.report.failure.as_ref().unwrap().actor, "settings");
+            assert!(value.is_err());
+            call(&db.handle, |_, ()| -> () { panic!("database died") }, ()).await;
+            continued.store(true, Ordering::SeqCst);
+        })
+        .await;
+    killswitch.stop();
 
-    let report = result.report.actors[0].diagnostics[0].diagnostics.clone();
+    let result = completed.wait().await;
+
+    assert_eq!(result.failure.as_ref().unwrap().actor, "settings");
+
+    let report = result.actors[0].diagnostics[0].diagnostics.clone();
 
     assert!(report.contains("Flush the settings"));
     assert!(report.contains("backup folder is read only"));
     assert!(!after.load(Ordering::SeqCst));
     assert_eq!(hooks.load(Ordering::SeqCst), 1);
-    assert_eq!(finished.wait().await.to_string(), result.diagnostics.report);
 }
 
 #[tokio::test]
 async fn stop_failure() {
-    let group = AktorGroup::with_grace(Duration::from_secs(1));
+    let mut group = AktorGroup::with_grace(Duration::from_secs(1));
     let kill = group.killswitch();
     let entered = Arc::new(Notify::new());
     let proceed = Arc::new(Notify::new());
@@ -180,43 +174,44 @@ async fn stop_failure() {
         proceed.notify_one();
     });
 
-    let result = group
-        .run(
-            async |app| {
-                let db = app
-                    .spawn(AktorArgs {
-                        name: "late failure".into(),
-                        capacity: 1,
-                        setup: || Ok::<_, AktorError>(0usize),
-                        cleanup: |_| Ok::<_, AktorError>(()),
-                    })
-                    .await
-                    .unwrap();
+    let completed = group.start_with(async |_| Ok::<_, String>(())).unwrap();
+    let killswitch = group.killswitch();
+    let app = &mut group;
 
-                let reply = call_async(
-                    &db.handle,
-                    async move |_, ()| {
-                        task_entered.notify_one();
-                        task_proceed.notified().await;
-                        panic!("crashed after the killswitch");
-                    },
-                    (),
-                )
-                .send()
-                .await;
+    killswitch
+        .run(async {
+            let db = app
+                .spawn_args(AktorArgs {
+                    name: "late failure".into(),
+                    capacity: 1,
+                    setup: || Ok::<_, String>(0usize),
+                    cleanup: |_| Ok::<_, String>(()),
+                })
+                .await
+                .unwrap();
 
-                reply.await;
-                Ok::<_, AktorError>(())
-            },
-            async |_| Ok::<_, AktorError>(()),
-        )
-        .await
-        .unwrap_err();
+            let reply = call_async(
+                &db.handle,
+                async move |_, ()| {
+                    task_entered.notify_one();
+                    task_proceed.notified().await;
+                    panic!("crashed after the killswitch");
+                },
+                (),
+            )
+            .send()
+            .await;
+
+            reply.await;
+        })
+        .await;
+    killswitch.stop();
+
+    let result = completed.wait().await;
 
     trigger.await.unwrap();
     assert!(
         result
-            .report
             .failure
             .unwrap()
             .message
@@ -226,7 +221,7 @@ async fn stop_failure() {
 
 #[tokio::test]
 async fn deadline() {
-    let Ok(case) = std::env::var("AKTOR_CHILD") else {
+    let Ok(case) = std::env::var("AKTOR_TEST_CASE") else {
         for case in [
             "cleanup",
             "operation",
@@ -234,7 +229,7 @@ async fn deadline() {
             #[cfg(feature = "std_thread")]
             "standard cleanup",
         ] {
-            let output = support::child("deadline", case);
+            let output = support::run_test("deadline", case);
 
             assert!(
                 String::from_utf8_lossy(&output.stderr)
@@ -253,139 +248,81 @@ async fn deadline() {
         return;
     };
 
-    let group = AktorGroup::with_grace(Duration::from_secs(1));
+    let mut group =
+        AktorGroup::with_policy(Duration::from_secs(1), AktorShutdownPolicy::AbortProcess);
     let kill = group.killswitch();
     let cleaned = Arc::new(AtomicBool::new(false));
     let cleanup_started = cleaned.clone();
-    let result = group
-        .run(
-            async |app| {
-                let db = app
-                    .spawn_async_on(
-                        AktorArgs {
-                            name: "stalled actor".into(),
-                            capacity: 1,
-                            setup: async || Ok::<_, AktorError>(0usize),
-                            cleanup: move |_| {
-                                let cleanup_started = cleanup_started.clone();
+    let completed = group.start_with(async |_| Ok::<_, String>(())).unwrap();
+    let killswitch = group.killswitch();
+    let app = &mut group;
 
-                                async move {
-                                    cleanup_started.store(true, Ordering::SeqCst);
-                                    core::future::pending::<()>().await;
-                                    Ok::<_, AktorError>(())
-                                }
-                            },
+    killswitch
+        .run(async {
+            let db = app
+                .spawn_async_on(
+                    AktorArgs {
+                        name: "stalled actor".into(),
+                        capacity: 1,
+                        setup: async || Ok::<_, String>(0usize),
+                        cleanup: move |_| {
+                            let cleanup_started = cleanup_started.clone();
+
+                            async move {
+                                cleanup_started.store(true, Ordering::SeqCst);
+                                // Blocked in sync code, so its grace can't cut it.
+                                std::thread::sleep(Duration::from_secs(3600));
+                                Ok::<_, String>(())
+                            }
                         },
-                        Default::default(),
-                        case == "standard cleanup",
-                    )
-                    .await
-                    .unwrap();
+                    },
+                    Default::default(),
+                    case == "standard cleanup",
+                )
+                .await
+                .unwrap();
 
-                if case == "operation" {
-                    let entered = Arc::new(Notify::new());
-                    let inside = entered.clone();
-                    let reply = call_async(
-                        &db.handle,
-                        async move |_, ()| {
-                            inside.notify_one();
-                            core::future::pending::<()>().await;
-                        },
-                        (),
-                    )
-                    .send()
-                    .await;
+            if case == "operation" {
+                let entered = Arc::new(Notify::new());
+                let inside = entered.clone();
+                let reply = call_async(
+                    &db.handle,
+                    async move |_, ()| {
+                        inside.notify_one();
+                        core::future::pending::<()>().await;
+                    },
+                    (),
+                )
+                .send()
+                .await;
 
-                    entered.notified().await;
-                    kill.stop();
-                    reply.await;
-                } else if case == "failure" {
-                    call(&db.handle, |_, ()| panic!("failed before cleanup"), ()).await;
-                } else {
-                    kill.stop();
-                    core::future::pending::<()>().await;
-                }
+                entered.notified().await;
+                kill.stop();
+                reply.await;
+            } else if case == "failure" {
+                call(&db.handle, |_, ()| panic!("failed before cleanup"), ()).await;
+            } else {
+                kill.stop();
+                core::future::pending::<()>().await;
+            }
+        })
+        .await;
+    killswitch.stop();
 
-                Ok::<_, AktorError>(())
-            },
-            async |_| Ok::<_, AktorError>(()),
-        )
-        .await
-        .unwrap_err();
+    let result = completed.wait().await;
 
     assert_eq!(
-        result.report.actors[0].retirement,
-        aktor::RetirementStatus::Unconfirmed
+        result.actors[0].retirement,
+        aktor::AktorRetireStatus::Unconfirmed
     );
     assert!(cleaned.load(Ordering::SeqCst));
     if case == "failure" {
-        assert_eq!(result.report.failure.unwrap().actor, "stalled actor");
+        assert_eq!(result.failure.unwrap().actor, "stalled actor");
     }
 
     eprintln!("cleanup remains pending");
     std::thread::sleep(Duration::from_secs(2));
     panic!("shutdown watchdog left cleanup running");
-}
-
-#[tokio::test]
-async fn pause() {
-    let result = AktorGroup::new()
-        .run(
-            async |app| {
-                let database = app
-                    .spawn(AktorArgs {
-                        name: "paused database".into(),
-                        capacity: 1,
-                        setup: || Ok::<_, AktorError>(7usize),
-                        cleanup: |_| Ok::<_, AktorError>(()),
-                    })
-                    .await
-                    .unwrap();
-
-                database.control.pause().await.unwrap();
-
-                let request = call(&database.handle, |value, ()| *value, ());
-
-                tokio::pin!(request);
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(20), &mut request)
-                        .await
-                        .is_err()
-                );
-                database
-                    .control
-                    .resume(|| {
-                        Err(AktorError {
-                            diagnostics: "opening failed".into(),
-                            data: (),
-                        })
-                    })
-                    .await
-                    .unwrap_err();
-
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(20), &mut request)
-                        .await
-                        .is_err()
-                );
-                database
-                    .control
-                    .resume(|| Ok::<_, AktorError>(19usize))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    tokio::time::timeout(Duration::from_secs(1), &mut request)
-                        .await
-                        .unwrap(),
-                    19
-                );
-                Ok::<_, AktorError>(())
-            },
-            async |_| Ok::<_, AktorError>(()),
-        )
-        .await;
-
-    assert!(result.is_ok());
 }
 
 struct HoldWake {
@@ -423,7 +360,7 @@ async fn latest_failure() {
         task::{Context, Waker},
     };
 
-    let group = AktorGroup::new();
+    let mut group = AktorGroup::new();
     let kill = group.killswitch();
     let wake = Arc::new(HoldWake {
         entered: Notify::new(),
@@ -432,65 +369,66 @@ async fn latest_failure() {
     });
 
     let resume = ResumeWake(wake.clone());
-    let result = group
-        .run(
-            async move |app| -> Result<(), AktorError> {
-                let owner = app
-                    .spawn(AktorArgs {
-                        name: "latest search".into(),
-                        capacity: 1,
-                        setup: || Ok::<_, AktorError>(0u32),
-                        cleanup: |_| Ok::<_, AktorError>(()),
-                    })
-                    .await
-                    .unwrap();
+    let completed = group.start_with(async |_| Ok::<_, String>(())).unwrap();
+    let killswitch = group.killswitch();
+    let app = &mut group;
 
-                let release = Arc::new(Notify::new());
-                let inside = release.clone();
-                let (sender, mut results) = (&owner.handle).session(
-                    aktor::operation::Operation {
-                        name: "failing search",
-                        caller: std::panic::Location::caller(),
-                    },
-                    async move |_: &mut u32, ()| {
-                        inside.notified().await;
-                        panic!("search handler exploded");
-                    },
-                );
+    killswitch
+        .run(async move {
+            let owner = app
+                .spawn_args(AktorArgs {
+                    name: "latest search".into(),
+                    capacity: 1,
+                    setup: || Ok::<_, String>(0u32),
+                    cleanup: |_| Ok::<_, String>(()),
+                })
+                .await
+                .unwrap();
 
-                sender.send(());
+            let release = Arc::new(Notify::new());
+            let inside = release.clone();
+            let (sender, mut results) = (&owner.handle).session(
+                aktor::operation::Operation {
+                    name: "failing search",
+                    caller: std::panic::Location::caller(),
+                },
+                async move |_: &mut u32, ()| {
+                    inside.notified().await;
+                    panic!("search handler exploded");
+                },
+            );
 
-                let waker = Waker::from(wake.clone());
-                let next = results.next();
+            sender.send(());
 
-                tokio::pin!(next);
-                assert!(
-                    next.as_mut()
-                        .poll(&mut Context::from_waker(&waker))
-                        .is_pending()
-                );
-                release.notify_one();
-                wake.entered.notified().await;
+            let waker = Waker::from(wake.clone());
+            let next = results.next();
 
-                // The actor is held in close(), before its panic collector can run.
-                assert!(
-                    next.as_mut()
-                        .poll(&mut Context::from_waker(Waker::noop()))
-                        .is_pending()
-                );
-                assert!(!kill.is_stopping());
-                drop(resume);
-                next.await;
-                Ok(())
-            },
-            async |_| Ok::<_, AktorError>(()),
-        )
-        .await
-        .unwrap_err();
+            tokio::pin!(next);
+            assert!(
+                next.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            release.notify_one();
+            wake.entered.notified().await;
+
+            // The actor is held in close(), before its panic collector can run.
+            assert!(
+                next.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert!(!kill.is_stopping());
+            drop(resume);
+            next.await;
+        })
+        .await;
+    killswitch.stop();
+
+    let result = completed.wait().await;
 
     assert!(
         result
-            .report
             .failure
             .unwrap()
             .message
@@ -537,20 +475,15 @@ async fn cleanup_failure() {
     let closing = actors
         .start_with(async move |_| {
             completed.store(true, Ordering::SeqCst);
-            Ok::<_, AktorCleanupError>(())
+            Ok::<_, String>(())
         })
         .unwrap();
 
     let actor = actors
-        .spawn(AktorArgs::new(
+        .spawn_args(AktorArgs::new(
             "storage",
-            || Ok::<_, AktorError>(()),
-            |_| {
-                Err::<(), _>(AktorCleanupError {
-                    diagnostics: "could not flush".into(),
-                    data: (),
-                })
-            },
+            || Ok::<_, String>(()),
+            |_| Err::<(), _>(String::from("could not flush")),
         ))
         .await
         .unwrap();
@@ -566,15 +499,15 @@ async fn cleanup_failure() {
 
     assert!(hook.load(Ordering::SeqCst));
     assert_eq!(report.to_string().matches("could not flush").count(), 1);
-    assert_eq!(report.failure.unwrap().actor, "storage");
-    assert!(
-        report.actors.iter().any(|actor| actor.actor == "storage"
-            && actor.diagnostics[0].diagnostics == "could not flush")
+    let failure = report.failure.unwrap();
+    assert_eq!(
+        (failure.actor.as_str(), failure.message.as_str()),
+        ("storage", "could not flush")
     );
     assert!(sibling.completion().wait().await.is_ok());
 
-    let error = actor.completion().wait().await.unwrap_err();
-    let aktor::owner::OwnerFailure::Cleanup(errors) = &error.error else {
+    let (error, _) = actor.completion().wait().await.unwrap_err();
+    let aktor::owner::OwnerError::Cleanup(errors) = &*error else {
         panic!("typed cleanup error was lost");
     };
 

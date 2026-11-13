@@ -12,27 +12,20 @@ async fn read(state: &usize) -> usize {
 async fn queued() {
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-
-            name: AktorName::new("audio"),
-            role: Audio,
+            name: "audio".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-start: async || Ok::<_, AktorSetupError>(0_usize),
-
-                end: (),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 32 },
+            start: async || Ok::<_, String>(0_usize),
+            end: (),
+            hooks: Default::default(),
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await
     .unwrap();
 
-    let _request = read(&actors.handles);
+    let audio = actors.handles.clone().with_role::<Audio>();
+    let _request = read(&audio);
 }

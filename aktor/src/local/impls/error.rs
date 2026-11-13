@@ -1,7 +1,7 @@
 use super::super::*;
 use crate::AktorError;
 
-impl<E> OwnerFailure<E> {
+impl<E> OwnerError<E> {
     fn summary(&self) -> (&str, Option<&str>) {
         match self {
             Self::Setup(err) => ("actor setup failed", Some(&err.diagnostics)),
@@ -9,6 +9,7 @@ impl<E> OwnerFailure<E> {
             Self::SetupPanic(err) => ("actor setup panicked", Some(&err.diagnostics)),
             Self::Cleanup(err) => ("actor cleanup failed", Some(&err.diagnostics)),
             Self::CleanupFailure(err) => ("actor cleanup failed", Some(&err.diagnostics)),
+            Self::CleanupUnconfirmed => ("actor stopped before cleanup completed", None),
             Self::Runner(err) => ("actor runner failed", Some(&err.diagnostics)),
             Self::Cancelled => ("actor owner stopped before cleanup completed", None),
         }
@@ -34,21 +35,20 @@ impl<E> OwnerFailure<E> {
     }
 
     /// Copy the diagnostic, leaving the original typed data available to observers.
-    pub fn without_data(&self) -> OwnerFailure {
+    pub fn without_data(&self) -> OwnerError {
         match self {
-            Self::Setup(error) => {
-                OwnerFailure::Setup(AktorError::new(error.diagnostics.clone(), ()))
-            }
+            Self::Setup(error) => OwnerError::Setup(AktorError::new(error.diagnostics.clone(), ())),
             Self::SetupDiagnostic(error, primary) => {
-                OwnerFailure::SetupDiagnostic(error.clone(), *primary)
+                OwnerError::SetupDiagnostic(error.clone(), *primary)
             }
-            Self::SetupPanic(error) => OwnerFailure::SetupPanic(error.clone()),
+            Self::SetupPanic(error) => OwnerError::SetupPanic(error.clone()),
             Self::Cleanup(error) => {
-                OwnerFailure::Cleanup(AktorError::new(error.diagnostics.clone(), ()))
+                OwnerError::Cleanup(AktorError::new(error.diagnostics.clone(), ()))
             }
-            Self::CleanupFailure(error) => OwnerFailure::CleanupFailure(error.clone()),
-            Self::Runner(error) => OwnerFailure::Runner(error.clone()),
-            Self::Cancelled => OwnerFailure::Cancelled,
+            Self::CleanupFailure(error) => OwnerError::CleanupFailure(error.clone()),
+            Self::CleanupUnconfirmed => OwnerError::CleanupUnconfirmed,
+            Self::Runner(error) => OwnerError::Runner(error.clone()),
+            Self::Cancelled => OwnerError::Cancelled,
         }
     }
 }
@@ -56,39 +56,20 @@ impl<E> OwnerFailure<E> {
 impl<E> Clone for SharedOwnerError<E> {
     fn clone(&self) -> Self {
         Self {
-            error: self.error.clone(),
-            diagnostics: self.diagnostics.clone(),
+            cause: self.cause.clone(),
         }
     }
 }
-impl<E> SharedOwnerError<E> {
-    #[doc(hidden)]
-    pub fn fmt_display(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.error)
-    }
+impl<E> From<OwnerError<E>> for (OwnerError<E>, String) {
+    fn from(error: OwnerError<E>) -> Self {
+        let report = alloc::format!("{error:#}");
 
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.diagnostics.report)
-    }
-}
-
-impl<E> From<OwnerFailure<E>> for OwnerError<E> {
-    fn from(error: OwnerFailure<E>) -> Self {
-        let diagnostics =
-            crate::AktorDiagnostic::new(alloc::format!("{error}"), alloc::format!("{error:#}"));
-
-        Self { error, diagnostics }
-    }
-}
-impl<E> OwnerError<E> {
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.diagnostics.report)
+        (error, report)
     }
 }
 impl<E> SharedOwnerError<E> {
-    pub fn from_failure(error: Rc<OwnerFailure<E>>, secondary: &[AktorError]) -> Self {
+    #[doc(hidden)]
+    pub fn from_failure(error: Rc<OwnerError<E>>, secondary: &[AktorError]) -> (Self, String) {
         let mut report = alloc::format!("{error:#}");
 
         for failure in secondary {
@@ -96,15 +77,10 @@ impl<E> SharedOwnerError<E> {
             report.push_str(&failure.diagnostics);
         }
 
-        let diagnostics = crate::AktorDiagnostic::new(alloc::format!("{error}"), report);
-
-        Self { error, diagnostics }
+        (Self { cause: error }, report)
     }
 
     pub fn without_data(self) -> OwnerError {
-        OwnerError {
-            error: self.error.without_data(),
-            diagnostics: self.diagnostics,
-        }
+        self.cause.without_data()
     }
 }

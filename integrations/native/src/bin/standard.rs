@@ -17,38 +17,29 @@ pub fn check() -> Result<(), String> {
     executor::block_on(async {
         let failed = aktor_start(AktorSetup {
             actors: AktorNew {
-                name: AktorName::new("typed startup"),
-                role: AktorNoRole,
+                name: "typed startup".into(),
                 kind: AktorKind::StdThread,
-                closures: AktorClosures {
-                    start: async || {
-                        Err::<Counter, _>(AktorSetupError {
-                            diagnostics: "storage refused".into(),
-                            data: (),
-                        })
-                    },
-
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: AktorNewOptions { capacity: 32 },
+                start: async || Err::<Counter, _>(String::from("storage refused")),
+                end: (),
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
             shutdown: |_| {},
-            options: AktorOptions {
-                shutdown_grace: Duration::from_secs(5),
-            },
+            grace: Duration::from_secs(5),
         })
         .await;
 
         match failed {
-            Err(AktorStartupError {
-                error: AktorStartError::Startup(error),
-                report: Some(report),
-                ..
-            }) => {
-                let listener::DedicatedStartError::Init(failure) = error.error.primary() else {
+            Err((
+                AktorStartError {
+                    cause: AktorStartCause::Startup(error),
+                    report: Some(report),
+                    ..
+                },
+                _,
+            )) => {
+                let listener::DedicatedStartError::Init(failure) = error.cause.primary() else {
                     return Err("typed startup lost its original failure".into());
                 };
 
@@ -66,19 +57,16 @@ pub fn check() -> Result<(), String> {
         let actors = aktor_start(AktorSetup {
             actors: (
                 AktorNew {
-                    name: AktorName::new("counter"),
-                    role: AktorNoRole,
+                    name: "counter".into(),
                     kind: AktorKind::StdThread,
-                    closures: AktorClosures {
-                        start: async move || {
-                            assert_ne!(thread::current().id(), caller);
-                            Ok(Counter(Rc::new(Cell::new(0))))
-                        },
-
-                        end: async move |counter: Counter| {
-                            end.send(counter.0.get())
-                                .map_err(|error| AktorCleanupError::new(error.to_string(), ()))
-                        },
+                    start: async move || {
+                        assert_ne!(thread::current().id(), caller);
+                        aktor_ready(Counter(Rc::new(Cell::new(0))))
+                    },
+                    end: async move |counter: Counter| {
+                        end.send(counter.0.get()).map_err(|error| error.to_string())
+                    },
+                    hooks: AktorHooks {
                         intervals: vec![AktorInterval {
                             every: Duration::from_millis(1),
                             run: (async move |_: &mut Counter| {
@@ -89,30 +77,24 @@ pub fn check() -> Result<(), String> {
                         before_each: None,
                         after_each: None,
                     },
-                    options: AktorNewOptions { capacity: 32 },
+                    capacity: 32,
+                    stuck: AktorStuck::Kill,
                 },
                 AktorNew {
-                    name: AktorName::new("sibling"),
-                    role: AktorNoRole,
+                    name: "sibling".into(),
                     kind: AktorKind::StdThread,
-                    closures: AktorClosures {
-                        start: async || Ok::<_, AktorSetupError>(0_u32),
-
-                        end: (),
-                        intervals: vec![],
-                        before_each: None,
-                        after_each: None,
-                    },
-                    options: AktorNewOptions { capacity: 32 },
+                    start: async || aktor_ready(0_u32),
+                    end: (),
+                    hooks: Default::default(),
+                    capacity: 32,
+                    stuck: AktorStuck::Kill,
                 },
             ),
             shutdown: |_| {},
-            options: AktorOptions {
-                shutdown_grace: Duration::from_secs(5),
-            },
+            grace: Duration::from_secs(5),
         })
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|(_, report)| report)?;
 
         ticked
             .recv_timeout(Duration::from_secs(1))
@@ -128,7 +110,7 @@ pub fn check() -> Result<(), String> {
             .0
             .shutdown()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|(_, report)| report)?;
         executor::sleep_until(std::time::Instant::now() + Duration::from_millis(10)).await;
         assert!(!actors.killswitch().is_stopping());
         assert_eq!(

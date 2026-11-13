@@ -1,11 +1,20 @@
 use super::*;
 use crate::{
-    AktorClosure, local::hooks::AktorHooks, operation::Operation, setup::AktorIntervalLogic,
+    AktorClosure,
+    local::hooks::CallHooks,
+    operation::Operation,
+    setup::{AktorIntervalLogic, initial::InitError},
 };
-use core::time::Duration;
+use core::{convert::Infallible, future::pending, time::Duration};
 use tokio::sync::mpsc;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 use web_sys::DedicatedWorkerGlobalScope;
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = reportError)]
+    fn report_error(error: &js_sys::Error);
+}
 
 pub struct Server {
     scope: DedicatedWorkerGlobalScope,
@@ -14,7 +23,7 @@ pub struct Server {
 }
 impl Server {
     /// Keep serving until shutdown and cleanup finish.
-    pub async fn wait(mut self) -> Result<(), WorkerError> {
+    pub async fn wait(mut self) -> Result<(), (WorkerError, String)> {
         let result = (&mut self.finished).await.unwrap_or_else(|_| {
             Err(WireError::new(
                 CallError::OutcomeUnknown,
@@ -23,7 +32,7 @@ impl Server {
         });
 
         drop(self);
-        result.map_err(WireError::without_data)
+        result.map_err(WireError::report_without_data)
     }
 }
 impl Drop for Server {
@@ -52,7 +61,7 @@ fn respond_with(
         buffers.write(&output).map_err(|error| {
             WireError::new(
                 CallError::OutcomeUnknown,
-                WorkerCause::Codec(format!("{error:?}")),
+                WorkerCause::Transport(format!("{error:?}")),
             )
         })?
     } else {
@@ -70,7 +79,7 @@ fn respond_with(
     sent.map_err(|error| {
         WireError::new(
             CallError::OutcomeUnknown,
-            WorkerCause::Codec(format!("{error:?}")),
+            WorkerCause::Transport(format!("{error:?}")),
         )
     })
 }
@@ -81,60 +90,122 @@ pub fn scope() -> Result<DedicatedWorkerGlobalScope, WireError> {
         .map_err(|_| WireError::setup(CallError::NotAdmitted, "serve needs a Dedicated Worker"))
 }
 
-pub fn setup_failed<T: Serialize>(error: crate::AktorSetupError<T>) -> Result<(), WireError> {
-    respond(
-        &scope()?,
-        Outgoing::SetupFailed(lifecycle_error(
-            WireError::setup(CallError::NotAdmitted, error.diagnostics),
-            &error.data,
-        )),
-    )
-}
-
-/// Report a setup failure when rollback cannot confirm cleanup.
-/// This never returns, keeping the setup's captures alive.
-pub async fn retain_setup<T, E: Serialize>(
-    error: crate::AktorSetupError<E>,
-) -> Result<T, crate::AktorSetupError<E>> {
+/// Report a typed initializer failure after releasing its resources. [`serve_setup`] reports its own.
+pub fn setup_failed<T: Serialize>(
+    error: crate::AktorError<T>,
+) -> Result<(), (WorkerError, String)> {
     let failure = lifecycle_error(
-        WireError::setup(CallError::OutcomeUnknown, error.diagnostics.clone()),
+        WireError::setup(CallError::NotAdmitted, error.diagnostics),
         &error.data,
     );
-    let reported = scope().and_then(|scope| respond(&scope, Outgoing::Unconfirmed(failure)));
+    let mut report = format!("{failure:#}");
+    let scope = scope().map_err(WireError::report_without_data)?;
 
-    let result = core::future::pending().await;
-    drop((error, reported));
-    result
+    send_start_failure(&scope, Outgoing::SetupFailed(failure)).map_err(|(notice, post)| {
+        let (post, reason) = post.report_without_data();
+        append_notice_error(&mut report, notice, &reason);
+        (post, report)
+    })
 }
 
-/// Report a cleanup failure without confirming retirement.
-/// This never returns, so cleanup keeps ownership of its unfinished work.
-pub async fn retain_cleanup<E: Serialize>(
-    error: crate::AktorCleanupError<E>,
-) -> Result<(), crate::AktorCleanupError<E>> {
-    let failure = lifecycle_error(
-        WireError::cleanup(CallError::OutcomeUnknown, error.diagnostics.clone()),
-        &error.data,
+pub(super) fn send_start_failure(
+    scope: &DedicatedWorkerGlobalScope,
+    failure: Outgoing,
+) -> Result<(), (&'static str, WireError)> {
+    respond(scope, failure).map_err(|error| ("startup failure", error))?;
+    respond(scope, Outgoing::SetupRetired).map_err(|error| ("retirement", error))
+}
+
+fn append_notice_error(report: &mut String, notice: &str, reason: &str) {
+    if !report.is_empty() {
+        report.push('\n');
+    }
+    report.push_str("Could not send the ");
+    report.push_str(notice);
+    report.push_str(" notice to the page: ");
+    report.push_str(reason);
+}
+
+pub(super) fn report_lost_notice(report: &mut String, notice: &str, post: WireError) {
+    let (_, reason) = post.report_without_data::<()>();
+    append_notice_error(report, notice, &reason);
+    report_error(&js_sys::Error::new(report));
+}
+
+/// Tell the page that startup failed and the initializer is still releasing its resources.
+/// The result tells you whether the browser accepted the notice. Keep releasing the resources
+/// either way, then return the initializer's error.
+pub fn report_setup_pending(report: impl Into<String>) -> Result<(), (WorkerError, String)> {
+    report_to_page(Outgoing::SetupPending(report.into()))
+}
+
+/// Report the initializer's error and keep its resources alive. This future stays pending.
+/// With `return retain_setup(error).await`, Rust checks the error type sent to the page
+/// against the initializer's return type. Use [`report_setup_pending`] if rollback can keep trying.
+pub async fn retain_setup<T, E, Mode>(error: E) -> Result<T, E>
+where
+    E: super::setup::WorkerInitError<Mode>,
+{
+    report_retained(error.failure(CallError::OutcomeUnknown), "pending startup");
+    let _retained = error;
+
+    match pending::<Infallible>().await {}
+}
+
+/// Report a cleanup failure while `end` is still working.
+/// `Ok(())` means `postMessage` returned successfully. The page may still be waiting for it.
+/// Return from `end` once you have released the resources so the page can confirm retirement.
+pub fn report_cleanup_pending(report: impl Into<String>) -> Result<(), (WorkerError, String)> {
+    report_to_page(Outgoing::Unconfirmed(WireError::cleanup(
+        CallError::OutcomeUnknown,
+        report,
+    )))
+}
+
+/// Report a cleanup failure and stay pending while the worker still owns its resources.
+/// Use [`report_cleanup_pending`] when cleanup can keep trying.
+/// An `end` closure that always parks needs an explicit return type such as `-> ()`.
+pub async fn retain_cleanup<E: InitError<Mode>, Mode>(error: E) -> ! {
+    let (error, report) = error.retain_with_report();
+    report_retained(
+        WireError::cleanup(CallError::OutcomeUnknown, report),
+        "pending cleanup",
     );
-    let reported = scope().and_then(|scope| respond(&scope, Outgoing::Unconfirmed(failure)));
+    let _retained = error;
 
-    let result = core::future::pending().await;
-    drop((error, reported));
-    result
+    match pending::<Infallible>().await {}
 }
 
-pub fn setup_retired(error: WireError) -> Result<(), WireError> {
-    let scope = scope()?;
-    respond(&scope, Outgoing::SetupFailed(error))?;
-    respond(&scope, Outgoing::SetupRetired)
+fn report_retained(mut failure: WireError, notice: &str) {
+    let Err((_, reason)) = report_to_page(Outgoing::Unconfirmed(failure.clone())) else {
+        return;
+    };
+
+    let mut report = failure
+        .diagnostics
+        .take()
+        .unwrap_or_else(|| failure.to_string());
+    append_notice_error(&mut report, notice, &reason);
+    failure.diagnostics = Some(report.clone());
+
+    if let Err((_, reason)) = report_to_page(Outgoing::Unconfirmed(failure)) {
+        append_notice_error(&mut report, "retry", &reason);
+        report_error(&js_sys::Error::new(&report));
+    }
 }
 
-pub fn serve<S: 'static>(state: S) -> Result<Server, WireError> {
+fn report_to_page(message: Outgoing) -> Result<(), (WorkerError, String)> {
+    let scope = scope().map_err(WireError::report_without_data)?;
+
+    respond(&scope, message).map_err(WireError::report_without_data)
+}
+
+pub fn serve<S: 'static>(state: S) -> Result<Server, (WorkerError, String)> {
     serve_with(
         state,
         async |state| {
             drop(state);
-            Ok::<_, crate::AktorCleanupError>(())
+            Ok::<_, crate::AktorError>(())
         },
         Options::default(),
     )
@@ -144,25 +215,39 @@ pub fn serve_with<S: 'static, C, CF, E: Serialize + 'static>(
     state: S,
     cleanup: C,
     options: Options,
-) -> Result<Server, WireError>
+) -> Result<Server, (WorkerError, String)>
 where
     C: FnOnce(S) -> CF + 'static,
-    CF: Future<Output = Result<(), crate::AktorCleanupError<E>>> + 'static,
+    CF: Future<Output = Result<(), crate::AktorError<E>>> + 'static,
 {
     serve_for::<(), _, _, _, E>(state, cleanup, options)
 }
 
-/// Pick the marker used by #[aktor(actor = ...)] when actors share a state type.
+/// Pick the marker used by #[aktor(role = ...)] when actors share a state type.
 pub fn serve_for<Role: 'static, S: 'static, C, CF, E: Serialize + 'static>(
     state: S,
     cleanup: C,
     options: Options,
-) -> Result<Server, WireError>
+) -> Result<Server, (WorkerError, String)>
 where
     C: FnOnce(S) -> CF + 'static,
-    CF: Future<Output = Result<(), crate::AktorCleanupError<E>>> + 'static,
+    CF: Future<Output = Result<(), crate::AktorError<E>>> + 'static,
 {
-    serve_logic::<Role, _, _, _, E>(state, cleanup, options, AktorHooks::default(), Vec::new())
+    serve_logic::<Role, _, _, _>(
+        state,
+        move |state| async move {
+            cleanup(state).await.map_err(|error| {
+                lifecycle_error(
+                    WireError::cleanup(CallError::OutcomeUnknown, error.diagnostics),
+                    &error.data,
+                )
+            })
+        },
+        options,
+        CallHooks::default(),
+        Vec::new(),
+    )
+    .map_err(WireError::report_without_data)
 }
 
 pub struct WorkerInterval<S> {
@@ -170,20 +255,22 @@ pub struct WorkerInterval<S> {
     pub run: AktorClosure<dyn AktorIntervalLogic<S>>,
 }
 
-pub fn serve_logic<Role: 'static, S: 'static, C, CF, E: Serialize + 'static>(
+pub fn serve_logic<Role: 'static, S: 'static, C, CF>(
     mut state: S,
     cleanup: C,
     options: Options,
-    mut hooks: AktorHooks<S>,
+    mut hooks: CallHooks<S>,
     mut intervals: Vec<WorkerInterval<S>>,
 ) -> Result<Server, WireError>
 where
     C: FnOnce(S) -> CF + 'static,
-    CF: Future<Output = Result<(), crate::AktorCleanupError<E>>> + 'static,
+    CF: Future<Output = Result<(), WireError>> + 'static,
 {
     let scope = scope()?;
 
-    options.validate().map_err(|error| error.without_data())?;
+    options
+        .validate_limits()
+        .map_err(WorkerFailure::without_data)?;
 
     let registry =
         registry::Registry::for_actor::<S, Role>().map_err(|error| error.without_data())?;
@@ -268,11 +355,24 @@ where
     });
 
     scope.set_onmessage(Some(callback.as_ref().unchecked_ref()));
-
+    let announcement = respond(
+        &scope,
+        Outgoing::Ready {
+            version: VERSION,
+            options,
+            operations,
+        },
+    );
+    let ready_failed = announcement.is_err();
     let replies = scope.clone();
     let (finished, completion) = oneshot::channel();
 
     wasm_bindgen_futures::spawn_local(async move {
+        if ready_failed {
+            receiver.close();
+            let _shutdown = stopped.wait_for(|stopping| *stopping).await;
+        }
+
         let mut closing = false;
         let mut next: Vec<_> = intervals
             .iter()
@@ -359,38 +459,41 @@ where
             }
         }
 
-        let result = match cleanup(state).await {
-            Ok(()) => Ok(()),
-            Err(error) => Err(lifecycle_error(
-                WireError::cleanup(CallError::OutcomeUnknown, error.diagnostics),
-                &error.data,
-            )),
-        };
+        let result = cleanup(state).await;
 
         drop((hooks, intervals));
         buffers.clear();
 
-        if let Err(error) = respond(&replies, Outgoing::Finished(result.clone())) {
-            fatal(error);
+        if let Err(post) = respond(&replies, Outgoing::Finished(result.clone())) {
+            let mut report = result
+                .as_ref()
+                .err()
+                .map_or_else(String::new, |error| format!("{error:#}"));
+            report_lost_notice(&mut report, "cleanup result", post);
         }
 
         let _sent = finished.send(result);
     });
 
-    respond(
-        &scope,
-        Outgoing::Ready {
-            version: VERSION,
-            options,
-            operations,
-        },
-    )?;
-
-    Ok(Server {
+    let server = Server {
         scope,
         _callback: callback,
         finished: completion,
-    })
+    };
+
+    if let Err(mut post) = announcement {
+        let report = format!("Could not send the ready notice to the page: {post}");
+        report_error(&js_sys::Error::new(&report));
+        post.diagnostics = Some(report);
+
+        // The initializer already handed us its state. Keep the shutdown handler alive for end.
+        wasm_bindgen_futures::spawn_local(async move {
+            let _result = server.wait().await;
+        });
+        return Err(post);
+    }
+
+    Ok(server)
 }
 
 pub(super) fn lifecycle_error<E: Serialize>(mut error: WireError, data: &E) -> WireError {

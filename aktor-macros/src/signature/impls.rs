@@ -72,6 +72,12 @@ impl VisitMut for Captures {
     }
 }
 
+impl syn::visit::Visit<'_> for HasImplTrait {
+    fn visit_type_impl_trait(&mut self, _: &syn::TypeImplTrait) {
+        self.0 = true;
+    }
+}
+
 impl VisitMut for DispatchOutput {
     fn visit_type_impl_trait_mut(&mut self, ty: &mut syn::TypeImplTrait) {
         visit_mut::visit_type_impl_trait_mut(self, ty);

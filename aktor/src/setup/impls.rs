@@ -1,86 +1,60 @@
 use super::*;
-use core::fmt;
-
-#[cfg(any(
-    test,
-    all(
-        any(feature = "tokio", feature = "std_thread"),
-        not(target_family = "wasm")
-    )
+use crate::AktorError;
+#[cfg(all(
+    any(feature = "tokio", feature = "std_thread"),
+    not(target_family = "wasm")
 ))]
-pub fn diagnostics(error: &(dyn core::error::Error + 'static)) -> String {
-    fn source_diagnostics(error: &(dyn core::error::Error + 'static)) -> String {
-        let mut output = String::new();
-        let mut source = Some(error);
-
-        for _ in 0..64 {
-            let Some(error) = source else {
-                return output;
-            };
-            if !output.is_empty() {
-                output.push_str("\ncaused by: ");
-            }
-            output.push_str(&alloc::format!("{error:#}"));
-            source = error.source();
-        }
-
-        if source.is_some() {
-            output.push_str("\ncaused by: ... (source chain truncated)");
-        }
-        output
-    }
-
-    let render = || source_diagnostics(error);
-    #[cfg(feature = "std")]
-    {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)) {
-            Ok(diagnostics) => diagnostics,
-            Err(payload) => {
-                let message = alloc::format!(
-                    "error formatter panicked: {}",
-                    crate::panic::panic_message(&payload)
-                );
-
-                crate::panic::dispose_secondary(payload);
-                message
-            }
-        }
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        render()
-    }
-}
+use crate::{AktorGroup, AktorShutdownPolicy};
+use alloc::string::ToString;
+use core::fmt;
 
 struct StartupDetails<'a> {
     primary: &'a str,
-    report: Option<&'a crate::ShutdownReport>,
+    report: Option<&'a crate::AktorShutdownReport>,
     source_is_failure: bool,
 }
 impl fmt::Display for StartupDetails<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("actor startup failed")?;
 
+        let failed_for = self
+            .report
+            .and_then(|report| report.failure.as_ref())
+            .filter(|_| self.source_is_failure);
+
+        if let Some(failure) = failed_for {
+            write!(f, " for {}", failure.actor)?;
+        }
+
+        // The reason goes first, the rollback of everything else comes after it.
+        write!(f, "\n{}", self.primary)?;
+
         if let Some(report) = &self.report {
-            if let Some(failure) = &report.failure {
-                if self.source_is_failure {
-                    write!(f, " for {}", failure.actor)?;
-                } else {
-                    write!(
-                        f,
-                        "\n{} failed during {}:\n{}",
-                        failure.actor, failure.phase, failure.message
-                    )?;
-                }
+            if let Some(failure) = &report.failure
+                && !self.source_is_failure
+            {
+                write!(
+                    f,
+                    "\n{} failed during {}:\n{}",
+                    failure.actor, failure.phase, failure.message
+                )?;
             }
 
             for actor in &report.actors {
                 for diagnostic in &actor.diagnostics {
-                    write!(f, "\n{} cleanup:\n{}", actor.actor, diagnostic.diagnostics)?;
+                    write!(
+                        f,
+                        "\n{} diagnostics:\n{}",
+                        actor.actor, diagnostic.diagnostics
+                    )?;
                 }
 
-                if actor.timed_out {
-                    write!(f, "\n{} rollback did not finish", actor.actor)?;
+                if let Some(status) = actor.retirement.diagnostic() {
+                    write!(f, "\n{} {status}", actor.actor)?;
+                }
+
+                if actor.ran_past_grace {
+                    write!(f, "\n{} rollback ran past its grace", actor.actor)?;
                 }
             }
 
@@ -88,29 +62,24 @@ impl fmt::Display for StartupDetails<'_> {
                 write!(f, "\nApplication shutdown:\n{}", diagnostic.diagnostics)?;
             }
 
-            if report.timed_out {
-                write!(f, "\nRollback deadline reached")?;
+            if let Some(error) = report.group_error {
+                write!(f, "\n{error}")?;
+            } else if report.ran_past_grace {
+                write!(f, "\nRollback ran past its grace")?;
             }
         }
-
-        write!(f, "\n{}", self.primary)?;
 
         Ok(())
     }
 }
 
-impl AktorStartupError {
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.diagnostics.report)
-    }
-
-    pub fn from_failure(
-        error: AktorStartError,
+impl<E> AktorStartError<E> {
+    pub(crate) fn with_report(
+        mut self,
         primary: String,
-        report: Option<Box<crate::ShutdownReport>>,
+        report: Option<Box<crate::AktorShutdownReport>>,
         source_is_failure: bool,
-    ) -> Self {
+    ) -> (Self, String) {
         let details = alloc::format!(
             "{}",
             StartupDetails {
@@ -120,56 +89,29 @@ impl AktorStartupError {
             }
         );
 
-        Self {
-            error,
-            diagnostics: Box::new(crate::AktorDiagnostic::new(
-                "actor initialization failed",
-                details,
-            )),
-            report,
-            source_is_failure,
-        }
+        self.report = report;
+        (self, details)
     }
 }
 
-impl AktorName {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
-    }
-}
-
-impl Default for AktorNewOptions {
-    fn default() -> Self {
-        Self { capacity: 32 }
-    }
-}
-
-impl Default for AktorOptions {
+impl<S: 'static, Kind: AktorMode> Default for AktorHooks<S, Kind> {
     fn default() -> Self {
         Self {
-            shutdown_grace: Duration::from_secs(5),
+            intervals: Vec::new(),
+            before_each: None,
+            after_each: None,
         }
     }
 }
 
-impl<S: 'static, Start, Kind: AktorMode, Role, End> AktorNew<S, Start, Kind, Role, End> {
-    pub fn with_role<NewRole>(self, role: NewRole) -> AktorNew<S, Start, Kind, NewRole, End> {
-        AktorNew {
-            name: self.name,
-            role,
-            kind: self.kind,
-            closures: self.closures,
-            options: self.options,
-        }
-    }
-
+impl<S: 'static, Start, Kind: AktorMode, End, Signature> AktorNew<S, Start, Kind, End, Signature> {
     pub fn execution(&self) -> AktorExecution {
         Kind::EXECUTION
     }
 }
 
 impl<Handles, Group: AktorSetupGroup> AktorStarted<Handles, Group> {
-    pub fn killswitch(&self) -> Group::KillSwitch {
+    pub fn killswitch(&self) -> Group::AktorKillSwitch {
         self.group.killswitch()
     }
 
@@ -177,9 +119,10 @@ impl<Handles, Group: AktorSetupGroup> AktorStarted<Handles, Group> {
         self.group.completion()
     }
 
-    pub fn shutdown(&self) -> Group::Closing {
+    /// Start shutdown and return its completion handle. Await it to get the report.
+    pub fn shutdown(&self) -> Group::Completion {
         Group::stop(&self.group.killswitch());
-        self.group.closing()
+        self.group.completion()
     }
 }
 
@@ -191,20 +134,54 @@ impl<Group: AktorSetupGroup> Clone for AktorStartContext<Group> {
     }
 }
 
-pub fn aktor_start<Setups, Shutdown, ShutdownOutput, ShutdownMode, StartMode>(
+/// Start a group and its actors. Keep the group with the handles, for example in your GUI state
+/// or a store you open and close. Dropping the group starts shutdown. Add more actors with
+/// `started.group.spawn(..)`.
+pub fn aktor_start<Setups, Shutdown, ShutdownOutput, ShutdownMode>(
     setup: AktorSetup<Setups, Shutdown, ShutdownOutput>,
-) -> AktorStartup<Setups, StartMode>
+) -> AktorStartup<Setups>
 where
-    Setups: AktorStart<StartMode>,
+    Setups: AktorStart,
     Setups::Group: shutdown::AktorShutdown<Shutdown, ShutdownOutput, ShutdownMode>,
-    Shutdown: FnOnce(crate::ShutdownReport) -> ShutdownOutput + 'static,
+    Shutdown: FnOnce(crate::AktorShutdownReport) -> ShutdownOutput + 'static,
 {
-    let mut group = Setups::Group::new(setup.options.shutdown_grace);
+    let group = Setups::Group::new(setup.grace);
 
+    start_group(group, setup)
+}
+
+/// Start a native group and choose what happens when shutdown gets stuck.
+#[cfg(all(
+    any(feature = "tokio", feature = "std_thread"),
+    not(target_family = "wasm")
+))]
+pub fn aktor_start_with_policy<Setups, Shutdown, ShutdownOutput, ShutdownMode>(
+    setup: AktorSetup<Setups, Shutdown, ShutdownOutput>,
+    policy: AktorShutdownPolicy,
+) -> AktorStartup<Setups>
+where
+    Setups: AktorStart<Group = AktorGroup>,
+    AktorGroup: shutdown::AktorShutdown<Shutdown, ShutdownOutput, ShutdownMode>,
+    Shutdown: FnOnce(crate::AktorShutdownReport) -> ShutdownOutput + 'static,
+{
+    let group = AktorGroup::with_policy(setup.grace, policy);
+
+    group.killswitch().set_starting(true);
+    start_group(group, setup)
+}
+
+fn start_group<Setups, Shutdown, ShutdownOutput, ShutdownMode>(
+    mut group: Setups::Group,
+    setup: AktorSetup<Setups, Shutdown, ShutdownOutput>,
+) -> AktorStartup<Setups>
+where
+    Setups: AktorStart,
+    Setups::Group: shutdown::AktorShutdown<Shutdown, ShutdownOutput, ShutdownMode>,
+    Shutdown: FnOnce(crate::AktorShutdownReport) -> ShutdownOutput + 'static,
+{
     group.track_startup();
     let registered = shutdown::AktorShutdown::on_shutdown(&group, setup.shutdown);
     let mut startup = AktorStartup {
-        mode: core::marker::PhantomData,
         killswitch: group.killswitch(),
         completion: group.completion(),
         begin: true,
@@ -217,33 +194,33 @@ where
 
     if let Err(error) = registered {
         startup.setup = None;
-        startup.failure = Some(Box::new(error.into()));
+        startup.failure = Some(Box::new(AktorStartError::not_run(AktorStartCause::Group(
+            error,
+        ))));
 
         if let Some(group) = &startup.group {
             Setups::Group::stop(&startup.killswitch);
-            startup.shutdown = Some(Box::pin(group.closing()));
+            startup.shutdown = Some(Box::pin(core::future::IntoFuture::into_future(
+                group.completion(),
+            )));
         }
     }
 
     startup
 }
 
+#[doc(hidden)]
 /// Add prepared actors to a group whose shutdown listener is already running.
 /// Failure or cancellation after startup begins stops the whole group, including existing actors.
-pub async fn aktor_start_in<Setup: AktorStart<Mode>, Mode>(
+pub async fn aktor_start_in<Setup: AktorStart>(
     group: &Setup::Group,
     setup: Setup,
-) -> Result<Setup::Handles, AktorStartupError> {
+) -> Result<Setup::Handles, (AktorStartError<Setup::Error>, String)> {
     if let Err(error) = group.check_started() {
-        let error = AktorStartError::from(error);
-        let diagnostics = Setup::diagnostics(&error);
+        let cause = AktorStartCause::Group(error);
+        let diagnostics = Setup::diagnostics(&cause);
 
-        return Err(AktorStartupError::from_failure(
-            error,
-            diagnostics,
-            None,
-            false,
-        ));
+        return Err(AktorStartError::not_run(cause).with_report(diagnostics, None, false));
     }
 
     let mut group = group.registration();
@@ -251,7 +228,6 @@ pub async fn aktor_start_in<Setup: AktorStart<Mode>, Mode>(
     group.track_startup();
 
     let startup = AktorStartup {
-        mode: core::marker::PhantomData,
         begin: false,
         killswitch: group.killswitch(),
         completion: group.completion(),
@@ -265,68 +241,103 @@ pub async fn aktor_start_in<Setup: AktorStart<Mode>, Mode>(
     startup.await.map(|started| started.handles)
 }
 
-impl<E: 'static> AktorStartError<E> {
+impl<E: 'static> AktorStartCause<E> {
+    #[cfg(any(
+        all(
+            any(feature = "tokio", feature = "std_thread"),
+            not(target_family = "wasm")
+        ),
+        all(
+            any(feature = "browser_local", feature = "wasm_browser_workers"),
+            target_family = "wasm",
+            target_os = "unknown"
+        )
+    ))]
+    pub(crate) fn group_error((error, _): (AktorGroupError, String)) -> Self {
+        Self::Group(error)
+    }
+
     #[doc(hidden)]
     pub fn source_is_setup(&self) -> bool {
         match self {
-            Self::Init(_) | Self::Setup(_) => true,
+            Self::Group(AktorGroupError::Stopping | AktorGroupError::Stopped) => false,
+            Self::Init(_) | Self::Setup(_) | Self::Group(_) => true,
+            #[cfg(all(
+                feature = "wasm_browser_workers",
+                target_family = "wasm",
+                target_os = "unknown"
+            ))]
+            Self::Worker(_, _) => true,
             #[cfg(all(
                 any(feature = "tokio", feature = "std_thread"),
                 not(target_family = "wasm")
             ))]
             Self::Thread(
                 crate::listener::DedicatedStartError::Panicked { .. }
-                | crate::listener::DedicatedStartError::InvalidCapacity,
+                | crate::listener::DedicatedStartError::InvalidCapacity
+                | crate::listener::DedicatedStartError::ThreadNotCreated(_)
+                | crate::listener::DedicatedStartError::Thread(_),
             ) => true,
             #[cfg(all(
                 any(feature = "tokio", feature = "std_thread"),
                 not(target_family = "wasm")
             ))]
-            Self::Startup(error) => match error.error.primary() {
+            Self::Startup(error) => match error.cause.primary() {
                 crate::listener::DedicatedStartError::Init(_)
                 | crate::listener::DedicatedStartError::Panicked { .. }
-                | crate::listener::DedicatedStartError::InvalidCapacity => true,
+                | crate::listener::DedicatedStartError::InvalidCapacity
+                | crate::listener::DedicatedStartError::ThreadNotCreated(_)
+                | crate::listener::DedicatedStartError::Thread(_) => true,
                 crate::listener::DedicatedStartError::Startup { .. }
                 | crate::listener::DedicatedStartError::Observer { .. }
                 | crate::listener::DedicatedStartError::NotStarted
                 | crate::listener::DedicatedStartError::Closed
-                | crate::listener::DedicatedStartError::NoRuntime
-                | crate::listener::DedicatedStartError::ThreadNotCreated(_)
-                | crate::listener::DedicatedStartError::Thread(_) => false,
+                | crate::listener::DedicatedStartError::NoRuntime => false,
             },
             #[cfg(feature = "local")]
-            Self::Local(crate::local::OwnerError {
-                error:
-                    crate::local::OwnerFailure::Setup(_) | crate::local::OwnerFailure::SetupPanic(_),
-                ..
-            }) => true,
+            Self::Local(
+                crate::local::OwnerError::Setup(_) | crate::local::OwnerError::SetupPanic(_),
+                _,
+            ) => true,
             _ => false,
         }
     }
 }
 
-impl<E: 'static> From<AktorSetupError> for AktorStartError<E> {
-    fn from(error: AktorSetupError) -> Self {
+impl<E: 'static> From<AktorError> for AktorStartCause<E> {
+    fn from(error: AktorError) -> Self {
         Self::Setup(error)
     }
 }
+impl<E: 'static> From<AktorGroupError> for AktorStartCause<E> {
+    fn from(error: AktorGroupError) -> Self {
+        Self::Group(error)
+    }
+}
 
-pub fn start_diagnostics(error: &AktorStartError) -> String {
+pub fn start_diagnostics(error: &AktorStartCause) -> String {
     match error {
-        AktorStartError::Init(error) => error.diagnostics.clone(),
-        AktorStartError::Setup(error) => error.diagnostics.clone(),
+        AktorStartCause::Init(error) => error.diagnostics.clone(),
+        AktorStartCause::Setup(error) => error.diagnostics.clone(),
+        AktorStartCause::Group(error) => error.to_string(),
         #[cfg(feature = "local")]
-        AktorStartError::Local(error) => alloc::format!("{error:#}"),
+        AktorStartCause::Local(_, report) => report.clone(),
+        #[cfg(all(
+            feature = "wasm_browser_workers",
+            target_family = "wasm",
+            target_os = "unknown"
+        ))]
+        AktorStartCause::Worker(_, report) => report.clone(),
         #[cfg(all(
             any(feature = "tokio", feature = "std_thread"),
             not(target_family = "wasm")
         ))]
-        AktorStartError::Thread(_) => diagnostics(error),
+        AktorStartCause::Thread(_) => diagnostics(error),
         #[cfg(all(
             any(feature = "tokio", feature = "std_thread"),
             not(target_family = "wasm")
         ))]
-        AktorStartError::Startup(error) => alloc::format!("{error:#}"),
+        AktorStartCause::Startup(error) => error.report(),
     }
 }
 
@@ -334,8 +345,8 @@ pub fn validation_error<Group: AktorSetupGroup>(
     group: &Group,
     actor: &str,
     kind: AktorExecution,
-    error: AktorStartError,
-) -> AktorStartError {
+    error: AktorStartCause,
+) -> AktorStartCause {
     Group::fail_startup(
         &group.killswitch(),
         crate::AktorFailureReport {
@@ -394,14 +405,18 @@ mod tests {
     #[test]
     fn sources() {
         let public = |cause| {
-            let captured = crate::AktorFailure::from(AktorSetupError::new(diagnostics(&cause), ()));
-            let error = AktorStartError::Init(captured);
+            let captured = crate::AktorFailure::from(AktorError::new(diagnostics(&cause), ()));
+            let error = AktorStartCause::Init(captured);
 
             let diagnostics = start_diagnostics(&error);
 
-            AktorStartupError::from_failure(error, diagnostics, None, false)
+            AktorStartError::<core::convert::Infallible>::from(error).with_report(
+                diagnostics,
+                None,
+                false,
+            )
         };
-        let finite = public(Cause {
+        let (_, finite) = public(Cause {
             source: Some(Box::new(Cause {
                 source: None,
                 cycle: false,
@@ -411,28 +426,22 @@ mod tests {
             panic: false,
         });
 
-        assert_eq!(
-            alloc::format!("{finite:#}")
-                .matches("initialization cause")
-                .count(),
-            2
-        );
+        assert_eq!(finite.matches("initialization cause").count(), 2);
 
         #[cfg(feature = "std")]
         {
-            let hostile = public(Cause {
+            let (hostile, output) = public(Cause {
                 source: None,
                 cycle: false,
                 panic: true,
             });
-            let output = alloc::format!("{hostile:#}");
 
             assert!(output.contains("actor startup failed"));
             assert!(output.contains("error formatter panicked: source panic sentinel"));
-            assert_eq!(alloc::format!("{hostile:?}"), "actor startup failed");
+            assert!(alloc::format!("{hostile:?}").starts_with("actor startup failed"));
         }
 
-        let captured = crate::AktorFailure::from(AktorSetupError::new(
+        let captured = crate::AktorFailure::from(AktorError::new(
             diagnostics(&Cause {
                 source: None,
                 cycle: true,
@@ -449,15 +458,15 @@ mod tests {
         assert!(captured.diagnostics.contains("source chain truncated"));
         assert!(!alloc::format!("{captured:?}").contains("source chain truncated"));
 
-        let cyclic = public(Cause {
+        let (cyclic, text) = public(Cause {
             source: None,
             cycle: true,
             panic: false,
         });
         let mut output = Output(String::new());
 
-        write!(output, "{cyclic:#}").expect("source walk exceeded its output budget");
+        write!(output, "{text}").expect("source walk exceeded its output budget");
         assert!(output.0.ends_with("(source chain truncated)"));
-        assert_eq!(alloc::format!("{cyclic:?}"), "actor startup failed");
+        assert!(alloc::format!("{cyclic:?}").starts_with("actor startup failed"));
     }
 }

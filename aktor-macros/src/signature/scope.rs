@@ -3,11 +3,11 @@ use syn::{
     visit_mut::{self, VisitMut},
 };
 
-pub struct Child {
+pub struct NestedModule {
     pub shadowed: &'static [&'static str],
     pub binders: Vec<String>,
 }
-impl Child {
+impl NestedModule {
     pub fn new(shadowed: &'static [&'static str], generics: &syn::Generics) -> Self {
         Self {
             shadowed,
@@ -24,8 +24,16 @@ impl Child {
         }
     }
 }
-impl VisitMut for Child {
+impl VisitMut for NestedModule {
     fn visit_type_path_mut(&mut self, ty: &mut syn::TypePath) {
+        if let Some(qself) = &mut ty.qself
+            && qself.position == 0
+        {
+            self.visit_qself_mut(qself);
+            visit_mut::visit_path_mut(self, &mut ty.path);
+            return;
+        }
+
         let before = ty.path.segments.len();
 
         visit_mut::visit_type_path_mut(self, ty);
@@ -36,6 +44,14 @@ impl VisitMut for Child {
     }
 
     fn visit_expr_path_mut(&mut self, expr: &mut syn::ExprPath) {
+        if let Some(qself) = &mut expr.qself
+            && qself.position == 0
+        {
+            self.visit_qself_mut(qself);
+            visit_mut::visit_path_mut(self, &mut expr.path);
+            return;
+        }
+
         let before = expr.path.segments.len();
 
         visit_mut::visit_expr_path_mut(self, expr);

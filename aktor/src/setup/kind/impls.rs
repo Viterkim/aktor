@@ -88,7 +88,7 @@ mod local {
     #[allow(non_snake_case)]
     pub fn Custom<Clock: crate::local::clock::AktorGroupClock, Runner>(
         _clock: Clock,
-        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), crate::AktorSetupError>
+        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), alloc::string::String>
         + 'static,
         runner: Runner,
     ) -> Custom<Clock, Runner> {
@@ -101,7 +101,7 @@ mod local {
 
     #[allow(non_snake_case)]
     pub fn Local<Clock: crate::local::clock::AktorGroupClock>(
-        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), crate::AktorSetupError>
+        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), alloc::string::String>
         + 'static,
     ) -> Local<Clock> {
         Local {
@@ -134,7 +134,7 @@ mod embassy {
 
     #[allow(non_snake_case)]
     pub fn EmbassyLocal(
-        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), crate::AktorSetupError>
+        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), alloc::string::String>
         + 'static,
     ) -> EmbassyLocal {
         EmbassyLocal {
@@ -159,7 +159,7 @@ mod cross_core {
 
     #[allow(non_snake_case)]
     pub fn EmbassyCrossCore(
-        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), crate::AktorSetupError>
+        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), alloc::string::String>
         + 'static,
     ) -> EmbassyCrossCore {
         EmbassyCrossCore {
@@ -205,13 +205,20 @@ mod worker {
     pub fn BrowserWebWorker<S: 'static>(
         program: impl Into<alloc::string::String>,
     ) -> BrowserWebWorker<S> {
-        BrowserWebWorker {
-            program: program.into(),
-            state: core::marker::PhantomData,
+        BrowserWebWorker::new(program)
+    }
+
+    impl<S, E> BrowserWebWorker<S, E> {
+        /// Open a worker whose initializer sends a typed error across the wire.
+        pub fn new(program: impl Into<alloc::string::String>) -> Self {
+            Self {
+                program: program.into(),
+                state: core::marker::PhantomData,
+            }
         }
     }
 
-    impl<S> AktorMode for BrowserWebWorker<S> {
+    impl<S, E> AktorMode for BrowserWebWorker<S, E> {
         type Each<T: 'static> = dyn FnMut(&mut T, Operation);
         type Interval<T: 'static> = dyn AktorIntervalLogic<T>;
 

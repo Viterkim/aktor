@@ -22,7 +22,7 @@ async fn local() {
     .await
     .unwrap();
 
-    let caller = handle.new_handle();
+    let caller = handle.clone();
 
     // The submitted reply must be Send even though the state is not.
     #[allow(clippy::async_yields_async)]
@@ -38,7 +38,7 @@ async fn local() {
     .await
     .unwrap();
 
-    actor.pause().await.unwrap();
+    actor.shutdown().await.unwrap();
     drop(handle);
     thread.join_async().await.unwrap().unwrap();
 
@@ -119,21 +119,18 @@ async fn async_lifecycle() {
     .await
     .unwrap();
 
-    actor.pause().await.unwrap();
-    actor.resume_async(|| setup(2)).await.unwrap();
-    actor.replace_async(|| setup(3)).await.unwrap();
-    assert_eq!(call(&handle, |state, ()| *state, ()).await, 3);
+    assert_eq!(call(&handle, |state, ()| *state, ()).await, 1);
 
     actor.shutdown().await.unwrap();
     thread.join_async().await.unwrap().unwrap();
 
-    assert_eq!(*cleaned.lock().unwrap(), [1, 2, 3]);
+    assert_eq!(*cleaned.lock().unwrap(), [1]);
 }
 
 #[test]
 fn sources() {
     use er::ErErrorPresentationExt;
-    use std::{error::Error, io, sync::Arc};
+    use std::{error::Error, io};
 
     let errors: Vec<Box<dyn Error>> = vec![
         Box::new(DedicatedStartError::Init(io::Error::other(
@@ -142,25 +139,13 @@ fn sources() {
         Box::new(DedicatedStartError::<io::Error>::Thread(io::Error::other(
             "thread sentinel",
         ))),
-        Box::new(ReplaceError::<io::Error, io::Error>::Setup(
-            io::Error::other("setup sentinel"),
-        )),
-        Box::new(ReplaceError::<io::Error, io::Error>::Cleanup(Arc::new(
-            io::Error::other("cleanup sentinel"),
-        ))),
         Box::new(RunError::Failed(io::Error::other("serve sentinel"))),
     ];
 
     for error in errors {
         let source = error.source().unwrap();
 
-        assert_eq!(
-            error
-                .er_report_string()
-                .matches(&source.to_string())
-                .count(),
-            1,
-        );
+        assert_eq!(error.er_report().matches(&source.to_string()).count(), 1,);
         assert!(source.is::<io::Error>(), "missing source: {error}");
     }
 }

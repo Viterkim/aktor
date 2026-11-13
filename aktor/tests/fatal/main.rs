@@ -1,7 +1,9 @@
 use aktor::listener::{
-    FailureKind, Handle, RunError, channel, spawn, spawn_local_with_policy, spawn_runner,
+    FailureKind, FailurePolicy, Handle, RunError, SpawnArgs, channel, spawn,
+    spawn_local_with_policy, spawn_runner,
 };
 use aktor::message::{Request, call};
+#[cfg(feature = "macros")]
 use aktor::*;
 
 #[path = "../support/mod.rs"]

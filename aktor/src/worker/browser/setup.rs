@@ -1,12 +1,20 @@
 use super::*;
-use crate::AktorError;
 use crate::{
-    AktorClosures, local::hooks::AktorHooks, setup::closures::AktorEndCall,
-    setup::kind::BrowserWebWorker,
+    AktorHooks,
+    local::hooks::CallHooks,
+    setup::{closures::AktorEndCall, initial, kind::BrowserWebWorker},
 };
 use core::ops::AsyncFnOnce;
 use server::{WorkerInterval, respond, scope};
 use wasm_bindgen::JsCast;
+
+/// The setup that a worker runs. Pass `serve_setup` a function that builds it from the app's config.
+pub struct AktorServe<S: 'static, Start, End = ()> {
+    pub start: Start,
+    /// Return `()` when cleanup always succeeds. A failed cleanup sends its full report to the page.
+    pub end: End,
+    pub hooks: AktorHooks<S, BrowserWebWorker<S>>,
+}
 
 struct Initialize {
     scope: web_sys::DedicatedWorkerGlobalScope,
@@ -18,10 +26,16 @@ impl Drop for Initialize {
     }
 }
 
-async fn configuration<Config: DeserializeOwned + 'static>(
+async fn configuration<S: 'static, Role: 'static, Config: DeserializeOwned + 'static>(
     options: Options,
-    operations: Operations,
 ) -> Result<Config, WireError> {
+    options
+        .validate_limits()
+        .map_err(WorkerFailure::without_data)?;
+    let operations = registry::Registry::for_actor::<S, Role>()
+        .map_err(WorkerFailure::without_data)?
+        .operations();
+
     let scope = scope()?;
     let (sender, config) = oneshot::channel();
     let sender = Rc::new(RefCell::new(Some(sender)));
@@ -43,9 +57,7 @@ async fn configuration<Config: DeserializeOwned + 'static>(
                     })
             })
             .and_then(|input| match input {
-                Incoming::Initialize { config } => {
-                    decode(&config).map_err(WorkerError::without_data)
-                }
+                Incoming::Initialize { config } => decode(&config).map_err(WireError::from),
                 Incoming::Shutdown => {
                     Err(WireError::new(CallError::NotAdmitted, WorkerCause::Closed))
                 }
@@ -78,6 +90,70 @@ async fn configuration<Config: DeserializeOwned + 'static>(
         .unwrap_or_else(|_| Err(WireError::new(CallError::NotAdmitted, WorkerCause::Closed)))
 }
 
+fn init_not_run(error: WireError) -> (WorkerError, String) {
+    report_start_failure(error, |error| Outgoing::InitNotRun {
+        version: VERSION,
+        error,
+    })
+}
+
+fn report_start_failure(
+    failure: WireError,
+    notice: impl FnOnce(WireError) -> Outgoing,
+) -> (WorkerError, String) {
+    let Ok(scope) = scope() else {
+        return failure.report_without_data();
+    };
+    let sent = server::send_start_failure(&scope, notice(failure.clone()));
+
+    let (error, mut report) = failure.report_without_data();
+    if let Err((notice, post)) = sent {
+        server::report_lost_notice(&mut report, notice, post);
+    }
+
+    (error, report)
+}
+
+#[doc(hidden)]
+pub trait WorkerInitError<Mode> {
+    fn failure(&self, outcome: CallError) -> WorkerFailure<Vec<u8>>;
+}
+
+fn setup_failure<E: Serialize>(
+    outcome: CallError,
+    report: impl Into<String>,
+    data: &E,
+) -> WireError {
+    server::lifecycle_error(WireError::setup(outcome, report), data)
+}
+
+impl<E: core::error::Error + Serialize + 'static> WorkerInitError<initial::Plain> for E {
+    fn failure(&self, outcome: CallError) -> WireError {
+        setup_failure(outcome, crate::setup::diagnostics(self), self)
+    }
+}
+impl WorkerInitError<initial::Text> for String {
+    fn failure(&self, outcome: CallError) -> WireError {
+        setup_failure(outcome, self.as_str(), &())
+    }
+}
+impl<E: Serialize> WorkerInitError<initial::Pair> for (E, String) {
+    fn failure(&self, outcome: CallError) -> WireError {
+        setup_failure(outcome, self.1.as_str(), &self.0)
+    }
+}
+impl<E: core::error::Error + Serialize + 'static> WorkerInitError<initial::Tree> for er::ErTree<E> {
+    fn failure(&self, outcome: CallError) -> WireError {
+        setup_failure(outcome, crate::report::tree_report(self), &self.top)
+    }
+}
+impl WorkerInitError<core::convert::Infallible> for core::convert::Infallible {
+    fn failure(&self, _: CallError) -> WireError {
+        match *self {}
+    }
+}
+
+/// Run the initializer with the config from the page. This sends its own startup notices.
 pub async fn serve_setup<
     Role: 'static,
     S: 'static,
@@ -85,67 +161,60 @@ pub async fn serve_setup<
     Start,
     End,
     CM,
+    E,
+    Mode,
 >(
     _: Role,
     options: Options,
-    logic: impl FnOnce(Config) -> AktorClosures<S, Start, BrowserWebWorker<S>, End>,
-) -> Result<Server, WireError>
+    logic: impl FnOnce(Config) -> AktorServe<S, Start, End>,
+) -> Result<Server, (WorkerError, String)>
 where
-    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError>,
+    Start: AsyncFnOnce() -> Result<S, E>,
+    E: WorkerInitError<Mode>,
     End: AktorEndCall<S, CM> + 'static,
 {
-    options.validate().map_err(WorkerError::without_data)?;
-
-    let operations = registry::Registry::for_actor::<S, Role>()
-        .map_err(WorkerError::without_data)?
-        .operations();
-    let config = match configuration(options.clone(), operations).await {
+    let config = match configuration::<S, Role, Config>(options.clone()).await {
         Ok(config) => config,
         Err(error) => {
             drop(logic);
-            server::setup_retired(error.clone())?;
-            return Err(error);
+            return Err(init_not_run(error));
         }
     };
 
-    let closures = logic(config);
-    let AktorClosures {
-        start,
-        mut end,
+    let AktorServe { start, end, hooks } = logic(config);
+    let AktorHooks {
         intervals,
         before_each,
         after_each,
-    } = closures;
+    } = hooks;
 
     if intervals.iter().any(|interval| interval.every.is_zero()) {
         let error = WireError::setup(CallError::NotAdmitted, "interval duration must be positive");
 
         drop((start, end, intervals, before_each, after_each));
-        server::setup_retired(error.clone())?;
-        return Err(error);
+        return Err(init_not_run(error));
     }
 
     let state = match start().await {
         Ok(state) => state,
         Err(error) => {
-            let failure = server::lifecycle_error(
-                WireError::setup(CallError::NotAdmitted, error.diagnostics.clone()),
-                &error.data,
-            );
+            let failure = error.failure(CallError::NotAdmitted);
             drop((error, end, intervals, before_each, after_each));
-            server::setup_retired(failure.clone())?;
-            return Err(failure);
+            return Err(report_start_failure(failure, Outgoing::SetupFailed));
         }
     };
 
-    server::serve_logic::<Role, _, _, _, ()>(
+    server::serve_logic::<Role, _, _, _>(
         state,
         async move |state| match end.run(state).await {
             Ok(()) => Ok(()),
-            Err(error) => Err(AktorError::new(error.diagnostics, ())),
+            Err(error) => Err(WireError::cleanup(
+                CallError::OutcomeUnknown,
+                error.diagnostics,
+            )),
         },
         options,
-        AktorHooks {
+        CallHooks {
             before_each: before_each.map(|callback| callback.0),
             after_each: after_each.map(|callback| callback.0),
             intervals: Vec::new(),
@@ -158,4 +227,5 @@ where
             })
             .collect(),
     )
+    .map_err(WireError::report_without_data)
 }

@@ -13,12 +13,12 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         self,
         setup: Setup,
         cleanup: Cleanup,
-    ) -> Result<(), OwnerError>
+    ) -> Result<(), (OwnerError, String)>
     where
         Setup: FnOnce() -> SetupFuture,
-        SetupFuture: Future<Output = Result<S, crate::AktorSetupError<E>>>,
+        SetupFuture: Future<Output = Result<S, crate::AktorError<E>>>,
         Cleanup: FnOnce(S) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), crate::AktorCleanupError<E>>>,
+        CleanupFuture: Future<Output = Result<(), crate::AktorError<E>>>,
     {
         self.run_with_custom(setup, cleanup, runner::serve).await
     }
@@ -28,10 +28,10 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         self,
         state: S,
         cleanup: Cleanup,
-    ) -> Result<(), OwnerError>
+    ) -> Result<(), (OwnerError, String)>
     where
         Cleanup: FnOnce(S) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), crate::AktorCleanupError<E>>>,
+        CleanupFuture: Future<Output = Result<(), crate::AktorError<E>>>,
     {
         self.run_custom(state, cleanup, runner::serve).await
     }
@@ -67,7 +67,7 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
         {
             let report = |payload: &Box<dyn std::any::Any + Send>| {
                 let error = crate::AktorError::new(crate::panic::panic_message(payload), ());
-                self.inner.fail(&OwnerFailure::Runner(error.clone()));
+                self.inner.fail(&OwnerError::Runner(error.clone()));
                 self.inner.completion.diagnostics.borrow_mut().push(error);
             };
 
@@ -82,7 +82,7 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
 
             if unfinished
                 && let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.inner.finish(Err(Rc::new(OwnerFailure::Cancelled)));
+                    self.inner.finish(Err(Rc::new(OwnerError::Cancelled)));
                 }))
             {
                 report(&payload);
@@ -104,7 +104,7 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
         }
         #[cfg(not(feature = "std"))]
         if self.inner.completion.result.borrow().is_none() {
-            self.inner.finish(Err(Rc::new(OwnerFailure::Cancelled)));
+            self.inner.finish(Err(Rc::new(OwnerError::Cancelled)));
         }
     }
 }

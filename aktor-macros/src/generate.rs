@@ -1,8 +1,8 @@
 use crate::{input, names, path, signature};
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::visit_mut::VisitMut;
 use syn::{FnArg, parse_quote};
+use syn::{visit::Visit, visit_mut::VisitMut};
 
 pub fn expand(options: input::Options, mut function: input::Function) -> syn::Result<TokenStream> {
     if crate::worker::supports(&function)? {
@@ -26,11 +26,12 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         .map_or_else(|| quote!(()), |role| quote!(#role));
     let mut names = names::Names::new(&function.signature, &function.body, quote!(#aktor #role));
     let output = signature::output(&function.signature);
+    let direct_signature = function.signature.clone();
     let (implementation, invoke) = signature::implementation(&function, &mut names, &output)?;
     let output = signature::dispatch_output(output);
-    let mut opaque_output = OpaqueOutput(false);
+    let mut opaque_output = signature::HasImplTrait(false);
 
-    syn::visit::Visit::visit_type(&mut opaque_output, &output);
+    opaque_output.visit_type(&output);
 
     let latest_factory = names::binding(&mut names.reserved, "__AktorLatestFactory");
     let latest_state = names::binding(&mut names.reserved, "__AktorLatestState");
@@ -224,8 +225,13 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         }
     }
 
-    let mut scope =
-        signature::scope::Child::new(&["request", "latest", "LatestSender"], &request.generics);
+    let mut scope = signature::scope::NestedModule::new(
+        &["direct", "request", "latest", "LatestSender"],
+        &request.generics,
+    );
+
+    let direct =
+        signature::body::direct(direct_signature, &names, &invoke, &attributes, &mut scope);
 
     scope.visit_signature_mut(&mut request);
 
@@ -597,6 +603,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             #[doc(hidden)]
             pub struct #body_type;
 
+            #direct
+
             #latest
 
             #[track_caller]
@@ -606,11 +614,4 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             }
         }
     })
-}
-
-struct OpaqueOutput(bool);
-impl<'ast> syn::visit::Visit<'ast> for OpaqueOutput {
-    fn visit_type_impl_trait(&mut self, _: &'ast syn::TypeImplTrait) {
-        self.0 = true;
-    }
 }

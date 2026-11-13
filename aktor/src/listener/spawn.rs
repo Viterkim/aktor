@@ -9,6 +9,7 @@ use tokio::{
     task::{self, JoinHandle},
 };
 
+#[doc(hidden)]
 pub fn channel<S>(capacity: usize) -> AktorStateResult<(Handle<S>, Listener<S>)> {
     if capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS {
         return Err(AktorStateError::InvalidCapacity);
@@ -32,7 +33,7 @@ pub fn channel<S>(capacity: usize) -> AktorStateResult<(Handle<S>, Listener<S>)>
         },
         Listener {
             name: std::any::type_name::<S>().into(),
-            hooks: hooks::AktorHooks::default(),
+            hooks: hooks::CallHooks::default(),
             receiver,
             failure: FailurePolicy::default(),
             admission,
@@ -71,6 +72,7 @@ pub fn startup_cause<T>(
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 pub fn spawn_local<S: 'static>(
     executor: &task::LocalSet,
     state: S,
@@ -80,6 +82,7 @@ pub fn spawn_local<S: 'static>(
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 pub fn spawn_local_with_policy<S: 'static>(
     executor: &task::LocalSet,
     state: S,
@@ -96,6 +99,7 @@ pub fn spawn_local_with_policy<S: 'static>(
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 pub fn spawn_thread<S: Send + 'static>(
     state: S,
     capacity: usize,
@@ -104,6 +108,7 @@ pub fn spawn_thread<S: Send + 'static>(
 }
 
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 pub fn spawn_thread_with_policy<S: Send + 'static>(
     state: S,
     capacity: usize,
@@ -129,6 +134,7 @@ pub fn spawn_thread_with_policy<S: Send + 'static>(
 /// Cleanup receives the serving outcome, including unwinding panics. After a
 /// panic its return value is discarded and the failure policy runs.
 #[cfg(feature = "tokio")]
+#[doc(hidden)]
 pub async fn spawn_runner<S, E, T, Setup, Serve, Cleanup>(
     args: SpawnArgs<Setup, Cleanup>,
     serve: Serve,

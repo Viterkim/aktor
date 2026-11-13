@@ -15,14 +15,16 @@ pub fn wrapper(attributes: &[Attribute]) -> syn::Result<Vec<Attribute>> {
                     | "must_use"
                     | "inline"
                     | "cold"
-                    | "track_caller"
             )
         })
     })
 }
 
 pub fn implementation(attributes: &[Attribute]) -> syn::Result<Vec<Attribute>> {
-    filter(attributes, |meta| !meta.path().is_ident("deprecated"))
+    filter(attributes, |meta| {
+        let path = meta.path();
+        !path.is_ident("deprecated") && !path.is_ident("track_caller")
+    })
 }
 
 fn filter(attributes: &[Attribute], keep: fn(&Meta) -> bool) -> syn::Result<Vec<Attribute>> {

@@ -1,10 +1,11 @@
 use super::*;
 use crate::{
-    Aktor, AktorGroup,
+    Aktor, AktorGroup, AktorKind, AktorNew,
     dispatch::{OwnedState, ReadCall, ReadState, WriteCall, WriteState},
     message::call_async,
     operation::Operation,
     owner::StartError,
+    setup::{AktorStart, AktorStartCause, AktorStartContext, AktorThreadFuture},
 };
 use core::{future::Future, ops::AsyncFnOnce};
 
@@ -15,8 +16,50 @@ pub struct Mock<S, Role = ()> {
     state: PhantomData<fn() -> (S, Role)>,
 }
 
+impl<S: 'static, Role: 'static> AktorStart for Preset<S, Role> {
+    type Error = core::convert::Infallible;
+    type Group = AktorGroup;
+    type Handles = Mock<S, Role>;
+    type Startup = AktorThreadFuture<Result<Mock<S, Role>, crate::AktorStartError>>;
+
+    fn begin(&self, group: &mut AktorGroup) -> Result<(), AktorStartCause> {
+        group
+            .start_threaded()
+            .map(|_| ())
+            .map_err(AktorStartCause::group_error)
+    }
+
+    fn start_in(self, context: AktorStartContext<AktorGroup>) -> Self::Startup {
+        let names = self.handlers.entries.keys().copied().collect();
+        let handlers = self.handlers;
+        let setup = AktorNew {
+            name: "test handlers".into(),
+            kind: AktorKind::TokioThread,
+            start: async move || crate::aktor_ready(handlers),
+            end: (),
+            hooks: Default::default(),
+            capacity: 32,
+            stuck: crate::AktorStuck::Kill,
+        };
+
+        Box::pin(async move {
+            let actor = setup.start_in(context).await?;
+
+            Ok(Mock {
+                actor,
+                names,
+                state: PhantomData,
+            })
+        })
+    }
+}
+
 impl<S, Role> Preset<S, Role> {
-    pub async fn start(self, actors: &mut AktorGroup) -> Result<Mock<S, Role>, StartError> {
+    #[doc(hidden)]
+    pub async fn start(
+        self,
+        actors: &mut AktorGroup,
+    ) -> Result<Mock<S, Role>, (StartError, String)> {
         let names = self.handlers.entries.keys().copied().collect();
         let actor = actors.spawn_value("test handlers", self.handlers).await?;
         Ok(Mock {
@@ -27,6 +70,13 @@ impl<S, Role> Preset<S, Role> {
     }
 }
 
+impl<S, Role> Mock<S, Role> {
+    /// Wrap the outermost future that needs to stop with this actor's group.
+    /// If the group starts closing first, `run` drops that future and returns `None`.
+    pub async fn run<F: Future>(&self, work: F) -> Option<F::Output> {
+        self.actor.run(work).await
+    }
+}
 impl<S: 'static, Role> ReadState<S, Role> for &Mock<S, Role> {
     type Lease = OwnedState<S>;
 }

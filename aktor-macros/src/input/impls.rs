@@ -50,7 +50,7 @@ impl Parse for Options {
 
             let value = match option.to_string().as_str() {
                 "crate" => &mut crate_path,
-                "role" | "actor" => &mut role,
+                "role" => &mut role,
                 _ => {
                     return Err(syn::Error::new(
                         option.span(),

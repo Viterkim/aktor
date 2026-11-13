@@ -13,7 +13,6 @@ crate-type = ["cdylib", "rlib"]
 er = { workspace = true, features = ["macros"] }
 aktor = { workspace = true, features = ["macros", "wasm_browser_workers", "tokio", "browser_local", "bevy", "serde"] }
 serde.workspace = true
-serde_json.workspace = true
 futures-util = { workspace = true, default-features = true }
 rusqlite.workspace = true
 
@@ -30,6 +29,10 @@ bevy_tasks.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 sqlite-wasm-rs.workspace = true
 sqlite-wasm-vfs.workspace = true
+serde_json.workspace = true
 
 [features]
 wrong-role = []
+
+[lints]
+workspace = true

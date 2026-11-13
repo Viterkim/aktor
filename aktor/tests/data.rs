@@ -137,6 +137,184 @@ impl<'de> Deserialize<'de> for OwnSerde {
     }
 }
 
+#[test]
+fn recursive_field_bounds() {
+    struct Device;
+    impl Value for Device {
+        type Item = u8;
+    }
+
+    #[derive(AktorData)]
+    struct Node<C: Value> {
+        entry: (C::Item, Option<Box<Self>>),
+    }
+    let node = Node::<Device> { entry: (19, None) };
+    let bytes = data::encode(&node).unwrap();
+    assert_eq!(data::decode::<Node<Device>>(&bytes).unwrap().entry.0, 19);
+}
+
+#[test]
+fn same_named_wire_type() {
+    mod wire {
+        #[derive(aktor::AktorData)]
+        pub struct Packet<T>(pub T);
+    }
+
+    #[derive(AktorData)]
+    struct Packet<T>(Option<wire::Packet<T>>);
+
+    let bytes = data::encode(&Packet(Some(wire::Packet(5u8)))).unwrap();
+    assert_eq!(data::decode::<Packet<u8>>(&bytes).unwrap().0.unwrap().0, 5);
+}
+
+#[test]
+fn field_type_macro() {
+    #[derive(AktorData)]
+    struct __Ref(u8);
+
+    macro_rules! field_type {
+        () => {
+            __Ref
+        };
+    }
+
+    #[derive(AktorData)]
+    struct Value(field_type!());
+
+    let bytes = data::encode(&Value(__Ref(7))).unwrap();
+    assert_eq!(data::decode::<Value>(&bytes).unwrap().0.0, 7);
+}
+
+#[test]
+fn generic_field_type_macro() {
+    macro_rules! field_type {
+        ($ty:ty) => { Option<$ty> };
+    }
+
+    #[derive(AktorData)]
+    struct Field<T>(field_type!(T));
+
+    let bytes = data::encode(&Field(Some(7u8))).unwrap();
+    assert_eq!(data::decode::<Field<u8>>(&bytes).unwrap().0, Some(7));
+}
+
+#[test]
+fn recursive_default_argument() {
+    struct Marker;
+    impl Value for Marker {
+        type Item = u8;
+    }
+
+    #[derive(AktorData)]
+    struct Node<M: Value, T = u8> {
+        value: T,
+        children: Vec<Node<M>>,
+        marker: M::Item,
+    }
+
+    let node = Node::<Marker, u16> {
+        value: 512,
+        children: vec![Node {
+            value: 7,
+            children: Vec::new(),
+            marker: 3,
+        }],
+        marker: 4,
+    };
+    let bytes = data::encode(&node).unwrap();
+    assert_eq!(
+        data::decode::<Node<Marker, u16>>(&bytes).unwrap().children[0].value,
+        7
+    );
+}
+
+#[test]
+fn self_projection() {
+    #[derive(AktorData)]
+    struct Projected<C: Value>(
+        <Self as Value>::Item,
+        #[aktor(skip)] core::marker::PhantomData<C>,
+    );
+
+    impl<C: Value> Value for Projected<C> {
+        type Item = C::Item;
+    }
+
+    struct Device;
+    impl Value for Device {
+        type Item = u32;
+    }
+
+    let bytes = data::encode(&Projected::<Device>(17, core::marker::PhantomData)).unwrap();
+    assert_eq!(data::decode::<Projected<Device>>(&bytes).unwrap().0, 17);
+}
+
+#[test]
+#[allow(non_upper_case_globals)]
+fn constants_in_scope() {
+    const __aktor_serializer: u8 = 7;
+    const __aktor_deserializer: u8 = 8;
+    const __aktor_wire: u8 = 9;
+    const __aktor_field_1: u8 = 10;
+
+    #[derive(AktorData, Debug, PartialEq)]
+    enum Value {
+        Sample([u8; 4]),
+    }
+
+    roundtrip(Value::Sample([
+        __aktor_serializer,
+        __aktor_deserializer,
+        __aktor_wire,
+        __aktor_field_1,
+    ]));
+}
+
+#[test]
+#[allow(non_upper_case_globals)]
+fn constants_in_type_macro() {
+    const __aktor_serializer: usize = 1;
+    const __aktor_deserializer: usize = 2;
+
+    macro_rules! bytes {
+        () => {
+            [u8; __aktor_serializer + __aktor_deserializer]
+        };
+    }
+
+    #[derive(AktorData, Debug, PartialEq)]
+    struct Packet<T>(T)
+    where
+        T: Into<bytes!()>;
+
+    roundtrip(Packet([4, 5, 6]));
+}
+
+#[test]
+fn nested_serde() {
+    #[derive(AktorData, Serialize, Deserialize)]
+    #[aktor(serde)]
+    #[serde(try_from = "u8")]
+    struct Level(u8);
+
+    impl TryFrom<u8> for Level {
+        type Error = &'static str;
+
+        fn try_from(value: u8) -> Result<Self, Self::Error> {
+            (value <= 10)
+                .then_some(Self(value))
+                .ok_or("level exceeds 10")
+        }
+    }
+
+    let bytes = data::encode(&Some(Level(10))).unwrap();
+    let level = data::decode::<Option<Level>>(&bytes).unwrap().unwrap();
+    assert_eq!(level.0, 10);
+
+    let invalid = data::encode(&Some(11_u8)).unwrap();
+    assert!(data::decode::<Option<Level>>(&invalid).is_err());
+}
+
 fn roundtrip<T: AktorData + PartialEq + std::fmt::Debug>(value: T) {
     let bytes = data::encode(&value).unwrap();
 
@@ -244,6 +422,26 @@ fn values() {
 
 #[test]
 fn representation() {
+    #[derive(AktorData, Debug, PartialEq)]
+    #[repr(u8)]
+    enum State {
+        Ready = 7,
+        Closed = 19,
+    }
+
+    assert_eq!(data::encode(&State::Closed).unwrap(), [1]);
+    assert_eq!(data::decode::<State>(&[0]).unwrap(), State::Ready);
+
+    for byte in 0..=u8::MAX {
+        let bits: [bool; 8] = std::array::from_fn(|bit| byte & (1 << bit) != 0);
+        assert_eq!(data::decode::<Vec<bool>>(&[2, byte, 1]).unwrap(), bits);
+    }
+
+    let signed = vec![-128i8, -1, 0, 127];
+    let encoded = [4, 128, 255, 0, 127];
+    assert_eq!(data::encode(&signed).unwrap(), encoded);
+    assert_eq!(data::decode::<Vec<i8>>(&encoded).unwrap(), signed);
+
     let custom = OwnSerde { value: 99 };
     assert_eq!(
         data::decode::<OwnSerde>(&data::encode(&custom).unwrap())

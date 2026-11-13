@@ -20,6 +20,7 @@
         serialization_shutdown_check,
         local_setup_check,
         remote_setup_check,
+        remote_cancel_check,
         remote_preflight_check,
         bevy_setup_check
     } from './pkg/aktor_worker_proof.js';
@@ -29,6 +30,7 @@
     window.bevySetupCheck = bevy_setup_check;
     window.localSetupCheck = local_setup_check;
     window.remoteSetupCheck = remote_setup_check;
+    window.remoteCancelCheck = remote_cancel_check;
     window.remotePreflightCheck = remote_preflight_check;
     window.Client = Client;
     window.sqliteListenerCheck = sqlite_listener_check;

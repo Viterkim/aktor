@@ -1,7 +1,7 @@
 use super::*;
 #[cfg(feature = "std")]
 use crate::panic::{dispose_secondary, panic_message};
-use crate::{AktorCleanupError, AktorSetupError, message::AktorStateError};
+use crate::{AktorError, message::AktorStateError};
 #[cfg(feature = "embassy_cross_core")]
 use crate::{AktorExecution, AktorFailureReport};
 use core::{
@@ -10,7 +10,25 @@ use core::{
 };
 
 /// The target's critical-section implementation must synchronize every calling core.
+#[doc(hidden)]
 pub fn channel<S>(capacity: usize) -> Result<(Handle<S>, Owner<S>), AktorStateError> {
+    let (handle, inner) = channel_parts(capacity)?;
+    Ok((handle, Owner::new(inner)))
+}
+
+#[cfg(all(
+    feature = "wasm_threads",
+    target_family = "wasm",
+    target_feature = "atomics"
+))]
+pub(crate) fn browser_channel<S>(
+    capacity: usize,
+) -> Result<(Handle<S>, impl FnOnce() -> Owner<S> + Send), AktorStateError> {
+    let (handle, inner) = channel_parts(capacity)?;
+    Ok((handle, move || Owner::new(inner)))
+}
+
+fn channel_parts<S>(capacity: usize) -> Result<(Handle<S>, Arc<Inner<S>>), AktorStateError> {
     if capacity == 0 {
         return Err(AktorStateError::InvalidCapacity);
     }
@@ -18,6 +36,7 @@ pub fn channel<S>(capacity: usize) -> Result<(Handle<S>, Owner<S>), AktorStateEr
     let inner = Arc::new(Inner {
         queue: Mutex::new(RefCell::new(Queue {
             open: true,
+            cancelled: false,
             handles: 1,
             ordinary: VecDeque::new(),
             services: VecDeque::new(),
@@ -35,17 +54,23 @@ pub fn channel<S>(capacity: usize) -> Result<(Handle<S>, Owner<S>), AktorStateEr
             inner: inner.clone(),
             role: PhantomData,
         },
-        Owner {
+        inner,
+    ))
+}
+
+impl<S> Owner<S> {
+    fn new(inner: Arc<Inner<S>>) -> Self {
+        Self {
             inner,
-            hooks: AktorHooks::default(),
+            hooks: CallHooks::default(),
             #[cfg(feature = "embassy_cross_core")]
             supervisor: None,
             local: PhantomData,
             intervals: Vec::new(),
             interval_cursor: 0,
             work_cursor: 0,
-        },
-    ))
+        }
+    }
 }
 
 impl<S> Inner<S> {
@@ -67,6 +92,21 @@ impl<S> Inner<S> {
             self.close_queue(&mut queue.borrow_mut());
         });
         self.notify();
+    }
+
+    fn cancel_calls(&self) {
+        self.queue.lock(|queue| queue.borrow_mut().cancelled = true);
+        self.notify();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.queue.lock(|queue| queue.borrow().cancelled)
+    }
+
+    fn mark_cut(&self) {
+        self.status
+            .state
+            .lock(|state| state.borrow_mut().cut_call = true);
     }
 
     fn notify(&self) {
@@ -166,24 +206,29 @@ impl<S> Inner<S> {
         }
     }
 
-    pub fn commit(&self, message: Message<S>, service: bool) -> Result<(), Message<S>> {
+    pub fn commit(&self, message: Message<S>) -> Result<(), Refused<S>> {
         self.queue.lock(|queue| {
             let mut queue = queue.borrow_mut();
-
-            if service {
-                if self.status.state.lock(|state| state.borrow().finishing) {
-                    return Err(message);
-                }
-
-                queue.services.push_back(message);
-            } else {
-                if !queue.open || queue.ordinary.len() == self.capacity {
-                    return Err(message);
-                }
-
-                queue.ordinary.push_back(message);
+            if !queue.open {
+                return Err(Refused::Closed(message));
+            }
+            if queue.ordinary.len() == self.capacity {
+                return Err(Refused::Full(message));
             }
 
+            queue.ordinary.push_back(message);
+            Ok(())
+        })
+    }
+
+    pub fn commit_service(&self, message: Message<S>) -> Result<(), Message<S>> {
+        self.queue.lock(|queue| {
+            let mut queue = queue.borrow_mut();
+            if self.status.state.lock(|state| state.borrow().finishing) {
+                return Err(message);
+            }
+
+            queue.services.push_back(message);
             Ok(())
         })
     }
@@ -241,7 +286,7 @@ impl<S, Role> Handle<S, Role> {
         }
     }
 
-    pub fn new_handle(&self) -> Self {
+    fn new_handle(&self) -> Self {
         self.inner
             .queue
             .lock(|queue| queue.borrow_mut().handles += 1);
@@ -268,18 +313,67 @@ impl<S, Role> Handle<S, Role> {
         }
     }
 
+    #[doc(hidden)]
     pub fn shutdown(&self) -> Completion {
         self.inner.close();
         self.completion()
     }
 
+    /// Stop serving calls, `end` still runs. Shutdown does this once an actor's grace is up.
+    #[doc(hidden)]
+    pub fn cancel_calls(&self) {
+        self.inner.cancel_calls();
+    }
+
+    /// Whether cancelling cut calls that were still being served.
+    #[doc(hidden)]
+    pub fn cut_call(&self) -> bool {
+        self.inner
+            .status
+            .state
+            .lock(|state| state.borrow().cut_call)
+    }
+
+    #[doc(hidden)]
     pub fn completion(&self) -> Completion {
         Completion {
             status: self.inner.status.clone(),
         }
     }
 
-    pub async fn ready(&self) -> Result<(), AktorError> {
+    /// Wrap the outermost future that needs to stop with this actor's group.
+    /// If the group starts closing first, `run` drops that future and returns `None`.
+    pub async fn run<F: Future>(&self, work: F) -> Option<F::Output> {
+        let changed = Event::listen(&self.inner.status.changed);
+        let mut work = core::pin::pin!(work);
+
+        poll_fn(|cx| {
+            changed.register(cx);
+
+            let stopped = self
+                .inner
+                .status
+                .state
+                .lock(|state| state.borrow().group_stopped);
+
+            if stopped {
+                return Poll::Ready(None);
+            }
+
+            work.as_mut().poll(cx).map(Some)
+        })
+        .await
+    }
+
+    #[doc(hidden)]
+    pub fn group_stopped(&self) {
+        self.inner.status.state.lock(|state| {
+            state.borrow_mut().group_stopped = true;
+        });
+        self.inner.status.changed.notify();
+    }
+
+    pub async fn ready(&self) -> Result<(), (OwnerError, String)> {
         let changed = Event::listen(&self.inner.status.changed);
 
         poll_fn(|cx| {
@@ -291,6 +385,7 @@ impl<S, Role> Handle<S, Role> {
                 .map_or(Poll::Pending, Poll::Ready)
         })
         .await
+        .map_err(|error| (OwnerError::Setup, error.diagnostics))
     }
 }
 impl<S, Role> Clone for Handle<S, Role> {
@@ -329,6 +424,19 @@ impl<S, Role> Drop for Handle<S, Role> {
 }
 
 impl<S, Role> WeakHandle<S, Role> {
+    /// Tell every handle's `run` the group closed. Works after the queue closed too.
+    #[doc(hidden)]
+    pub fn group_stopped(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+
+        inner.status.state.lock(|state| {
+            state.borrow_mut().group_stopped = true;
+        });
+        inner.status.changed.notify();
+    }
+
     pub fn upgrade(&self) -> Option<Handle<S, Role>> {
         let inner = self.inner.upgrade()?;
         let open = inner.queue.lock(|queue| {
@@ -362,6 +470,38 @@ impl<S, Role> Clone for WeakHandle<S, Role> {
 }
 
 impl Completion {
+    #[cfg(feature = "embassy_cross_core")]
+    pub(crate) fn owner_status(&self) -> crate::local::OwnerStatus {
+        self.status.state.lock(|state| {
+            let state = state.borrow();
+
+            crate::local::OwnerStatus {
+                cleanup_completed: Some(state.cleanup_completed),
+                ran_past_grace: state.cut_call,
+                cleanup_diagnostic: state
+                    .cleanup_failure
+                    .as_ref()
+                    .filter(|error| !error.primary)
+                    .map(|error| AktorError::new(error.diagnostics.clone(), ())),
+                #[cfg(feature = "std")]
+                panic_reported: state.panic_reported,
+                #[cfg(not(feature = "std"))]
+                panic_reported: false,
+            }
+        })
+    }
+
+    #[cfg(all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    ))]
+    pub(crate) fn initialized(&self) -> bool {
+        self.status
+            .state
+            .lock(|state| state.borrow().ready.as_ref().is_some_and(Result::is_ok))
+    }
+
     #[cfg(all(
         feature = "wasm_threads",
         target_family = "wasm",
@@ -373,14 +513,56 @@ impl Completion {
             .lock(|status| status.borrow().cleanup_completed)
     }
 
-    #[doc(hidden)]
-    pub fn diagnostics(&self) -> Vec<AktorError> {
-        self.status
-            .state
-            .lock(|state| state.borrow().diagnostics.clone())
+    #[cfg(all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    ))]
+    pub(crate) fn cut_call(&self) -> bool {
+        self.status.state.lock(|status| status.borrow().cut_call)
     }
 
-    pub async fn wait(&self) -> Result<(), AktorError> {
+    #[cfg(all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    ))]
+    pub(crate) fn cleanup_failed(&self) -> bool {
+        self.status
+            .state
+            .lock(|state| state.borrow().cleanup_failure.is_some())
+    }
+
+    #[cfg(all(
+        feature = "wasm_threads",
+        target_family = "wasm",
+        target_feature = "atomics"
+    ))]
+    pub(crate) fn secondary_diagnostics(&self) -> Vec<AktorError> {
+        self.collect_diagnostics(false)
+    }
+
+    #[doc(hidden)]
+    pub fn diagnostics(&self) -> Vec<AktorError> {
+        self.collect_diagnostics(true)
+    }
+
+    fn collect_diagnostics(&self, include_primary: bool) -> Vec<AktorError> {
+        self.status.state.lock(|state| {
+            let state = state.borrow();
+            let mut diagnostics = state.diagnostics.clone();
+
+            if let Some(error) = &state.cleanup_failure
+                && (include_primary || !error.primary)
+            {
+                diagnostics.push(AktorError::new(error.diagnostics.clone(), ()));
+            }
+
+            diagnostics
+        })
+    }
+
+    pub async fn wait(&self) -> Result<(), (OwnerError, String)> {
         let changed = Event::listen(&self.status.changed);
 
         poll_fn(|cx| {
@@ -391,6 +573,20 @@ impl Completion {
                 .map_or(Poll::Pending, Poll::Ready)
         })
         .await
+        .map_err(|error| (OwnerError::Completion, self.report(error.diagnostics)))
+    }
+
+    fn report(&self, mut report: String) -> String {
+        let primary_len = report.len();
+
+        for diagnostic in self.diagnostics() {
+            if diagnostic.diagnostics != report[..primary_len] {
+                report.push('\n');
+                report.push_str(&diagnostic.diagnostics);
+            }
+        }
+
+        report
     }
 }
 
@@ -548,7 +744,7 @@ impl<S> Owner<S> {
     }
 
     #[cfg(feature = "embassy_cross_core")]
-    pub fn manage(&mut self, name: alloc::string::String, kill: crate::embassy::KillSwitch) {
+    pub fn manage(&mut self, name: alloc::string::String, kill: crate::embassy::AktorKillSwitch) {
         self.inner.status.state.lock(|state| {
             let mut state = state.borrow_mut();
             state.managed = true;
@@ -560,47 +756,49 @@ impl<S> Owner<S> {
         let _ = (phase, diagnostic);
         #[cfg(feature = "embassy_cross_core")]
         if let Some((name, kill)) = &self.supervisor {
-            return kill.fail(AktorFailureReport {
+            let reason = AktorFailureReport {
                 actor: name.clone(),
                 kind: Some(AktorExecution::EmbassyCrossCore),
                 phase: phase.into(),
                 message: diagnostic.into(),
-            });
-        }
+            };
 
-        false
-    }
-
-    fn fail_startup(&self, diagnostic: &str) -> bool {
-        let _ = diagnostic;
-        #[cfg(feature = "embassy_cross_core")]
-        if let Some((name, kill)) = &self.supervisor {
-            return kill.fail_startup(AktorFailureReport {
-                actor: name.clone(),
-                kind: Some(AktorExecution::EmbassyCrossCore),
-                phase: "setup".into(),
-                message: diagnostic.into(),
-            });
+            return if phase == "setup" {
+                kill.fail_startup(reason)
+            } else {
+                kill.fail(reason)
+            };
         }
 
         false
     }
 
     #[cfg(feature = "std")]
+    fn report_panic(&self, phase: &str, message: &str) {
+        let _ = (phase, message);
+        #[cfg(feature = "embassy_cross_core")]
+        if let Some((name, kill)) = &self.supervisor {
+            if !self.fail(phase, message) {
+                kill.record_diagnostic(AktorError::new(
+                    alloc::format!("{name} {phase}: {message}"),
+                    (),
+                ));
+            }
+
+            self.inner
+                .status
+                .state
+                .lock(|state| state.borrow_mut().panic_reported = true);
+        }
+    }
+
+    #[cfg(feature = "std")]
     fn diagnostic(&self, phase: &str, error: AktorError) {
-        let _primary = self.fail(phase, &error.diagnostics);
+        self.report_panic(phase, &error.diagnostics);
         self.inner
             .status
             .state
-            .lock(|state| state.borrow_mut().diagnostics.push(error.clone()));
-
-        #[cfg(feature = "embassy_cross_core")]
-        if !_primary && let Some((name, kill)) = &self.supervisor {
-            kill.record_diagnostic(AktorError::new(
-                alloc::format!("{name}: {}", error.diagnostics),
-                (),
-            ));
-        }
+            .lock(|state| state.borrow_mut().diagnostics.push(error));
     }
 
     #[cfg(feature = "std")]
@@ -640,19 +838,35 @@ impl<S> Owner<S> {
         self,
         start: Start,
         end: End,
-    ) -> Result<(), AktorError>
+    ) -> Result<(), (OwnerError, String)>
     where
         Start: FnOnce() -> StartFuture,
-        StartFuture: Future<Output = Result<S, AktorSetupError>>,
+        StartFuture: Future<Output = Result<S, AktorError>>,
         End: FnOnce(S) -> EndFuture,
-        EndFuture: Future<Output = Result<(), AktorCleanupError>>,
+        EndFuture: Future<Output = Result<(), AktorError>>,
     {
         #[cfg(feature = "embassy_cross_core")]
         let supervisor = self.supervisor.clone();
+        #[cfg(feature = "embassy_cross_core")]
+        let end_supervisor = supervisor.clone();
+        let completion = Completion {
+            status: self.inner.status.clone(),
+        };
         let result = self
             .run_prepared(
                 async move || start().await.map_err(AktorFailure::from),
                 async move |state| end(state).await.map_err(AktorFailure::from),
+                move |_error| {
+                    #[cfg(feature = "embassy_cross_core")]
+                    if !_error.primary
+                        && let Some((name, kill)) = end_supervisor
+                    {
+                        kill.record_diagnostic(AktorError::new(
+                            alloc::format!("{name} cleanup: {}", _error.diagnostics),
+                            (),
+                        ));
+                    }
+                },
             )
             .await;
 
@@ -662,6 +876,10 @@ impl<S> Owner<S> {
                 #[cfg(feature = "embassy_cross_core")]
                 if !error.primary
                     && let Some((name, kill)) = supervisor
+                    && completion
+                        .status
+                        .state
+                        .lock(|state| state.borrow().cleanup_failure.is_none())
                 {
                     kill.record_diagnostic(AktorError::new(
                         alloc::format!("{name}: {}", error.diagnostics),
@@ -669,15 +887,16 @@ impl<S> Owner<S> {
                     ));
                 }
 
-                Err(AktorError::new(error.diagnostics, ()))
+                Err((OwnerError::Completion, completion.report(error.diagnostics)))
             }
         }
     }
 
-    pub async fn run_prepared<Start, StartFuture, End, EndFuture>(
+    pub(crate) async fn run_prepared<Start, StartFuture, End, EndFuture>(
         mut self,
         start: Start,
         end: End,
+        on_cleanup_error: impl FnOnce(&AktorFailure),
     ) -> Result<(), AktorFailure>
     where
         Start: FnOnce() -> StartFuture,
@@ -685,9 +904,26 @@ impl<S> Owner<S> {
         End: FnOnce(S) -> EndFuture,
         EndFuture: Future<Output = Result<(), AktorFailure>>,
     {
+        let inner = self.inner.clone();
+        let cancel_changed = Event::listen(&inner.changed);
+        let starting = async {
+            let mut start = core::pin::pin!(async { start().await });
+
+            poll_fn(|cx| {
+                cancel_changed.register(cx);
+
+                if inner.is_cancelled() {
+                    return Poll::Ready(None);
+                }
+
+                start.as_mut().poll(cx).map(Some)
+            })
+            .await
+        };
+
         #[cfg(feature = "std")]
-        let started = crate::local::panic::catch(async { start().await }, |_, payload| {
-            self.fail_startup(&panic_message(payload));
+        let started = crate::local::panic::catch(starting, |_, payload| {
+            self.report_panic("setup", &panic_message(payload));
         })
         .await;
         #[cfg(feature = "std")]
@@ -716,16 +952,28 @@ impl<S> Owner<S> {
             }
         };
         #[cfg(not(feature = "std"))]
-        let started = start().await;
+        let started = starting.await;
+
+        let Some(started) = started else {
+            inner.mark_cut();
+            inner.finish(Err(AktorError::new("actor stopped during startup", ())));
+            return Ok(());
+        };
 
         let mut state = match started {
             Ok(state) => state,
             Err(mut error) => {
-                self.inner
-                    .status
-                    .state
-                    .lock(|status| status.borrow_mut().cleanup_completed = true);
-                error.primary |= self.fail_startup(&error.diagnostics);
+                error.primary |= self.fail("setup", &error.diagnostics);
+                self.inner.status.state.lock(|status| {
+                    let mut status = status.borrow_mut();
+                    status.cleanup_completed = true;
+
+                    if status.managed && !error.primary {
+                        status
+                            .diagnostics
+                            .push(AktorError::new(error.diagnostics.clone(), ()));
+                    }
+                });
                 #[cfg(feature = "std")]
                 if let Some(payload) = self.dispose_hooks() {
                     dispose_secondary(payload);
@@ -749,7 +997,7 @@ impl<S> Owner<S> {
         self.inner.status.changed.notify();
 
         let changed = Event::listen(&self.inner.changed);
-        let serving = async {
+        let serve = async {
             loop {
                 let work = poll_fn(|cx| self.poll_work(&changed, cx)).await;
 
@@ -798,11 +1046,27 @@ impl<S> Owner<S> {
                 .await;
             }
         };
+        // Dropping `serve` drops the call it was running, then `end` runs like after any stop.
+        let serving = async {
+            let mut serve = core::pin::pin!(serve);
+
+            poll_fn(|cx| {
+                cancel_changed.register(cx);
+
+                if inner.is_cancelled() {
+                    inner.mark_cut();
+                    return Poll::Ready(());
+                }
+
+                serve.as_mut().poll(cx)
+            })
+            .await
+        };
         #[cfg(feature = "std")]
         let mut primary = crate::local::panic::catch(serving, |_, _| {}).await.err();
         #[cfg(feature = "std")]
         if let Some(payload) = &primary {
-            self.fail("operation", &panic_message(payload));
+            self.report_panic("operation", &panic_message(payload));
         }
         #[cfg(not(feature = "std"))]
         serving.await;
@@ -827,26 +1091,43 @@ impl<S> Owner<S> {
         #[cfg(not(feature = "std"))]
         self.inner.discard_queued();
 
+        let ending = async {
+            let mut result = end(state).await;
+
+            self.inner.status.state.lock(|state| {
+                let mut state = state.borrow_mut();
+                state.cleanup_completed = true;
+                state.cleanup_failure = result.as_ref().err().cloned();
+            });
+
+            if let Err(error) = &mut result {
+                if self.fail("cleanup", &error.diagnostics) {
+                    error.primary = true;
+                    self.inner.status.state.lock(|state| {
+                        if let Some(failure) = &mut state.borrow_mut().cleanup_failure {
+                            failure.primary = true;
+                        }
+                    });
+                }
+                on_cleanup_error(error);
+            }
+
+            result
+        };
         #[cfg(feature = "std")]
-        let cleaned = crate::local::panic::catch(
-            async {
-                let result = end(state).await;
-                self.inner
-                    .status
-                    .state
-                    .lock(|status| status.borrow_mut().cleanup_completed = true);
-                result
-            },
-            |_, payload| {
-                self.fail("cleanup", &panic_message(payload));
-            },
-        )
+        let cleaned = crate::local::panic::catch(ending, |_, payload| {
+            self.report_panic("cleanup", &panic_message(payload));
+        })
         .await;
         #[cfg(feature = "std")]
         let result = match cleaned {
             Ok(result) => result,
             Err(payload) => {
-                let error = AktorFailure::from(AktorError::new(panic_message(&payload), ()));
+                let diagnostic = AktorError::new(panic_message(&payload), ());
+                self.inner
+                    .status
+                    .state
+                    .lock(|state| state.borrow_mut().diagnostics.push(diagnostic.clone()));
 
                 if primary.is_none() {
                     primary = Some(payload);
@@ -854,29 +1135,11 @@ impl<S> Owner<S> {
                     dispose_secondary(payload);
                 }
 
-                Err(error)
+                Err(diagnostic.into())
             }
         };
         #[cfg(not(feature = "std"))]
-        let result = {
-            let result = end(state).await;
-            self.inner
-                .status
-                .state
-                .lock(|status| status.borrow_mut().cleanup_completed = true);
-            result
-        };
-
-        let mut result = result;
-        if let Err(error) = &mut result {
-            error.primary |= self.fail("cleanup", &error.diagnostics);
-            self.inner.status.state.lock(|state| {
-                state
-                    .borrow_mut()
-                    .diagnostics
-                    .push(AktorError::new(error.diagnostics.clone(), ()));
-            });
-        }
+        let result = ending.await;
         #[cfg(feature = "std")]
         if let Some(payload) = self.dispose_hooks() {
             if primary.is_none() {
@@ -981,7 +1244,7 @@ impl<S> Drop for Owner<S> {
 }
 
 impl core::future::IntoFuture for Completion {
-    type Output = Result<(), AktorError>;
+    type Output = Result<(), (OwnerError, String)>;
     type IntoFuture = core::pin::Pin<Box<dyn Future<Output = Self::Output> + Send>>;
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.wait().await })
@@ -1123,7 +1386,7 @@ mod tests {
 
             assert_eq!(&**cleaned.borrow(), if setup { &[][..] } else { &[7][..] });
             assert_eq!(failure.unwrap().downcast_ref::<&str>(), Some(&reason));
-            assert_eq!(ready(completion.wait()).unwrap_err().diagnostics, reason);
+            assert_eq!(ready(completion.wait()).unwrap_err().1, reason);
 
             let report = ready(&mut driver);
 
@@ -1264,7 +1527,7 @@ mod arbitration_tests {
         fn run<'a>(
             &'a mut self,
             _: &'a mut (),
-            _: &'a mut AktorHooks<()>,
+            _: &'a mut CallHooks<()>,
             _: Operation,
         ) -> LocalFuture<'a, ()> {
             Box::pin(async {})

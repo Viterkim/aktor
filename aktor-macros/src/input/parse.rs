@@ -112,4 +112,13 @@ impl<'a> Visit<'a> for OutputVisitor {
 
         visit::visit_type_reference(self, reference);
     }
+
+    fn visit_lifetime(&mut self, lifetime: &'a syn::Lifetime) {
+        if lifetime.ident == "_" && self.error.is_none() {
+            self.error = Some(syn::Error::new(
+                lifetime.span(),
+                "actor outputs cannot borrow the state; return owned data or an explicit 'static reference",
+            ));
+        }
+    }
 }

@@ -1,7 +1,7 @@
 use super::*;
-use core::{future::poll_fn, task::Poll};
+use core::{future::poll_fn, ops::Deref, task::Poll};
 
-pub fn channel<T: Clone>(value: T) -> (Sender<T>, Receiver<T>) {
+pub fn channel<T>(value: T) -> (Sender<T>, Receiver<T>) {
     let sender = Sender {
         shared: Arc::new(Shared {
             state: Mutex::new(State {
@@ -15,7 +15,7 @@ pub fn channel<T: Clone>(value: T) -> (Sender<T>, Receiver<T>) {
     let receiver = sender.subscribe();
     (sender, receiver)
 }
-impl<T: Clone> Sender<T> {
+impl<T> Sender<T> {
     pub fn subscribe(&self) -> Receiver<T> {
         Receiver {
             shared: self.shared.clone(),
@@ -49,15 +49,17 @@ impl<T> Clone for Receiver<T> {
         }
     }
 }
-impl<T: Clone> Receiver<T> {
-    pub fn borrow(&self) -> T {
-        self.shared.state.guard().value.clone()
+impl<T> Receiver<T> {
+    pub fn borrow(&self) -> Ref<'_, T> {
+        Ref {
+            state: self.shared.state.guard(),
+        }
     }
 
-    pub fn borrow_and_update(&mut self) -> T {
+    pub fn borrow_and_update(&mut self) -> Ref<'_, T> {
         let state = self.shared.state.guard();
         self.revision = state.revision;
-        state.value.clone()
+        Ref { state }
     }
 
     pub async fn changed(&mut self) -> Result<(), ()> {
@@ -75,5 +77,17 @@ impl<T: Clone> Receiver<T> {
             }
         })
         .await
+    }
+}
+impl<T> Ref<'_, T> {
+    pub fn is_closed(&self) -> bool {
+        self.state.closed
+    }
+}
+impl<T> Deref for Ref<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.state.value
     }
 }

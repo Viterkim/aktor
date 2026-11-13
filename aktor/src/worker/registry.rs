@@ -8,12 +8,12 @@ use core::{
 pub struct Registration(pub fn() -> Option<Registered>);
 inventory::collect!(Registration);
 
-type Run = for<'a> fn(&'a mut dyn Any, &'a [u8]) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>;
+type Run = for<'a> fn(&'a mut dyn Any, &'a [u8]) -> LocalFuture<'a, Result<Vec<u8>, WorkerFailure>>;
 #[cfg(feature = "testing")]
 type MockRun = for<'a> fn(
     &'a mut crate::testing::Handlers,
     &'a [u8],
-) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>;
+) -> LocalFuture<'a, Result<Vec<u8>, WorkerFailure>>;
 
 pub struct Registered {
     name: &'static str,
@@ -43,7 +43,7 @@ impl Registered {
         &self,
         state: &'a mut dyn Any,
         input: &'a [u8],
-    ) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>> {
+    ) -> LocalFuture<'a, Result<Vec<u8>, WorkerFailure>> {
         (self.run)(state, input)
     }
 }
@@ -85,14 +85,14 @@ impl Registry {
         handlers: &mut crate::testing::Handlers,
         name: String,
         input: Vec<u8>,
-    ) -> Result<Vec<u8>, WorkerError> {
+    ) -> Result<Vec<u8>, WorkerFailure> {
         let operation = self.resolve(&name).ok_or_else(|| {
-            WorkerError::new(CallError::NotAdmitted, WorkerCause::UnknownOperation(name))
+            WorkerFailure::new(CallError::NotAdmitted, WorkerCause::UnknownOperation(name))
         })?;
         (operation.mock)(handlers, &input).await
     }
 
-    pub fn for_remote<S: 'static, Role: 'static>() -> Result<Self, WorkerError> {
+    pub fn for_remote<S: 'static, Role: 'static>() -> Result<Self, WorkerFailure> {
         Self::collect(registered::<S, Role>().filter(|operation| operation.remote))
     }
 
@@ -113,18 +113,18 @@ impl Registry {
             .map(|index| &self.0[index])
     }
 
-    pub fn for_actor<S: 'static, Role: 'static>() -> Result<Self, WorkerError> {
+    pub fn for_actor<S: 'static, Role: 'static>() -> Result<Self, WorkerFailure> {
         Self::collect(registered::<S, Role>())
     }
 
-    fn collect(operations: impl Iterator<Item = Registered>) -> Result<Self, WorkerError> {
+    fn collect(operations: impl Iterator<Item = Registered>) -> Result<Self, WorkerFailure> {
         let mut operations: Vec<_> = operations.collect();
 
         operations.sort_unstable_by_key(|operation| operation.name);
 
         for pair in operations.windows(2) {
             if pair[0].name == pair[1].name {
-                return Err(WorkerError::setup(
+                return Err(WorkerFailure::setup(
                     CallError::NotAdmitted,
                     format!("duplicate worker operation {:?}", pair[0].name),
                 ));
@@ -146,9 +146,9 @@ impl Registry {
         state: &mut S,
         name: String,
         input: Vec<u8>,
-    ) -> Result<Vec<u8>, WorkerError> {
+    ) -> Result<Vec<u8>, WorkerFailure> {
         let operation = self.resolve(&name).ok_or_else(|| {
-            WorkerError::new(CallError::Discarded, WorkerCause::UnknownOperation(name))
+            WorkerFailure::new(CallError::Discarded, WorkerCause::UnknownOperation(name))
         })?;
 
         operation.execute(state, &input).await
@@ -160,6 +160,7 @@ pub struct Exporter<E, C = crate::dispatch::DataCodec> {
     pub export: PhantomData<(E, C)>,
 }
 
+#[doc(hidden)]
 pub trait Register {
     fn register(self) -> Option<Registered>;
 }
@@ -195,7 +196,7 @@ where
 fn run_mock<'a, E, C>(
     handlers: &'a mut crate::testing::Handlers,
     input: &'a [u8],
-) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>
+) -> LocalFuture<'a, Result<Vec<u8>, WorkerFailure>>
 where
     E: Export<C>,
     E::Input: 'static,
@@ -210,17 +211,17 @@ where
             .run(E::NAME, Box::new(input))
             .await
             .map_err(|error| {
-                WorkerError::new(
+                WorkerFailure::new(
                     CallError::Discarded,
                     WorkerCause::UnknownOperation(error.operation),
                 )
             })?;
         let output = output
             .downcast::<E::Output>()
-            .map_err(|_| WorkerError::new(CallError::OutcomeUnknown, WorkerCause::Protocol))?;
+            .map_err(|_| WorkerFailure::new(CallError::OutcomeUnknown, WorkerCause::Protocol))?;
         <C as Codec<E::Output>>::encode(&output).map_err(|mut error| {
             error.outcome = CallError::OutcomeUnknown;
-            error
+            error.into()
         })
     })
 }
@@ -228,7 +229,7 @@ where
 fn run<'a, E, C>(
     state: &'a mut dyn Any,
     input: &'a [u8],
-) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>
+) -> LocalFuture<'a, Result<Vec<u8>, WorkerFailure>>
 where
     E: Export<C> + Default,
     C: Codec<E::Input> + Codec<E::Output>,
@@ -236,7 +237,7 @@ where
     Box::pin(async move {
         let state = state
             .downcast_mut::<E::State>()
-            .ok_or_else(|| WorkerError::new(CallError::Discarded, WorkerCause::Protocol))?;
+            .ok_or_else(|| WorkerFailure::new(CallError::Discarded, WorkerCause::Protocol))?;
 
         run_export::<E, C>(E::default(), state, input).await
     })
@@ -255,10 +256,27 @@ pub async fn dispatch<S: 'static, Role: 'static>(
     state: &mut S,
     name: String,
     input: Vec<u8>,
-) -> Result<Vec<u8>, WorkerError> {
+) -> Result<Vec<u8>, WorkerFailure> {
     Registry::for_actor::<S, Role>()?
         .dispatch(state, name, input)
         .await
+}
+
+// Worker builds register ordinary calls too. Native transport only needs explicit remote exports.
+#[doc(hidden)]
+#[macro_export]
+#[cfg(feature = "wasm_browser_workers")]
+macro_rules! __aktor_register_worker {
+    ($export:ty, $name:expr, $codec:ty) => {
+        $crate::__aktor_register!($export, $name, $codec);
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+#[cfg(not(feature = "wasm_browser_workers"))]
+macro_rules! __aktor_register_worker {
+    ($($operation:tt)*) => {};
 }
 
 #[doc(hidden)]
@@ -277,7 +295,7 @@ macro_rules! __aktor_register {
         $crate::__aktor_register!($export, $name, $codec);
     };
     ($export:ty, $name:expr, $codec:ty, false) => {
-        $crate::__aktor_register!($export, $name, $codec);
+        $crate::__aktor_register_worker!($export, $name, $codec);
     };
     ($export:ty, $name:expr, $codec:ty) => {
         const _: () = {
@@ -334,7 +352,7 @@ mod tests {
     fn first<'a>(
         state: &'a mut dyn Any,
         _: &'a [u8],
-    ) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>> {
+    ) -> LocalFuture<'a, Result<Vec<u8>, WorkerFailure>> {
         Box::pin(async move {
             state.downcast_mut::<State>().unwrap().0 += 1;
             Ok(Vec::new())
@@ -344,7 +362,7 @@ mod tests {
     fn second<'a>(
         state: &'a mut dyn Any,
         _: &'a [u8],
-    ) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>> {
+    ) -> LocalFuture<'a, Result<Vec<u8>, WorkerFailure>> {
         Box::pin(async move {
             state.downcast_mut::<State>().unwrap().0 += 17;
             Ok(Vec::new())
@@ -364,7 +382,7 @@ mod tests {
             #[cfg(feature = "testing")]
             mock: |_, _| {
                 Box::pin(async {
-                    Err(WorkerError::new(
+                    Err(WorkerFailure::new(
                         CallError::NotAdmitted,
                         WorkerCause::Protocol,
                     ))

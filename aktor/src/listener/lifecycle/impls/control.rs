@@ -1,6 +1,6 @@
 use super::super::*;
 
-impl<S, E, C> AktorControl<S, E, C> {
+impl<C> AktorControl<C> {
     pub fn close_admission(&self) {
         self.admission.shutdown();
     }
@@ -32,114 +32,11 @@ impl<S, E, C> AktorControl<S, E, C> {
         self.running.has_changed().is_ok() && *self.running.borrow()
     }
 
-    /// Wait for running state, reporting closure independently of the setup error type.
-    pub async fn wait_running(&self) -> Result<(), LifecycleError<core::convert::Infallible>> {
-        let mut running = self.running.clone();
-
-        loop {
-            if *running.borrow_and_update() {
-                return Ok(());
-            }
-
-            running
-                .changed()
-                .await
-                .map_err(|_| LifecycleError::Closed)?;
-        }
-    }
-
-    /// Finish the work already queued and clean up. Calls wait while paused.
-    pub async fn pause(&self) -> Result<(), LifecycleError<Arc<C>>> {
-        let (reply, answer) = oneshot::channel();
-
-        self.commands
-            .send(Command::Pause(reply))
-            .await
-            .map_err(|_| LifecycleError::Closed)?;
-
-        answer.await.map_err(|_| LifecycleError::Closed)?
-    }
-
-    /// Build new state on the actor thread. Failed setup leaves the actor paused.
-    pub async fn resume<F>(&self, setup: F) -> Result<(), LifecycleError<E>>
-    where
-        F: FnOnce() -> Result<S, E> + Send + 'static,
-        S: 'static,
-        E: 'static,
-    {
-        self.resume_async(move || core::future::ready(setup()))
-            .await
-    }
-
-    /// Finish admitted work and teardown. Paused actors discard queued work.
-    pub async fn shutdown(&self) -> Result<(), LifecycleError<Arc<C>>> {
-        let (reply, answer) = oneshot::channel();
-
-        self.commands
-            .send(Command::Shutdown(reply))
-            .await
-            .map_err(|_| LifecycleError::Closed)?;
-
-        let result = answer.await;
-
+    /// Drain admitted calls, wait for the listener to close and return its cleanup result.
+    pub async fn shutdown(&self) -> Result<(), CleanupError<C>> {
+        self.request_shutdown();
         self.closed().await;
-
-        result.map_err(|_| LifecycleError::Closed)?
-    }
-
-    /// Replace state even if the caller stops waiting.
-    pub async fn replace<F>(&self, setup: F) -> Result<(), ReplaceError<E, C>>
-    where
-        F: FnOnce() -> Result<S, E> + Send + 'static,
-        S: 'static,
-        E: 'static,
-    {
-        self.replace_async(move || core::future::ready(setup()))
-            .await
-    }
-
-    pub async fn resume_async<F, Fut>(&self, setup: F) -> Result<(), LifecycleError<E>>
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: core::future::Future<Output = Result<S, E>> + 'static,
-    {
-        let (reply, answer) = oneshot::channel();
-
-        self.commands
-            .send(Command::Resume {
-                setup: Box::new(move || Box::pin(setup())),
-                reply,
-            })
-            .await
-            .map_err(|_| LifecycleError::Closed)?;
-
-        answer
-            .await
-            .map_err(|_| LifecycleError::Closed)?
-            .take()
-            .ok_or(LifecycleError::Closed)?
-    }
-
-    pub async fn replace_async<F, Fut>(&self, setup: F) -> Result<(), ReplaceError<E, C>>
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: core::future::Future<Output = Result<S, E>> + 'static,
-    {
-        let (reply, answer) = oneshot::channel();
-
-        self.commands
-            .send(Command::Replace {
-                setup: Box::new(move || Box::pin(setup())),
-                reply,
-            })
-            .await
-            .map_err(|_| ReplaceError::Closed)?;
-
-        answer
-            .await
-            .map_err(|_| ReplaceError::Closed)?
-            .take()
-            .ok_or(ReplaceError::Closed)?
+        wait_cleanup(self.cleanup.clone()).await
     }
 
     pub async fn closed(&self) {
@@ -148,27 +45,25 @@ impl<S, E, C> AktorControl<S, E, C> {
         while running.changed().await.is_ok() {}
     }
 
-    pub fn new_controller(&self) -> Self {
+    fn new_controller(&self) -> Self {
         Self {
             admission: self.admission.clone(),
-            commands: self.commands.clone(),
             force: self.force.clone(),
             shutdown: self.shutdown.clone(),
             running: self.running.clone(),
-            abandoned_setup: self.abandoned_setup.clone(),
             failed_cleanup: self.failed_cleanup.clone(),
+            cleanup: self.cleanup.clone(),
         }
     }
 
-    /// Setup errors whose callers stopped waiting after admission.
-    pub fn take_abandoned_setup(&self) -> Vec<AbandonedSetup<E>> {
-        std::mem::take(&mut *self.abandoned_setup.lock())
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn cleanup_receipt(&self) -> CleanupReceipt<C> {
+        self.cleanup.clone()
     }
 
-    /// Cleanup errors retained after a panic.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn cleanup_completed(&self) -> bool {
-        self.failed_cleanup.lock().completed
+        self.cleanup.borrow().is_some()
     }
 
     pub fn cleanup_errors(&self) -> CleanupErrors<C> {
@@ -180,21 +75,45 @@ impl<S, E, C> AktorControl<S, E, C> {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn cleanup_ran_out(&self) -> bool {
+        self.failed_cleanup.lock().ran_out
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn cut_call(&self) -> bool {
+        self.failed_cleanup.lock().cut_call
+    }
+
     #[doc(hidden)]
     pub fn group_primary(&self) -> bool {
         self.failed_cleanup.lock().group_primary
     }
 }
-impl<S, E, C> Clone for AktorControl<S, E, C> {
+impl<C> Clone for AktorControl<C> {
     fn clone(&self) -> Self {
         self.new_controller()
     }
 }
-impl<S, E, C> core::fmt::Debug for AktorControl<S, E, C> {
+impl<C> core::fmt::Debug for AktorControl<C> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
             .debug_struct("AktorControl")
             .field("running", &self.is_running())
             .finish()
+    }
+}
+
+pub(crate) async fn wait_cleanup<C>(mut receipt: CleanupReceipt<C>) -> Result<(), CleanupError<C>> {
+    let returned = receipt
+        .wait_for(Option::is_some)
+        .await
+        .ok()
+        .and_then(|value| value.clone());
+
+    match returned {
+        Some(Ok(())) => Ok(()),
+        Some(Err(error)) => Err(CleanupError::Returned(error)),
+        None => Err(CleanupError::Unconfirmed),
     }
 }

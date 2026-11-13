@@ -29,11 +29,11 @@ impl Admission {
         }
     }
 
-    pub fn manage(&self, name: String, group: crate::group::KillSwitch) {
+    pub fn manage(&self, name: String, group: crate::group::AktorKillSwitch) {
         self.state.lock().borrow_mut().group = Some((name, group));
     }
 
-    pub fn group(&self) -> Option<crate::group::KillSwitch> {
+    pub fn group(&self) -> Option<crate::group::AktorKillSwitch> {
         self.state
             .lock()
             .borrow()
@@ -90,10 +90,13 @@ impl Admission {
         }
     }
 
-    pub fn lost(&self) {
-        let group = self.state.lock().borrow().group.clone();
+    pub fn lost(&self) -> bool {
+        let Some((name, group)) = self.state.lock().borrow().group.clone() else {
+            return false;
+        };
 
-        if let Some((name, group)) = group {
+        // During shutdown a lost reply is a call shutdown cancelled, a crash reports itself.
+        if !group.is_stopping() {
             group.fail(crate::group::AktorFailureReport {
                 kind: None,
                 actor: name,
@@ -101,20 +104,14 @@ impl Admission {
                 message: "actor stopped without returning the operation's output".into(),
             });
         }
+
+        true
     }
 
     pub fn rejected(&self) {
         if !self.group().is_some_and(|group| group.is_stopping()) {
             self.lost();
         }
-    }
-
-    pub fn close(&self) {
-        self.set(|_| Phase::Paused);
-    }
-
-    pub fn open(&self) {
-        self.set(|_| Phase::Running);
     }
 
     pub fn register_session(&self, callback: Arc<dyn Fn(Phase) -> bool + Send + Sync>) {
@@ -143,24 +140,17 @@ impl Admission {
     }
 
     pub fn shutdown(&self) {
-        self.set(|phase| Phase::Closing {
-            paused: matches!(phase, Phase::Paused),
-        });
-    }
-
-    fn set(&self, transition: impl FnOnce(Phase) -> Phase) {
         let lock = self.state.lock();
         let mut state = lock.borrow_mut();
 
-        if matches!(state.phase, Phase::Closing { .. }) {
+        if state.phase.is_closing() {
             return;
         }
 
-        let phase = transition(state.phase);
-        let open = matches!(phase, Phase::Running);
+        let phase = Phase::Closing;
 
         state.phase = phase;
-        state.open = open;
+        state.open = false;
         state.epoch = state.epoch.wrapping_add(1);
 
         let epoch = state.epoch;
@@ -184,6 +174,15 @@ impl Admission {
         }
 
         failures.resume();
+    }
+}
+
+impl Phase {
+    pub fn is_closing(self) -> bool {
+        match self {
+            Phase::Running => false,
+            Phase::Closing => true,
+        }
     }
 }
 
@@ -226,126 +225,6 @@ mod tests {
         crate::message::call(&handle, |_, ()| (), ()).cast().await;
         drop(receiver);
         listener.try_recv().unwrap().run(&mut 0).await;
-    }
-
-    #[test]
-    fn closing_sessions() {
-        use crate::latest::{SendLatest, Session};
-        use core::{
-            future::Future,
-            task::{Context, Poll, Waker},
-        };
-        use std::{
-            sync::atomic::{AtomicUsize, Ordering},
-            task::Wake,
-        };
-
-        struct BrokenWake;
-        impl Wake for BrokenWake {
-            fn wake(self: Arc<Self>) {
-                panic!("session wake failed");
-            }
-        }
-
-        struct CountWake(AtomicUsize);
-        impl Wake for CountWake {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        struct BrokenInput;
-        impl Drop for BrokenInput {
-            fn drop(&mut self) {
-                panic!("session input drop failed");
-            }
-        }
-
-        let (handle, mut listener) = crate::listener::channel::<()>(1).unwrap();
-        let operation = crate::operation::Operation {
-            name: "closing sessions",
-            caller: std::panic::Location::caller(),
-        };
-        let (_first, mut first) = (&handle).session(operation, async |_: &mut (), _: ()| ());
-        let (second, mut second_output) =
-            (&handle).session(operation, async |_: &mut (), _: BrokenInput| ());
-        let (_third, mut third) = (&handle).session(operation, async |_: &mut (), _: ()| ());
-        let broken = Waker::from(Arc::new(BrokenWake));
-        let count = Arc::new(CountWake(AtomicUsize::new(0)));
-        let waker = Waker::from(count.clone());
-
-        handle.inner.admission.close();
-        second.send(BrokenInput);
-
-        let _pending = Box::pin(first.next())
-            .as_mut()
-            .poll(&mut Context::from_waker(&broken));
-        let _pending = Box::pin(second_output.next())
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker));
-        let _pending = Box::pin(third.next())
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker));
-
-        let mut failures = Failures::new("closing sessions".into());
-        failures.capture(FailureKind::Runtime, || listener.close());
-
-        assert_eq!(count.0.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            Box::pin(third.next())
-                .as_mut()
-                .poll(&mut Context::from_waker(&waker)),
-            Poll::Ready(None)
-        );
-        let failure = failures.first.unwrap();
-        assert_eq!(
-            failure.payload.downcast_ref::<&str>(),
-            Some(&"session wake failed")
-        );
-        assert!(
-            failure
-                .diagnostics
-                .iter()
-                .any(|error| error.diagnostics.contains("session input drop failed"))
-        );
-
-        #[cfg(feature = "local")]
-        {
-            let (handle, _owner) = crate::local::channel::<(), 1, ()>().unwrap();
-            let count = Arc::new(CountWake(AtomicUsize::new(0)));
-            let waker = Waker::from(count.clone());
-            let (_first, mut first) = (&handle).session(operation, async |_: &mut (), _: ()| ());
-            let (_second, mut second) = (&handle).session(operation, async |_: &mut (), _: ()| ());
-            let _pending = Box::pin(first.next())
-                .as_mut()
-                .poll(&mut Context::from_waker(&broken));
-            let _pending = Box::pin(second.next())
-                .as_mut()
-                .poll(&mut Context::from_waker(&waker));
-
-            let _failure =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(handle.shutdown())));
-            assert_eq!(count.0.load(Ordering::Relaxed), 1);
-        }
-
-        #[cfg(feature = "embassy_cross_core")]
-        {
-            let (handle, _owner) = crate::cross_core::channel::<()>(1).unwrap();
-            let count = Arc::new(CountWake(AtomicUsize::new(0)));
-            let waker = Waker::from(count.clone());
-            let (_first, mut first) = (&handle).session(operation, async |_: &mut (), _: ()| ());
-            let (_second, mut second) = (&handle).session(operation, async |_: &mut (), _: ()| ());
-            let _pending = Box::pin(first.next())
-                .as_mut()
-                .poll(&mut Context::from_waker(&broken));
-            let _pending = Box::pin(second.next())
-                .as_mut()
-                .poll(&mut Context::from_waker(&waker));
-
-            let _failure =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(handle.shutdown())));
-            assert_eq!(count.0.load(Ordering::Relaxed), 1);
-        }
     }
 
     #[test]
@@ -408,30 +287,27 @@ mod tests {
         let callback_entered = entered.clone();
         let callback_resume = resume.clone();
         let observed = Arc::downgrade(&admission);
-        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let saw_pause = paused.clone();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_close = closed.clone();
 
         let registration = std::thread::spawn(move || {
             registering.register_session(Arc::new(move |phase| {
-                if matches!(phase, Phase::Running) {
+                if !phase.is_closing() {
                     callback_entered.wait();
                     callback_resume.wait();
                 }
 
                 let current = observed.upgrade().unwrap().phase();
 
-                saw_pause.store(
-                    matches!(current, Phase::Paused),
-                    std::sync::atomic::Ordering::SeqCst,
-                );
+                saw_close.store(current.is_closing(), std::sync::atomic::Ordering::SeqCst);
                 true
             }));
         });
 
         entered.wait();
-        admission.close();
+        admission.shutdown();
         resume.wait();
         registration.join().unwrap();
-        assert!(paused.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

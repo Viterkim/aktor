@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Timeout, message::Reply};
+use crate::{AktorTimeout, message::Reply};
 use core::{
     pin::Pin,
     task::{Context, Poll},
@@ -102,7 +102,7 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Queued<'a, S, I
         self.into_request().send().await
     }
 
-    pub fn timeout(self, duration: Duration) -> Timeout<Request<'a, S, O>> {
+    pub fn timeout(self, duration: Duration) -> AktorTimeout<Request<'a, S, O>> {
         self.into_request().timeout(duration)
     }
 }

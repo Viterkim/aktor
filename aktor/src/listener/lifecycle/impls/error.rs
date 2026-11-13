@@ -35,3 +35,20 @@ impl<C: fmt::Display> fmt::Display for CleanupErrors<C> {
     }
 }
 impl<C: fmt::Debug + fmt::Display> std::error::Error for CleanupErrors<C> {}
+
+impl<C: fmt::Display> fmt::Display for CleanupError<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Returned(error) => write!(f, "actor cleanup failed: {error}"),
+            Self::Unconfirmed => f.write_str("actor cleanup result is unconfirmed"),
+        }
+    }
+}
+impl<C: std::error::Error + 'static> std::error::Error for CleanupError<C> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Returned(error) => Some(&**error),
+            Self::Unconfirmed => None,
+        }
+    }
+}

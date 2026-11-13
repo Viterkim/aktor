@@ -1,4 +1,4 @@
-use crate::{CallError, Cause, Error, client::Inner};
+use crate::{CallError, Cause, Error, Failure, client::Inner};
 use aktor::{operation::Operation, worker::Codec};
 use std::{
     future::Future,
@@ -20,7 +20,7 @@ pub struct AktorRetryOpts {
     pub timeout: Duration,
 }
 
-type Answer<O> = Pin<Box<dyn Future<Output = Result<O, Error>> + Send>>;
+type Answer<O> = Pin<Box<dyn Future<Output = Result<O, Failure>> + Send>>;
 
 struct Execution<O> {
     answer: Answer<O>,
@@ -39,5 +39,5 @@ pub struct Request<I, O, C> {
 
 #[must_use = "await the reply to receive the operation's result"]
 pub struct Reply<O> {
-    answer: tokio::task::JoinHandle<Result<O, Error>>,
+    answer: tokio::task::JoinHandle<Result<O, Failure>>,
 }

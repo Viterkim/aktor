@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 struct Broken(Arc<AtomicUsize>);
 impl Drop for Broken {
@@ -15,7 +16,7 @@ impl Drop for Broken {
 
 #[test]
 fn teardown() {
-    let Ok(mode) = std::env::var("AKTOR_CHILD") else {
+    let Ok(mode) = std::env::var("AKTOR_TEST_CASE") else {
         for mode in [
             "local queue",
             "local hooks",
@@ -33,7 +34,7 @@ fn teardown() {
             "local setup",
             "cross setup",
         ] {
-            let output = support::child("teardown::teardown", mode);
+            let output = support::run_test("teardown::teardown", mode);
 
             assert!(
                 output.status.success(),
@@ -123,15 +124,15 @@ fn teardown() {
             if mode.ends_with("setup") {
                 let result = owner
                     .run_with(
-                        async || Err(AktorSetupError::new("primary setup", ())),
+                        async || Err(AktorError::new("primary setup", ())),
                         async |_| Ok(()),
                     )
                     .await;
 
-                assert!(format!("{:#}", result.unwrap_err()).contains("primary setup"));
+                assert!(result.unwrap_err().1.contains("primary setup"));
                 assert_eq!(completion.diagnostics().len(), 2);
-                let error = completion.wait().await.unwrap_err();
-                assert!(format!("{error:#}").contains("primary setup"));
+                let (_, report) = completion.wait().await.unwrap_err();
+                assert!(report.contains("primary setup"));
                 assert_eq!(count.load(Ordering::SeqCst), 2);
                 return;
             }
@@ -209,15 +210,15 @@ fn teardown() {
             if mode.ends_with("setup") {
                 let result = owner
                     .run_with(
-                        async || Err(AktorSetupError::new("primary setup", ())),
+                        async || Err(AktorError::new("primary setup", ())),
                         async |_| Ok(()),
                     )
                     .await;
 
-                assert!(result.unwrap_err().diagnostics.contains("primary setup"));
+                assert!(result.unwrap_err().1.contains("primary setup"));
                 assert_eq!(handle.completion().diagnostics().len(), 2);
-                let error = handle.completion().wait().await.unwrap_err();
-                assert!(error.diagnostics.contains("primary setup"));
+                let (_, report) = handle.completion().wait().await.unwrap_err();
+                assert!(report.contains("primary setup"));
                 assert_eq!(count.load(Ordering::SeqCst), 2);
                 return;
             }
@@ -250,30 +251,26 @@ fn teardown() {
             assert!(handle.completion().wait().await.is_err());
         } else {
             let mut setup = AktorNew {
-                name: AktorName::new("teardown task"),
-                role: AktorNoRole,
+                name: "teardown task".into(),
                 kind: AktorKind::TokioTask,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(()),
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: AktorNewOptions { capacity: 3 },
+                start: async || Ok::<_, String>(()),
+                end: (),
+                hooks: Default::default(),
+                capacity: 3,
+                stuck: AktorStuck::Kill,
             };
 
             if mode.ends_with("hooks") {
                 let before = Broken(count.clone());
                 let after = Broken(count.clone());
 
-                setup.closures.before_each = Some(
+                setup.hooks.before_each = Some(
                     (move |_: &mut (), _: operation::Operation| {
                         std::hint::black_box(&before);
                     })
                     .into(),
                 );
-                setup.closures.after_each = Some(
+                setup.hooks.after_each = Some(
                     (move |_: &mut (), _: operation::Operation| {
                         std::hint::black_box(&after);
                     })
@@ -284,7 +281,7 @@ fn teardown() {
             if mode.ends_with("before") {
                 let capture = Broken(count.clone());
 
-                setup.closures.before_each = Some(
+                setup.hooks.before_each = Some(
                     (move |_: &mut (), _: operation::Operation| {
                         std::hint::black_box(&capture);
                         panic!("primary hook");
@@ -297,7 +294,7 @@ fn teardown() {
                 for _ in 0..2 {
                     let capture = Broken(count.clone());
 
-                    setup.closures.intervals.push(AktorInterval {
+                    setup.hooks.intervals.push(AktorInterval {
                         every: Duration::from_secs(60),
                         run: (move |_: AktorTaskState<()>| {
                             std::hint::black_box(&capture);
@@ -311,9 +308,7 @@ fn teardown() {
             let actors = aktor_start(AktorSetup {
                 actors: setup,
                 shutdown: |_| {},
-                options: AktorOptions {
-                    shutdown_grace: Duration::from_secs(5),
-                },
+                grace: Duration::from_secs(5),
             })
             .await
             .unwrap();

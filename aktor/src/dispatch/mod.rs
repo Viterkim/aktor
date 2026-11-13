@@ -25,6 +25,9 @@ pub mod request;
 pub use request::Queued;
 pub mod opaque;
 pub use opaque::{ReadOpaque, WriteOpaque};
+mod transport;
+#[doc(hidden)]
+pub use transport::{ReadDispatch, WriteDispatch};
 
 #[doc(hidden)]
 pub struct Native;
@@ -47,6 +50,7 @@ pub trait Transport<S, I, O, Role = (), Codec = DataCodec> {
 }
 
 /// The local body and types needed when registering a concrete operation for transport.
+#[doc(hidden)]
 pub trait Export<Codec = DataCodec> {
     const REMOTE: bool = false;
     const NAME: &'static str = "";

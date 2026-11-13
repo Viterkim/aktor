@@ -37,11 +37,11 @@ impl Failures {
                     });
 
                     if let (Some(group), Some(failure)) = (&self.group, &mut self.first) {
-                        let message = failure.to_string();
+                        let message = failure.message();
                         failure.group_primary = group.fail(crate::group::AktorFailureReport {
                             kind: None,
                             actor: failure.actor.clone(),
-                            phase: format!("{:?}", failure.kind),
+                            phase: failure.kind.to_string(),
                             message,
                         });
                     }
@@ -52,7 +52,7 @@ impl Failures {
                     }
                 } else if let Some(first) = &mut self.first {
                     first.diagnostics.push(crate::AktorError::new(
-                        format!("{kind:?}: {}", crate::panic::panic_message(&payload)),
+                        format!("{kind}: {}", crate::panic::panic_message(&payload)),
                         (),
                     ));
                     first.diagnostics.extend(diagnostics);

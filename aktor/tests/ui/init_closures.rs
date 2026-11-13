@@ -2,15 +2,11 @@ use aktor::*;
 
 fn missing_end() {
     let _actor = AktorNew {
-        name: AktorName::new("counter"),
-        role: AktorNoRole,
+        name: "counter".into(),
         kind: AktorKind::TokioThread,
-        closures: AktorClosures {
-            start: async || Ok::<_, AktorSetupError>(0_u32),
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
-        },
-        options: Default::default(),
+        start: async || Ok::<_, String>(0_u32),
+        hooks: Default::default(),
+        capacity: 32,
+        stuck: AktorStuck::Kill,
     };
 }

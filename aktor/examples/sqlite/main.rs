@@ -1,6 +1,7 @@
 use aktor::*;
 use er::*;
 use rusqlite::Connection;
+use std::time::Duration;
 
 pub mod adopt;
 pub mod get;
@@ -42,34 +43,28 @@ fn close_database(db: Connection) -> ErResult<(), CloseErr> {
         Ok(()) => Ok(()),
         Err((db, err)) => {
             drop(db);
-            Err(err).er(())
+            Err(err.er(()))
         }
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> std::result::Result<(), Box<dyn core::error::Error>> {
-    let setup = async || open_database().er_into(|report| report);
-    let cleanup = async |db| close_database(db).er_into(|report| report);
-
+async fn main() -> ErMain {
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("sqlite"),
-            role: AktorNoRole,
+            name: "sqlite".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: setup,
-                end: cleanup,
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 128 },
+            start: async || open_database(),
+            end: close_database,
+            hooks: Default::default(),
+            capacity: 128,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| (),
-        options: Default::default(),
+        grace: Duration::from_secs(5),
     })
-    .await?;
+    .await
+    .er_test()?;
 
     let database = &actors.handles;
     schema::create(database).await?;
@@ -97,11 +92,7 @@ async fn main() -> std::result::Result<(), Box<dyn core::error::Error>> {
     assert_eq!(get::owners::count(database).await?, 1);
     assert_eq!(get::cats::by_id(database, bingo).await?.owner, Some(owner));
 
-    let report = actors.shutdown().await;
-
-    if report.failed() {
-        return Err(aktor::AktorRunError::from(report).into());
-    }
+    actors.shutdown().await.into_result().er_test()?;
 
     Ok(())
 }

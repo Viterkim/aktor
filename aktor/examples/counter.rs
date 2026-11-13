@@ -1,4 +1,6 @@
 use aktor::*;
+use er::*;
+use std::time::Duration;
 
 #[aktor]
 async fn add(count: &mut u32, amount: u32) -> u32 {
@@ -8,17 +10,16 @@ async fn add(count: &mut u32, amount: u32) -> u32 {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn core::error::Error>> {
+async fn main() -> ErMain {
     let aktor_setup = AktorNew {
-        name: AktorName::new("counter"),
-        role: AktorNoRole,
+        name: "counter".into(),
         kind: AktorKind::TokioThread,
-
-        closures: AktorClosures {
-            start: async || Ok::<_, AktorSetupError>(0_u32),
-            end: async |count: u32| {
-                println!("final count: {count}");
-            },
+        start: async || aktor_ready(0_u32),
+        end: async |count: u32| {
+            println!("final count: {count}");
+        },
+        hooks: AktorHooks {
+            intervals: vec![],
             before_each: Some(
                 (|_: &mut u32, operation: operation::Operation| {
                     println!("starting {}", operation.name);
@@ -31,9 +32,9 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
                 })
                 .into(),
             ),
-            intervals: vec![],
         },
-        options: Default::default(),
+        capacity: 32,
+        stuck: AktorStuck::Kill,
     };
 
     let actors = aktor_start(AktorSetup {
@@ -45,18 +46,15 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
 
             println!("application cleanup finished");
         },
-        options: Default::default(),
+        grace: Duration::from_secs(5),
     })
-    .await?;
+    .await
+    .er_report()?;
 
     println!("reply: {}", add(&actors.handles, 2).await);
     println!("reply: {}", add(&actors.handles, 3).await);
 
-    let report = actors.shutdown().await;
-
-    if report.failed() {
-        return Err(aktor::AktorRunError::from(report).into());
-    }
+    actors.shutdown().await.into_result().er_report()?;
 
     Ok(())
 }

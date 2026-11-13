@@ -11,7 +11,7 @@ publish = false
 
 [workspace.dependencies]
 aktor = { path = "../aktor", default-features = false }
-er = { version = "0.8", default-features = false }
+er = { version = "0.9", path = "../../er/er", default-features = false }
 tokio = "1.53.1"
 bevy_tasks = { version = "0.20", features = ["multi_threaded"] }
 serde = { version = "1", features = ["derive"] }

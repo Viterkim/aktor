@@ -75,7 +75,7 @@ async fn listening() -> Result<(), &'static str> {
     let mut actors = embassy::AktorGroup::new();
     let kill = actors.killswitch();
     let closing = actors
-        .listen_with(async |_| Ok::<_, AktorError>(()))
+        .listen_with(async |_| Ok::<_, String>(()))
         .map_err(|_| "listener")?;
     let setup = async || {
         Ok::<_, AktorError>(State {
@@ -88,11 +88,13 @@ async fn listening() -> Result<(), &'static str> {
 
     args.capacity = 1;
 
-    let actor = actors.spawn::<State, 1, ()>(args).map_err(|_| "actor")?;
+    let actor = actors
+        .spawn_args::<State, 1, ()>(args)
+        .map_err(|_| "actor")?;
     let work = async {
         let value = append(&actor, Line("ordinary startup".into()))
             .await
-            .unwrap_report();
+            .er_unwrap_report();
 
         drop(actors);
         value
@@ -114,11 +116,14 @@ async fn listening() -> Result<(), &'static str> {
 async fn grouped() -> Result<(), &'static str> {
     let cleaned = Rc::new(Cell::new(false));
     let cleanup = cleaned.clone();
-    let value = embassy::AktorGroup::new()
-        .run(
-            async move |group| {
+    let mut group = embassy::AktorGroup::new();
+    let closing = group.listen().map_err(|_| "local group")?;
+    let killswitch = group.killswitch();
+    let work = async {
+        let value = killswitch
+            .run(async move {
                 let actor = group
-                    .spawn::<State, 1, ()>(AktorArgs {
+                    .spawn_args::<State, 1, ()>(AktorArgs {
                         name: "lines".into(),
                         capacity: 1,
                         setup: async || {
@@ -138,24 +143,33 @@ async fn grouped() -> Result<(), &'static str> {
                 sender.send(Line("b".into()));
                 sender.send(Line("c".into()));
                 drop(sender);
-                assert_eq!(results.next().await.unwrap().unwrap_report(), "c");
+                assert_eq!(results.next().await.unwrap().er_unwrap_report(), "c");
                 assert!(results.next().await.is_none());
-                Ok::<_, AktorError>(17)
-            },
-            async |_| Ok::<_, AktorError>(()),
-        )
-        .await
-        .map_err(|_| "local group")?;
+                17
+            })
+            .await;
+
+        killswitch.stop();
+        value
+    };
+    let (report, value) = join(closing, work).await;
+
+    if report.failed() {
+        return Err("local group");
+    }
 
     if value != Some(17) || !cleaned.get() {
         return Err("local group cleanup");
     }
 
-    let timed = embassy::AktorGroup::with_grace(core::time::Duration::from_micros(10))
-        .run(
-            async |group| {
+    let mut group = embassy::AktorGroup::with_grace(core::time::Duration::from_micros(10));
+    let closing = group.listen().map_err(|_| "group timeout")?;
+    let killswitch = group.killswitch();
+    let work = async {
+        killswitch
+            .run(async move {
                 let actor = group
-                    .spawn::<State, 1, ()>(AktorArgs {
+                    .spawn_args::<State, 1, ()>(AktorArgs {
                         name: "stuck cleanup".into(),
                         capacity: 1,
                         setup: async || {
@@ -170,16 +184,15 @@ async fn grouped() -> Result<(), &'static str> {
                     })
                     .unwrap();
 
-                append(&actor, Line("a".into())).await.unwrap_report();
-                Ok::<_, AktorError>(())
-            },
-            async |_| Ok::<_, AktorError>(()),
-        )
-        .await
-        .err()
-        .ok_or("group timeout")?;
+                append(&actor, Line("a".into())).await.er_unwrap_report();
+            })
+            .await;
 
-    if !timed.report.timed_out {
+        killswitch.stop();
+    };
+    let (timed, ()) = join(closing, work).await;
+
+    if !timed.ran_past_grace {
         return Err("group timeout outcome");
     }
 
@@ -279,7 +292,7 @@ async fn timeout_limits() -> Result<(), &'static str> {
                 if state.text == "kept" {
                     Ok(())
                 } else {
-                    Err(AktorCleanupError::new("timed out operation was lost", ()))
+                    Err(AktorError::new("timed out operation was lost", ()))
                 }
             },
         )
@@ -298,33 +311,26 @@ async fn local_setup() -> Result<(), &'static str> {
     let work = async move {
         let actors = aktor_start(AktorSetup {
             actors: AktorNew {
-                name: AktorName::new("host executor"),
-                role: AktorNoRole,
+                name: "host executor".into(),
                 kind: AktorKind::Local::<local::clock::Embassy>(move |future| {
                     spawner.borrow_mut().push(future);
                     Ok(())
                 }),
-                closures: AktorClosures {
-                    start: async || {
-                        Ok::<_, AktorSetupError>(State {
-                            text: String::new(),
-                        })
-                    },
-
-                    end: async move |_: State| {
-                        ended.set(true);
-                        Ok::<_, AktorCleanupError>(())
-                    },
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: async || {
+                    Ok::<_, String>(State {
+                        text: String::new(),
+                    })
                 },
-                options: AktorNewOptions { capacity: 32 },
+                end: async move |_: State| {
+                    ended.set(true);
+                    Ok::<_, String>(())
+                },
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
             shutdown: |_| {},
-            options: AktorOptions {
-                shutdown_grace: core::time::Duration::from_secs(5),
-            },
+            grace: core::time::Duration::from_secs(5),
         })
         .await
         .map_err(|_| "host setup")?;
@@ -338,7 +344,7 @@ async fn local_setup() -> Result<(), &'static str> {
             .next()
             .await
             .ok_or("host latest ended")?
-            .unwrap_report();
+            .er_unwrap_report();
 
         if latest != "b" {
             return Err("host latest input");
@@ -346,7 +352,7 @@ async fn local_setup() -> Result<(), &'static str> {
 
         if append(&actors.handles, Line("c".into()))
             .await
-            .unwrap_report()
+            .er_unwrap_report()
             != "bc"
         {
             return Err("host ordinary input");
@@ -354,7 +360,7 @@ async fn local_setup() -> Result<(), &'static str> {
 
         let report = actors.shutdown().await;
 
-        if report.failed() || report.actors[0].kind != Some(AktorExecution::Local) {
+        if report.failed() || report.actors[0].kind != AktorExecution::Local {
             return Err("host cleanup report");
         }
 
@@ -409,7 +415,7 @@ async fn exercise() -> Result<(), &'static str> {
             .err()
             .ok_or("domain error")?;
 
-        if !error.er_report_string().contains("AppendErr") {
+        if !error.er_report().contains("AppendErr") {
             return Err("diagnostics");
         }
 
@@ -437,7 +443,7 @@ async fn exercise() -> Result<(), &'static str> {
 
         let last = append::request(&actor, Line("d".into())).send().await;
         let completed = actor.shutdown();
-        let observer = completed.new_observer();
+        let observer = completed.clone();
 
         drop(actor);
 
@@ -471,26 +477,26 @@ async fn exercise() -> Result<(), &'static str> {
             async |_| {
                 let tree = ErTree::new(AppendErr, ["backup folder is read only"]);
 
-                Err(AktorCleanupError {
-                    diagnostics: tree.er_report_string(),
+                Err(AktorError {
+                    diagnostics: tree.er_report(),
                     data: tree,
                 })
             },
         )
         .await;
 
-    let error = result.err().ok_or("cleanup failure")?;
+    let (_, report) = result.err().ok_or("cleanup failure")?;
 
-    if !format!("{error:#}").contains("backup folder is read only") {
+    if !report.contains("backup folder is read only") {
         return Err("cleanup diagnostics");
     }
 
-    let typed = completion
+    let (typed, _) = completion
         .wait_with_data()
         .await
         .err()
         .ok_or("typed cleanup observation")?;
-    let embassy::OwnerFailure::Cleanup(cleanup) = &*typed.error else {
+    let embassy::OwnerError::Cleanup(cleanup) = &*typed.cause else {
         return Err("cleanup kind");
     };
 
@@ -498,13 +504,13 @@ async fn exercise() -> Result<(), &'static str> {
         return Err("cleanup structure");
     }
 
-    let observed = completion
+    let (observed, _) = completion
         .wait_with_data()
         .await
         .err()
         .ok_or("cleanup observation")?;
 
-    if !Rc::ptr_eq(&typed.error, &observed.error) {
+    if !Rc::ptr_eq(&typed.cause, &observed.cause) {
         return Err("retained cleanup failure");
     }
 

@@ -1,12 +1,9 @@
 #![cfg(all(feature = "tokio", feature = "local"))]
 
 use aktor::{
-    AktorArgs, AktorCleanupError, AktorClosures, AktorError, AktorKind, AktorName, AktorNew,
-    AktorNewOptions, AktorNoRole, AktorOptions, AktorSetup, AktorSetupError, aktor_start, local,
-    operation::Operation,
+    AktorKind, AktorNew, AktorSetup, AktorStuck, aktor_start, local, operation::Operation,
 };
-use futures_util::FutureExt;
-use std::{cell::Cell, panic::AssertUnwindSafe, rc::Rc, time::Duration};
+use std::{cell::Cell, rc::Rc, time::Duration};
 
 struct DropFailure {
     dropped: Rc<Cell<bool>>,
@@ -40,48 +37,41 @@ async fn shutdown() {
                 });
                 let actors = aktor_start(AktorSetup {
                     actors: AktorNew {
-                        name: AktorName::new("local shutdown hook"),
-                        role: AktorNoRole,
+                        name: "local shutdown hook".into(),
                         kind: AktorKind::Local::<local::clock::Tokio>(|future| {
                             tokio::task::spawn_local(future);
                             Ok(())
                         }),
-                        closures: AktorClosures {
-                            start: async || Ok::<_, AktorSetupError>(()),
-                            end: async move |_| {
-                                core::future::poll_fn(|cx| {
-                                    if release.get() {
-                                        core::task::Poll::Ready(())
-                                    } else {
-                                        cx.waker().wake_by_ref();
-                                        core::task::Poll::Pending
-                                    }
-                                })
-                                .await;
-                                tokio::task::yield_now().await;
-                                clean.set(clean.get() + 1);
-
-                                if fault >= 4 {
-                                    Err(AktorCleanupError::new("local cleanup sentinel", ()))
+                        start: async || aktor::aktor_ready(()),
+                        end: async move |_| {
+                            core::future::poll_fn(|cx| {
+                                if release.get() {
+                                    core::task::Poll::Ready(())
                                 } else {
-                                    Ok(())
+                                    cx.waker().wake_by_ref();
+                                    core::task::Poll::Pending
                                 }
-                            },
+                            })
+                            .await;
+                            tokio::task::yield_now().await;
+                            clean.set(clean.get() + 1);
 
-                            intervals: vec![],
-                            before_each: None,
-                            after_each: None,
+                            if fault >= 4 {
+                                Err(std::io::Error::other("local cleanup sentinel"))
+                            } else {
+                                Ok(())
+                            }
                         },
-                        options: AktorNewOptions { capacity: 32 },
+                        hooks: Default::default(),
+                        capacity: 32,
+                        stuck: AktorStuck::Kill,
                     },
                     shutdown: move |_| {
                         called.set(called.get() + 1);
                         assert_eq!(checked.get(), 1);
                         drop(held);
                     },
-                    options: AktorOptions {
-                        shutdown_grace: Duration::from_secs(5),
-                    },
+                    grace: Duration::from_secs(5),
                 })
                 .await
                 .unwrap();
@@ -143,7 +133,7 @@ async fn shutdown() {
                     .expect("shutdown hook stalled");
 
                 assert_eq!(hooks.get(), 1);
-                assert!(!report.timed_out, "{report}");
+                assert!(!report.ran_past_grace, "{report}");
                 assert_eq!(report.failed(), fault != 0, "{report}");
 
                 if fault >= 4 {
@@ -151,17 +141,15 @@ async fn shutdown() {
                         report.to_string().matches("local cleanup sentinel").count(),
                         1
                     );
-                    assert_eq!(report.actors[0].diagnostics.is_empty(), fault == 4);
                     if fault == 4 {
                         let completion = actors.handles.completion();
-                        let error = completion.wait().await.unwrap_err();
-                        let diagnostic = format!("{error:#}");
+                        let (error, diagnostic) = completion.wait().await.unwrap_err();
 
                         assert_eq!(error.to_string(), "actor cleanup failed");
                         assert_eq!(diagnostic.matches("local cleanup sentinel").count(), 1);
 
-                        let shared = completion.wait_with_data().await.unwrap_err();
-                        assert_eq!(format!("{shared:#}"), diagnostic);
+                        let (_, detail) = completion.wait_with_data().await.unwrap_err();
+                        assert_eq!(detail, diagnostic);
                     }
                 }
 
@@ -187,27 +175,21 @@ async fn shutdown() {
             let called = calls.clone();
             let startup = aktor_start(AktorSetup {
                 actors: AktorNew {
-                    name: AktorName::new("unpolled local hook"),
-                    role: AktorNoRole,
+                    name: "unpolled local hook".into(),
                     kind: AktorKind::Local::<local::clock::Tokio>(|_| {
                         panic!("unpolled startup installed a driver");
                     }),
-                    closures: AktorClosures {
-                        start: async || Ok::<_, AktorSetupError>(()),
-                        end: (),
-                        intervals: vec![],
-                        before_each: None,
-                        after_each: None,
-                    },
-                    options: AktorNewOptions { capacity: 32 },
+                    start: async || aktor::aktor_ready(()),
+                    end: (),
+                    hooks: Default::default(),
+                    capacity: 32,
+                    stuck: AktorStuck::Kill,
                 },
                 shutdown: move |_| {
                     called.set(called.get() + 1);
                     drop(held);
                 },
-                options: AktorOptions {
-                    shutdown_grace: Duration::from_secs(5),
-                },
+                grace: Duration::from_secs(5),
             });
             let completion = startup.completion();
             drop(startup);
@@ -218,94 +200,61 @@ async fn shutdown() {
         .await;
 }
 
-#[tokio::test]
-async fn panic_cleanup() {
-    for mode in 0..3 {
-        let group = local::AktorGroup::<local::clock::Tokio>::new();
-        let completion = group.completion();
-        let cleaned = Rc::new(Cell::new(0));
-        let clean = cleaned.clone();
-        let notified = Rc::new(Cell::new(false));
-        let notification = notified.clone();
-        let cleanup_done = cleaned.clone();
-        group
-            .on_shutdown(move |_| {
-                assert_eq!(cleanup_done.get(), 1);
-                notification.set(true);
+#[tokio::test(start_paused = true)]
+async fn drop_before_next_end() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (held, released) = tokio::sync::oneshot::channel::<()>();
+            let kind = || {
+                AktorKind::Local::<local::clock::Tokio>(|future| {
+                    tokio::task::spawn_local(future);
+                    Ok(())
+                })
+            };
+
+            let reader = AktorNew {
+                name: "reader".into(),
+                kind: kind(),
+                start: async move || aktor::aktor_ready(released),
+                end: async |released: tokio::sync::oneshot::Receiver<()>| {
+                    let _ = released.await;
+                },
+                hooks: Default::default(),
+                capacity: 1,
+                stuck: AktorStuck::Leave,
+            };
+            let writer = AktorNew {
+                name: "writer".into(),
+                kind: kind(),
+                start: async move || aktor::aktor_ready(held),
+                end: async |held: tokio::sync::oneshot::Sender<()>| {
+                    core::future::pending::<()>().await;
+                    drop(held);
+                },
+                hooks: Default::default(),
+                capacity: 1,
+                stuck: AktorStuck::Leave,
+            };
+
+            let actors = aktor_start(AktorSetup {
+                actors: (reader, writer),
+                shutdown: |_| {},
+                grace: Duration::from_secs(1),
             })
+            .await
             .unwrap();
-        let dropped = Rc::new(Cell::new(false));
-        let drop_signal = dropped.clone();
-        let hook_calls = Rc::new(Cell::new(0));
-        let hooks = hook_calls.clone();
+            let report = actors.shutdown().await;
 
-        let run = group.run(
-            async move |group| {
-                let handle = group
-                    .spawn::<(), 1, ()>(AktorArgs {
-                        name: "application actor".into(),
-                        capacity: 1,
-                        setup: async || Ok(()),
-                        cleanup: async move |_| {
-                            assert!(mode == 0 || drop_signal.get());
-                            tokio::task::yield_now().await;
-                            clean.set(clean.get() + 1);
-                            Ok(())
-                        },
-                    })
-                    .unwrap();
-
-                handle.ready().await.unwrap();
-
-                if mode == 0 {
-                    panic!("application poll failed");
-                }
-
-                let captured = DropFailure {
-                    dropped,
-                    fails: true,
-                };
-
-                if mode == 1 {
-                    let _captured = captured;
-                    return Err(AktorError::new("application domain failure", ()));
-                }
-
-                group.killswitch().stop();
-                core::future::pending::<()>().await;
-                drop(captured);
-                Ok(())
-            },
-            move |_| hooks.set(hooks.get() + 1),
-        );
-        let result =
-            tokio::time::timeout(Duration::from_secs(2), AssertUnwindSafe(run).catch_unwind())
-                .await
-                .expect("local cleanup stalled")
-                .expect("application panic escaped its group");
-        let report = result.expect_err("application failure was lost");
-
-        assert!(notified.get());
-        assert_eq!(hook_calls.get(), 1);
-        assert!(!report.report.timed_out, "{report}");
-        assert!(completion.try_report().unwrap().failed());
-
-        if mode == 0 {
+            let reader = report
+                .actors
+                .iter()
+                .find(|actor| actor.actor == "reader")
+                .unwrap();
             assert_eq!(
-                report
-                    .diagnostics
-                    .report
-                    .matches("application poll failed")
-                    .count(),
-                1
+                reader.retirement,
+                aktor::AktorRetireStatus::Confirmed,
+                "{report}"
             );
-        } else {
-            assert!(
-                report
-                    .diagnostics
-                    .report
-                    .contains("application destructor failed")
-            );
-        }
-    }
+        })
+        .await;
 }

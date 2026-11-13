@@ -10,6 +10,7 @@ pub struct AktorClosure<F: ?Sized>(pub Box<F>);
 pub type AktorEndFuture =
     core::pin::Pin<Box<dyn core::future::Future<Output = Result<(), AktorFailure>> + Send>>;
 
+#[doc(hidden)]
 pub trait AktorIntervalLogic<S> {
     fn run<'a>(&'a mut self, state: &'a mut S) -> LocalFuture<'a, ()>;
 }

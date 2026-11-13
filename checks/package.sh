@@ -18,6 +18,7 @@ test -f "$package_dir/aktor/src/data/decode.rs"
 test -f "$package_dir/aktor-macros/src/data/generate.rs"
 tar --exclude=target --exclude=pkg -cf - integrations \
     | tar -xf - -C "$package_dir"
+sed -i '/^er = /s@, path = "../../er/er"@@' "$package_dir/integrations/Cargo.toml"
 cp rust-toolchain.toml "$package_dir/"
 cat > "$package_dir/.cargo/config.toml" <<EOF
 [patch.crates-io]

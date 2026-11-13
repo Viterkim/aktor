@@ -1,16 +1,17 @@
 use super::*;
-use crate::listener::{DedicatedStartError, SpawnArgs, WeakHandle};
-use crate::{AktorCleanupOutput, AktorExecution, AktorFailure, FailurePolicy};
+use crate::listener::{DedicatedStartError, FailurePolicy, SpawnArgs, WeakHandle};
+use crate::{AktorCleanupOutput, AktorExecution, AktorFailure};
 use core::{fmt, future::Future};
 
 impl<S: 'static> Aktor<S> {
     /// Start the actor on its own thread. Returns after setup succeeds.
+    #[doc(hidden)]
     pub async fn spawn<Setup, Cleanup, Output>(
         args: SpawnArgs<Setup, Cleanup>,
-    ) -> Result<Self, StartError>
+    ) -> Result<Self, (StartError, String)>
     where
         Output: AktorCleanupOutput,
-        Setup: FnOnce() -> Result<S, crate::AktorSetupError> + Send + 'static,
+        Setup: FnOnce() -> Result<S, String> + Send + 'static,
         Cleanup: FnMut(S) -> Output + Send + 'static,
     {
         let SpawnArgs {
@@ -32,42 +33,45 @@ impl<S: 'static> Aktor<S> {
     }
 
     /// Async setup and cleanup run on the actor's thread too.
+    #[doc(hidden)]
     pub async fn spawn_async<Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         args: SpawnArgs<Setup, Cleanup>,
-    ) -> Result<Self, StartError>
+    ) -> Result<Self, (StartError, String)>
     where
         Output: AktorCleanupOutput,
         Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, crate::AktorSetupError>>,
+        SetupFuture: Future<Output = Result<S, String>>,
         Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
         CleanupFuture: Future<Output = Output>,
     {
-        Self::spawn_async_with_hooks(args, crate::listener::hooks::AktorHooks::default()).await
+        Self::spawn_async_with_hooks(args, crate::listener::hooks::CallHooks::default()).await
     }
 
+    #[doc(hidden)]
     pub async fn spawn_async_with_hooks<Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         args: SpawnArgs<Setup, Cleanup>,
-        hooks: crate::listener::hooks::AktorHooks<S>,
-    ) -> Result<Self, StartError>
+        hooks: crate::listener::hooks::CallHooks<S>,
+    ) -> Result<Self, (StartError, String)>
     where
         Output: AktorCleanupOutput,
         Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, crate::AktorSetupError>>,
+        SetupFuture: Future<Output = Result<S, String>>,
         Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
         CleanupFuture: Future<Output = Output>,
     {
         Self::spawn_async_on(args, hooks, false).await
     }
 
+    #[doc(hidden)]
     pub async fn spawn_async_on<Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
         args: SpawnArgs<Setup, Cleanup>,
-        hooks: crate::listener::hooks::AktorHooks<S>,
+        hooks: crate::listener::hooks::CallHooks<S>,
         standard: bool,
-    ) -> Result<Self, StartError>
+    ) -> Result<Self, (StartError, String)>
     where
         Output: AktorCleanupOutput,
         Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, crate::AktorSetupError>>,
+        SetupFuture: Future<Output = Result<S, String>>,
         Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
         CleanupFuture: Future<Output = Output>,
     {
@@ -95,10 +99,14 @@ impl<S: 'static> Aktor<S> {
             setup: move || async move {
                 match setup().await {
                     Ok(state) => Ok(state),
-                    Err(error) => Err(match kill {
-                        Some(kill) => kill.startup_error(actor, kind, error),
-                        None => AktorFailure::from(error),
-                    }),
+                    Err(report) => {
+                        let error = crate::AktorError::new(report, ());
+
+                        Err(match kill {
+                            Some(kill) => kill.startup_error(actor, kind, error),
+                            None => AktorFailure::from(error),
+                        })
+                    }
                 }
             },
             cleanup: move |state| {
@@ -109,14 +117,14 @@ impl<S: 'static> Aktor<S> {
 
         Self::spawn_async_captured(args, hooks, standard)
             .await
-            .map_err(StartError::from)
+            .map_err(|error| StartError::from(error).into_report())
     }
 }
 
 impl<S: 'static> Aktor<S> {
     async fn spawn_async_captured<Initial, Setup, SetupFuture, Cleanup, CleanupFuture>(
         args: SpawnArgs<Setup, Cleanup>,
-        hooks: crate::listener::hooks::AktorHooks<S>,
+        hooks: crate::listener::hooks::CallHooks<S>,
         standard: bool,
     ) -> Result<Self, DedicatedStartError<Initial>>
     where
@@ -128,7 +136,8 @@ impl<S: 'static> Aktor<S> {
     {
         let runtime = crate::executor::Spawner::current(standard)
             .map_err(|_| DedicatedStartError::NoRuntime)?;
-        let (owner, observing) = Self::spawn_observed(args, hooks, standard).await?;
+        let (owner, observing) =
+            Self::spawn_observed(args, hooks, standard, None, crate::AktorStuck::Kill).await?;
         let observing = Arc::new(parking_lot::Mutex::new(Some(observing)));
         let scheduled = observing.clone();
         let result = runtime.spawn_named("aktor join", async move {
@@ -148,7 +157,7 @@ impl<S: 'static> Aktor<S> {
                 observing.await;
             }
 
-            let completion = owner.completion.wait().await;
+            let completion = owner.completion.observe().await;
             return Err(DedicatedStartError::Observer {
                 cause: error,
                 completion,
@@ -161,8 +170,10 @@ impl<S: 'static> Aktor<S> {
     #[doc(hidden)]
     pub async fn spawn_observed<Initial, Setup, SetupFuture, Cleanup, CleanupFuture>(
         args: SpawnArgs<Setup, Cleanup>,
-        hooks: crate::listener::hooks::AktorHooks<S>,
+        hooks: crate::listener::hooks::CallHooks<S>,
         standard: bool,
+        cancelled: Option<watch::Receiver<bool>>,
+        stuck: crate::AktorStuck,
     ) -> Result<(Self, impl Future<Output = ()> + Send + 'static), DedicatedStartError<Initial>>
     where
         Initial: Send + 'static,
@@ -175,33 +186,34 @@ impl<S: 'static> Aktor<S> {
             .map_err(|_| DedicatedStartError::NoRuntime)?;
         let (handle, actor, thread) = crate::listener::lifecycle::spawn::spawn_async_initial_on::<
             S,
-            crate::AktorSetupError,
             Initial,
             AktorFailure,
             _,
             _,
             _,
             _,
-        >(args, hooks, standard)
+        >(args, hooks, standard, cancelled, stuck)
         .await?;
         let (completed, result) = watch::channel(None);
-        let observer = actor.new_controller();
+        let observer = actor.clone();
+        let cleanup = actor.cleanup_receipt();
         let observing = async move {
             let outcome = match runtime.join(thread).await {
-                Ok(Ok(())) if observer.is_cancelled() => {
-                    Err(Arc::new(OwnerFailure::Cancelled.into()))
+                Ok(Ok(())) if !observer.cleanup_completed() => {
+                    Err(Arc::new(OwnerError::CleanupUnconfirmed))
                 }
+                Ok(Ok(())) if observer.cut_call() => Err(Arc::new(OwnerError::Cancelled)),
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(Arc::new(OwnerFailure::Cleanup(error).into())),
+                Ok(Err(error)) => Err(Arc::new(OwnerError::Cleanup(error))),
                 Err(cause) => {
                     let cleanup = observer.cleanup_errors();
                     let error = if cleanup.errors.is_empty() && cleanup.diagnostics.is_empty() {
-                        OwnerFailure::Panicked(cause)
+                        OwnerError::Panicked(cause)
                     } else {
-                        OwnerFailure::PanickedWithCleanup { cause, cleanup }
+                        OwnerError::PanickedWithCleanup { cause, cleanup }
                     };
 
-                    Err(Arc::new(OwnerError::from(error)))
+                    Err(Arc::new(error))
                 }
             };
 
@@ -212,19 +224,33 @@ impl<S: 'static> Aktor<S> {
             Self {
                 handle,
                 control: Lifecycle { inner: actor },
-                completion: OwnerCompletion { result },
+                completion: OwnerCompletion { result, cleanup },
             },
             observing,
         ))
     }
 }
 impl<S, Role> Aktor<S, Role> {
-    pub fn completion(&self) -> OwnerCompletion {
-        self.completion.new_observer()
+    /// Wrap the outermost future that needs to stop with this actor's group.
+    /// If the group starts closing first, `run` drops that future and returns `None`.
+    pub async fn run<F: Future>(&self, work: F) -> Option<F::Output> {
+        self.handle.run(work).await
     }
 
-    pub fn new_handle(&self) -> Handle<S, Role> {
-        self.handle.new_handle()
+    /// Use the group's completion to wait for the shutdown report or confirm that every actor
+    /// has stopped. Returns `None` if the actor has no group.
+    pub fn group_completion(&self) -> Option<crate::AktorGroupCompletion> {
+        self.handle.group_completion()
+    }
+
+    /// Keep this to observe the dedicated thread after dropping the actor handle.
+    pub fn completion(&self) -> OwnerCompletion {
+        self.completion.clone()
+    }
+
+    /// A plain handle for calls, without the owner's shutdown and completion.
+    pub fn handle(&self) -> Handle<S, Role> {
+        self.handle.clone()
     }
 
     pub fn downgrade(&self) -> WeakHandle<S, Role> {
@@ -239,24 +265,67 @@ impl<S, Role> Aktor<S, Role> {
         }
     }
 }
+impl<S, Role> Clone for Aktor<S, Role> {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            control: self.control.clone(),
+            completion: self.completion.clone(),
+        }
+    }
+}
 impl<S: 'static, Role> Aktor<S, Role> {
+    /// Use this just before returning a final reply when the state can no longer serve calls.
+    /// Starts group shutdown. This actor discards queued calls and runs `end` after the current call.
+    pub fn retire(&self) {
+        let inner = &self.handle.inner;
+        if let Some(group) = inner.admission.group() {
+            group.stop();
+        }
+
+        inner.sender.retire();
+        self.control.close_admission();
+    }
+
+    #[doc(hidden)]
     /// Finish queued calls and cleanup. Once started, it keeps going if you stop awaiting it.
     /// Owners started with `Aktor::spawn` need their runtime running until completion.
     pub fn shutdown(&self) -> OwnerCompletion {
         self.control.request_shutdown();
-        self.completion.new_observer()
+        self.completion.clone()
     }
 }
 
 impl OwnerCompletion {
-    pub fn new_observer(&self) -> Self {
-        Self {
-            result: self.result.clone(),
+    /// Read the current outcome of `end` without waiting or formatting its report.
+    pub fn cleanup_status(&self) -> crate::AktorCleanupStatus {
+        use crate::AktorCleanupStatus;
+
+        let closed = self.cleanup.has_changed().is_err();
+        match &*self.cleanup.borrow() {
+            Some(Ok(())) => AktorCleanupStatus::Succeeded,
+            Some(Err(_)) => AktorCleanupStatus::Failed,
+            None if closed => AktorCleanupStatus::Unconfirmed,
+            None => AktorCleanupStatus::Pending,
         }
     }
 
+    /// Wait for this actor’s `end` to return. An earlier call panic still lets `end` succeed.
+    pub async fn wait_cleanup(&self) -> Result<(), (CleanupError, String)> {
+        crate::listener::lifecycle::wait_cleanup(self.cleanup.clone())
+            .await
+            .map_err(lifecycle::cleanup_error)
+    }
+
     /// Wait for completion. You can get the same result again later.
-    pub async fn wait(&self) -> Result<(), Arc<OwnerError>> {
+    pub async fn wait(&self) -> Result<(), (Arc<OwnerError>, String)> {
+        self.observe().await.map_err(|error| {
+            let report = error.report();
+            (error, report)
+        })
+    }
+
+    pub(crate) async fn observe(&self) -> Result<(), Arc<OwnerError>> {
         let mut result = self.result.clone();
 
         loop {
@@ -265,13 +334,13 @@ impl OwnerCompletion {
             }
 
             if result.changed().await.is_err() {
-                return Err(Arc::new(OwnerFailure::RuntimeStopped.into()));
+                return Err(Arc::new(OwnerError::RuntimeStopped));
             }
         }
     }
 }
 
-impl fmt::Display for OwnerFailure {
+impl fmt::Display for OwnerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cleanup(error) => {
@@ -325,6 +394,7 @@ impl fmt::Display for OwnerFailure {
 
                 Ok(())
             }
+            Self::CleanupUnconfirmed => write!(formatter, "{}", CleanupError::Unconfirmed),
             Self::Cancelled => formatter.write_str("actor work was cancelled during shutdown"),
             Self::RuntimeStopped => formatter.write_str("owner runtime stopped before completion"),
         }
@@ -332,7 +402,7 @@ impl fmt::Display for OwnerFailure {
 }
 
 impl core::future::IntoFuture for OwnerCompletion {
-    type Output = Result<(), Arc<OwnerError>>;
+    type Output = Result<(), (Arc<OwnerError>, String)>;
     type IntoFuture = core::pin::Pin<Box<dyn Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -340,7 +410,7 @@ impl core::future::IntoFuture for OwnerCompletion {
     }
 }
 impl<'a> core::future::IntoFuture for &'a OwnerCompletion {
-    type Output = Result<(), Arc<OwnerError>>;
+    type Output = Result<(), (Arc<OwnerError>, String)>;
     type IntoFuture = core::pin::Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -348,35 +418,34 @@ impl<'a> core::future::IntoFuture for &'a OwnerCompletion {
     }
 }
 
-impl From<OwnerFailure> for OwnerError {
-    fn from(error: OwnerFailure) -> Self {
-        let diagnostics = crate::AktorDiagnostic::new(error.to_string(), format!("{error:#}"));
-
-        Self { error, diagnostics }
+impl fmt::Debug for OwnerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
     }
 }
+impl core::error::Error for OwnerError {}
+
 impl OwnerError {
-    /// Whether the OS thread was joined. Cleanup may have failed or been skipped.
-    pub fn physically_joined(&self) -> bool {
-        match &self.error {
-            OwnerFailure::Cleanup(_) | OwnerFailure::Cancelled => true,
-            OwnerFailure::Panicked(cause) | OwnerFailure::PanickedWithCleanup { cause, .. } => {
-                cause.physically_joined
-            }
-            OwnerFailure::RuntimeStopped => false,
-        }
+    pub(crate) fn report(&self) -> String {
+        format!("{self:#}")
     }
 
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.diagnostics.report)
+    /// Whether the OS thread was joined. Cleanup may have failed or been skipped.
+    pub fn physically_joined(&self) -> bool {
+        match self {
+            OwnerError::Cleanup(_) | OwnerError::CleanupUnconfirmed | OwnerError::Cancelled => true,
+            OwnerError::Panicked(cause) | OwnerError::PanickedWithCleanup { cause, .. } => {
+                cause.physically_joined
+            }
+            OwnerError::RuntimeStopped => false,
+        }
     }
 }
 
 #[cfg(all(test, feature = "std_thread", feature = "tokio"))]
 mod tests {
     use super::*;
-    use crate::{AktorArgs, AktorCleanupError, AktorGroup, AktorSetupError, FailurePolicy};
+    use crate::{AktorArgs, AktorGroup};
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
@@ -386,7 +455,6 @@ mod tests {
     async fn owner_handoff() {
         handoff(false).await;
         notification(false).await;
-        replacement().await;
     }
 
     #[tokio::test]
@@ -423,14 +491,14 @@ mod tests {
                     setup: move || async move {
                         if cancelled {
                             kill.stop();
-                            core::future::pending::<Result<(), AktorSetupError>>().await
+                            core::future::pending::<Result<(), String>>().await
                         } else {
-                            Err(AktorSetupError::new("original setup failure", ()))
+                            Err(String::from("original setup failure"))
                         }
                     },
                     cleanup: move |_: ()| {
                         let _retained = &tail;
-                        core::future::ready(Ok::<_, AktorCleanupError>(()))
+                        core::future::ready(Ok::<_, String>(()))
                     },
                 })
                 .await
@@ -440,7 +508,7 @@ mod tests {
             let DedicatedStartError::Startup {
                 join: crate::listener::StartupJoin::Failed(join),
                 ..
-            } = &error.error
+            } = &error.0.cause
             else {
                 panic!("startup lost its failed join");
             };
@@ -449,7 +517,7 @@ mod tests {
             let report = group.completion().wait().await;
             assert_eq!(
                 report.actors[0].retirement,
-                crate::RetirementStatus::Unconfirmed
+                crate::AktorRetireStatus::Terminated
             );
             assert!(
                 report.to_string().contains("startup join tail failed"),
@@ -474,7 +542,7 @@ mod tests {
                 name: "join handoff".into(),
                 capacity: 1,
                 failure: FailurePolicy::Unwind,
-                setup: || core::future::ready(Ok::<_, AktorSetupError>(())),
+                setup: || core::future::ready(Ok::<_, String>(())),
                 cleanup: move |_| {
                     let entered = cleanup_entered.clone();
                     let release = cleanup_release.clone();
@@ -486,7 +554,7 @@ mod tests {
                         cleanup.fetch_add(1, Ordering::Relaxed);
 
                         if failed_cleanup {
-                            Err(AktorCleanupError::new("cleanup also failed", ()))
+                            Err(String::from("cleanup also failed"))
                         } else {
                             Ok(())
                         }
@@ -512,11 +580,11 @@ mod tests {
 
         crate::executor::FAIL_SPAWN.with(|setting| setting.set(None));
 
-        let Err(error) = result else {
+        let Err((error, report)) = result else {
             panic!("completion scheduling failure was lost");
         };
 
-        let DedicatedStartError::Observer { cause, completion } = &error.error else {
+        let DedicatedStartError::Observer { cause, completion } = &error.cause else {
             panic!("observer failure lost its typed causes");
         };
 
@@ -526,7 +594,7 @@ mod tests {
             Err(error) => {
                 assert!(failed_cleanup);
                 assert!(error.physically_joined());
-                assert!(format!("{error:#}").contains("cleanup also failed"));
+                assert!(report.contains("cleanup also failed"));
             }
         }
 
@@ -557,10 +625,10 @@ mod tests {
             name: "notification".into(),
             capacity: 1,
             failure: FailurePolicy::Unwind,
-            setup: || core::future::ready(Ok::<_, AktorSetupError>(0_u32)),
+            setup: || core::future::ready(Ok::<_, String>(0_u32)),
             cleanup: move |_| {
                 cleanup.fetch_add(1, Ordering::Relaxed);
-                core::future::ready(Ok::<_, AktorCleanupError>(()))
+                core::future::ready(Ok::<_, String>(()))
             },
         };
         let mut group = AktorGroup::new();
@@ -607,7 +675,7 @@ mod tests {
             );
             assert_eq!(
                 report.actors[0].retirement,
-                crate::RetirementStatus::Confirmed
+                crate::AktorRetireStatus::Confirmed
             );
         } else {
             let _notification =
@@ -626,61 +694,6 @@ mod tests {
         assert_eq!(cleaned.load(Ordering::Relaxed), 1);
     }
 
-    async fn replacement() {
-        use crate::message::call_async;
-        use futures_util::FutureExt;
-        use tokio::sync::oneshot;
-
-        let cleaned = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let cleanup = cleaned.clone();
-        let owner = Aktor::spawn_async_on(
-            SpawnArgs {
-                name: "replacement handoff".into(),
-                capacity: 1,
-                failure: FailurePolicy::Unwind,
-                setup: || core::future::ready(Ok::<_, AktorSetupError>(1_u32)),
-                cleanup: move |state| {
-                    cleanup.lock().push(state);
-                    core::future::ready(Ok::<_, AktorCleanupError>(()))
-                },
-            },
-            Default::default(),
-            true,
-        )
-        .await
-        .unwrap();
-
-        let (entered, entering) = oneshot::channel();
-        let (release, released) = oneshot::channel();
-        let reply = call_async(
-            &owner.handle,
-            async |_: &mut u32, ()| {
-                entered.send(()).unwrap();
-                released.await.unwrap();
-            },
-            (),
-        )
-        .send()
-        .await;
-
-        entering.await.unwrap();
-
-        let mut replacing = Box::pin(owner.control.replace(|| Ok::<_, AktorSetupError>(2)));
-
-        assert!(replacing.as_mut().now_or_never().is_none());
-        drop(replacing);
-
-        let completion = owner.shutdown();
-
-        release.send(()).unwrap();
-        reply.await;
-        tokio::time::timeout(Duration::from_millis(250), completion.wait())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(*cleaned.lock(), [1, 2]);
-    }
-
     async fn handoff(grouped: bool) {
         crate::executor::FAIL_SPAWN.with(|setting| setting.set(Some("aktor shutdown")));
 
@@ -690,10 +703,10 @@ mod tests {
             name: "handoff".into(),
             capacity: 1,
             failure: FailurePolicy::Unwind,
-            setup: || core::future::ready(Ok::<_, AktorSetupError>(0_u32)),
+            setup: || core::future::ready(Ok::<_, String>(0_u32)),
             cleanup: move |_| {
                 cleanup.fetch_add(1, Ordering::Relaxed);
-                core::future::ready(Ok::<_, AktorCleanupError>(()))
+                core::future::ready(Ok::<_, String>(()))
             },
         };
 
@@ -741,5 +754,13 @@ mod tests {
         );
         assert!(owner.shutdown().await.is_ok());
         assert_eq!(cleaned.load(Ordering::Relaxed), 1);
+    }
+}
+impl Clone for OwnerCompletion {
+    fn clone(&self) -> Self {
+        Self {
+            result: self.result.clone(),
+            cleanup: self.cleanup.clone(),
+        }
     }
 }

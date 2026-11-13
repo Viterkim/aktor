@@ -1,4 +1,6 @@
 use aktor::*;
+use er::*;
+use std::time::Duration;
 
 #[derive(Default)]
 pub struct Connection {
@@ -23,28 +25,38 @@ pub async fn count(connection: &Connection) -> usize {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn core::error::Error>> {
-    let mut actors = AktorGroup::new();
-    actors.start()?;
+async fn main() -> ErMain {
+    let started = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: "database".into(),
+            kind: AktorKind::TokioThread,
+            start: async || aktor_ready(Connection::default()),
+            end: (),
+            hooks: Default::default(),
+            capacity: 32,
+            stuck: AktorStuck::Kill,
+        },
+        shutdown: |report| {
+            if report.failed() {
+                eprintln!("{report}");
+            }
+        },
+        grace: Duration::from_secs(5),
+    })
+    .await
+    .er_report()?;
+    let database = &started.handles;
 
-    let database = actors
-        .spawn_value("database", Connection::default())
-        .await?;
-
-    let inserted = insert(&database, "BingoManden".to_owned()).send().await;
-    let rows: usize = count(&database).await;
+    let inserted = insert(database, "BingoManden".to_owned()).send().await;
+    let rows: usize = count(database).await;
 
     let id: usize = inserted.await;
-    let row: Option<String> = find(&database, id).await;
+    let row: Option<String> = find(database, id).await;
 
     assert_eq!(row.as_deref(), Some("BingoManden"));
     assert_eq!(rows, 1);
 
-    let report = actors.shutdown().await;
-
-    if report.failed() {
-        return Err(aktor::AktorRunError::from(report).into());
-    }
+    started.shutdown().await;
 
     Ok(())
 }

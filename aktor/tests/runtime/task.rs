@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 
 struct Counter(std::cell::RefCell<u32>);
 
@@ -51,22 +51,16 @@ async fn task_echo_fixed(counter: &mut Counter, value: u32) -> u32 {
 async fn cooperative() {
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("task admission"),
-            role: AktorNoRole,
+            name: "task admission".into(),
             kind: AktorKind::TokioTask,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
-                end: (),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 1024 },
+            start: async || aktor_ready(Counter(std::cell::RefCell::new(0))),
+            end: (),
+            hooks: Default::default(),
+            capacity: 1024,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await
     .unwrap();
@@ -89,6 +83,180 @@ async fn cooperative() {
     assert!(observed < 1024, "submission monopolised the executor");
 }
 
+#[tokio::test]
+async fn returned_lease() {
+    type Lease = AktorTaskState<Counter>;
+    type Exchange = (oneshot::Sender<Lease>, oneshot::Receiver<Lease>);
+
+    async fn exchange(lease: Lease, (send, receive): Exchange) -> (Lease, ()) {
+        assert!(send.send(lease).is_ok());
+        (receive.await.unwrap(), ())
+    }
+
+    let hooks = Arc::new(Mutex::new(Vec::new()));
+    let counter = |name: &str, value| AktorNew {
+        name: name.into(),
+        kind: AktorKind::TokioTask,
+        start: async move || aktor_ready(Counter(std::cell::RefCell::new(value))),
+        end: (),
+        hooks: AktorHooks {
+            after_each: Some({
+                let hooks = hooks.clone();
+                (move |state: &mut Counter, operation: operation::Operation| {
+                    hooks
+                        .lock()
+                        .unwrap()
+                        .push((operation.name, *state.0.get_mut()));
+                })
+                .into()
+            }),
+            ..Default::default()
+        },
+        capacity: 1,
+        stuck: AktorStuck::Kill,
+    };
+    let actors = aktor_start(AktorSetup {
+        actors: (counter("first", 0), counter("second", 10)),
+        shutdown: |_| {},
+        grace: Duration::from_secs(5),
+    })
+    .await
+    .unwrap();
+
+    let (first, second) = &actors.handles;
+    let (send_first, from_first) = oneshot::channel();
+    let (send_second, from_second) = oneshot::channel();
+    let operation = operation::Operation {
+        name: "exchange",
+        caller: core::panic::Location::caller(),
+    };
+
+    tokio::join!(
+        task::AktorTaskRequest::new(first, operation, (send_first, from_second), exchange),
+        task::AktorTaskRequest::new(second, operation, (send_second, from_first), exchange),
+    );
+    assert!(hooks.lock().unwrap().is_empty());
+
+    assert_eq!(
+        tokio::join!(task_add(first, 1), task_add(second, 1)),
+        (Ok(1), Ok(11))
+    );
+
+    actors.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_with_detached_lease() {
+    async fn detach(
+        lease: AktorTaskState<Counter>,
+        sent: oneshot::Sender<AktorTaskState<Counter>>,
+    ) -> (AktorTaskState<Counter>, ()) {
+        assert!(sent.send(lease).is_ok());
+        core::future::pending().await
+    }
+
+    let actors = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: "detached lease".into(),
+            kind: AktorKind::TokioTask,
+            start: async || aktor_ready(Counter(std::cell::RefCell::new(0))),
+            end: (),
+            hooks: Default::default(),
+            capacity: 1,
+            stuck: AktorStuck::Leave,
+        },
+        shutdown: |_| {},
+        grace: Duration::from_millis(50),
+    })
+    .await
+    .unwrap();
+    let handle = actors.handles.clone();
+    let (sent, received) = oneshot::channel();
+    let operation = operation::Operation {
+        name: "detach",
+        caller: core::panic::Location::caller(),
+    };
+    task::AktorTaskRequest::new(&handle, operation, sent, detach)
+        .cast()
+        .await;
+    let lease = received.await.unwrap();
+
+    let report = actors.shutdown().await;
+    assert!(report.ran_past_grace);
+    assert_eq!(report.actors[0].retirement, AktorRetireStatus::Unconfirmed);
+    tokio::time::timeout(Duration::from_secs(2), handle.finished())
+        .await
+        .expect("owner stalled trying to recover its state");
+    drop(lease);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_recovery_and_end_share_grace() {
+    async fn detach(
+        lease: AktorTaskState<()>,
+        (sent, cancelled): (oneshot::Sender<AktorTaskState<()>>, Arc<Notify>),
+    ) -> (AktorTaskState<()>, ()) {
+        struct OnDrop(Arc<Notify>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let _cancelled = OnDrop(cancelled);
+        assert!(sent.send(lease).is_ok());
+        core::future::pending().await
+    }
+
+    let cancelled = Arc::new(Notify::new());
+    let entering_end = Arc::new(Notify::new());
+    let entered_end = entering_end.clone();
+    let actors = aktor_start(AktorSetup {
+        actors: AktorNew {
+            name: "cleanup grace".into(),
+            kind: AktorKind::TokioTask,
+            start: async || aktor_ready(()),
+            end: async move |()| {
+                entering_end.notify_one();
+                tokio::time::sleep(Duration::from_secs(7)).await;
+                Ok::<_, String>(())
+            },
+            hooks: Default::default(),
+            capacity: 1,
+            stuck: AktorStuck::Leave,
+        },
+        shutdown: |_| {},
+        grace: Duration::from_secs(10),
+    })
+    .await
+    .unwrap();
+    let (sent, received) = oneshot::channel();
+    let operation = operation::Operation {
+        name: "detach until cleanup",
+        caller: core::panic::Location::caller(),
+    };
+    task::AktorTaskRequest::new(
+        &actors.handles,
+        operation,
+        (sent, cancelled.clone()),
+        detach,
+    )
+    .cast()
+    .await;
+    let lease = received.await.unwrap();
+
+    let closing = actors.shutdown();
+    cancelled.notified().await;
+    tokio::time::advance(Duration::from_secs(6)).await;
+    drop(lease);
+    entered_end.notified().await;
+
+    tokio::time::timeout(Duration::from_millis(4500), actors.handles.finished())
+        .await
+        .expect("cleanup got a new grace after recovering state");
+    assert!(closing.await.ran_past_grace);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn calls() {
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -97,15 +265,14 @@ async fn calls() {
     let end = log.clone();
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("counter task"),
-            role: AktorNoRole,
+            name: "counter task".into(),
             kind: AktorKind::TokioTask,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
-                end: async move |mut counter: Counter| {
-                    end.lock().unwrap().push(("end", *counter.0.get_mut()));
-                    Ok::<_, AktorCleanupError>(())
-                },
+            start: async || aktor_ready(Counter(std::cell::RefCell::new(0))),
+            end: async move |mut counter: Counter| {
+                end.lock().unwrap().push(("end", *counter.0.get_mut()));
+                Ok::<_, String>(())
+            },
+            hooks: AktorHooks {
                 intervals: vec![],
                 before_each: Some(
                     (move |counter: &mut Counter, _: operation::Operation| {
@@ -123,12 +290,11 @@ async fn calls() {
                     .into(),
                 ),
             },
-            options: AktorNewOptions { capacity: 1 },
+            capacity: 1,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await
     .unwrap();
@@ -197,7 +363,7 @@ async fn calls() {
     input.send(4);
     input.send(5);
 
-    let shutdown = actors.shutdown();
+    let shutdown = core::future::IntoFuture::into_future(actors.shutdown());
 
     tokio::pin!(shutdown);
     assert!(shutdown.as_mut().now_or_never().is_none());
@@ -220,12 +386,11 @@ async fn intervals() {
     let ping = tick.clone();
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("interval task"),
-            role: AktorNoRole,
+            name: "interval task".into(),
             kind: AktorKind::TokioTask,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
-                end: (),
+            start: async || aktor_ready(Counter(std::cell::RefCell::new(0))),
+            end: (),
+            hooks: AktorHooks {
                 intervals: vec![AktorInterval {
                     every: Duration::from_millis(10),
                     run: (move |mut counter: AktorTaskState<Counter>| {
@@ -240,12 +405,11 @@ async fn intervals() {
                 before_each: None,
                 after_each: None,
             },
-            options: AktorNewOptions { capacity: 32 },
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await
     .unwrap();
@@ -293,28 +457,23 @@ async fn cleanup() {
     let actors = aktor_start(AktorSetup {
         actors: (
             AktorNew {
-                name: AktorName::new("failed task"),
-                role: AktorNoRole,
+                name: "failed task".into(),
                 kind: AktorKind::TokioTask,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
-                    end: async move |mut counter: Counter| {
-                        *saved.lock().unwrap() = Some(*counter.0.get_mut());
-                        Ok::<_, AktorCleanupError>(())
-                    },
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: async || aktor_ready(Counter(std::cell::RefCell::new(0))),
+                end: async move |mut counter: Counter| {
+                    *saved.lock().unwrap() = Some(*counter.0.get_mut());
+                    Ok::<_, String>(())
                 },
-                options: AktorNewOptions { capacity: 32 },
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
             AktorNew {
-                name: AktorName::new("hook drop task"),
-                role: AktorNoRole,
+                name: "hook drop task".into(),
                 kind: AktorKind::TokioTask,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
-                    end: (),
+                start: async || aktor_ready(Counter(std::cell::RefCell::new(0))),
+                end: (),
+                hooks: AktorHooks {
                     intervals: vec![],
                     before_each: Some(
                         (move |_: &mut Counter, _: operation::Operation| {
@@ -324,13 +483,12 @@ async fn cleanup() {
                     ),
                     after_each: None,
                 },
-                options: AktorNewOptions { capacity: 32 },
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
         ),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await
     .unwrap();
@@ -346,7 +504,7 @@ async fn cleanup() {
 
     assert_eq!(cleaned.lock().unwrap().take(), Some(7));
     assert!(report.failure.as_ref().unwrap().phase.contains("task_fail"));
-    assert!(!report.timed_out);
+    assert!(!report.ran_past_grace);
     assert!(output.next().now_or_never().is_none());
 
     let hook = report
@@ -366,22 +524,21 @@ async fn cleanup() {
         let held = (mode == 2).then(|| PanicPayload);
         let actors = aktor_start(AktorSetup {
             actors: AktorNew {
-                name: AktorName::new("cleanup reporting task"),
-                role: AktorNoRole,
+                name: "cleanup reporting task".into(),
                 kind: AktorKind::TokioTask,
-                closures: AktorClosures {
-                    start: async || Ok(0_u32),
-                    end: async move |_: u32| {
-                        if mode == 1 {
-                            panic!("cleanup sentinel");
-                        }
+                start: async || aktor_ready(0_u32),
+                end: async move |_: u32| {
+                    if mode == 1 {
+                        panic!("cleanup sentinel");
+                    }
 
-                        if mode == 0 {
-                            Err(AktorCleanupError::new("cleanup sentinel", ()))
-                        } else {
-                            Ok(())
-                        }
-                    },
+                    if mode == 0 {
+                        Err(String::from("cleanup sentinel"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                hooks: AktorHooks {
                     intervals: vec![],
                     before_each: Some(
                         (move |_: &mut u32, _| {
@@ -391,10 +548,11 @@ async fn cleanup() {
                     ),
                     after_each: None,
                 },
-                options: Default::default(),
+                capacity: 32,
+                stuck: AktorStuck::Kill,
             },
             shutdown: |_| {},
-            options: Default::default(),
+            grace: Duration::from_secs(5),
         })
         .await
         .unwrap();
@@ -409,9 +567,9 @@ async fn cleanup() {
         assert_eq!(
             report.actors[0].retirement,
             if mode == 1 {
-                RetirementStatus::Unconfirmed
+                AktorRetireStatus::Terminated
             } else {
-                RetirementStatus::Confirmed
+                AktorRetireStatus::Confirmed
             }
         );
     }
@@ -426,55 +584,45 @@ async fn mixed_cleanup() {
         let ended = Arc::new(Mutex::new(false));
         let end = ended.clone();
         let tokio = AktorNew {
-            name: AktorName::new("Tokio counter"),
-            role: AktorNoRole,
+            name: "Tokio counter".into(),
             kind: AktorKind::TokioTask,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(0_u32),
-                end: (),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 32 },
+            start: async || aktor_ready(0_u32),
+            end: (),
+            hooks: Default::default(),
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         };
 
         let bevy = AktorNew {
-            name: AktorName::new("Bevy counter"),
-            role: AktorNoRole,
+            name: "Bevy counter".into(),
             kind: AktorKind::BevyTask(&pool),
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(0_u32),
-                end: async move |_: u32| {
-                    let mut yielded = false;
+            start: async || aktor_ready(0_u32),
+            end: async move |_: u32| {
+                let mut yielded = false;
 
-                    core::future::poll_fn(|cx| {
-                        if yielded {
-                            std::task::Poll::Ready(())
-                        } else {
-                            yielded = true;
-                            cx.waker().wake_by_ref();
-                            std::task::Poll::Pending
-                        }
-                    })
-                    .await;
-                    *end.lock().unwrap() = true;
-                    Ok::<_, AktorCleanupError>(())
-                },
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
+                core::future::poll_fn(|cx| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                *end.lock().unwrap() = true;
+                Ok::<_, String>(())
             },
-            options: AktorNewOptions { capacity: 32 },
+            hooks: Default::default(),
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         };
 
         let report = if bevy_first {
             aktor_start(AktorSetup {
                 actors: (bevy, tokio),
                 shutdown: |_| {},
-                options: AktorOptions {
-                    shutdown_grace: Duration::from_secs(5),
-                },
+                grace: Duration::from_secs(5),
             })
             .await
             .unwrap()
@@ -484,9 +632,7 @@ async fn mixed_cleanup() {
             aktor_start(AktorSetup {
                 actors: (tokio, bevy),
                 shutdown: |_| {},
-                options: AktorOptions {
-                    shutdown_grace: Duration::from_secs(5),
-                },
+                grace: Duration::from_secs(5),
             })
             .await
             .unwrap()
@@ -508,17 +654,13 @@ async fn admission_wait() {
 
         for mode in 0..modes {
             let setup = AktorNew {
-                name: AktorName::new("task admission"),
-                role: AktorNoRole,
+                name: "task admission".into(),
                 kind: AktorKind::TokioTask,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: AktorNewOptions { capacity: 1 },
+                start: async || aktor_ready(Counter(std::cell::RefCell::new(0))),
+                end: (),
+                hooks: Default::default(),
+                capacity: 1,
+                stuck: AktorStuck::Kill,
             };
 
             #[cfg(feature = "bevy")]
@@ -526,21 +668,15 @@ async fn admission_wait() {
                 aktor_start(AktorSetup {
                     actors: AktorNew {
                         name: setup.name,
-                        role: setup.role,
                         kind: AktorKind::BevyTask(&pool),
-                        closures: AktorClosures {
-                            start: setup.closures.start,
-                            end: (),
-                            intervals: vec![],
-                            before_each: None,
-                            after_each: None,
-                        },
-                        options: setup.options,
+                        start: setup.start,
+                        end: (),
+                        hooks: Default::default(),
+                        capacity: setup.capacity,
+                        stuck: AktorStuck::Kill,
                     },
                     shutdown: |_| {},
-                    options: AktorOptions {
-                        shutdown_grace: Duration::from_secs(5),
-                    },
+                    grace: Duration::from_secs(5),
                 })
                 .await
                 .unwrap()
@@ -548,9 +684,7 @@ async fn admission_wait() {
                 aktor_start(AktorSetup {
                     actors: setup,
                     shutdown: |_| {},
-                    options: AktorOptions {
-                        shutdown_grace: Duration::from_secs(5),
-                    },
+                    grace: Duration::from_secs(5),
                 })
                 .await
                 .unwrap()
@@ -562,9 +696,7 @@ async fn admission_wait() {
                 aktor_start(AktorSetup {
                     actors: setup,
                     shutdown: |_| {},
-                    options: AktorOptions {
-                        shutdown_grace: Duration::from_secs(5),
-                    },
+                    grace: Duration::from_secs(5),
                 })
                 .await
                 .unwrap()
@@ -661,24 +793,16 @@ async fn parked_admission() {
             let release = Arc::new(Notify::new());
             let actors = aktor_start(AktorSetup {
                 actors: AktorNew {
-                    name: AktorName::new("parked admission"),
-                    role: AktorNoRole,
+                    name: "parked admission".into(),
                     kind: AktorKind::TokioTask,
-                    closures: AktorClosures {
-                        start: async || {
-                            Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0)))
-                        },
-                        end: (),
-                        intervals: vec![],
-                        before_each: None,
-                        after_each: None,
-                    },
-                    options: AktorNewOptions { capacity: 1 },
+                    start: async || aktor_ready(Counter(std::cell::RefCell::new(0))),
+                    end: (),
+                    hooks: Default::default(),
+                    capacity: 1,
+                    stuck: AktorStuck::Kill,
                 },
                 shutdown: |_| {},
-                options: AktorOptions {
-                    shutdown_grace: Duration::from_secs(5),
-                },
+                grace: Duration::from_secs(5),
             })
             .await
             .unwrap();
@@ -718,7 +842,6 @@ async fn parked_admission() {
             }
 
             actors.killswitch().stop();
-            assert!(waiting.as_mut().now_or_never().is_none());
 
             if !assigned {
                 release.notify_one();
@@ -734,7 +857,6 @@ async fn parked_admission() {
             assert!(!report.failed(), "{report}");
             assert_eq!(first.await, 1);
             assert_eq!(second.await, 2);
-            assert!(waiting.as_mut().now_or_never().is_none());
         }
     }
 }
@@ -743,22 +865,16 @@ async fn parked_admission() {
 async fn consumed() {
     let actors = aktor_start(AktorSetup {
         actors: AktorNew {
-            name: AktorName::new("consumed task"),
-            role: AktorNoRole,
+            name: "consumed task".into(),
             kind: AktorKind::TokioTask,
-            closures: AktorClosures {
-                start: async || Ok::<_, AktorSetupError>(Counter(std::cell::RefCell::new(0))),
-                end: (),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 32 },
+            start: async || aktor_ready(Counter(std::cell::RefCell::new(0))),
+            end: (),
+            hooks: Default::default(),
+            capacity: 32,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     })
     .await
     .unwrap();

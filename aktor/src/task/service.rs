@@ -47,6 +47,14 @@ impl<S> Services<S> {
         Ok(())
     }
 
+    pub fn is_open(&self) -> bool {
+        !self
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+    }
+
     pub fn close(&self) {
         self.queue
             .lock()
@@ -85,7 +93,7 @@ impl<S> Services<S> {
 
 pub struct ServiceDriver<S> {
     pub services: Arc<Services<S>>,
-    pub kill: KillSwitch,
+    pub kill: AktorKillSwitch,
 }
 impl<S> Drop for ServiceDriver<S> {
     fn drop(&mut self) {
@@ -100,12 +108,21 @@ impl<S> Drop for ServiceDriver<S> {
 }
 
 pub struct CallDriver<S> {
-    pub receiver: mpsc::Receiver<Message<S>>,
-    pub kill: KillSwitch,
+    pub receiver: mpsc::UnboundedReceiver<Message<S>>,
+    pub slots: Arc<Semaphore>,
+    pub kill: AktorKillSwitch,
 }
 impl<S> CallDriver<S> {
+    pub async fn recv(&mut self) -> Option<Message<S>> {
+        let message = self.receiver.recv().await?;
+        self.slots.add_permits(1);
+
+        Some(message)
+    }
+
     pub fn close(&mut self) {
         contain(|| self.receiver.close(), &self.kill, "task queue close");
+        contain(|| self.slots.close(), &self.kill, "task admission close");
     }
 }
 impl<S> Drop for CallDriver<S> {

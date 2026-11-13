@@ -19,16 +19,18 @@ impl Server {
         address: impl Into<Address>,
         actor: &Aktor<S, Role>,
         options: ServerOptions,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, (Error, String)> {
+        let registry = Registry::for_remote::<S, Role>().map_err(Failure::from)?;
         let service = Service {
-            registry: Registry::for_remote::<S, Role>()?,
+            operations: registry.operations(),
+            registry,
             run: |registry, state, name, input| Box::pin(registry.dispatch(state, name, input)),
             #[cfg(test)]
             pending: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             cancelled: Arc::new(tokio::sync::Notify::new()),
         };
-        Self::start(address.into(), actor, options, service).await
+        Ok(Self::start(address.into(), actor, options, service).await?)
     }
 
     #[cfg(feature = "testing")]
@@ -36,9 +38,11 @@ impl Server {
         address: impl Into<Address>,
         actor: &aktor::testing::Mock<S, Role>,
         options: ServerOptions,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, (Error, String)> {
+        let registry = Registry::for_remote::<S, Role>().map_err(Failure::from)?;
         let service = Service {
-            registry: Registry::for_remote::<S, Role>()?,
+            operations: registry.operations(),
+            registry,
             run: |registry, state, name, input| {
                 Box::pin(registry.dispatch_mock(state, name, input))
             },
@@ -47,7 +51,7 @@ impl Server {
             #[cfg(test)]
             cancelled: Arc::new(tokio::sync::Notify::new()),
         };
-        Self::start(address.into(), &actor.actor, options, service).await
+        Ok(Self::start(address.into(), &actor.actor, options, service).await?)
     }
 
     async fn start<S: 'static, Role: 'static>(
@@ -55,14 +59,14 @@ impl Server {
         actor: &Aktor<S, Role>,
         options: ServerOptions,
         service: Service<S>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Failure> {
         wire::validate(options.max_frame)?;
         if options.max_connections == 0
             || options.max_connections > tokio::sync::Semaphore::MAX_PERMITS
             || options.shutdown_timeout.is_zero()
             || options.io_timeout.is_zero()
         {
-            return Err(Error::new(
+            return Err(Failure::new(
                 CallError::NotAdmitted,
                 Cause::Protocol,
                 "invalid connection limit or timeout",
@@ -83,7 +87,7 @@ impl Server {
         let (finished, completion) = watch::channel(None);
         let (errors, _) = broadcast::channel(64);
         let diagnostics = errors.clone();
-        let handle = actor.new_handle();
+        let handle = actor.handle();
 
         tokio::spawn(async move {
             let result = drive(listener, handle, registry, options, stopping, diagnostics).await;
@@ -103,30 +107,31 @@ impl Server {
         })
     }
 
-    pub async fn shutdown(&self) -> Result<(), Error> {
+    pub async fn shutdown(&self) -> Result<(), (Error, String)> {
         self.stop.send_replace(true);
         self.wait().await
     }
 
-    /// Observe protocol failures without stopping the service. Ordinary disconnects are omitted.
-    pub fn errors(&self) -> broadcast::Receiver<Error> {
+    /// Observe protocol failures without stopping the service. The listener skips ordinary disconnects.
+    pub fn errors(&self) -> broadcast::Receiver<(Error, String)> {
         self.errors.subscribe()
     }
 
-    pub async fn wait(&self) -> Result<(), Error> {
+    pub async fn wait(&self) -> Result<(), (Error, String)> {
         let mut finished = self.finished.clone();
 
         loop {
             if let Some(result) = finished.borrow_and_update().clone() {
-                return result;
+                return Ok(result?);
             }
 
             if finished.changed().await.is_err() {
-                return Err(Error::new(
+                return Err(Failure::new(
                     CallError::OutcomeUnknown,
                     Cause::Closed,
                     "remote listener stopped without a result",
-                ));
+                )
+                .into());
             }
         }
     }
@@ -153,12 +158,13 @@ async fn drive<S: 'static, Role: 'static>(
     registry: Arc<Service<S>>,
     options: ServerOptions,
     stop: watch::Sender<bool>,
-    errors: broadcast::Sender<Error>,
-) -> Result<(), Error> {
+    errors: broadcast::Sender<(Error, String)>,
+) -> Result<(), Failure> {
     let mut stopping = stop.subscribe();
     let mut clients = JoinSet::new();
     let capacity = Arc::new(tokio::sync::Semaphore::new(options.max_connections));
     let sessions = Arc::new(super::sessions::Sessions::default());
+    let mut accepting = core::pin::pin!(accept(&listener, &errors));
     let mut result = loop {
         if *stopping.borrow() {
             break Ok(());
@@ -166,7 +172,7 @@ async fn drive<S: 'static, Role: 'static>(
 
         tokio::select! {
             _ = stopping.changed() => break Ok(()),
-            _ = handle.wait_closing() => break Err(Error::new(CallError::OutcomeUnknown, Cause::Closed, "served actor is closing")),
+            _ = handle.wait_closing() => break Err(Failure::new(CallError::OutcomeUnknown, Cause::Closed, "served actor is closing")),
             joined = clients.join_next(), if !clients.is_empty() => {
                 if let Some(joined) = joined
                     && let Err(error) = session_result(joined, &errors)
@@ -175,12 +181,14 @@ async fn drive<S: 'static, Role: 'static>(
                 }
             }
             // One extra handshake can retire a latest connection at capacity.
-            accepted = listener.accept(), if clients.len() <= options.max_connections => {
+            accepted = &mut accepting, if clients.len() <= options.max_connections => {
                 let stream = match accepted {
                     Ok(accepted) => accepted,
-                    Err(error) => break Err(error.into()),
+                    Err(error) => break Err(error),
                 };
-                let handle = handle.new_handle();
+                accepting.set(accept(&listener, &errors));
+
+                let handle = handle.clone();
                 let registry = registry.clone();
                 let options = options.clone();
                 let stopping = stopping.clone();
@@ -211,7 +219,7 @@ async fn drive<S: 'static, Role: 'static>(
             clients.abort_all();
             while clients.join_next().await.is_some() {}
 
-            return Err(Error::new(
+            return Err(Failure::new(
                 CallError::OutcomeUnknown,
                 Cause::Timeout,
                 "remote sessions did not finish before shutdown deadline",
@@ -222,16 +230,79 @@ async fn drive<S: 'static, Role: 'static>(
     result
 }
 
+async fn accept(
+    listener: &Listener,
+    errors: &broadcast::Sender<(Error, String)>,
+) -> Result<Stream, Failure> {
+    use rustix::io::Errno;
+    use std::io::ErrorKind;
+
+    loop {
+        let (error, backoff) = match listener.accept().await {
+            Ok(stream) => match stream.configure() {
+                Ok(()) => return Ok(stream),
+                Err(error) => (error, false),
+            },
+            Err(error) => {
+                let errno = error.raw_os_error().map(Errno::from_raw_os_error);
+                let backoff = error.kind() == ErrorKind::OutOfMemory
+                    || matches!(
+                        errno,
+                        Some(Errno::MFILE | Errno::NFILE | Errno::NOMEM | Errno::NOBUFS)
+                    );
+                #[cfg(target_os = "linux")]
+                let pending_network_error = matches!(listener, Listener::Tcp(_))
+                    && matches!(
+                        errno,
+                        Some(
+                            Errno::PROTO
+                                | Errno::NETDOWN
+                                | Errno::NOPROTOOPT
+                                | Errno::HOSTDOWN
+                                | Errno::NONET
+                                | Errno::HOSTUNREACH
+                                | Errno::OPNOTSUPP
+                                | Errno::NETUNREACH
+                        )
+                    );
+                #[cfg(not(target_os = "linux"))]
+                let pending_network_error = false;
+                let transient = matches!(
+                    error.kind(),
+                    ErrorKind::Interrupted
+                        | ErrorKind::WouldBlock
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::TimedOut
+                );
+
+                if !transient && !backoff && !pending_network_error {
+                    return Err(error.into());
+                }
+
+                (error, backoff)
+            }
+        };
+
+        let _ = errors.send(Failure::from(error).into());
+        if backoff {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        } else {
+            tokio::task::coop::consume_budget().await;
+        }
+    }
+}
+
 fn session_result(
-    joined: Result<Result<(), Error>, tokio::task::JoinError>,
-    errors: &broadcast::Sender<Error>,
-) -> Result<(), Error> {
+    joined: Result<Result<(), Failure>, tokio::task::JoinError>,
+    errors: &broadcast::Sender<(Error, String)>,
+) -> Result<(), Failure> {
     match joined {
         Ok(Err(error)) if error.cause != Cause::Connection => {
-            let _ = errors.send(error);
+            let _ = errors.send(error.into());
         }
         Err(error) => {
-            return Err(Error::new(
+            return Err(Failure::new(
                 CallError::OutcomeUnknown,
                 Cause::Closed,
                 error.to_string(),
@@ -244,22 +315,24 @@ fn session_result(
 }
 
 async fn session<S: 'static, Role: 'static>(
-    mut stream: Stream,
+    stream: Stream,
     handle: Handle<S, Role>,
     registry: Arc<Service<S>>,
     options: ServerOptions,
     mut stopping: watch::Receiver<bool>,
     sessions: Arc<super::sessions::Sessions>,
     capacity: Arc<tokio::sync::Semaphore>,
-) -> Result<(), Error> {
+) -> Result<(), Failure> {
     if *stopping.borrow() {
         return Ok(());
     }
 
+    let mut stream = stream.buffered();
+    let frames = wire::FrameReader::default();
     let hello = tokio::select! {
         _ = stopping.changed() => return Ok(()),
-        hello = timeout(options.io_timeout, wire::read(&mut stream, wire::MAX_HANDSHAKE)) => {
-            hello.map_err(|_| Error::new(CallError::NotAdmitted, Cause::Timeout, "remote handshake timed out"))??
+        hello = timeout(options.io_timeout, frames.read_handshake(&mut stream)) => {
+            hello.map_err(|_| Failure::new(CallError::NotAdmitted, Cause::Timeout, "remote handshake timed out"))??
         },
     };
     let mut output_limit = options.max_frame;
@@ -284,19 +357,26 @@ async fn session<S: 'static, Role: 'static>(
             } else if build != options.build {
                 Some((
                     "remote build mismatch",
-                    format!("remote build {build:?}, server expects {:?}", options.build),
-                ))
-            } else if !registry.operations().supports(&operations) {
-                Some((
-                    "remote operation catalogue mismatch",
                     format!(
-                        "operation catalogue mismatch\nserver: {:?}\nclient: {:?}",
-                        registry.operations().0,
-                        operations.0
+                        "remote build {:?}, server expects {:?}",
+                        preview(&build),
+                        preview(&options.build),
                     ),
                 ))
             } else {
-                None
+                operations
+                    .0
+                    .iter()
+                    .find(|operation| registry.operations.0.binary_search(operation).is_err())
+                    .map(|operation| {
+                        (
+                            "remote operation catalogue mismatch",
+                            format!(
+                                "operation catalogue mismatch: unsupported operation {:?}",
+                                preview(operation)
+                            ),
+                        )
+                    })
             }
         }
         _ => Some((
@@ -306,10 +386,14 @@ async fn session<S: 'static, Role: 'static>(
     };
 
     if let Some((summary, diagnostics)) = mismatch {
-        let error = Error::new(CallError::NotAdmitted, Cause::Protocol, diagnostics);
+        let error = Failure::new(CallError::NotAdmitted, Cause::Protocol, diagnostics);
         write_response(
             &mut stream,
-            &Message::Reject(Error::new(CallError::NotAdmitted, Cause::Protocol, summary)),
+            &Message::Reject(Failure::new(
+                CallError::NotAdmitted,
+                Cause::Protocol,
+                summary,
+            )),
             output_limit,
             options.io_timeout,
         )
@@ -328,8 +412,7 @@ async fn session<S: 'static, Role: 'static>(
     .await?;
 
     let mut slot = capacity.clone().try_acquire_owned().ok();
-    let compress = stream.compresses();
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let compress = stream.get_ref().compresses();
     loop {
         if *stopping.borrow() {
             return Ok(());
@@ -338,11 +421,11 @@ async fn session<S: 'static, Role: 'static>(
         let message = tokio::select! {
             _ = stopping.changed() => return Ok(()),
             message = async {
-                let frame = wire::read_idle(&mut reader, options.max_frame, options.io_timeout);
+                let frame = frames.read_idle(&mut stream, options.max_frame, options.io_timeout);
                 if slot.is_some() {
                     frame.await
                 } else {
-                    timeout(options.io_timeout, frame).await.map_err(|_| Error::new(
+                    timeout(options.io_timeout, frame).await.map_err(|_| Failure::new(
                         CallError::NotAdmitted, Cause::Timeout, "remote replacement handshake timed out",
                     ))?
                 }
@@ -358,19 +441,23 @@ async fn session<S: 'static, Role: 'static>(
         } = message
         {
             if slot.is_none() && session.is_none() {
-                return Err(Error::new(
+                return Err(Failure::new(
                     CallError::NotAdmitted,
                     Cause::Closed,
                     "remote connection limit reached",
                 ));
             }
-            let claim = match sessions.claim(session, generation).await {
+            let claim = tokio::select! {
+                _ = stopping.changed() => return Ok(()),
+                claim = sessions.claim(session, generation, &mut slot) => claim,
+            };
+            let claim = match claim {
                 Ok(claim) => claim,
                 Err(error) => {
                     wire::write_reply(
-                        &mut writer,
+                        &mut stream,
                         &wire::encode(
-                            &Message::Reject(Error::new(
+                            &Message::Reject(Failure::new(
                                 error.outcome,
                                 error.cause,
                                 "latest session refused",
@@ -385,41 +472,22 @@ async fn session<S: 'static, Role: 'static>(
             };
             let Some(mut claim) = claim else {
                 wire::write_reply(
-                    &mut writer,
+                    &mut stream,
                     &wire::encode(&Message::LatestExpired, output_limit)?,
                     options.io_timeout,
                 )
                 .await?;
+                if slot.is_none() {
+                    return Ok(());
+                }
+
                 continue;
             };
-            if slot.is_none() {
-                slot = Some(
-                    timeout(options.io_timeout, capacity.clone().acquire_owned())
-                        .await
-                        .map_err(|_| {
-                            Error::new(
-                                CallError::NotAdmitted,
-                                Cause::Timeout,
-                                "remote replacement capacity timed out",
-                            )
-                        })?
-                        .map_err(|_| {
-                            Error::new(
-                                CallError::NotAdmitted,
-                                Cause::Closed,
-                                "remote listener closed",
-                            )
-                        })?,
-                );
-            }
             #[cfg(test)]
             let cancelled = registry.cancelled.clone();
             let result = tokio::select! {
-                result = async move {
-                    let _slot = slot;
-                    super::latest::serve(reader.unsplit(writer), handle, registry, super::latest::Latest { operation, session: claim.session }, options, output_limit, stopping).await
-                } => result,
-                _ = claim.cancel.changed() => Err(Error::new(CallError::OutcomeUnknown, Cause::Closed, "latest connection superseded")),
+                result = super::latest::serve(stream, handle, registry, super::latest::Latest { operation, session: claim.session, frames }, options, output_limit, stopping) => result,
+                _ = claim.cancel.changed() => Err(Failure::new(CallError::OutcomeUnknown, Cause::Closed, "latest connection superseded")),
             };
             #[cfg(test)]
             cancelled.notify_one();
@@ -431,20 +499,20 @@ async fn session<S: 'static, Role: 'static>(
             input,
         } = message
         else {
-            return Err(Error::new(
+            return Err(Failure::new(
                 CallError::Discarded,
                 Cause::Protocol,
                 "expected remote call",
             ));
         };
         if slot.is_none() {
-            let error = Error::new(
+            let error = Failure::new(
                 CallError::NotAdmitted,
                 Cause::Closed,
                 "remote connection limit reached",
             );
             wire::write_reply(
-                &mut writer,
+                &mut stream,
                 &wire::encode(
                     &Message::Answer {
                         id,
@@ -469,9 +537,9 @@ async fn session<S: 'static, Role: 'static>(
                     &handle,
                     async move |state: &mut S, ()| {
                         registry
-                            .dispatch(state, operation, input)
+                            .dispatch(state, operation.into_owned(), input.into_owned())
                             .await
-                            .map_err(Error::from)
+                            .map_err(Failure::from)
                     },
                     (),
                 )
@@ -482,7 +550,7 @@ async fn session<S: 'static, Role: 'static>(
 
                 let admitted = tokio::select! {
                     biased;
-                    error = disconnected(&mut reader) => {
+                    error = disconnected(&mut stream) => {
                         #[cfg(test)]
                         cancelled.notify_one();
                         return Err(error);
@@ -494,30 +562,30 @@ async fn session<S: 'static, Role: 'static>(
                 match admitted {
                     Some(reply) => {
                         wire::write_reply(
-                            &mut writer,
+                            &mut stream,
                             &wire::encode(&Message::Admitted { id }, output_limit)?,
                             options.io_timeout,
                         )
                         .await?;
                         tokio::select! {
                             biased;
-                            error = disconnected(&mut reader) => return Err(error),
-                            output = reply.receive() => output.unwrap_or_else(|outcome| {
-                                Err(Error::new(outcome, Cause::Closed, "served actor closed before replying"))
+                            error = disconnected(&mut stream) => return Err(error),
+                            output = reply.receive_settled() => output.unwrap_or_else(|outcome| {
+                                Err(Failure::new(outcome, Cause::Closed, "served actor closed before replying"))
                             }),
                         }
                     }
-                    None => Err(Error::new(
+                    None => Err(Failure::new(
                         CallError::NotAdmitted,
                         Cause::Closed,
                         "remote service stopped before admission",
                     )),
                 }
             }
-            None => Err(Error::new(
+            None => Err(Failure::new(
                 CallError::Discarded,
                 Cause::Protocol,
-                format!("unknown remote operation {operation:?}"),
+                format!("unknown remote operation {:?}", preview(&operation)),
             )),
         };
 
@@ -529,8 +597,19 @@ async fn session<S: 'static, Role: 'static>(
         let answer = Message::Answer { id, output };
         let bytes = match wire::encode(&answer, output_limit) {
             Ok(bytes) => bytes,
-            Err(mut error) => {
-                error.outcome = CallError::OutcomeUnknown;
+            Err(error) => {
+                let error = if let Some(protocol) = &protocol {
+                    Failure::new(
+                        protocol.outcome,
+                        protocol.cause,
+                        "remote operation rejected",
+                    )
+                } else {
+                    Failure {
+                        outcome: CallError::OutcomeUnknown,
+                        ..error
+                    }
+                };
                 wire::encode(
                     &Message::Answer {
                         id,
@@ -546,7 +625,7 @@ async fn session<S: 'static, Role: 'static>(
         } else {
             bytes
         };
-        wire::write_reply(&mut writer, &bytes, options.io_timeout).await?;
+        wire::write_reply(&mut stream, &bytes, options.io_timeout).await?;
         if let Some(error) = protocol {
             return Err(error);
         }
@@ -554,15 +633,15 @@ async fn session<S: 'static, Role: 'static>(
 }
 
 async fn write_response(
-    stream: &mut Stream,
-    message: &Message,
+    stream: &mut BufferedStream,
+    message: &Message<'_>,
     limit: usize,
     duration: Duration,
-) -> Result<(), Error> {
+) -> Result<(), Failure> {
     timeout(duration, wire::write(stream, message, limit))
         .await
         .map_err(|_| {
-            Error::new(
+            Failure::new(
                 CallError::NotAdmitted,
                 Cause::Timeout,
                 "remote handshake write timed out",
@@ -570,12 +649,12 @@ async fn write_response(
         })?
 }
 
-async fn disconnected<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Error {
+async fn disconnected<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Failure {
     use tokio::io::AsyncReadExt;
 
     match stream.read_u8().await {
-        Err(error) => Error::from(error),
-        Ok(_) => Error::new(
+        Err(error) => Failure::from(error),
+        Ok(_) => Failure::new(
             CallError::OutcomeUnknown,
             Cause::Protocol,
             "remote client sent another frame before its reply",

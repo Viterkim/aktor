@@ -1,5 +1,5 @@
 #![cfg(feature = "wasm_browser_workers")]
-use aktor::{AktorCleanupError, worker};
+use aktor::{AktorError, worker};
 use er::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -26,7 +26,7 @@ struct Portable {
     units: Vec<Option<()>>,
     map: BTreeMap<(u32, String), u128>,
     choice: Vec<Choice>,
-    cleanup: AktorCleanupError<Vec<u32>>,
+    cleanup: AktorError<Vec<u32>>,
     limits: (i128, u128, char),
     numbers: (i8, u8, i16, u16, i32, u32, i64, u64, f32, f64),
 }
@@ -45,7 +45,7 @@ fn values() {
             Choice::Tagged(Tagged::Pair(7, 17)),
             Choice::Tagged(Tagged::Fields { value: 7 }),
         ],
-        cleanup: AktorCleanupError {
+        cleanup: AktorError {
             diagnostics: "first\nsecond".into(),
             data: vec![7, 17],
         },
@@ -85,23 +85,19 @@ pub enum PublicKind {
 }
 #[derive(Er, Serialize, Deserialize, PartialEq)]
 pub struct PublicError {
-    #[er(into_top)]
-    pub kind: PublicKind,
-    #[er(into_report_string)]
     pub diagnostics: String,
-    #[er(into_snapshot)]
-    pub snapshot: ErSnapshot,
 }
 
 #[test]
 fn diagnostics() {
     let tree = ErTree::new(PublicKind::Failed(17), ["backup folder is read only"]);
-    let result: Result<(), PublicError> = Err::<(), _>(tree).er_into(|report| report);
-    let value = AktorCleanupError {
+    let result: Result<(), PublicError> =
+        Err::<(), _>(tree).er_split_with(|(_, report)| PublicError::new(report));
+    let value = AktorError {
         diagnostics: "could not flush".into(),
         data: result.unwrap_err(),
     };
-    let decoded: AktorCleanupError<PublicError> =
+    let decoded: AktorError<PublicError> =
         worker::decode(&worker::encode(&value).unwrap()).unwrap();
 
     assert_eq!(decoded, value);

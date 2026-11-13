@@ -173,7 +173,7 @@ struct Target(usize);
 struct T(usize);
 struct M(usize);
 
-#[aktor(actor = __AktorTarget)]
+#[aktor(role = __AktorTarget)]
 async fn collision(state: &Target, first: T, second: M) -> usize {
     state.0 + first.0 + second.0
 }
@@ -186,7 +186,7 @@ mod relative {
     pub struct Role;
 
     pub mod queries {
-        #[aktor::aktor(actor = super::Role)]
+        #[aktor::aktor(role = super::Role)]
         pub async fn read(state: &super::State, value: super::Value) -> super::Value {
             super::Value(state.0 + value.0)
         }

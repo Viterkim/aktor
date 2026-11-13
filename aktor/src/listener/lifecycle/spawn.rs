@@ -1,16 +1,17 @@
 use super::*;
-use crate::FailurePolicy;
+use crate::listener::FailurePolicy;
 use std::thread;
 #[cfg(feature = "tokio")]
 use tokio::task;
 
-/// Start after setup succeeds. Cleanup runs on each pause and final shutdown.
+/// Start after setup succeeds. Cleanup runs at shutdown.
+#[doc(hidden)]
 pub async fn spawn_async<S, E, C, Setup, SetupFuture, Cleanup, CleanupFuture>(
     args: SpawnArgs<Setup, Cleanup>,
 ) -> Result<
     (
         Handle<S>,
-        AktorControl<S, E, C>,
+        AktorControl<C>,
         Dedicated<Result<(), CleanupErrors<C>>>,
     ),
     DedicatedStartError<E>,
@@ -24,16 +25,17 @@ where
     Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
     CleanupFuture: core::future::Future<Output = Result<(), C>>,
 {
-    spawn_async_with_hooks(args, crate::listener::hooks::AktorHooks::default()).await
+    spawn_async_with_hooks(args, crate::listener::hooks::CallHooks::default()).await
 }
 
+#[doc(hidden)]
 pub async fn spawn_async_with_hooks<S, E, C, Setup, SetupFuture, Cleanup, CleanupFuture>(
     args: SpawnArgs<Setup, Cleanup>,
-    hooks: crate::listener::hooks::AktorHooks<S>,
+    hooks: crate::listener::hooks::CallHooks<S>,
 ) -> Result<
     (
         Handle<S>,
-        AktorControl<S, E, C>,
+        AktorControl<C>,
         Dedicated<Result<(), CleanupErrors<C>>>,
     ),
     DedicatedStartError<E>,
@@ -52,12 +54,12 @@ where
 
 pub async fn spawn_async_on<S, E, C, Setup, SetupFuture, Cleanup, CleanupFuture>(
     args: SpawnArgs<Setup, Cleanup>,
-    hooks: crate::listener::hooks::AktorHooks<S>,
+    hooks: crate::listener::hooks::CallHooks<S>,
     standard: bool,
 ) -> Result<
     (
         Handle<S>,
-        AktorControl<S, E, C>,
+        AktorControl<C>,
         Dedicated<Result<(), CleanupErrors<C>>>,
     ),
     DedicatedStartError<E>,
@@ -71,24 +73,32 @@ where
     Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
     CleanupFuture: core::future::Future<Output = Result<(), C>>,
 {
-    spawn_async_initial_on::<S, E, E, C, _, _, _, _>(args, hooks, standard).await
+    spawn_async_initial_on::<S, E, C, _, _, _, _>(
+        args,
+        hooks,
+        standard,
+        None,
+        crate::AktorStuck::Kill,
+    )
+    .await
 }
 
-pub async fn spawn_async_initial_on<S, E, Initial, C, Setup, SetupFuture, Cleanup, CleanupFuture>(
+pub async fn spawn_async_initial_on<S, Initial, C, Setup, SetupFuture, Cleanup, CleanupFuture>(
     args: SpawnArgs<Setup, Cleanup>,
-    hooks: crate::listener::hooks::AktorHooks<S>,
+    hooks: crate::listener::hooks::CallHooks<S>,
     standard: bool,
+    cancelled: Option<watch::Receiver<bool>>,
+    stuck: crate::AktorStuck,
 ) -> Result<
     (
         Handle<S>,
-        AktorControl<S, E, C>,
+        AktorControl<C>,
         Dedicated<Result<(), CleanupErrors<C>>>,
     ),
     DedicatedStartError<Initial>,
 >
 where
     S: 'static,
-    E: Send + 'static,
     Initial: Send + 'static,
     C: Send + Sync + 'static,
     Setup: FnOnce() -> SetupFuture + Send + 'static,
@@ -96,6 +106,10 @@ where
     Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
     CleanupFuture: core::future::Future<Output = Result<(), C>>,
 {
+    // Threads are tracked natively only, `stuck` decides for them there.
+    #[cfg(target_family = "wasm")]
+    let _ = stuck;
+
     let SpawnArgs {
         name,
         capacity,
@@ -123,14 +137,13 @@ where
         _ => None,
     };
 
-    let (commands, receiver) = mpsc::channel(1);
     let (force, forced) = watch::channel(false);
     let (shutdown, closing) = watch::channel(false);
     let (status, running) = watch::channel(false);
-    let abandoned_setup = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let retained_setup = abandoned_setup.clone();
+    let (returned, receipt) = watch::channel(None);
     let failed_cleanup = Arc::new(Mutex::new(FailedCleanup {
-        completed: false,
+        ran_out: false,
+        cut_call: false,
         errors: Vec::new(),
         diagnostics: Vec::new(),
         group_primary: false,
@@ -140,7 +153,7 @@ where
 
     #[cfg(not(target_family = "wasm"))]
     let lifetime = match &listener.failure {
-        FailurePolicy::Group(group) => Some(group.track_thread(actor_name.clone())),
+        FailurePolicy::Group(group) => Some(group.track_thread(actor_name.clone(), stuck)),
         _ => None,
     };
 
@@ -150,8 +163,8 @@ where
         let runtime = match crate::executor::Driver::new(standard) {
             Ok(runtime) => runtime,
             Err(error) => {
-                drop(listener);
                 let _sent = started.send(Err(DedicatedStartError::Thread(error)));
+                drop(listener);
                 return Some(Ok(()));
             }
         };
@@ -161,7 +174,20 @@ where
                 biased;
                 _ = async {
                     if let Some(group) = &group {
-                        group.wait_for_force_on(standard).await;
+                        // The group cancels a stuck start on its turn, before the group deadline.
+                        let own = async {
+                            match cancelled {
+                                Some(mut cancelled) => {
+                                    let _ = cancelled.wait_for(|cancelled| *cancelled).await;
+                                }
+                                None => core::future::pending().await,
+                            }
+                        };
+
+                        tokio::select! {
+                            _ = group.wait_for_force_on(standard) => {},
+                            _ = own => {},
+                        }
                     } else {
                         started.closed().await;
                     }
@@ -175,23 +201,23 @@ where
                 &runtime,
                 state,
                 listener,
-                receiver,
                 status,
                 started,
                 cleanup,
-                retained_setup,
                 retained_cleanup,
+                returned,
                 forced,
                 closing,
+                standard,
             ),
             Some(Err(error)) => {
-                drop(listener);
                 let _result = started.send(Err(DedicatedStartError::Init(error)));
+                drop(listener);
                 Ok(())
             }
             None => {
-                drop(listener);
                 let _result = started.send(Err(DedicatedStartError::Closed));
+                drop(listener);
                 Ok(())
             }
         })
@@ -207,12 +233,11 @@ where
                 handle,
                 AktorControl {
                     admission,
-                    commands,
                     force,
                     shutdown,
                     running,
-                    abandoned_setup,
                     failed_cleanup,
+                    cleanup: receipt,
                 },
                 Dedicated { thread, finished },
             ))
@@ -275,12 +300,13 @@ fn spawn_owner<T: Send + 'static>(
     thread::Builder::new().name(name).spawn(owner)
 }
 
+#[doc(hidden)]
 pub async fn spawn<S, E, C, Setup, Cleanup>(
     args: SpawnArgs<Setup, Cleanup>,
 ) -> Result<
     (
         Handle<S>,
-        AktorControl<S, E, C>,
+        AktorControl<C>,
         Dedicated<Result<(), CleanupErrors<C>>>,
     ),
     DedicatedStartError<E>,
@@ -326,8 +352,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "tokio")]
     use crate::{
-        AktorClosures, AktorGroup, AktorKind, AktorName, AktorNew, AktorNewOptions, AktorNoRole,
-        AktorSetupError, AktorStartError, aktor_start_in, executor::FAIL_SPAWN,
+        AktorGroup, AktorKind, AktorNew, AktorStartCause, aktor_start_in, executor::FAIL_SPAWN,
     };
     #[cfg(feature = "tokio")]
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -351,14 +376,16 @@ mod tests {
                 SpawnArgs {
                     name: "startup join".into(),
                     capacity: 1,
-                    failure: crate::FailurePolicy::Unwind,
+                    failure: FailurePolicy::Unwind,
                     setup: || core::future::ready(Err::<(), _>(17_u8)),
-                    cleanup: move |_: ()| {
-                        let _retained = &tail;
-                        core::future::ready(Ok::<_, ()>(()))
-                    },
+                    cleanup: |_: ()| core::future::ready(Ok::<_, ()>(())),
                 },
-                Default::default(),
+                crate::listener::hooks::CallHooks {
+                    before_each: Some(Box::new(move |_, _| {
+                        let _retained = &tail;
+                    })),
+                    after_each: None,
+                },
                 standard,
             )
             .await
@@ -381,6 +408,32 @@ mod tests {
 
     #[cfg(feature = "tokio")]
     #[tokio::test]
+    async fn supervisor_failure() {
+        let startup = crate::aktor_start(crate::AktorSetup {
+            actors: AktorNew {
+                name: "cannot schedule supervisor".into(),
+                kind: AktorKind::TokioThread,
+                start: async || crate::aktor_ready(()),
+                end: (),
+                hooks: Default::default(),
+                capacity: 1,
+                stuck: crate::AktorStuck::Kill,
+            },
+            shutdown: |_| {},
+            grace: core::time::Duration::from_secs(1),
+        });
+        let completion = startup.completion();
+
+        FAIL_SPAWN.with(|setting| setting.set(Some("aktor supervisor")));
+        let (error, _) = startup.await.err().unwrap();
+        FAIL_SPAWN.with(|setting| setting.set(None));
+
+        assert_eq!(error.init, crate::AktorInitOutcome::NotRun);
+        completion.wait_retired().await.unwrap();
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
     async fn thread_failure() {
         struct Reset;
         impl Drop for Reset {
@@ -398,20 +451,15 @@ mod tests {
         let _actor = aktor_start_in(
             &group,
             AktorNew {
-                name: AktorName::new("already started"),
-                role: AktorNoRole,
+                name: "already started".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async || Ok::<_, AktorSetupError>(()),
-                    end: async move |_: ()| {
-                        count.fetch_add(1, Ordering::SeqCst);
-                    },
-
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: async || Ok::<_, String>(()),
+                end: async move |_: ()| {
+                    count.fetch_add(1, Ordering::SeqCst);
                 },
-                options: AktorNewOptions { capacity: 32 },
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: crate::AktorStuck::Kill,
             },
         )
         .await
@@ -421,35 +469,32 @@ mod tests {
 
         FAIL_SPAWN.with(|setting| setting.set(Some("aktor owner")));
 
-        let error = aktor_start_in(
+        let (error, _) = aktor_start_in(
             &group,
             AktorNew {
-                name: AktorName::new("cannot create thread"),
-                role: AktorNoRole,
+                name: "cannot create thread".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async || -> Result<(), AktorSetupError> {
-                        panic!("setup ran after thread creation failed")
-                    },
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: async || -> Result<(), String> {
+                    panic!("setup ran after thread creation failed")
                 },
-                options: AktorNewOptions { capacity: 32 },
+                end: (),
+                hooks: Default::default(),
+                capacity: 32,
+                stuck: crate::AktorStuck::Kill,
             },
         )
         .await
         .err()
         .unwrap();
 
-        let AktorStartError::Thread(DedicatedStartError::ThreadNotCreated(cause)) = error.error
+        let AktorStartCause::Thread(DedicatedStartError::ThreadNotCreated(cause)) = error.cause
         else {
             panic!("thread failure lost its typed cause");
         };
 
+        assert_eq!(error.init, crate::AktorInitOutcome::NotRun);
         assert_eq!(cause.to_string(), "injected owner thread failure");
-        assert!(!error.report.unwrap().timed_out);
+        assert!(!error.report.unwrap().ran_past_grace);
         assert_eq!(cleaned.load(Ordering::SeqCst), 1);
     }
 }

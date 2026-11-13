@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    AktorError, AktorFailureReport, AktorGroup, AktorOutcome, cross_core,
-    local::hooks::AktorHooks,
+    AktorError, AktorFailureReport, AktorGroup, AktorOutcome, AktorRetireStatus, cross_core,
+    local::hooks::CallHooks,
     threads::{self, Thread},
 };
 use alloc::rc::Rc;
@@ -11,62 +11,79 @@ use core::{
 };
 use tokio::sync::oneshot;
 
-impl<S: 'static, Start, Role, End, CM> AktorStart<CM>
-    for AktorNew<S, Start, kind::BrowserThread, Role, End>
+impl<S: 'static, Start, End, CM: 'static, E, M: 'static> AktorStart
+    for AktorNew<S, Start, kind::BrowserThread, End, (CM, E, M)>
 where
-    Start: AsyncFnOnce() -> Result<S, AktorSetupError> + Send + 'static,
+    Start: AsyncFnOnce() -> Result<S, E> + Send + 'static,
+    E: InitError<M> + 'static,
+    E::Error: Send + 'static,
     End: closures::AktorEndCall<S, CM> + Send + 'static,
 {
     type Group = AktorGroup;
-    type Handles = cross_core::Handle<S, Role>;
-    type Startup = crate::message::LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
+    type Error = E::Error;
+    type Handles = cross_core::Handle<S>;
+    type Startup =
+        crate::message::LocalFuture<'static, Result<Self::Handles, AktorStartError<Self::Error>>>;
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        group.start().map(|_| ()).map_err(Into::into)
+    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorStartCause> {
+        group
+            .start()
+            .map(|_| ())
+            .map_err(AktorStartCause::group_error)
     }
 
     fn start_in(self, mut context: AktorStartContext<Self::Group>) -> Self::Startup {
-        let setup = self.with_role(AktorNoRole);
+        let setup = self;
 
         Box::pin(async move {
-            let name = setup.name.name;
+            let name = setup.name;
+            let stuck = setup.stuck;
             let kind = AktorExecution::BrowserThread;
             let fail = |error| {
-                validation_error(&context.group, &name, kind, AktorStartError::Setup(error))
+                validation_error(&context.group, &name, kind, AktorStartCause::Setup(error))
             };
 
-            if setup.options.capacity == 0 {
-                return Err(fail(AktorError::new("actor capacity must be positive", ())));
-            }
+            let (handle, open_owner) =
+                cross_core::browser_channel(setup.capacity).map_err(|error| {
+                    AktorStartError::not_run(fail(AktorError::new(error.to_string(), ())))
+                })?;
 
             if setup
-                .closures
+                .hooks
                 .intervals
                 .iter()
                 .any(|interval| interval.every.is_zero())
             {
-                return Err(fail(AktorError::new(
+                return Err(AktorStartError::not_run(fail(AktorError::new(
                     "interval duration must be positive",
                     (),
-                )));
+                ))));
             }
 
-            let AktorClosures {
-                start,
-                mut end,
+            let start = setup.start;
+            let end = setup.end;
+            let AktorHooks {
                 intervals,
                 before_each,
                 after_each,
-            } = setup.closures;
-            let (opened, handle) = oneshot::channel();
-            let capacity = setup.options.capacity;
+            } = setup.hooks;
+            let (failed_start, mut init) = oneshot::channel();
+            let (begin, accepted) = oneshot::channel();
+            let kill = context.group.killswitch();
+            let owner_kill = kill.clone();
+            let label = name.clone();
+            let completion = handle.completion();
+            let owner_completion = completion.clone();
+
+            handle.managed();
             let job = threads::insert(Box::new(move || {
                 Box::pin(async move {
-                    let (handle, mut owner) = cross_core::channel(capacity)
-                        .map_err(|error| AktorError::new(error.to_string(), ()))?;
+                    if accepted.await.is_err() {
+                        return Ok(());
+                    }
 
-                    handle.managed();
-                    owner.hooks = AktorHooks {
+                    let mut owner = open_owner();
+                    owner.hooks = CallHooks {
                         before_each: before_each.map(|hook| {
                             hook.0 as Box<dyn FnMut(&mut S, crate::operation::Operation)>
                         }),
@@ -87,38 +104,80 @@ where
                             .collect(),
                     )?;
 
-                    if opened.send(handle).is_err() {
-                        return Err(AktorError::new("shared actor startup was cancelled", ()));
-                    }
-
-                    owner
+                    let mut setup_failed = false;
+                    let result = owner
                         .run_prepared(
-                            async move || start().await.map_err(Into::into),
-                            async move |state| end.run(state).await,
+                            || async {
+                                start().await.map_err(|error| {
+                                    let (data, report) = error.split();
+                                    let mut unsent = None;
+                                    setup_failed = true;
+
+                                    let failure = owner_kill.startup_error_with(
+                                        label.clone(),
+                                        kind,
+                                        AktorError::new(report, ()),
+                                        |primary, diagnostics| {
+                                            let failure = crate::AktorFailure {
+                                                diagnostics: diagnostics.into(),
+                                                primary,
+                                            };
+                                            unsent = failed_start.send((data, failure)).err();
+                                        },
+                                    );
+
+                                    drop(unsent);
+                                    failure
+                                })
+                            },
+                            |state| async {
+                                let mut result = end.run(state).await;
+
+                                if let Err(error) = &mut result {
+                                    error.primary = owner_kill.fail(AktorFailureReport {
+                                        actor: label.clone(),
+                                        kind: Some(kind),
+                                        phase: "cleanup".into(),
+                                        message: error.diagnostics.clone(),
+                                    });
+                                }
+
+                                result
+                            },
+                            |_| {},
                         )
-                        .await
-                        .map_err(|error| AktorError::new(error.diagnostics, ()))
+                        .await;
+
+                    if setup_failed || owner_completion.cleanup_failed() {
+                        Ok(())
+                    } else {
+                        result.map_err(|error| AktorError::new(error.diagnostics, ()))
+                    }
                 })
             }));
             let thread = match Thread::start(&setup.kind.program, job) {
                 Ok(thread) => Rc::new(thread),
                 Err(error) => {
                     threads::remove(job);
-                    return Err(fail(AktorError::new(alloc::format!("{error:?}"), ())));
+                    return Err(AktorStartError::not_run(fail(AktorError::new(
+                        alloc::format!("{error:?}"),
+                        (),
+                    ))));
                 }
             };
 
-            let stopping = Rc::new(Cell::new(false));
-            let stopped = stopping.clone();
-            let retained = Rc::new(RefCell::new(None::<cross_core::Handle<S>>));
-            let shutdown = retained.clone();
-            let diagnostics = retained.clone();
-            let failed = retained.clone();
-            let initialized = Rc::new(Cell::new(false));
-            let ready = initialized.clone();
+            let bootstrap_cancelled = Rc::new(Cell::new(false));
+            let cancelled_bootstrap = bootstrap_cancelled.clone();
+            let stopping_bootstrap = bootstrap_cancelled.clone();
+            let shutdown = handle.clone();
+            let killing = stuck == crate::AktorStuck::Kill;
+            let cancelling_calls = killing.then(|| handle.clone());
+            let failed = handle.clone();
+            let startup_failure = Rc::new(RefCell::new(None));
+            let monitor_startup = startup_failure.clone();
             let (finished, result) = oneshot::channel();
             let monitor = thread.clone();
-            let kill = context.group.killswitch();
+            let monitor_kill = kill.clone();
             let label = name.clone();
 
             wasm_bindgen_futures::spawn_local(async move {
@@ -127,32 +186,35 @@ where
                     .await
                     .err()
                     .map(|error| AktorError::new(alloc::format!("{error:?}"), ()));
-                threads::remove(job);
+                let never_entered = threads::remove(job) || cancelled_bootstrap.get();
 
-                if let Some(error) = &error {
+                let mut secondary = None;
+                if let Some(error) = error.filter(|_| !cancelled_bootstrap.get()) {
+                    let initialized = failed.completion().initialized();
                     let failure = AktorFailureReport {
                         actor: label,
                         kind: Some(kind),
-                        phase: if initialized.get() { "owner" } else { "setup" }.into(),
+                        phase: if initialized { "owner" } else { "setup" }.into(),
                         message: error.diagnostics.clone(),
                     };
 
-                    if initialized.get() {
-                        kill.fail(failure);
+                    let primary = if initialized {
+                        monitor_kill.fail(failure)
                     } else {
-                        kill.fail_startup(failure);
-                    }
+                        *monitor_startup.borrow_mut() = Some((error.clone(), never_entered));
+                        monitor_kill.fail_startup(failure)
+                    };
 
-                    if let Some(handle) = &*failed.borrow() {
-                        handle.finish_failed(error.clone());
+                    failed.finish_failed(error.clone());
+                    if !primary {
+                        secondary = Some(error);
                     }
                 }
 
-                let _sent = finished.send((error, monitor.retirement_received()));
+                let _sent =
+                    finished.send((secondary, monitor.retirement_received(), never_entered));
             });
 
-            let cancelled = Rc::new(Cell::new(false));
-            let forced = cancelled.clone();
             let label = name.clone();
             let cancel = thread.clone();
             let bootstrap = thread.clone();
@@ -161,85 +223,111 @@ where
                 name.clone(),
                 kind,
                 Box::new(move || {
-                    stopped.set(true);
-
-                    if let Some(handle) = &*shutdown.borrow() {
-                        handle.shutdown();
-                    } else if threads::remove(job) {
+                    if threads::remove(job) {
+                        stopping_bootstrap.set(true);
                         bootstrap.cancel();
                     }
+
+                    shutdown.shutdown();
                 }),
                 Box::new(move || {
-                    forced.set(true);
-                    threads::remove(job);
-                    cancel.cancel();
+                    if let Some(handle) = cancelling_calls {
+                        handle.cancel_calls();
+                    }
                 }),
+                // Aborting the job doesn't stop the thread right away, so it isn't gone for sure.
+                killing.then(|| {
+                    Box::new(move || {
+                        threads::remove(job);
+                        cancel.cancel();
+                        false
+                    }) as Box<dyn FnOnce() -> bool>
+                }),
+                None,
                 Box::pin(async move {
                     let result = result.await;
-                    let (error, received) = result.unwrap_or((None, false));
-                    let confirmed = received
-                        && diagnostics
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|handle| handle.completion().cleanup_completed());
-                    let mut diagnostics = diagnostics
-                        .borrow()
-                        .as_ref()
-                        .map(|handle| handle.completion().diagnostics())
-                        .unwrap_or_default();
+                    let (error, received, never_entered) = result.unwrap_or((None, false, false));
+                    let cleaned = completion.cleanup_completed();
+                    let mut diagnostics = completion.secondary_diagnostics();
 
                     if let Some(error) = error {
                         diagnostics.push(error);
                     }
 
                     AktorOutcome {
-                        retirement: if !confirmed {
-                            crate::RetirementStatus::Unconfirmed
-                        } else {
-                            crate::RetirementStatus::Confirmed
+                        retirement: match (received, cleaned || never_entered) {
+                            (true, true) => AktorRetireStatus::Confirmed,
+                            (true, false) => AktorRetireStatus::Terminated,
+                            (false, _) => AktorRetireStatus::Unconfirmed,
                         },
                         actor: label,
-                        kind: Some(kind),
+                        kind,
                         diagnostics,
-                        timed_out: cancelled.get(),
+                        ran_past_grace: completion.cut_call(),
                     }
                 }),
             );
 
             if let Err(error) = registered {
+                bootstrap_cancelled.set(true);
                 threads::remove(job);
                 thread.cancel();
-                return Err(validation_error(
-                    &context.group,
-                    &name,
-                    kind,
-                    AktorStartError::Setup(error),
-                ));
+                return Err(AktorStartError::not_run(AktorStartCause::Group(error)));
             }
+            let _sent = begin.send(());
 
-            let kill = context.group.killswitch();
-            let handle = tokio::select! {
-                value = handle => value.map_err(|_| validation_error(&context.group, &name, kind,
-                    AktorStartError::Setup(AktorError::new("shared actor stopped during startup", ()))) )?,
-                _ = kill.wait_stopping() => return Err(AktorStartError::Setup(AktorError::new("shared actor stopped during startup", ()))),
+            let startup_error = || match startup_failure.borrow_mut().take() {
+                Some((error, true)) => AktorStartError::not_run(AktorStartCause::Setup(error)),
+                Some((error, false)) => AktorStartCause::Setup(error).into(),
+                None if bootstrap_cancelled.get() => {
+                    AktorStartError::not_run(AktorStartCause::Group(AktorGroupError::Stopping))
+                }
+                None => AktorGroupError::Stopping.into(),
+            };
+            let completed = context.group.completion();
+            let started = tokio::select! {
+                biased;
+                ready = handle.ready() => Some(ready),
+                _ = completed.wait() => None,
             };
 
-            *retained.borrow_mut() = Some(handle.new_handle());
-
-            if stopping.get() {
-                handle.shutdown();
+            if let Ok((data, failure)) = init.try_recv() {
+                return Err(AktorStartError {
+                    init: AktorInitOutcome::Failed(data),
+                    cause: AktorStartCause::Init(failure),
+                    report: None,
+                });
             }
 
-            tokio::select! {
-                biased;
-                ready = handle.ready() => ready.map_err(|error| {
-                    AktorStartError::Init(kill.startup_error(name.clone(), kind, error))
-                })?,
-                _ = kill.wait_stopping() => return Err(AktorStartError::Setup(AktorError::new("shared actor stopped during startup", ()))),
+            match started {
+                Some(Ok(())) => {}
+                Some(Err((_, report))) if !kill.is_stopping() => {
+                    return Err(validation_error(
+                        &context.group,
+                        &name,
+                        kind,
+                        AktorStartCause::Setup(AktorError::new(report, ())),
+                    )
+                    .into());
+                }
+                Some(Err(_)) | None => return Err(startup_error()),
             }
 
-            ready.set(true);
-            Ok(handle.with_role::<Role>())
+            // The group lives on this thread, `handle.run(work)` hears about it closing here.
+            let watching = handle.downgrade();
+
+            let ending = thread.clone();
+
+            // An actor that ends closes its group too, so the watcher ends with either.
+            wasm_bindgen_futures::spawn_local(async move {
+                let stopping = core::pin::pin!(kill.wait_stopping());
+                let ended = core::pin::pin!(ending.wait());
+
+                let _ = futures_util::future::select(stopping, ended).await;
+                watching.group_stopped();
+            });
+
+            Ok(handle)
         })
     }
 }

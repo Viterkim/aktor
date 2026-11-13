@@ -1,10 +1,10 @@
 # Aktor, not an actor framework
 
-Write normal functions, call them with a handle and .await. Go to definition takes you to the actual SQL or whatever you wrote. The actor runs one call at a time, on a native thread or a browser worker.
+Write normal functions and call them with a handle and `.await`. Go to Definition takes you to the actual SQL or whatever you wrote. An actor runs one call at a time and can live on a native thread or in a browser worker.
 
 ```toml
 [dependencies]
-aktor = { version = "0.0.12", features = ["tokio"] }
+aktor = { version = "0.0.13", features = ["tokio"] }
 ```
 
 The API can change before 0.1.
@@ -13,63 +13,92 @@ The API can change before 0.1.
 
 ```rust
 use aktor::*;
+use std::time::Duration;
 
 #[aktor]
 async fn add(count: &mut u32, amount: u32) -> u32 {
     *count += amount;
+
     *count
 }
 
-let actors = aktor_start(AktorSetup {
+let started = aktor_start(AktorSetup {
     actors: AktorNew {
-        name: AktorName::new("counter"),
-        role: AktorNoRole,
+        name: "counter".into(),
         kind: AktorKind::TokioThread,
-        closures: AktorClosures {
-            start: async || Ok(0_u32),
-            end: (),
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
-        },
-        options: Default::default(),
+        start: async || aktor_ready(0_u32),
+        end: (),
+        hooks: Default::default(),
+        capacity: 32,
+        stuck: AktorStuck::Kill,
     },
     shutdown: |report| {
         if report.failed() {
             eprintln!("{report}");
         }
     },
-    options: Default::default(),
-}).await?;
+    grace: Duration::from_secs(5),
+})
+.await?;
 
-let count = add(&actors.handles, 5).await;
+let count = add(&started.handles, 5).await;
 ```
 
-Keep the returned owner alive. Dropping it starts shutdown, and actors.shutdown().await waits for cleanup and returns the report.
+A failed start gives you `(AktorStartError<E>, String)`. Match `AktorInitOutcome::Failed(error)` in the startup error's `init` field to handle an error from your initializer. The report includes how rollback went for actors that already started. In an Er app, `.await.er(())?` keeps both the typed error and the report.
 
-An actor failure shuts down the group and runs cleanup. A query returning Err just gives you the error. A native actor stuck past the shutdown deadline takes the process down with it.
-
-## SQLite, including the browser
+Keep the group where you keep the handles. Returning just `started.handles` drops the group and starts shutting down the actor you just opened.
 
 ```rust
+let store = Store {
+    counter: started.handles,
+    group: started.group,
+};
+```
+
+A query returning `Err` is just a query returning `Err`. If the database actor panics, the group shuts down and runs cleanup. Wrap outside work like a server's request loop in the handle's `run` so it stops when shutdown starts. [Code that lives longer than the group](aktor/docs/good-and-bad.md#code-that-lives-longer-than-the-group).
+
+Use `started.shutdown().await` to close the group and get its report. Actors close in reverse order so an actor can still call the ones that started before it during cleanup. [Starting more actors and shutting down](aktor/docs/examples.md).
+
+## SQLite
+
+Here we use Er 0.9 so a failed insert tells us which name we tried to add.
+
+```rust
+use aktor::aktor;
+use er::*;
+use rusqlite::Connection;
+
+#[derive(Er)]
+pub struct InsertUserErr {
+    pub name: String,
+}
+
 #[aktor]
-pub async fn insert_user(db: &Connection, name: String) -> Result<i64, String> {
-    db.execute("INSERT INTO user (name) VALUES (?)", [name])
-        .map_err(|error| error.to_string())?;
+pub async fn insert_user(db: &Connection, name: String) -> ErResult<i64, InsertUserErr> {
+    db.execute("INSERT INTO user (name) VALUES (?)", [&name])
+        .er(&name)?;
 
     Ok(db.last_insert_rowid())
 }
 
-let id = insert_user(&actors.handles, "Katten".into()).await?;
+let id = insert_user(&database, "Katten".into()).await?;
 ```
 
-Open the connection in start and close it in end. Use TokioThread on native, or [BrowserWebWorker](integrations/worker/README.md) to open it in a browser worker. Same query, same call.
+Open the connection in `start` and close it in `end`. Use `TokioThread` on native. In a browser worker the query still takes the connection, and its reply needs a type that can cross the worker boundary. [Browser SQLite](integrations/worker/README.md).
 
-Inside another query, pass the connection directly, passing its handle queues behind yourself.
+Inside another query you already have the connection, so pass it in. A call using the handle would queue behind the one you're still in.
 
 ## More
 
 [Examples](aktor/docs/examples.md)
+
+[Changelog](changelog.md)
+
+[Good and bad](aktor/docs/good-and-bad.md)
+
+[The same SQLite query with tokio-rusqlite and Aktor](aktor/docs/compare-libs.md)
+
+[Performance](aktor/docs/performance.md)
 
 [Shared memory browser threads](integrations/threads/README.md)
 

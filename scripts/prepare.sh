@@ -22,14 +22,20 @@ release_dir=$(mktemp -d "${TMPDIR:-/tmp}/aktor-release.XXXXXX")
 git archive HEAD | tar -xf - -C "$release_dir"
 release_url="https://github.com/Viterkim/aktor/blob/$(git rev-parse HEAD)"
 
+# The sibling Er checkout is only there while developing the two together.
+sed -i -E '/^er = /s@, path = "(\.\./)+er/er"@@' \
+    "$release_dir/Cargo.toml" "$release_dir/integrations/Cargo.toml"
+
 # Only the published copy gets full links.
 sed -i -E \
     -e "s@\]\((\./)?aktor/@](${release_url}/aktor/@g" \
     -e "s@\]\((\./)?aktor-remote/@](${release_url}/aktor-remote/@g" \
     -e "s@\]\((\./)?integrations/@](${release_url}/integrations/@g" \
+    -e "s@\]\((\./)?changelog\.md\)@](${release_url}/changelog.md)@g" \
     "$release_dir/README.md"
 sed -i -E \
     -e "s@\]\((\./)?\.\./examples/@](${release_url}/aktor/examples/@g" \
+    -e "s@\]\(https://github.com/Viterkim/aktor/blob/main/aktor/examples/@](${release_url}/aktor/examples/@g" \
     "$release_dir/aktor/docs/examples.md"
 sed -i -E \
     -e "s@\]\((\./)?\.\./README\.md@](${release_url}/README.md@g" \

@@ -2,6 +2,7 @@ use super::{AktorTaskFuture, AktorTaskState};
 use crate::AktorClosure;
 use core::future::Future;
 
+#[doc(hidden)]
 pub trait AktorTaskEnd<S> {
     fn run(self: Box<Self>, state: S) -> AktorTaskFuture<'static, Result<(), crate::AktorFailure>>;
 }
@@ -16,6 +17,7 @@ where
     }
 }
 
+#[doc(hidden)]
 pub trait AktorTaskInterval<S> {
     fn run(&mut self, state: AktorTaskState<S>) -> AktorTaskFuture<'static, ()>;
 }

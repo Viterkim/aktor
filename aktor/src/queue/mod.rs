@@ -24,7 +24,7 @@ pub struct Admission {
 struct AdmissionState {
     open: bool,
     epoch: u64,
-    group: Option<(String, crate::group::KillSwitch)>,
+    group: Option<(String, crate::group::AktorKillSwitch)>,
     phase: Phase,
     sessions: Vec<Weak<dyn Fn(Phase) -> bool + Send + Sync>>,
     prune_at: usize,
@@ -33,6 +33,5 @@ struct AdmissionState {
 #[derive(Clone, Copy)]
 pub enum Phase {
     Running,
-    Paused,
-    Closing { paused: bool },
+    Closing,
 }

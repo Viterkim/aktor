@@ -1,21 +1,14 @@
 use aktor::*;
+use std::io::Error;
 
-fn setup() {
-    let _startup = aktor_start(AktorSetup {
-        actors: AktorNew {
-            name: AktorName::new("database"),
-            role: AktorNoRole,
-            kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: async || Err::<u32, _>(std::io::Error::other("raw error")),
-                end: (),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: Default::default(),
-        },
-        shutdown: |_| {},
-        options: Default::default(),
-    });
+fn database() -> impl AktorDefinition<Aktor<Result<u32, Error>>, Error> {
+    AktorNew {
+        name: "database".into(),
+        kind: AktorKind::TokioThread,
+        start: async || Err::<u32, _>(Error::other("open failed")),
+        end: (),
+        hooks: Default::default(),
+        capacity: 32,
+        stuck: AktorStuck::Kill,
+    }
 }

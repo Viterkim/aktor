@@ -110,7 +110,11 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
                 let mut seq = Sequence {
                     decoder,
                     ended: false,
-                    len: usize::try_from(len).ok(),
+                    len: if len == u64::MAX {
+                        None
+                    } else {
+                        usize::try_from(len).ok()
+                    },
                 };
 
                 let value = visitor.visit_seq(&mut seq)?;

@@ -4,12 +4,14 @@ use serde::{Deserializer, Serializer};
 /// A compact transport representation which leaves ordinary Serde unchanged.
 ///
 /// `#[derive(AktorData)]` uses Rust fields and variants. `#[aktor(skip)]` omits
-/// a field and restores `Default::default()` when decoding it.
+/// a field and restores `Default::default()` when decoding it. If your type already
+/// checks its data in a Serde impl, put `#[aktor(serde)]` on the type to use that
+/// impl wherever the type travels.
 pub trait AktorData: Sized {
-    #[doc(hidden)]
+    /// Write one value to the transport.
     fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>;
 
-    #[doc(hidden)]
+    /// Read a value written by `serialize_data`.
     fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>;
 
     #[doc(hidden)]

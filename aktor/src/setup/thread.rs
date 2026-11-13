@@ -2,15 +2,17 @@ use super::closures::AktorEndCall;
 use super::*;
 use crate::{
     Aktor, AktorArgs, AktorError, AktorFailure,
-    listener::{Handle, hooks::AktorHooks},
+    listener::{Handle, hooks::CallHooks},
     message::call_async,
     operation::Operation,
 };
+use er::*;
 use parking_lot::Mutex;
 use std::{
     ops::AsyncFnOnce,
     sync::{Arc, Weak},
 };
+use tokio::sync::oneshot;
 
 #[cfg(all(test, feature = "std_thread"))]
 mod tests;
@@ -19,53 +21,59 @@ mod tests;
 use super::kind::TokioThread;
 
 #[cfg(feature = "tokio")]
-impl<S, Start, Role, End, CM> AktorStart<CM> for AktorNew<S, Start, TokioThread, Role, End>
+impl<S, Start, End, CM: 'static, E, M: 'static> AktorStart
+    for AktorNew<S, Start, TokioThread, End, (CM, E, M)>
 where
     S: 'static,
     End: AktorEndCall<S, CM> + Send + 'static,
-    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + Send + 'static,
+    Start: AsyncFnOnce() -> Result<S, E> + Send + 'static,
+    E: InitError<M> + 'static,
+    E::Error: Send + 'static,
 {
     type Group = crate::AktorGroup;
-    type Handles = Aktor<S, Role>;
-    type Startup = AktorThreadFuture<Result<Self::Handles, AktorStartError>>;
+    type Error = E::Error;
+    type Handles = Aktor<S>;
+    type Startup = AktorThreadFuture<Result<Self::Handles, AktorStartError<Self::Error>>>;
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        group.start_threaded().map(|_| ()).map_err(Into::into)
+    fn needs_tokio_group(&self) -> bool {
+        true
+    }
+
+    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorStartCause> {
+        group
+            .start_threaded()
+            .map(|_| ())
+            .map_err(AktorStartCause::group_error)
     }
 
     fn start_in(self, context: AktorStartContext<crate::AktorGroup>) -> Self::Startup {
-        let setup = self.with_role(AktorNoRole);
-
-        Box::pin(async move {
-            start_thread(setup, context, false)
-                .await
-                .map(Aktor::with_role)
-        })
+        Box::pin(start_thread(self, context, false))
     }
 }
 #[cfg(feature = "std_thread")]
-impl<S, Start, Role, End, CM> AktorStart<CM> for AktorNew<S, Start, kind::StdThread, Role, End>
+impl<S, Start, End, CM: 'static, E, M: 'static> AktorStart
+    for AktorNew<S, Start, kind::StdThread, End, (CM, E, M)>
 where
     S: 'static,
     End: AktorEndCall<S, CM> + Send + 'static,
-    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + Send + 'static,
+    Start: AsyncFnOnce() -> Result<S, E> + Send + 'static,
+    E: InitError<M> + 'static,
+    E::Error: Send + 'static,
 {
     type Group = crate::AktorGroup;
-    type Handles = Aktor<S, Role>;
-    type Startup = AktorThreadFuture<Result<Self::Handles, AktorStartError>>;
+    type Error = E::Error;
+    type Handles = Aktor<S>;
+    type Startup = AktorThreadFuture<Result<Self::Handles, AktorStartError<Self::Error>>>;
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        group.start_standard().map(|_| ()).map_err(Into::into)
+    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorStartCause> {
+        group
+            .start_standard()
+            .map(|_| ())
+            .map_err(AktorStartCause::group_error)
     }
 
     fn start_in(self, context: AktorStartContext<Self::Group>) -> Self::Startup {
-        let setup = self.with_role(AktorNoRole);
-
-        Box::pin(async move {
-            start_thread(setup, context, true)
-                .await
-                .map(Aktor::with_role)
-        })
+        Box::pin(start_thread(self, context, true))
     }
 }
 struct ThreadInterval<S> {
@@ -73,11 +81,11 @@ struct ThreadInterval<S> {
     callback: Weak<Mutex<Option<AktorClosure<dyn AktorIntervalLogic<S> + Send>>>>,
 }
 
-async fn start_thread<S, Start, Kind, End, CM>(
-    setup: AktorNew<S, Start, Kind, AktorNoRole, End>,
+async fn start_thread<S, Start, Kind, End, CM, E, M>(
+    setup: AktorNew<S, Start, Kind, End, (CM, E, M)>,
     mut context: AktorStartContext<crate::AktorGroup>,
     standard: bool,
-) -> Result<Aktor<S>, AktorStartError>
+) -> Result<Aktor<S>, AktorStartError<E::Error>>
 where
     S: 'static,
     Kind: AktorMode<
@@ -85,43 +93,44 @@ where
             Interval<S> = dyn AktorIntervalLogic<S> + Send,
         >,
     End: AktorEndCall<S, CM> + Send + 'static,
-    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + Send + 'static,
+    Start: AsyncFnOnce() -> Result<S, E> + Send + 'static,
+    E: InitError<M> + 'static,
+    E::Error: Send + 'static,
 {
     let AktorNew {
         name,
-        closures,
-        options,
-        ..
-    } = setup;
-
-    let name = name.name;
-    let AktorClosures {
         start,
         end,
+        hooks,
+        capacity,
+        stuck,
+        ..
+    } = setup;
+    let AktorHooks {
         intervals,
         before_each,
         after_each,
-    } = closures;
+    } = hooks;
 
     if intervals.iter().any(|interval| interval.every.is_zero()) {
-        return Err(validation_error(
+        return Err(AktorStartError::not_run(validation_error(
             &context.group,
             &name,
             Kind::EXECUTION,
-            AktorStartError::Setup(AktorError::new("interval duration must be positive", ())),
-        ));
+            AktorStartCause::Setup(AktorError::new("interval duration must be positive", ())),
+        )));
     }
 
-    if options.capacity == 0 || options.capacity > tokio::sync::Semaphore::MAX_PERMITS {
-        return Err(validation_error(
+    if capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(AktorStartError::not_run(validation_error(
             &context.group,
             &name,
             Kind::EXECUTION,
-            AktorStartError::Thread(crate::listener::DedicatedStartError::InvalidCapacity),
-        ));
+            AktorStartCause::Thread(crate::listener::DedicatedStartError::InvalidCapacity),
+        )));
     }
 
-    let hooks = AktorHooks {
+    let hooks = CallHooks {
         before_each: before_each.map(|hook| hook.0),
         after_each: after_each.map(|hook| hook.0),
     };
@@ -139,79 +148,139 @@ where
         })
         .collect();
 
-    let end = Arc::new(tokio::sync::Mutex::new(end));
+    let mut cleanup = Some((end, retained));
     let startup_kill = context.group.killswitch();
     let startup_name = name.clone();
+    let (typed, mut initial_error) = oneshot::channel();
+    let (enter, mut entered) = oneshot::channel();
     let actor = context
         .group
         .spawn_async_initial_on_reported::<S, _, _, _, _, _>(
             AktorArgs {
                 name: name.clone(),
-                capacity: options.capacity,
-                setup: async move || match start().await {
-                    Ok(state) => Ok(state),
-                    Err(error) => {
-                        Err(startup_kill.startup_error(startup_name, Kind::EXECUTION, error))
+                capacity,
+                setup: async move || {
+                    let _ = enter.send(());
+                    match start().await {
+                        Ok(state) => Ok(state),
+                        Err(error) => {
+                            let (data, report) = error.split();
+                            let mut unsent = None;
+                            let failure = startup_kill.startup_error_with(
+                                startup_name,
+                                Kind::EXECUTION,
+                                crate::AktorError::new(report, ()),
+                                |primary, diagnostics| {
+                                    unsent = typed
+                                        .send((
+                                            data,
+                                            AktorFailure {
+                                                diagnostics: diagnostics.into(),
+                                                primary,
+                                            },
+                                        ))
+                                        .err();
+                                },
+                            );
+                            crate::group::shutdown::contain_drop(
+                                unsent,
+                                &startup_kill,
+                                "startup reply drop",
+                            );
+                            Err(failure)
+                        }
                     }
                 },
                 cleanup: move |state| {
-                    let end = end.clone();
-                    let retained = retained.clone();
+                    let cleanup = cleanup.take();
 
                     async move {
-                        let _retained = retained;
-                        let mut callback = end.lock().await;
-                        callback.run(state).await
+                        match cleanup {
+                            Some((end, _retained)) => end.run(state).await,
+                            None => Ok(()),
+                        }
                     }
                 },
             },
             hooks,
             standard,
-            |error| error.diagnostics.clone(),
-            |error| (error.diagnostics.clone(), error.primary),
+            stuck,
+            |failure| (failure.diagnostics.clone(), failure.primary),
         )
         .await
-        .map_err(AktorStartError::from)?;
+        .map_err(|error| {
+            // A live sender can still enter start if the supervisor disappears.
+            let mut init = match entered.try_recv() {
+                Err(oneshot::error::TryRecvError::Closed) => AktorInitOutcome::NotRun,
+                _ => AktorInitOutcome::Unconfirmed,
+            };
+            let cause = match initial_error.try_recv() {
+                Ok((data, failure)) => {
+                    init = AktorInitOutcome::Failed(data);
+                    if matches!(error.primary(), DedicatedStartError::Closed) {
+                        AktorStartCause::Init(failure)
+                    } else {
+                        error.into()
+                    }
+                }
+                Err(_) => error.into(),
+            };
+            AktorStartError {
+                init,
+                cause,
+                report: None,
+            }
+        })?;
 
     for interval in intervals {
-        schedule(
-            interval,
-            actor.new_handle(),
-            context.group.killswitch(),
-            standard,
-            &context.group,
-            context.group.spawner(standard).map_err(|error| {
-                validation_error(
-                    &context.group,
-                    &name,
-                    Kind::EXECUTION,
-                    AktorStartError::Setup(AktorError::new(error.to_string(), ())),
-                )
-            })?,
-        )
-        .map_err(|error| {
-            validation_error(
+        if let Err(tree) = start_interval(interval, &actor, &context.group, &name, standard) {
+            return Err(validation_error(
                 &context.group,
                 &name,
                 Kind::EXECUTION,
-                AktorStartError::Setup(AktorError::new(error.to_string(), ())),
+                AktorStartCause::Setup(AktorError::new(tree.er_report(), ())),
             )
-        })?;
+            .into());
+        }
     }
 
     Ok(actor)
 }
 
+#[derive(Er)]
+pub struct IntervalErr {
+    pub actor: String,
+}
+fn start_interval<S: 'static>(
+    interval: ThreadInterval<S>,
+    actor: &Aktor<S>,
+    group: &crate::AktorGroup,
+    name: &str,
+    standard: bool,
+) -> ErResult<(), IntervalErr> {
+    let spawner = group.spawner(standard).er(name)?;
+
+    schedule(
+        interval,
+        actor.handle(),
+        group.killswitch(),
+        standard,
+        group,
+        spawner,
+    )
+    .er(name)
+}
+
 fn schedule<S: 'static>(
     interval: ThreadInterval<S>,
     handle: Handle<S>,
-    kill: crate::KillSwitch,
+    kill: crate::AktorKillSwitch,
     standard: bool,
     group: &crate::AktorGroup,
     spawner: crate::executor::Spawner,
 ) -> std::io::Result<()> {
     let callback = interval.callback;
-    let lifetime = kill.track_thread("aktor interval".into());
+    let lifetime = kill.track_thread("aktor interval".into(), crate::AktorStuck::Kill);
 
     let work = async move {
         let _lifetime = lifetime;
@@ -219,7 +288,6 @@ fn schedule<S: 'static>(
         loop {
             tokio::select! {
                 biased;
-                _ = kill.wait_stopping() => break,
                 _ = handle.wait_closing() => break,
                 _ = interval_wait(interval.every, standard) => {},
             }
@@ -247,7 +315,6 @@ fn schedule<S: 'static>(
 
             tokio::select! {
                 biased;
-                _ = kill.wait_stopping() => break,
                 _ = handle.wait_closing() => break,
                 admitted = request.run_interval() => {
                     if !admitted { break; }
@@ -279,7 +346,7 @@ async fn interval_wait(every: Duration, standard: bool) {
     tokio::time::sleep(every).await;
 }
 
-impl From<DedicatedStartError<AktorFailure>> for AktorStartError {
+impl From<DedicatedStartError<AktorFailure>> for AktorStartCause {
     fn from(error: DedicatedStartError<AktorFailure>) -> Self {
         match error {
             error

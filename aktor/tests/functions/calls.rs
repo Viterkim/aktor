@@ -54,10 +54,10 @@ async fn typed() {
     let (db, actor) = spawn_thread(Db::default(), 8).unwrap();
 
     let id: usize = insert(&db, "BingoManden".into()).await;
-    let row: Option<String> = find(&db, id).await;
+    let row: Option<String> = find::request(&db, id).settle().await.unwrap();
 
     assert_eq!(row.as_deref(), Some("BingoManden"));
-    assert_eq!(fail(&db).await, Err(QueryError));
+    assert_eq!(fail(&db).settle().await, Ok(Err(QueryError)));
 
     let reply: Reply<DbResult<usize>> = aliased::request(&db).send().await;
 

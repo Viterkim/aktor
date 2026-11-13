@@ -40,6 +40,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     let state = input::parse::state(&function.signature.inputs[0])?;
     let state_type = &state.ty;
+    let direct_signature = function.signature.clone();
     let (implementation, invoke) = signature::implementation(&function, &mut names, &output)?;
     let body_type = &names.body;
 
@@ -78,7 +79,6 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let inner_name = &names.inner;
     let results_name = &names.results;
     let sender_name = &names.sender;
-    let function_name = &names.function;
     let parameter = match &state.pattern {
         syn::Pat::Ident(pattern) if pattern.subpat.is_none() => pattern.ident.clone(),
         _ => state_name.clone(),
@@ -91,11 +91,16 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     let mode = names::binding(&mut names.reserved, "__AktorMode");
     let adapter = names::binding(&mut names.reserved, "__AktorExport");
-    let dispatch_trait = names::binding(&mut names.reserved, "__AktorDispatch");
-    let state_parameter = names::binding(&mut names.reserved, "__AktorState");
-    let input_parameter = names::binding(&mut names.reserved, "__AktorInput");
-    let output_parameter = names::binding(&mut names.reserved, "__AktorOutput");
-    let role_parameter = names::binding(&mut names.reserved, "__AktorRole");
+    let dispatch_trait = if state.mutable {
+        quote!(WriteDispatch)
+    } else {
+        quote!(ReadDispatch)
+    };
+    let codec = if options.serde {
+        quote!(SerdeCodec)
+    } else {
+        quote!(DataCodec)
+    };
 
     let latest_factory = names::binding(&mut names.reserved, "__AktorLatestFactory");
     let latest_state = names::binding(&mut names.reserved, "__AktorLatestState");
@@ -107,16 +112,11 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let latest_inner = names::binding(&mut names.reserved, "__AktorLatestInner");
 
     let function_parameter = names::binding(&mut names.reserved, "__AktorFunction");
-    let future_parameter = names::binding(&mut names.reserved, "__AktorFuture");
+    let function_name = &names.function;
+
     let future_name = names::binding(&mut names.reserved, "__aktor_future");
     let future_lifetime = syn::Lifetime::new(&format!("'{future_name}"), future_name.span());
     let output_name = names::binding(&mut names.reserved, "__aktor_output");
-
-    let lease_bound = if state.mutable {
-        quote!(::core::ops::DerefMut)
-    } else {
-        quote!(::core::ops::Deref)
-    };
 
     let lease_binding = if state.mutable {
         quote!(mut #state_name)
@@ -130,16 +130,10 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         quote!(&*#state_name)
     };
 
-    let state_reference_generic = if state.mutable {
-        quote!(&'s mut #state_parameter)
-    } else {
-        quote!(&'s #state_parameter)
-    };
-
     let name = &function.signature.ident;
 
     function.signature.generics.params.push(
-        parse_quote!(#target: #name::#dispatch_trait<#mode, #state_type, #input_type, #output, #role>),
+        parse_quote!(#target: #aktor::dispatch::#dispatch_trait<#mode, #state_type, #input_type, #output, #role, #aktor::dispatch::#codec>),
     );
     function.signature.generics.params.push(parse_quote!(#mode));
 
@@ -151,41 +145,21 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     let predicates = &mut function.signature.generics.make_where_clause().predicates;
 
-    predicates.push(parse_quote!(
-        <#target as #name::#dispatch_trait<
-            #mode, #state_type, #input_type, #output, #role
-        >>::Lease: #future_lifetime
-    ));
+    predicates.push(parse_quote!(#target::Lease: #future_lifetime));
     predicates.push(parse_quote!(#input_type: #future_lifetime));
 
     function.signature.asyncness = None;
     function.signature.output = parse_quote!(-> #aktor::call::Call<
         #target,
         #input_type,
-        <#target as #name::#dispatch_trait<
-            #mode, #state_type, #input_type, #output, #role
-        >>::Request<
-            impl ::core::future::Future<Output = (
-                <#target as #name::#dispatch_trait<
-                    #mode, #state_type, #input_type, #output, #role
-                >>::Lease,
-                #output
-            )> + #future_lifetime
+        #target::Request<
+            impl ::core::future::Future<Output = (#target::Lease, #output)>
+                + #future_lifetime
         >,
         #name::#latest_factory<
-            #state_type,
-            #input_type,
-            #output,
-            #role,
-            <#target as #name::#dispatch_trait<
-                #mode, #state_type, #input_type, #output, #role
-            >>::Lease,
-            impl ::core::future::Future<Output = (
-                <#target as #name::#dispatch_trait<
-                    #mode, #state_type, #input_type, #output, #role
-                >>::Lease,
-                #output
-            )> + #future_lifetime
+            #state_type, #input_type, #output, #role, #target::Lease,
+            impl ::core::future::Future<Output = (#target::Lease, #output)>
+                + #future_lifetime
         >
     >);
 
@@ -193,9 +167,10 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
     let visibility = &function.visibility;
     let attributes = input::attributes::wrapper(&function.attributes)?;
 
-    let mut scope = signature::scope::Child::new(
+    let mut scope = signature::scope::NestedModule::new(
         &[
             "NAME",
+            "direct",
             "request",
             "export",
             "handler",
@@ -205,6 +180,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         ],
         &function.signature.generics,
     );
+
+    let direct =
+        signature::body::direct(direct_signature, &names, &invoke, &attributes, &mut scope);
 
     let mut state_type = state_type.clone();
 
@@ -232,23 +210,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     scope.visit_path_mut(&mut aktor);
 
-    let (wire, transport_note) = if options.serde {
-        (
-            quote!(#aktor::dispatch::SerdeCodec),
-            "Check the actor's state type and actor marker. #[aktor(serde)] transport arguments and results must implement Serialize and DeserializeOwned.",
-        )
-    } else {
-        (
-            quote!(#aktor::dispatch::DataCodec),
-            "Check the actor's state type and actor marker. Transport arguments and results must implement AktorData.",
-        )
-    };
-
-    let dispatch = if state.mutable {
-        quote!(#aktor::dispatch::WriteCall)
-    } else {
-        quote!(#aktor::dispatch::ReadCall)
-    };
+    let wire = quote!(#aktor::dispatch::#codec);
 
     let state_reference = if state.mutable {
         quote!(&mut #state_type)
@@ -291,6 +253,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             #[allow(non_camel_case_types)]
             #[doc(hidden)]
             pub struct #body_type;
+
+            #direct
 
             pub const NAME: &str = ::core::module_path!();
 
@@ -400,137 +364,10 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 (LatestSender { inner: #inner_name }, #results_name)
             }
 
-            #[doc(hidden)]
-            #[diagnostic::on_unimplemented(
-                note = #transport_note
-            )]
-            pub trait #dispatch_trait<
-                #mode,
-                #state_parameter: 'static,
-                #input_parameter,
-                #output_parameter: 'static,
-                #role_parameter
-            > {
-                type Lease: #lease_bound<Target = #state_parameter>;
-                type Request<#future_parameter>;
-
-                fn request<#function_parameter, #future_parameter>(
-                    self,
-                    #input_name: #input_parameter,
-                    #operation_name: #aktor::operation::Operation,
-                    #function_name: #function_parameter,
-                    #sender_name: fn(Self::Lease, #input_parameter) -> #future_parameter
-                ) -> Self::Request<#future_parameter>
-                where
-                    #function_parameter: for<'s> ::core::ops::AsyncFnOnce(
-                        #state_reference_generic,
-                        #input_parameter
-                    ) -> #output_parameter + ::core::marker::Send + 'static,
-                    #future_parameter: ::core::future::Future<Output = (Self::Lease, #output_parameter)>;
-            }
-
-            impl<
-                #target,
-                #state_parameter: 'static,
-                #input_parameter,
-                #output_parameter: 'static,
-                #role_parameter
-            > #dispatch_trait<
-                #aktor::dispatch::Native,
-                #state_parameter,
-                #input_parameter,
-                #output_parameter,
-                #role_parameter
-            > for #target
-            where
-                #target: #dispatch<#state_parameter, #input_parameter, #output_parameter, #role_parameter>
-            {
-                type Lease = #target::Lease;
-                type Request<#future_parameter> = <#target as #dispatch<
-                    #state_parameter,
-                    #input_parameter,
-                    #output_parameter,
-                    #role_parameter
-                >>::Request<#future_parameter>;
-
-                fn request<#function_parameter, #future_parameter>(
-                    self,
-                    #input_name: #input_parameter,
-                    #operation_name: #aktor::operation::Operation,
-                    #function_name: #function_parameter,
-                    #sender_name: fn(Self::Lease, #input_parameter) -> #future_parameter
-                ) -> Self::Request<#future_parameter>
-                where
-                    #function_parameter: for<'s> ::core::ops::AsyncFnOnce(
-                        #state_reference_generic,
-                        #input_parameter
-                    ) -> #output_parameter + ::core::marker::Send + 'static,
-                    #future_parameter: ::core::future::Future<Output = (Self::Lease, #output_parameter)>
-                {
-                    <#target as #dispatch<#state_parameter, #input_parameter, #output_parameter, #role_parameter>>::dispatch(
-                        self,
-                        #operation_name,
-                        #function_name,
-                        #input_name,
-                        #sender_name
-                    )
-                }
-            }
-            impl<
-                #target,
-                #state_parameter: 'static,
-                #input_parameter,
-                #output_parameter: 'static,
-                #role_parameter
-            > #dispatch_trait<
-                #aktor::dispatch::Remote,
-                #state_parameter,
-                #input_parameter,
-                #output_parameter,
-                #role_parameter
-            > for #target
-            where
-                #target: #aktor::dispatch::Transport<
-                    #state_parameter,
-                    #input_parameter,
-                    #output_parameter,
-                    #role_parameter,
-                    #wire
-                >
-            {
-                type Lease = #aktor::dispatch::OwnedState<#state_parameter>;
-                type Request<#future_parameter> = <#target as #aktor::dispatch::Transport<
-                    #state_parameter,
-                    #input_parameter,
-                    #output_parameter,
-                    #role_parameter,
-                    #wire
-                >>::Request;
-
-                fn request<#function_parameter, #future_parameter>(
-                    self,
-                    #input_name: #input_parameter,
-                    #operation_name: #aktor::operation::Operation,
-                    _: #function_parameter,
-                    _: fn(Self::Lease, #input_parameter) -> #future_parameter
-                ) -> Self::Request<#future_parameter>
-                where
-                    #function_parameter: for<'s> ::core::ops::AsyncFnOnce(
-                        #state_reference_generic,
-                        #input_parameter
-                    ) -> #output_parameter + ::core::marker::Send + 'static,
-                    #future_parameter: ::core::future::Future<Output = (Self::Lease, #output_parameter)>
-                {
-                    <#target as #aktor::dispatch::Transport<
-                        #state_parameter, #input_parameter, #output_parameter, #role_parameter, #wire
-                    >>::request(self, #operation_name, #input_name)
-                }
-            }
-
             #[track_caller]
             pub fn request<
                 #future_lifetime,
-                #target: #dispatch_trait<#mode, #state_type, #input_type, #output, #role>,
+                #target: #aktor::dispatch::#dispatch_trait<#mode, #state_type, #input_type, #output, #role, #aktor::dispatch::#codec>,
                 #mode
             >(#parameter: #target, #(#bindings: #input_types),*) -> #aktor::call::Call<
                 #target,
@@ -552,8 +389,10 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                 #aktor::call::Call::new(
                     #parameter, (#(#bindings,)*),
                     #aktor::operation::Operation { name: NAME, caller: ::core::panic::Location::caller() },
-                    |#parameter, #input_name, #operation_name| #parameter.request(
-                        #input_name, #operation_name,
+                    |#parameter, #input_name, #operation_name| <#target as #aktor::dispatch::#dispatch_trait<
+                        #mode, #state_type, #input_type, #output, #role, #wire
+                    >>::request(
+                        #parameter, #input_name, #operation_name,
                         async move |#state_name: #state_reference, #input_name| {
                             let (#(#bindings,)*) = #input_name;
                             #invoke(#state_name, #(#bindings),*).await
