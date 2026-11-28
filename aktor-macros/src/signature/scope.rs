@@ -3,11 +3,36 @@ use syn::{
     visit_mut::{self, VisitMut},
 };
 
-pub struct Child {
+/// The same visibility seen from inside the generated module. A plain `pub` in there claims
+/// more than a private function has, and the compiler then refuses private traits in the
+/// types that item mentions.
+pub fn nested_visibility(visibility: &syn::Visibility) -> syn::Visibility {
+    match visibility {
+        syn::Visibility::Public(_) => visibility.clone(),
+        syn::Visibility::Inherited => parse_quote!(pub(super)),
+        syn::Visibility::Restricted(restricted) => {
+            let mut path = (*restricted.path).clone();
+
+            if path.is_ident("self") {
+                path = parse_quote!(super);
+            } else if path
+                .segments
+                .first()
+                .is_some_and(|first| first.ident == "super")
+            {
+                path.segments.insert(0, parse_quote!(super));
+            }
+
+            parse_quote!(pub(in #path))
+        }
+    }
+}
+
+pub struct NestedModule {
     pub shadowed: &'static [&'static str],
     pub binders: Vec<String>,
 }
-impl Child {
+impl NestedModule {
     pub fn new(shadowed: &'static [&'static str], generics: &syn::Generics) -> Self {
         Self {
             shadowed,
@@ -24,8 +49,16 @@ impl Child {
         }
     }
 }
-impl VisitMut for Child {
+impl VisitMut for NestedModule {
     fn visit_type_path_mut(&mut self, ty: &mut syn::TypePath) {
+        if let Some(qself) = &mut ty.qself
+            && qself.position == 0
+        {
+            self.visit_qself_mut(qself);
+            visit_mut::visit_path_mut(self, &mut ty.path);
+            return;
+        }
+
         let before = ty.path.segments.len();
 
         visit_mut::visit_type_path_mut(self, ty);
@@ -36,6 +69,14 @@ impl VisitMut for Child {
     }
 
     fn visit_expr_path_mut(&mut self, expr: &mut syn::ExprPath) {
+        if let Some(qself) = &mut expr.qself
+            && qself.position == 0
+        {
+            self.visit_qself_mut(qself);
+            visit_mut::visit_path_mut(self, &mut expr.path);
+            return;
+        }
+
         let before = expr.path.segments.len();
 
         visit_mut::visit_expr_path_mut(self, expr);

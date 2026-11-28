@@ -1,7 +1,3 @@
-use crate::{latest::Factory, operation::Operation};
-use core::{future::Future, pin::Pin};
-use pin_project_lite::pin_project;
-
 #[cfg(all(
     feature = "wasm_browser_workers",
     target_family = "wasm",
@@ -18,11 +14,6 @@ mod browser;
 ))]
 mod cross_core;
 mod impls;
-mod request;
-mod retry;
-#[doc(hidden)]
-pub use request::{CastRequest, RetryRequest, SendRequest, TimeoutRequest};
-pub use retry::Retried;
 #[cfg(feature = "local")]
 mod local;
 #[cfg(any(
@@ -30,18 +21,24 @@ mod local;
     all(feature = "std_thread", not(target_family = "wasm"))
 ))]
 mod native;
+mod request;
+mod retry;
 #[cfg(any(all(feature = "tokio", not(target_family = "wasm")), feature = "bevy"))]
 mod task;
 
-pin_project! {
-    /// The call returned by an #[aktor] function.
-    #[must_use = "await the call, send it, or make a latest session"]
-    pub struct Call<T, I, R, L = ()> {
-        pending: Option<(T, I)>,
-        #[pin]
-        running: Option<R>,
-        request: fn(T, I, Operation) -> R,
-        latest: L,
-        operation: Operation,
-    }
+#[doc(hidden)]
+pub use request::{CastRequest, RetryRequest, SendRequest, TimeoutRequest};
+pub use retry::Retried;
+
+use crate::{latest::Factory, operation::Operation};
+use core::future::{Future, IntoFuture};
+
+/// The call returned by an #[aktor] function. Use `.into_future()` to pin or poll it yourself.
+#[must_use = "await the call, send it, or make a latest session"]
+pub struct Call<T, I, R, L = ()> {
+    target: T,
+    input: I,
+    request: fn(T, I, Operation) -> R,
+    factory: L,
+    operation: Operation,
 }

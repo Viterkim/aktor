@@ -7,6 +7,7 @@ mod connection;
 mod error;
 mod latest;
 mod packet;
+mod receipt;
 mod request;
 mod server;
 #[cfg(feature = "udp")]
@@ -16,11 +17,12 @@ mod wire;
 #[cfg(test)]
 mod tests;
 
-pub use client::{Client, ClientOptions, connect};
-pub use connection::Address;
-pub use error::{Cause, Error};
+pub use client::{Client, ClientOptions, ClientOptionsError};
+pub use connection::{Address, ListenAddress, UnixListenerOptions};
+pub use error::Cause;
+use error::{Rejection, WireFailure};
 pub use latest::{LatestResults, LatestSender};
-pub use request::{AktorRetryOpts, Reply, Request};
-pub use server::{Server, ServerOptions, listen};
+pub use request::{AktorRetryOptions, Reply, Request};
+pub use server::{Server, ServerError, ServerFailure, ServerOptions};
 
-pub use aktor::message::CallError;
+pub use aktor::{AktorDeliveryError, AktorDeliveryOutcome};

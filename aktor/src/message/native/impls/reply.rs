@@ -2,118 +2,44 @@ use super::super::*;
 use core::task::ready;
 
 impl<O> Reply<O> {
-    /// Receive the call outcome without waiting for actor cleanup.
-    /// An outcome does not confirm retirement of the actor or its external work.
-    pub async fn receive_settled(mut self) -> Result<O, CallError> {
-        let output = match self.error.take() {
-            Some(error) => Err(error),
-            None => core::future::poll_fn(|cx| self.answer.poll(cx)).await,
-        };
-
-        self.taken = true;
-        output
-    }
-
-    #[doc(hidden)]
-    pub async fn receive(mut self) -> Result<O, CallError> {
-        let output = core::future::poll_fn(|cx| self.poll_result(cx)).await;
-        self.taken = true;
-        output
-    }
-
-    /// Take a ready output once. A pending reply can still be awaited.
-    pub fn try_take(&mut self) -> Option<O> {
-        if self.taken || self.parked {
+    pub fn try_take(&mut self) -> Option<Result<O, crate::AktorDeliveryError>> {
+        if self.taken {
             return None;
         }
 
-        if self.closing.is_none() {
-            match self.answer.try_take()? {
-                Ok(output) => {
-                    self.taken = true;
-                    return Some(output);
-                }
-                Err(error) => self.close(error),
-            }
-        }
-
-        if matches!(self.finished.has_changed(), Ok(false)) {
-            return None;
-        }
-
-        if self.group.is_some() {
-            self.admission.lost();
-            self.parked = true;
-            None
-        } else {
-            stopped()
-        }
+        let output = self.answer.try_take()?;
+        self.taken = true;
+        Some(match output {
+            Ok(value) => Ok(value),
+            Err(outcome) => Err(outcome.error(self.receive)),
+        })
     }
 
-    pub fn timeout(&mut self, duration: core::time::Duration) -> crate::Timeout<&mut Self> {
+    pub fn timeout(&mut self, duration: core::time::Duration) -> crate::AktorTimeout<&mut Self> {
         let standard = self.admission.is_standard();
 
-        crate::Timeout::queued(
+        crate::AktorTimeout::queued(
             self,
             duration,
             |_| crate::timeout::WaitStatus { admitted: true },
             standard,
         )
     }
-
-    pub async fn wait_closed(&mut self) {
-        let _result = self.finished.changed().await;
-    }
-
-    fn close(&mut self, error: CallError) {
-        let mut finished = self.finished.clone();
-
-        self.closing = Some(Box::pin(async move {
-            let _result = finished.changed().await;
-        }));
-        self.error = Some(error);
-    }
-
-    fn poll_result(&mut self, cx: &mut Context<'_>) -> Poll<Result<O, CallError>> {
-        if self.closing.is_none() {
-            match ready!(self.answer.poll(cx)) {
-                Ok(output) => return Poll::Ready(Ok(output)),
-                Err(error) => self.close(error),
-            }
-        }
-
-        if let Some(closing) = &mut self.closing {
-            ready!(closing.as_mut().poll(cx));
-        }
-
-        match self.error {
-            Some(error) => Poll::Ready(Err(error)),
-            None => Poll::Ready(Err(CallError::OutcomeUnknown)),
-        }
-    }
 }
 impl<O> Future for Reply<O> {
-    type Output = O;
+    type Output = Result<O, crate::AktorDeliveryError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
-        let this = self.get_mut();
-
-        if this.parked {
-            return Poll::Pending;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.taken {
+            consumed();
         }
 
-        match ready!(this.poll_result(cx)) {
-            Ok(output) => {
-                this.taken = true;
-                Poll::Ready(output)
-            }
-            Err(_) if this.group.is_some() => {
-                this.admission.lost();
-                this.parked = true;
-                Poll::Pending
-            }
-            Err(_) => stopped(),
-        }
+        let output = ready!(self.answer.poll(cx));
+        self.taken = true;
+        Poll::Ready(match output {
+            Ok(value) => Ok(value),
+            Err(outcome) => Err(outcome.error(self.receive)),
+        })
     }
 }
 impl<O> Drop for Reply<O> {

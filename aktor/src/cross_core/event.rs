@@ -26,18 +26,39 @@ impl Event {
     }
 
     pub fn notify(&self) {
-        let wakers: Vec<_> = self.waiters.lock(|waiters| {
-            waiters
-                .borrow()
-                .iter()
-                .filter_map(Weak::upgrade)
-                .filter_map(|waker| waker.lock(|waker| waker.borrow_mut().take()))
-                .collect()
-        });
+        let mut rest = Vec::new();
+        let first = loop {
+            let result = self.waiters.lock(|waiters| {
+                let waiters = waiters.borrow();
+                let extra = waiters.len().saturating_sub(2);
+                if rest.capacity() < extra {
+                    return Err(extra);
+                }
+
+                let mut ready = waiters
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .filter_map(|waker| waker.lock(|waker| waker.borrow_mut().take()));
+
+                let first = [ready.next(), ready.next()];
+                rest.extend(ready);
+                Ok(first)
+            });
+
+            match result {
+                Ok(first) => break first,
+                Err(extra) => rest.reserve(extra),
+            }
+        };
+        let wakers = first.into_iter().flatten().chain(rest);
 
         #[cfg(feature = "std")]
         if let Some(payload) = crate::local::panic::capture_each(wakers, Waker::wake, |_| {}) {
-            std::panic::resume_unwind(payload);
+            if std::thread::panicking() {
+                crate::panic::dispose_secondary(payload);
+            } else {
+                std::panic::resume_unwind(payload);
+            }
         }
         #[cfg(not(feature = "std"))]
         for waker in wakers {
@@ -52,6 +73,15 @@ pub struct Listener {
 }
 impl Listener {
     pub fn register(&self, cx: &Context<'_>) {
+        if self.waker.lock(|waker| {
+            waker
+                .borrow()
+                .as_ref()
+                .is_some_and(|wake| wake.will_wake(cx.waker()))
+        }) {
+            return;
+        }
+
         let replacement = cx.waker().clone();
         let previous = self
             .waker

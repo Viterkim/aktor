@@ -1,7 +1,7 @@
 use super::*;
 use crate::listener::Handle;
 
-/// Call without the macro.
+#[doc(hidden)]
 #[track_caller]
 pub fn call<S: 'static, Role, F, I, O>(
     handle: &Handle<S, Role>,
@@ -13,34 +13,35 @@ where
     I: Send + 'static,
     O: Send + 'static,
 {
-    let packet = Arc::new(Packet::new(function, input));
+    let packet = Arc::new(Packet::new(
+        function,
+        input,
+        Some(handle.inner.admission.clone()),
+    ));
+
+    let operation = crate::listener::Operation {
+        name: std::any::type_name::<F>(),
+        caller: core::panic::Location::caller(),
+    };
 
     Request {
         sender: &handle.inner.sender,
         admission: &handle.inner.admission,
-        available: None,
         submission: Submission::Unsent(Message {
-            operation: crate::listener::Operation {
-                name: std::any::type_name::<F>(),
-                caller: core::panic::Location::caller(),
-            },
+            operation,
             job: packet.clone(),
             finished: false,
-            counted: true,
         }),
         reply: Reply {
+            receive: true,
             admission: handle.inner.admission.clone(),
             answer: packet,
-            finished: handle.inner.finished.clone(),
-            closing: None,
-            error: None,
-            group: handle.inner.admission.group(),
-            parked: false,
             taken: false,
         },
     }
 }
 
+#[doc(hidden)]
 #[track_caller]
 pub fn call_async<S: 'static, Role, F, I, O>(
     handle: &Handle<S, Role>,
@@ -52,30 +53,46 @@ where
     I: Send + 'static,
     O: Send + 'static,
 {
-    let packet = Arc::new(AsyncJob(Packet::new(function, input)));
+    let packet = Arc::new(AsyncJob(Packet::new(
+        function,
+        input,
+        Some(handle.inner.admission.clone()),
+    )));
+
+    let operation = crate::listener::Operation {
+        name: std::any::type_name::<F>(),
+        caller: core::panic::Location::caller(),
+    };
 
     Request {
         sender: &handle.inner.sender,
         admission: &handle.inner.admission,
-        available: None,
         submission: Submission::Unsent(Message {
-            operation: crate::listener::Operation {
-                name: std::any::type_name::<F>(),
-                caller: core::panic::Location::caller(),
-            },
+            operation,
             job: packet.clone(),
             finished: false,
-            counted: true,
         }),
         reply: Reply {
+            receive: true,
             admission: handle.inner.admission.clone(),
             answer: packet,
-            finished: handle.inner.finished.clone(),
-            closing: None,
-            error: None,
-            group: handle.inner.admission.group(),
-            parked: false,
             taken: false,
         },
+    }
+}
+
+/// A message nobody waits on, like an interval's turn.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn detached<S: 'static, F>(
+    operation: crate::listener::Operation,
+    function: F,
+) -> Message<S>
+where
+    F: for<'s> core::ops::AsyncFnOnce(&'s mut S, ()) + Send + 'static,
+{
+    Message {
+        operation,
+        job: Arc::new(AsyncJob(Packet::new(function, (), None))),
+        finished: false,
     }
 }

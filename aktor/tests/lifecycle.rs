@@ -1,6 +1,7 @@
 use aktor::*;
-use er::{Er, ErPresentationExt, ErTree};
-use std::{io, sync::Arc};
+use core::num::NonZeroUsize;
+use er::{Er, ErTree};
+use std::{io, sync::Arc, time::Duration};
 
 #[derive(Er)]
 #[er(format = "open database {value}")]
@@ -13,53 +14,51 @@ struct CloseErr {
     value: u32,
 }
 
-async fn open() -> Result<u32, AktorSetupError> {
+async fn open() -> Result<u32, (core::convert::Infallible, String)> {
     Ok(31)
 }
-fn close(value: u32) -> Result<(), AktorCleanupError> {
+fn close(value: u32) -> Result<(), (CloseErr, String)> {
     Err(ErTree::new(
         CloseErr { value },
         [
-            io::Error::other("flush sentinel"),
-            io::Error::other("journal sentinel"),
+            io::Error::new(io::ErrorKind::WriteZero, "flush sentinel"),
+            io::Error::new(io::ErrorKind::PermissionDenied, "journal sentinel"),
         ],
-    ))
-    .er_into(|report| report)
+    )
+    .into())
 }
 
 #[tokio::test]
 async fn direct() {
     let actors = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
         actors: AktorNew {
-            name: AktorName::new("tree"),
-            role: AktorNoRole,
+            name: "tree".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: open,
-                end: close,
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: Default::default(),
+            start: AktorInit::Try(open),
+            end: close,
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: Default::default(),
-    })
-    .await
-    .unwrap();
+        grace: Duration::from_secs(5),
+    });
+    actors.ready().await.unwrap();
 
-    let report = actors.shutdown().await;
-
+    let completion = actors.handles().completion();
+    let (actors, handles) = actors.into_parts();
+    drop(handles);
+    let report = actors.stop_released().await.unwrap().into_report();
+    assert!(report.released());
+    assert!(report.to_string().contains("flush sentinel"));
     assert_eq!(report.to_string().matches("journal sentinel").count(), 1);
 
-    let error = actors.handles.completion().wait().await.unwrap_err();
-    let owner::OwnerFailure::Cleanup(errors) = &error.error else {
+    let (error, report) = completion.wait().await.unwrap_err();
+    let owner::OwnerError::Cleanup = &*error else {
         panic!("cleanup error lost");
     };
-    let diagnostic = &errors.errors[0].diagnostics;
-
-    assert!(diagnostic.contains("journal sentinel"));
+    assert!(report.contains("journal sentinel"));
 }
 
 #[tokio::test]
@@ -67,310 +66,137 @@ async fn rollback() {
     let tree = ErTree::new(OpenErr { value: 17 }, [io::Error::other("open sentinel")]);
     let cleaned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cleanup = cleaned.clone();
-    let error = aktor_start(AktorSetup {
+    let actors = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
         actors: (
             AktorNew {
-                name: AktorName::new("ready"),
-                role: AktorNoRole,
+                name: "ready".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: open,
-                    end: async move |value| {
-                        cleanup.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        close(value)
-                    },
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: AktorInit::Try(open),
+                end: async move |value| {
+                    cleanup.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    close(value)
                 },
-                options: Default::default(),
+                hooks: AktorHooks::NONE,
+                capacity: NonZeroUsize::new(32).unwrap(),
+                stuck: AktorStuck::Kill,
             },
             AktorNew {
-                name: AktorName::new("failed"),
-                role: AktorNoRole,
+                name: "ready".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async move || Err::<(), _>(tree).er_into(|report| report),
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: Default::default(),
+                start: AktorInit::Try(async move || Err::<(), _>(tree)),
+                end: (),
+                hooks: AktorHooks::NONE,
+                capacity: NonZeroUsize::new(32).unwrap(),
+                stuck: AktorStuck::Kill,
             },
         ),
         shutdown: |_| {},
-        options: Default::default(),
-    })
-    .await
-    .err()
-    .unwrap();
+        grace: Duration::from_secs(5),
+    });
+
+    let (first, second) = tokio::join!(actors.ready(), actors.ready());
+    let (error, error_report) = first.unwrap_err();
+    let (repeated, _) = second.unwrap_err();
 
     assert_eq!(cleaned.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(format!("{error:#}").matches("open sentinel").count(), 1);
-    let wrapped = er::ErTree::from(error);
-    assert_eq!(
-        wrapped.er_report_string().matches("open sentinel").count(),
-        0
+    assert_eq!(error_report.matches("open sentinel").count(), 1);
+    assert!(core::ptr::eq(error, repeated));
+
+    let id = actors.handles().1.actor_id().unwrap();
+    let entry = error
+        .startup()
+        .unwrap()
+        .actors
+        .iter()
+        .find(|actor| actor.id == id)
+        .unwrap();
+    assert_eq!(entry.init, AktorInitEvidence::Entered);
+
+    let report = error.startup().unwrap().report.as_ref().unwrap();
+
+    assert!(
+        report
+            .actor_failures(id)
+            .any(|failure| failure.error.contains("open sentinel"))
     );
-    let report = wrapped.top.report.unwrap();
-
-    assert!(report.failure.unwrap().message.contains("open sentinel"));
-    assert!(report.actors.iter().any(|actor| {
-        actor
-            .diagnostics
-            .iter()
-            .any(|error| error.diagnostics.contains("journal sentinel"))
-    }));
-}
-
-#[tokio::test]
-async fn recovery() {
-    let cleanup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let calls = cleanup_calls.clone();
-    let actors = aktor_start(AktorSetup {
-        actors: AktorNew {
-            name: AktorName::new("recoverable"),
-            role: AktorNoRole,
-            kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: open,
-                end: async move |value| {
-                    if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                        close(value)
-                    } else {
-                        Ok(())
-                    }
-                },
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: Default::default(),
-        },
-        shutdown: |_| {},
-        options: Default::default(),
-    })
-    .await
-    .unwrap();
-    let controller = actors.handles.control.new_controller();
-    let actor = controller.clone();
-    let error = controller.replace(|| Ok(41)).await.unwrap_err();
-    let listener::ReplaceError::Cleanup(error) = error.error else {
-        panic!("replacement lost cleanup classification");
-    };
-
-    assert!(error.diagnostics.contains("close database 31"));
-    let error = actor
-        .resume(|| Err(AktorSetupError::new("resume sentinel", ())))
-        .await
-        .unwrap_err();
-    let listener::LifecycleError::Failed(error) = error.error else {
-        panic!("resume lost setup classification");
-    };
-
-    assert!(error.diagnostics.contains("resume sentinel"));
-    assert!(!actor.is_running());
-    assert!(!actors.killswitch().is_stopping());
-    controller.resume(|| Ok(43)).await.unwrap();
-    let error = actor
-        .replace(|| {
-            let tree = ErTree::new(OpenErr { value: 44 }, [] as [io::Error; 0]);
-            Err(tree).er_into(|report| report)
-        })
-        .await
-        .unwrap_err();
-    let listener::ReplaceError::Setup(error) = error.error else {
-        panic!("replacement lost setup classification");
-    };
-
-    assert!(error.diagnostics.contains("open database 44"));
-
-    use futures_util::FutureExt;
-    use tokio::sync::oneshot;
-
-    let (release, gate) = oneshot::channel();
-    let mut resume = Box::pin(actor.resume_async(move || async move {
-        gate.await.unwrap();
-        Err::<u32, _>(AktorSetupError::new("buffered resume error", ()))
-    }));
-
-    assert!(resume.as_mut().now_or_never().is_none());
-    release.send(()).unwrap();
-    actor.pause().await.unwrap();
-    drop(resume);
-
-    let (release, gate) = oneshot::channel();
-    let mut replace = Box::pin(actor.replace_async(move || async move {
-        gate.await.unwrap();
-        Err::<u32, _>(AktorSetupError::new("buffered replace error", ()))
-    }));
-
-    assert!(replace.as_mut().now_or_never().is_none());
-    release.send(()).unwrap();
-    actor.pause().await.unwrap();
-    drop(replace);
-
-    let failures = actor.take_abandoned_setup();
-    let [
-        listener::AbandonedSetup::Resume(resume),
-        listener::AbandonedSetup::Replace(replace),
-    ] = failures.as_slice()
-    else {
-        panic!("buffered lifecycle failures lost");
-    };
-
-    assert_eq!(resume.diagnostics, "buffered resume error");
-    assert_eq!(replace.diagnostics, "buffered replace error");
-
-    actor.resume(|| Ok(45)).await.unwrap();
-    assert!(!actors.shutdown().await.timed_out);
-    assert_eq!(cleanup_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert!(report.to_string().contains("journal sentinel"));
 }
 
 #[tokio::test]
 async fn task() {
     let actors = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
         actors: AktorNew {
-            name: AktorName::new("task tree"),
-            role: AktorNoRole,
+            name: "task tree".into(),
             kind: AktorKind::TokioTask,
-            closures: AktorClosures {
-                start: open,
-                end: close,
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: Default::default(),
+            start: AktorInit::Try(open),
+            end: close,
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
         },
         shutdown: async |_| {},
-        options: Default::default(),
-    })
-    .await
-    .unwrap();
-    let report = actors.shutdown().await;
+        grace: Duration::from_secs(5),
+    });
+    actors.ready().await.unwrap();
+    let report = actors.stop().await;
 
     assert_eq!(report.to_string().matches("journal sentinel").count(), 1);
-    assert!(
-        actors.handles.cleanup.lock()[0]
-            .diagnostics
-            .contains("close database 31")
-    );
 }
 
 #[tokio::test]
 async fn reports() {
-    let message = "entry sentinel\nfirst cause\nsecond cause";
-    let mut group = AktorGroup::new();
-    let completed = group
-        .start_with(move |_| Err(AktorCleanupError::new(message, ())))
-        .unwrap();
-    group.shutdown();
-    let report = completed.wait().await;
+    let failure = ErTree::new(
+        CloseErr { value: 1 },
+        [io::Error::other(
+            "entry sentinel\nfirst cause\nsecond cause",
+        )],
+    );
 
-    assert_eq!(report.application[0].diagnostics, message);
+    let started = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: AktorNew {
+            name: "report".into(),
+            kind: AktorKind::TokioThread,
+            start: AktorInit::Ready(async || ()),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::MIN,
+            stuck: AktorStuck::Kill,
+        },
+        shutdown: move |_| Err::<(), _>(failure),
+        grace: Duration::from_secs(1),
+    });
+    started.ready().await.unwrap();
+    let report = started.stop().await;
+
+    assert!(report.failures[0].error.contains("entry sentinel"));
     assert_eq!(report.to_string().matches("entry sentinel").count(), 1);
-
-    let report = AktorGroup::new()
-        .run(
-            async |_| Err::<(), _>(AktorError::new("application sentinel", ())),
-            async |_| Err(AktorCleanupError::new("shutdown sentinel", ())),
-        )
-        .await
-        .unwrap_err();
-
-    assert_eq!(
-        report.report.application[0].diagnostics,
-        "application sentinel"
-    );
-    assert_eq!(
-        report.report.application[1].diagnostics,
-        "shutdown sentinel"
-    );
-
-    let report = AktorGroup::new()
-        .run(
-            async |_| -> Result<(), AktorError> { panic!("application panic sentinel") },
-            async |_| -> Result<(), AktorCleanupError> { panic!("shutdown panic sentinel") },
-        )
-        .await
-        .unwrap_err();
-    let text = &report.diagnostics.report;
-
-    assert_eq!(
-        text.matches("application panic sentinel").count(),
-        1,
-        "{text}"
-    );
-    assert_eq!(text.matches("shutdown panic sentinel").count(), 1, "{text}");
-    assert_eq!(report.report.failure.as_ref().unwrap().phase, "run");
-
-    let standalone = Aktor::spawn(SpawnArgs {
-        name: "standalone".into(),
-        capacity: 1,
-        failure: FailurePolicy::Unwind,
-        setup: || Ok(31),
-        cleanup: close,
-    })
-    .await
-    .unwrap();
-    let error = standalone.shutdown().await.unwrap_err();
-    let owner::OwnerFailure::Cleanup(errors) = &error.error else {
-        panic!("standalone cleanup lost");
-    };
-    assert!(errors.errors[0].diagnostics.contains("journal sentinel"));
-
-    let standalone = Aktor::spawn(SpawnArgs {
-        name: "standalone panic".into(),
-        capacity: 1,
-        failure: FailurePolicy::Unwind,
-        setup: || Ok(31_u32),
-        cleanup: |_| Ok::<_, AktorCleanupError>(()),
-    })
-    .await
-    .unwrap();
-    message::call(
-        &standalone.handle,
-        |_: &mut u32, ()| panic!("owner panic sentinel"),
-        (),
-    )
-    .cast()
-    .await;
-
-    let error = standalone.completion().await.unwrap_err();
-    assert_eq!(error.to_string(), "actor thread failed");
-    assert_eq!(
-        format!("{error:#}").matches("owner panic sentinel").count(),
-        1
-    );
 }
 
 #[tokio::test]
 async fn definition() {
-    let definition: AktorDefinition<Aktor<u32>> = AktorNew {
-        name: AktorName::new("definition"),
-        role: AktorNoRole,
-        kind: AktorKind::TokioThread,
-        closures: AktorClosures {
-            start: async || Ok(31),
-            end: async |_| Ok(()),
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
-        },
-        options: Default::default(),
+    fn definition() -> impl AktorDefinition<Aktor<u32>> {
+        AktorNew {
+            name: "definition".into(),
+            kind: AktorKind::TokioThread,
+            start: AktorInit::Ready(async || 31),
+            end: async |_| {},
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
+        }
     }
-    .definition();
     let actors = aktor_start(AktorSetup {
-        actors: definition,
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: definition(),
         shutdown: |_| {},
-        options: Default::default(),
-    })
-    .await
-    .unwrap();
+        grace: Duration::from_secs(5),
+    });
+    actors.ready().await.unwrap();
 
-    assert!(!actors.shutdown().await.failed());
+    assert!(!actors.stop().await.failed());
 }
 
 #[cfg(feature = "local")]
@@ -382,69 +208,51 @@ async fn local() {
             let payload = std::rc::Rc::new(47);
             let original = payload.clone();
             let actors = aktor_start(AktorSetup {
+                stuck: AktorGroupStuck::KeepRunning,
                 actors: AktorNew {
-                    name: AktorName::new("local payload"),
-                    role: AktorNoRole,
+                    name: "local payload".into(),
                     kind: AktorKind::TokioLocal(&executor),
-                    closures: AktorClosures {
-                        start: open,
-                        end: move |_| {
-                            Err(AktorCleanupError::new(format!("local error {payload}"), ()))
-                        },
-                        intervals: vec![],
-                        before_each: None,
-                        after_each: None,
-                    },
-                    options: Default::default(),
+                    start: AktorInit::Try(open),
+                    end: move |_| Err((payload.clone(), format!("local error {payload}"))),
+                    hooks: AktorHooks::NONE,
+                    capacity: NonZeroUsize::new(32).unwrap(),
+                    stuck: AktorStuck::Kill,
                 },
                 shutdown: |_| {},
-                options: Default::default(),
-            })
-            .await
-            .unwrap();
-            let completed = actors.handles.completion();
-            let report = actors.shutdown().await;
+                grace: Duration::from_secs(5),
+            });
+            actors.ready().await.unwrap();
+            let completed = actors.handles().completion();
+            let report = actors.stop().await;
             assert_eq!(report.to_string().matches("local error 47").count(), 1);
-            let error = completed.wait_with_data().await.unwrap_err();
-            let local::OwnerFailure::CleanupFailure(error) = &*error.error else {
+            let (error, completion_text) = completed.wait_with_data().await.unwrap_err();
+            let local::OwnerError::CleanupFailure { .. } = &*error.cause else {
                 panic!("local cleanup value lost");
             };
 
-            assert!(error.diagnostics.contains("local error 47"));
+            assert!(completion_text.contains("local error 47"));
 
             let startup_payload = original.clone();
-            let failed = aktor_start(AktorSetup {
+            let attempt = aktor_start(AktorSetup {
+                stuck: AktorGroupStuck::KeepRunning,
                 actors: AktorNew {
-                    name: AktorName::new("local startup"),
-                    role: AktorNoRole,
+                    name: "local startup".into(),
                     kind: AktorKind::TokioLocal(&executor),
-                    closures: AktorClosures {
-                        start: async move || {
-                            Err::<(), _>(AktorSetupError::new(
-                                format!("local error {startup_payload}"),
-                                (),
-                            ))
-                        },
-                        end: (),
-                        intervals: vec![],
-                        before_each: None,
-                        after_each: None,
-                    },
-                    options: Default::default(),
+                    start: AktorInit::Try(async move || {
+                        Err::<(), _>(((), format!("local error {startup_payload}")))
+                    }),
+                    end: (),
+                    hooks: AktorHooks::NONE,
+                    capacity: NonZeroUsize::new(32).unwrap(),
+                    stuck: AktorStuck::Kill,
                 },
                 shutdown: |_| {},
-                options: Default::default(),
-            })
-            .await
-            .err()
-            .expect("local startup succeeded");
-            let AktorStartError::Init(error) = &failed.error else {
-                panic!("local startup value lost");
-            };
-
-            assert!(error.diagnostics.contains("local error 47"));
-            assert_eq!(format!("{failed:#}").matches("local error 47").count(), 1);
-            assert!(!format!("{failed:?}").contains("local error 47"));
+                grace: Duration::from_secs(5),
+            });
+            let (failed, failed_report) =
+                attempt.ready().await.expect_err("local startup succeeded");
+            assert_eq!(failed.reason(), AktorStartReason::Init);
+            assert_eq!(failed_report.matches("local error 47").count(), 1);
         })
         .await;
 }
@@ -453,188 +261,163 @@ async fn local() {
 async fn validation() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    async fn check<Setups, Mode>(actors: Setups, reason: &str, kind: AktorExecution)
+    async fn check<Setups>(actors: Setups, kind: AktorExecution)
     where
-        Setups: setup::AktorStart<Mode, Group = AktorGroup>,
+        Setups: AktorStart<Group = AktorGroup>,
     {
         let (seen, callback) = tokio::sync::oneshot::channel();
         let startup = aktor_start(AktorSetup {
+            stuck: AktorGroupStuck::KeepRunning,
             actors,
             shutdown: move |report| {
                 seen.send(report).unwrap();
             },
-            options: Default::default(),
+            grace: Duration::from_secs(5),
         });
         let completion = startup.completion();
-        let error = startup.await.err().expect("invalid setup succeeded");
+        let (error, _) = startup.ready().await.expect_err("invalid setup succeeded");
 
-        assert!(matches!(
-            error.error,
-            AktorStartError::Setup(_) | AktorStartError::Thread(_)
-        ));
-        assert_eq!(format!("{error:#}").matches(reason).count(), 1);
+        assert_eq!(error.reason(), AktorStartReason::InvalidSetup);
 
-        for report in [callback.await.unwrap(), completion.wait().await] {
+        for report in [callback.await.unwrap(), completion.wait().await.unwrap()] {
             assert!(report.failed(), "{report}");
-            assert!(!report.timed_out);
-            let failure = report.failure.as_ref().unwrap();
+            assert!(!report.ran_past_grace());
+            let failure = &report.failures[0];
 
-            assert_eq!(failure.kind, Some(kind));
-            assert_eq!(failure.phase, "setup");
-            assert_eq!(report.to_string().matches(reason).count(), 1);
+            assert!(
+                matches!(failure.source, aktor::AktorFailureSource::Actor { kind: execution, .. } if execution == kind)
+            );
+            assert!(matches!(
+                failure.source,
+                aktor::AktorFailureSource::Actor {
+                    phase: aktor::AktorPhase::Start,
+                    ..
+                }
+            ));
         }
     }
 
     for sibling in [false, true] {
         let invalid = AktorNew {
-            name: AktorName::new("invalid"),
-            role: AktorNoRole,
+            name: "invalid".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-                start: async || Ok(0_u32),
-                end: (),
-                intervals: vec![AktorInterval {
-                    every: std::time::Duration::ZERO,
-                    run: (async |_: &mut u32| {}).into(),
-                }],
-                before_each: None,
-                after_each: None,
-            },
-            options: Default::default(),
+            start: AktorInit::Ready(async || 0_u32),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::MAX,
+            stuck: AktorStuck::Kill,
         };
         let cleaned = Arc::new(AtomicUsize::new(0));
         let cleanup = cleaned.clone();
 
         if sibling {
             let healthy = AktorNew {
-                name: AktorName::new("healthy"),
-                role: AktorNoRole,
+                name: "healthy".into(),
                 kind: AktorKind::TokioThread,
-                closures: AktorClosures {
-                    start: async || Ok(()),
-                    end: move |()| {
-                        cleanup.fetch_add(1, Ordering::SeqCst);
-                    },
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: AktorInit::Ready(async || ()),
+                end: move |()| {
+                    cleanup.fetch_add(1, Ordering::SeqCst);
                 },
-                options: Default::default(),
+                hooks: AktorHooks::NONE,
+                capacity: NonZeroUsize::new(32).unwrap(),
+                stuck: AktorStuck::Kill,
             };
 
-            check(
-                (healthy, invalid),
-                "interval duration must be positive",
-                AktorExecution::TokioThread,
-            )
-            .await;
+            check((healthy, invalid), AktorExecution::TokioThread).await;
             assert_eq!(cleaned.load(Ordering::SeqCst), 1);
         } else {
-            check(
-                invalid,
-                "interval duration must be positive",
-                AktorExecution::TokioThread,
-            )
-            .await;
+            check(invalid, AktorExecution::TokioThread).await;
         }
     }
 
     check(
         AktorNew {
-            name: AktorName::new("invalid"),
-            role: AktorNoRole,
+            name: "invalid".into(),
             kind: AktorKind::TokioTask,
-            closures: AktorClosures {
-                start: async || Ok(()),
-                end: (),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 0 },
+            start: AktorInit::Ready(async || ()),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(usize::MAX).unwrap(),
+            stuck: AktorStuck::Kill,
         },
-        "queue capacity must be positive",
         AktorExecution::TokioTask,
     )
     .await;
 }
 
+#[cfg(feature = "testing")]
 #[tokio::test]
 async fn startup_during_shutdown() {
     use tokio::sync::Notify;
 
     for panics in [false, true] {
         let (seen, callback) = tokio::sync::oneshot::channel();
-        let mut group = AktorGroup::new();
-        let completion = group
-            .start_with(move |report| {
+        let started = aktor_start(AktorSetup {
+            stuck: AktorGroupStuck::KeepRunning,
+            actors: AktorNew {
+                name: "running".into(),
+                kind: AktorKind::TokioThread,
+                start: AktorInit::Ready(async || ()),
+                end: (),
+                hooks: AktorHooks::NONE,
+                capacity: NonZeroUsize::new(32).unwrap(),
+                stuck: AktorStuck::Kill,
+            },
+            shutdown: move |report| {
                 seen.send(report).unwrap();
-            })
-            .unwrap();
-        let actor = group.spawn_value("running", ()).await.unwrap();
+            },
+            grace: Duration::from_secs(1),
+        });
+        started.ready().await.unwrap();
+        let completion = started.completion();
+        let actor = started.handles();
+        let group = started.group();
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let gate = release.clone();
         let begin = entered.clone();
-        let mut startup = Box::pin(aktor_start_in(
-            &group,
-            AktorNew {
-                name: AktorName::new("starting"),
-                role: AktorNoRole,
-                kind: AktorKind::TokioTask,
-                closures: AktorClosures {
-                    start: async move || {
-                        begin.notify_one();
-                        gate.notified().await;
+        let spawning = group.spawn(AktorNew {
+            name: "starting".into(),
+            kind: AktorKind::TokioTask,
+            start: AktorInit::Try(async move || {
+                begin.notify_one();
+                gate.notified().await;
 
-                        if panics {
-                            panic!("secondary startup sentinel");
-                        }
+                if panics {
+                    panic!("secondary startup sentinel");
+                }
 
-                        Err::<(), _>(AktorSetupError::new("secondary startup sentinel", ()))
-                    },
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: Default::default(),
-            },
-        ));
+                Err::<(), _>(((), String::from("secondary startup sentinel")))
+            }),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
+        });
+        let mut startup = Box::pin(spawning.ready());
 
         tokio::select! {
             _ = &mut startup => panic!("startup escaped its gate"),
             _ = entered.notified() => {},
         }
 
-        message::call(
-            &actor.handle,
-            |_, ()| panic!("primary operation sentinel"),
-            (),
-        )
-        .cast()
-        .await;
+        aktor::testing::call(actor, async |_| panic!("primary operation sentinel"))
+            .cast()
+            .await
+            .unwrap();
         group.killswitch().wait_stopping().await;
         release.notify_one();
         assert!(startup.await.is_err());
 
-        for report in [callback.await.unwrap(), completion.wait().await] {
-            assert_eq!(report.failure.as_ref().unwrap().actor, "running");
-            assert!(!report.timed_out);
-            let actor = report
-                .actors
-                .iter()
-                .find(|actor| actor.actor == "starting")
-                .unwrap();
-
-            assert_eq!(
-                actor
-                    .diagnostics
-                    .iter()
-                    .filter(|error| error.diagnostics.contains("secondary startup sentinel"))
-                    .count(),
-                1
+        for report in [callback.await.unwrap(), completion.wait().await.unwrap()] {
+            assert!(
+                matches!(&report.failures[0].source, aktor::AktorFailureSource::Actor { name, .. } if name == "running")
             );
+            assert!(!report.ran_past_grace());
+            assert!(report.failures.iter().any(|failure| {
+                matches!(&failure.source, aktor::AktorFailureSource::Actor { name, .. } if name == "starting")
+                    && failure.error.contains("secondary startup sentinel")
+            }));
             assert_eq!(
                 report
                     .to_string()

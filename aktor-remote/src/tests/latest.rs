@@ -1,26 +1,28 @@
 use super::*;
+use aktor::data::{DataError, Reader, Writer};
 use tokio::time::{sleep, timeout};
 
-#[derive(serde::Deserialize)]
 struct Counted {
     value: u32,
-    #[serde(skip)]
     count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl serde::Serialize for Counted {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-
+impl AktorData for Counted {
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
         self.count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut value = serializer.serialize_struct("Counted", 1)?;
-        value.serialize_field("value", &self.value)?;
-        value.end()
+        writer.write(&self.value)
+    }
+
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        Ok(Self {
+            value: reader.read()?,
+            count: Arc::default(),
+        })
     }
 }
 
-#[aktor(remote, serde)]
+#[aktor(remote, latest)]
 async fn counted(_: &State, value: Counted) -> u32 {
     value.value
 }
@@ -30,8 +32,14 @@ async fn encoding() {
     let (actors, actor) = actor().await;
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
-    let server = listen(&socket, &actor).await.unwrap();
-    let client = Client::<State>::new(&socket);
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
+    let client = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (updates, mut results) = counted(
         &client,
@@ -52,22 +60,28 @@ async fn encoding() {
 
     drop((updates, results));
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
 async fn queued() {
     let (actors, actor) = actor().await;
-    let (entered, release) = gates(&actor).await;
-    let mut running = Box::pin(slow(&actor));
+    let (entered, release) = gates(&actor).await.unwrap();
+    let mut running = Box::pin(slow(&actor).into_future());
     tokio::select! {
         _ = entered.notified() => {},
         _ = &mut running => panic!("owner did not block"),
     }
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
-    let server = listen(&socket, &actor).await.unwrap();
-    let client = connect::<State>(&socket).await.unwrap();
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
+    let client = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
     let (updates, mut results) = target(&client, 2).latest();
     timeout(Duration::from_secs(2), results.seen(1))
         .await
@@ -81,23 +95,29 @@ async fn queued() {
     drop((updates, cloned));
 
     release.notify_one();
-    running.await;
+    running.await.unwrap();
     assert_eq!(results.next().await.unwrap().unwrap().unwrap(), 4);
     assert!(results.next().await.is_none());
-    assert_eq!(history(&actor).await, [4]);
+    assert_eq!(history(&actor).await.unwrap(), [4]);
 
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
 async fn running() {
     let (actors, actor) = actor().await;
-    let (entered, release) = gates(&actor).await;
+    let (entered, release) = gates(&actor).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
-    let server = listen(&socket, &actor).await.unwrap();
-    let client = connect::<State>(&socket).await.unwrap();
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
+    let client = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
     let (updates, mut results) = target(&client, 1).latest();
     timeout(Duration::from_secs(2), entered.notified())
         .await
@@ -111,28 +131,34 @@ async fn running() {
     release.notify_one();
 
     assert_eq!(results.next().await.unwrap().unwrap().unwrap(), 1000);
-    assert_eq!(history(&actor).await, [1, 1000]);
+    assert_eq!(history(&actor).await.unwrap(), [1, 1000]);
     updates.send(0);
     assert_eq!(results.next().await.unwrap().unwrap(), Err(Rejected(17)));
 
     drop((updates, results));
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
 async fn independent() {
     let (actors, actor) = actor().await;
-    let (entered, release) = gates(&actor).await;
-    let mut running = Box::pin(slow(&actor));
+    let (entered, release) = gates(&actor).await.unwrap();
+    let mut running = Box::pin(slow(&actor).into_future());
     tokio::select! {
         _ = entered.notified() => {},
         _ = &mut running => panic!("owner did not block"),
     }
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
-    let server = listen(&socket, &actor).await.unwrap();
-    let client = connect::<State>(&socket).await.unwrap();
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
+    let client = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
     let (first, mut a) = target(&client, 2).latest();
     let (second, mut b) = target(&client, 3).latest();
     timeout(Duration::from_secs(2), a.seen(1)).await.unwrap();
@@ -141,7 +167,7 @@ async fn independent() {
     timeout(Duration::from_secs(2), a.seen(2)).await.unwrap();
 
     release.notify_one();
-    running.await;
+    running.await.unwrap();
     assert_eq!(
         (
             a.next().await.unwrap().unwrap().unwrap(),
@@ -152,32 +178,32 @@ async fn independent() {
 
     drop((first, second, a, b));
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
 async fn receiver() {
     let (actors, actor) = actor().await;
-    let (entered, release) = gates(&actor).await;
+    let (entered, release) = gates(&actor).await.unwrap();
     let _unblock = Release(release.clone());
-    let mut running = Box::pin(slow(&actor));
+    let mut running = Box::pin(slow(&actor).into_future());
     tokio::select! {
         _ = entered.notified() => {},
         _ = &mut running => panic!("owner did not block"),
     }
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
-    let server = Server::listen_with(
-        &socket,
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
         &actor,
         ServerOptions {
-            max_connections: 1,
-            ..Default::default()
+            max_connections: core::num::NonZeroUsize::MIN,
+            ..server_options()
         },
     )
     .await
     .unwrap();
-    let client = connect::<State>(&socket).await.unwrap();
+    let client = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
     let (updates, results) = target(&client, 9).latest();
     timeout(Duration::from_secs(2), results.seen(1))
         .await
@@ -187,39 +213,41 @@ async fn receiver() {
         .await
         .unwrap();
 
-    let next = timeout(Duration::from_secs(2), connect::<State>(&socket))
-        .await
-        .unwrap()
-        .unwrap();
+    let next = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
     let reply = timeout(Duration::from_secs(2), read(&next).send())
         .await
         .unwrap()
         .unwrap();
     release.notify_one();
-    running.await;
+    running.await.unwrap();
     reply.await.unwrap();
-    assert!(history(&actor).await.is_empty());
+    assert!(history(&actor).await.unwrap().is_empty());
 
     drop(updates);
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
 async fn budget() {
     let (actors, actor) = actor().await;
-    let (_, release) = gates(&actor).await;
+    let (_, release) = gates(&actor).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
-    let server = listen(&socket, &actor).await.unwrap();
-    let client = Client::<State>::connect_with(
-        &socket,
-        ClientOptions {
-            timeout: Duration::from_millis(150),
-            ..Default::default()
-        },
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
     )
     .await
+    .unwrap();
+    let client = Client::<State>::new(
+        Address::from(&socket),
+        ClientOptions {
+            timeout: Duration::from_millis(150),
+            ..client_options()
+        },
+    )
     .unwrap();
     let (updates, mut results) = target(&client, 2).latest();
     results.next().await.unwrap().unwrap().unwrap();
@@ -232,15 +260,44 @@ async fn budget() {
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert_eq!(
-        (error.cause, error.outcome),
-        (Cause::Timeout, CallError::OutcomeUnknown)
-    );
+    assert_eq!(error.outcome, AktorDeliveryOutcome::OutcomeUnknown);
     release.notify_one();
 
     drop((updates, results));
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_retry_after_connect() {
+    use aktor::call::RetryRequest;
+
+    let (actors, actor) = actor().await;
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("power.sock");
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
+    let client = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
+    let (updates, mut results) = increment(&client, 1).latest();
+    results.next().await.unwrap().unwrap().unwrap();
+
+    let updates = updates.retry(AktorRetryOptions {
+        attempts: core::num::NonZeroUsize::MIN,
+        timeout: Duration::ZERO,
+    });
+    updates.send(10);
+    let error = results.next().await.unwrap().unwrap_err();
+    assert_eq!(error.outcome, AktorDeliveryOutcome::NotAdmitted);
+    assert_eq!(read(&actor).await.unwrap().0, 1);
+
+    drop((updates, results));
+    server.shutdown().await.unwrap();
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
@@ -262,20 +319,20 @@ async fn generation(address: Address) {
     use wire::Message;
 
     let (actors, actor) = actor().await;
-    let (entered, release) = gates(&actor).await;
+    let (entered, release) = gates(&actor).await.unwrap();
     let _unblock = Release(release.clone());
-    let server = Server::listen_with(
-        address,
+    let server = Server::listen(
+        listen_address(address),
         &actor,
         ServerOptions {
-            max_connections: 1,
-            ..ServerOptions::default()
+            max_connections: core::num::NonZeroUsize::MIN,
+            ..server_options()
         },
     )
     .await
     .unwrap();
-    let client = connect::<State>(server.address.clone()).await.unwrap();
-    let mut old = client.inner.take_idle().unwrap().unwrap().stream;
+    let client = Client::<State>::new(server.address.clone(), client_options()).unwrap();
+    let mut old = client.inner.open().await.er_unwrap().stream;
 
     wire::write(
         &mut old,
@@ -287,8 +344,8 @@ async fn generation(address: Address) {
         wire::MAX_FRAME,
     )
     .await
-    .unwrap();
-    let Message::LatestReady { session } = wire::read(&mut old, wire::MAX_FRAME).await.unwrap()
+    .er_unwrap();
+    let Message::LatestReady { session } = wire::read(&mut old, wire::MAX_FRAME).await.er_unwrap()
     else {
         panic!("missing latest acknowledgement")
     };
@@ -298,19 +355,21 @@ async fn generation(address: Address) {
             &Message::Update {
                 session,
                 revision,
-                input: <DataCodec as Codec<(u32,)>>::encode(&(revision as u32,)).unwrap(),
+                input: <DataCodec as Codec<(u32,)>>::encode(&(revision as u32,))
+                    .unwrap()
+                    .into(),
             },
             wire::MAX_FRAME,
         )
         .await
-        .unwrap();
+        .er_unwrap();
         let _ = timeout(
             Duration::from_secs(2),
             wire::read(&mut old, wire::MAX_FRAME),
         )
         .await
         .unwrap()
-        .unwrap();
+        .er_unwrap();
         if revision == 1 {
             timeout(Duration::from_secs(2), entered.notified())
                 .await
@@ -321,7 +380,7 @@ async fn generation(address: Address) {
     let mut replacement = timeout(Duration::from_secs(2), client.inner.open())
         .await
         .unwrap()
-        .unwrap()
+        .er_unwrap()
         .stream;
     wire::write(
         &mut replacement,
@@ -333,33 +392,33 @@ async fn generation(address: Address) {
         wire::MAX_FRAME,
     )
     .await
-    .unwrap();
+    .er_unwrap();
     let ready = timeout(
         Duration::from_secs(2),
         wire::read(&mut replacement, wire::MAX_FRAME),
     )
     .await
     .unwrap()
-    .unwrap();
+    .er_unwrap();
     assert!(matches!(ready, Message::LatestReady { session: ready } if ready == session));
     wire::write(
         &mut replacement,
         &Message::Update {
             session,
             revision: 3,
-            input: <DataCodec as Codec<(u32,)>>::encode(&(3,)).unwrap(),
+            input: <DataCodec as Codec<(u32,)>>::encode(&(3,)).unwrap().into(),
         },
         wire::MAX_FRAME,
     )
     .await
-    .unwrap();
+    .er_unwrap();
     let _ = timeout(
         Duration::from_secs(2),
         wire::read(&mut replacement, wire::MAX_FRAME),
     )
     .await
     .unwrap()
-    .unwrap();
+    .er_unwrap();
     release.notify_one();
     let _ = timeout(
         Duration::from_secs(2),
@@ -367,12 +426,13 @@ async fn generation(address: Address) {
     )
     .await
     .unwrap()
-    .unwrap();
-    assert_eq!(history(&actor).await, [1, 3]);
+    .er_unwrap();
+    assert_eq!(history(&actor).await.unwrap(), [1, 3]);
 
-    drop((old, replacement));
+    drop(old);
+    connection::finish(replacement, Duration::from_secs(1));
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
@@ -382,14 +442,20 @@ async fn lost() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("power.sock");
         let proxy = directory.path().join("proxy.sock");
-        let server = listen(&socket, &actor).await.unwrap();
+        let server = Server::listen(
+            listen_address(Address::from(&socket)),
+            &actor,
+            server_options(),
+        )
+        .await
+        .unwrap();
         let forwarding = lose_reply(&proxy, &socket).await;
-        let client = connect::<State>(&proxy).await.unwrap();
+        let client = Client::<State>::new(Address::from(&proxy), client_options()).unwrap();
 
         if retry {
             let (_updates, mut results) = increment(&client, 1)
-                .retry(AktorRetryOpts {
-                    attempts: 2,
+                .retry(AktorRetryOptions {
+                    attempts: core::num::NonZeroUsize::new(2).unwrap(),
                     timeout: Duration::from_secs(2),
                 })
                 .latest();
@@ -409,14 +475,14 @@ async fn lost() {
                 .unwrap()
                 .unwrap()
                 .unwrap_err();
-            assert_eq!(error.outcome, CallError::OutcomeUnknown);
-            assert_eq!(read(&actor).await.0, 1);
+            assert_eq!(error.outcome, AktorDeliveryOutcome::OutcomeUnknown);
+            assert_eq!(read(&actor).await.unwrap().0, 1);
         }
 
         forwarding.abort();
         let _ = forwarding.await;
         server.shutdown().await.unwrap();
-        actors.shutdown().await;
+        let _ = actors.stop().await;
     }
 }
 
@@ -426,36 +492,42 @@ async fn uncertain_retry() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
     let proxy = directory.path().join("proxy.sock");
-    let server = listen(&socket, &actor).await.unwrap();
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
     let forwarding = lose_reply(&proxy, &socket).await;
-    let client = Client::<State>::with_options(
-        &proxy,
+    let client = Client::<State>::new(
+        Address::from(&proxy),
         ClientOptions {
             retry_delay: Duration::from_millis(200),
-            ..Default::default()
+            ..client_options()
         },
     )
     .unwrap();
     let (_updates, mut results) = echo(&client, vec![0; 1024])
-        .retry(AktorRetryOpts {
-            attempts: 2,
+        .retry(AktorRetryOptions {
+            attempts: core::num::NonZeroUsize::new(2).unwrap(),
             timeout: Duration::from_secs(2),
         })
         .latest();
     timeout(Duration::from_secs(2), async {
-        while read(&actor).await.0 == 0 {
+        while read(&actor).await.unwrap().0 == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
     server.shutdown().await.unwrap();
-    let server = Server::listen_with(
-        &socket,
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
         &actor,
         ServerOptions {
             max_frame: 128,
-            ..Default::default()
+            ..server_options()
         },
     )
     .await
@@ -466,15 +538,12 @@ async fn uncertain_retry() {
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert_eq!(
-        (error.cause, error.outcome),
-        (Cause::Codec, CallError::OutcomeUnknown)
-    );
+    assert_eq!(error.outcome, AktorDeliveryOutcome::OutcomeUnknown);
 
     forwarding.abort();
     let _ = forwarding.await;
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
@@ -482,19 +551,30 @@ async fn backoff() {
     let (actors, actor) = actor().await;
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
-    let client = Client::<State>::new(&socket);
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
+    let proxy = directory.path().join("proxy.sock");
+    let listener = UnixListener::bind(&proxy).unwrap();
+    let client = Client::<State>::new(Address::from(&proxy), client_options()).unwrap();
     let (updates, mut results) = read(&client)
-        .retry(AktorRetryOpts {
-            attempts: 2,
-            timeout: Duration::from_millis(50),
+        .retry(AktorRetryOptions {
+            attempts: core::num::NonZeroUsize::new(2).unwrap(),
+            timeout: Duration::from_secs(5),
         })
         .latest();
-    let clone = updates.clone();
-    sleep(Duration::from_millis(20)).await;
-    drop(clone);
-    sleep(Duration::from_millis(60)).await;
-    let server = listen(&socket, &actor).await.unwrap();
-
+    let forwarding = tokio::spawn(async move {
+        let (first, _) = listener.accept().await.unwrap();
+        drop(first);
+        let (mut client, mut backend) = proxy_pair(&listener, &socket).await;
+        tokio::io::copy_bidirectional(&mut client, &mut backend)
+            .await
+            .unwrap();
+    });
     timeout(Duration::from_secs(2), results.next())
         .await
         .unwrap()
@@ -502,8 +582,9 @@ async fn backoff() {
         .unwrap();
 
     drop((updates, results));
+    forwarding.await.unwrap();
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
@@ -512,7 +593,13 @@ async fn obsolete() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
     let proxy = directory.path().join("proxy.sock");
-    let server = listen(&socket, &actor).await.unwrap();
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
     let listener = UnixListener::bind(&proxy).unwrap();
     let target_socket = socket.clone();
     let held = Arc::new(Notify::new());
@@ -529,7 +616,7 @@ async fn obsolete() {
         let writing = async {
             let mut first = true;
             loop {
-                let answer = wire::read(&mut answers, wire::MAX_FRAME).await.unwrap();
+                let answer = wire::read(&mut answers, wire::MAX_FRAME).await.er_unwrap();
                 if first && matches!(answer, wire::Message::LatestAnswer { .. }) {
                     first = false;
                     captured.notify_one();
@@ -537,12 +624,12 @@ async fn obsolete() {
                 }
                 wire::write(&mut replies, &answer, wire::MAX_FRAME)
                     .await
-                    .unwrap();
+                    .er_unwrap();
             }
         };
         tokio::join!(reading, writing);
     });
-    let client = connect::<State>(&proxy).await.unwrap();
+    let client = Client::<State>::new(Address::from(&proxy), client_options()).unwrap();
     let (updates, mut results) = target(&client, 7).latest();
     timeout(Duration::from_secs(2), held.notified())
         .await
@@ -571,17 +658,17 @@ async fn obsolete() {
     assert_eq!(results.next().await.unwrap().unwrap().unwrap(), 10);
 
     drop((updates, results));
+    server.shutdown().await.unwrap();
     forwarding.abort();
     let _ = forwarding.await;
-    server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
 async fn actor_shutdown() {
     let (actors, actor) = actor().await;
-    let (entered, release) = gates(&actor).await;
-    let mut running = Box::pin(slow(&actor));
+    let (entered, release) = gates(&actor).await.unwrap();
+    let mut running = Box::pin(slow(&actor).into_future());
     tokio::select! {
         _ = entered.notified() => {},
         _ = &mut running => panic!("owner did not block"),
@@ -589,27 +676,34 @@ async fn actor_shutdown() {
 
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
-    let server = listen(&socket, &actor).await.unwrap();
-    let client = connect::<State>(&socket).await.unwrap();
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
+    let client = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
     let (_updates, mut results) = target(&client, 9).latest();
     timeout(Duration::from_secs(2), results.seen(1))
         .await
         .unwrap();
 
-    let closing = actors.shutdown();
-    let handle = actor.new_handle();
+    let closing = actors.stop();
+    let handle = actor.handle();
     timeout(Duration::from_secs(2), handle.wait_closing())
         .await
         .unwrap();
     release.notify_one();
-    running.await;
+    running.await.unwrap();
 
     let (_, output) = timeout(Duration::from_secs(2), async {
-        tokio::join!(async { closing.await }, results.next())
+        tokio::join!(closing, results.next())
     })
     .await
     .unwrap();
     assert_eq!(output.unwrap().unwrap().unwrap(), 9);
+    assert!(results.next().await.is_none());
     let _ = server.shutdown().await;
 }
 
@@ -617,11 +711,11 @@ async fn actor_shutdown() {
 async fn shutdown() {
     for overdue in [false, true] {
         let (actors, actor) = actor().await;
-        let (entered, release) = gates(&actor).await;
+        let (entered, release) = gates(&actor).await.unwrap();
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("power.sock");
-        let server = Server::listen_with(
-            &socket,
+        let server = Server::listen(
+            listen_address(Address::from(&socket)),
             &actor,
             ServerOptions {
                 shutdown_timeout: if overdue {
@@ -629,12 +723,12 @@ async fn shutdown() {
                 } else {
                     Duration::from_secs(1)
                 },
-                ..Default::default()
+                ..server_options()
             },
         )
         .await
         .unwrap();
-        let client = connect::<State>(&socket).await.unwrap();
+        let client = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
         let (updates, mut results) = slow(&client).latest();
         timeout(Duration::from_secs(2), entered.notified())
             .await
@@ -643,10 +737,12 @@ async fn shutdown() {
         tokio::pin!(closing);
 
         if overdue {
-            assert_eq!(closing.await.unwrap_err().cause, Cause::Timeout);
+            assert!(
+                failures(closing.await.unwrap_err().0).contains(&ServerFailure::ShutdownTimeout)
+            );
             assert_eq!(
                 results.next().await.unwrap().unwrap_err().outcome,
-                CallError::OutcomeUnknown
+                AktorDeliveryOutcome::OutcomeUnknown
             );
             release.notify_one();
         } else {
@@ -659,7 +755,7 @@ async fn shutdown() {
         }
 
         drop((updates, results));
-        actors.shutdown().await;
+        let _ = actors.stop().await;
     }
 }
 
@@ -668,14 +764,20 @@ async fn runtime() {
     let (actors, actor) = actor().await;
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
-    let server = listen(&socket, &actor).await.unwrap();
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
     let (updates, mut results) = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let client = connect::<State>(&socket).await.unwrap();
+            let client = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
             target(&client, 2).latest()
         })
     })
@@ -687,74 +789,82 @@ async fn runtime() {
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert_eq!(error.cause, Cause::Closed);
+    assert!(error.report.contains("Closed"));
 
     drop(updates);
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }
 
 #[tokio::test]
 async fn rejected() {
     let (actors, actor) = actor().await;
-    let (entered, release) = gates(&actor).await;
+    let (entered, release) = gates(&actor).await.unwrap();
     let _unblock = Release(release.clone());
-    let mut running = Box::pin(slow(&actor));
+    let mut running = Box::pin(slow(&actor).into_future());
     tokio::select! {
         _ = entered.notified() => {},
         _ = &mut running => panic!("owner did not block"),
     }
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("power.sock");
-    let server = Server::listen_with(
-        &socket,
+    let server = Server::listen(
+        listen_address(Address::from(&socket)),
         &actor,
         ServerOptions {
-            max_connections: 1,
+            max_connections: core::num::NonZeroUsize::MIN,
             max_frame: 4096,
-            ..Default::default()
+            ..server_options()
         },
     )
     .await
     .unwrap();
-    let client = connect::<State>(&socket).await.unwrap();
+    let client = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
     let (updates, mut results) = echo(&client, vec![1]).latest();
     timeout(Duration::from_secs(2), results.seen(1))
         .await
         .unwrap();
-    let overflow = connect::<State>(&socket).await.unwrap();
+    let overflow = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
     let error = increment(&overflow, 100).await.unwrap_err();
-    assert_eq!(
-        (error.cause, error.outcome),
-        (Cause::Closed, CallError::NotAdmitted)
-    );
+    assert_eq!(error.outcome, AktorDeliveryOutcome::NotAdmitted);
+    let (refused, mut refusal) = increment(&overflow, 100).latest();
+    let error = refusal.next().await.unwrap().unwrap_err();
+    assert_eq!(error.outcome, AktorDeliveryOutcome::NotAdmitted);
+    drop((refused, refusal));
+
     updates.send(vec![2]);
     timeout(Duration::from_secs(2), results.seen(2))
         .await
         .unwrap();
 
     updates.send(vec![0; 8192]);
-    assert_eq!(
-        results.next().await.unwrap().unwrap_err().cause,
-        Cause::Codec
+    assert!(
+        results
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err()
+            .report
+            .contains("Codec")
     );
 
     timeout(Duration::from_secs(2), server.cancelled.notified())
         .await
         .unwrap();
-    let next = timeout(Duration::from_secs(2), connect::<State>(&socket))
-        .await
-        .unwrap()
-        .unwrap();
+    let next = Client::<State>::new(Address::from(&socket), client_options()).unwrap();
     let reply = timeout(Duration::from_secs(2), read(&next).send())
         .await
         .unwrap()
         .unwrap();
     release.notify_one();
-    running.await;
+    running.await.unwrap();
     assert_eq!(reply.await.unwrap().0, 1);
 
     drop((updates, results));
-    server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let (error, _) = server.shutdown().await.unwrap_err();
+    assert_eq!(
+        failures(error),
+        vec![ServerFailure::session(Cause::Closed); 2]
+    );
+    let _ = actors.stop().await;
 }

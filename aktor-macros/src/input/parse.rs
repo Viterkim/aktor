@@ -59,11 +59,50 @@ pub fn state(input: &FnArg) -> syn::Result<State> {
         ));
     };
 
+    let mut borrowed = Borrowed(None);
+
+    borrowed.visit_type(&reference.elem);
+
+    if let Some(lifetime) = borrowed.0 {
+        return Err(syn::Error::new(
+            lifetime.span(),
+            "actor state must be 'static, the actor owns it for as long as it runs",
+        ));
+    }
+
     Ok(State {
         pattern,
         ty: (*reference.elem).clone(),
         mutable: reference.mutability.is_some(),
     })
+}
+
+/// A lifetime in the state type. Function pointers and closure traits are left to rustc,
+/// `Box<dyn Fn(&str)>` borrows nothing from outside.
+struct Borrowed(Option<syn::Lifetime>);
+impl<'a> Visit<'a> for Borrowed {
+    fn visit_type_fn_ptr(&mut self, _: &'a syn::TypeFnPtr) {}
+
+    fn visit_type_trait_object(&mut self, _: &'a syn::TypeTraitObject) {}
+
+    fn visit_type_impl_trait(&mut self, _: &'a syn::TypeImplTrait) {}
+
+    fn visit_parenthesized_generic_arguments(&mut self, _: &'a syn::ParenthesizedGenericArguments) {
+    }
+
+    fn visit_lifetime(&mut self, lifetime: &'a syn::Lifetime) {
+        if lifetime.ident != "static" && self.0.is_none() {
+            self.0 = Some(lifetime.clone());
+        }
+    }
+
+    fn visit_type_reference(&mut self, reference: &'a syn::TypeReference) {
+        if reference.lifetime.is_none() && self.0.is_none() {
+            self.0 = Some(syn::Lifetime::new("'_", reference.and_token.span));
+        }
+
+        visit::visit_type_reference(self, reference);
+    }
 }
 
 pub fn argument(input: &FnArg) -> syn::Result<Argument> {
@@ -111,5 +150,14 @@ impl<'a> Visit<'a> for OutputVisitor {
         }
 
         visit::visit_type_reference(self, reference);
+    }
+
+    fn visit_lifetime(&mut self, lifetime: &'a syn::Lifetime) {
+        if lifetime.ident == "_" && self.error.is_none() {
+            self.error = Some(syn::Error::new(
+                lifetime.span(),
+                "actor outputs cannot borrow the state; return owned data or an explicit 'static reference",
+            ));
+        }
     }
 }

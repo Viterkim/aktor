@@ -1,4 +1,5 @@
 use aktor::*;
+use core::num::NonZeroUsize;
 use futures_util::FutureExt;
 use std::{
     cell::Cell,
@@ -15,17 +16,13 @@ struct Counter {
     value: Rc<Cell<u32>>,
 }
 
-mod aktors {
-    pub struct Counter;
-}
-
-#[aktor(role = aktors::Counter)]
+#[aktor(latest)]
 async fn add(counter: &mut Counter, by: u32) -> Rc<Cell<u32>> {
     counter.value.set(counter.value.get() + by);
     counter.value.clone()
 }
 
-#[aktor(role = aktors::Counter)]
+#[aktor]
 async fn wait(counter: &mut Counter, millis: u32) -> u32 {
     gloo_timers::future::TimeoutFuture::new(millis).await;
     counter.value.set(counter.value.get() + 1);
@@ -46,52 +43,47 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
     let (closed, closing) = tokio::sync::oneshot::channel();
     let hook_cleaned = cleaned.clone();
     let actors = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
         actors: AktorNew {
-            name: AktorName::new("browser counter"),
-            role: aktors::Counter,
+            name: "browser counter".into(),
             kind: AktorKind::BrowserLocal,
-            closures: AktorClosures {
-                start: async move || Ok::<_, AktorSetupError>(Counter { value: count }),
-
-                end: async move |_: Counter| {
-                    end.set(true);
-                    Ok::<_, AktorCleanupError>(())
-                },
-                intervals: vec![AktorInterval {
-                    every: Duration::from_millis(5),
-                    run: (async move |_: &mut Counter| {
+            start: AktorInit::Ready(async move || Counter { value: count }),
+            end: async move |_: Counter| {
+                end.set(true);
+            },
+            hooks: AktorHooks {
+                intervals: vec![
+                    AktorInterval::new(Duration::from_millis(5), async move |_: &mut Counter| {
                         tick.set(true);
                     })
-                    .into(),
-                }],
-                before_each: Some(
-                    (move |_: &mut Counter, _: operation::Operation| {
-                        log.set(log.get() + 1);
-                    })
-                    .into(),
-                ),
-                after_each: None,
+                    .unwrap(),
+                ],
+                before_each: move |_: &mut Counter, _: operation::Operation| {
+                    log.set(log.get() + 1);
+                },
+                after_each: (),
             },
-            options: AktorNewOptions { capacity: 32 },
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
         },
         shutdown: move |report| {
             assert!(hook_cleaned.get());
             let _sent = closed.send(report);
         },
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
-    })
-    .await
-    .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
+        grace: Duration::from_secs(5),
+    });
+    actors
+        .ready()
+        .await
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
-    let result = add(&actors.handles, 2).await;
+    let result = add(actors.handles(), 2).await.unwrap();
 
     if !Rc::ptr_eq(&result, &value) || result.get() != 2 {
         return Err(JsValue::from_str("local state or output changed"));
     }
 
-    let (sender, mut results) = add::latest(&actors.handles);
+    let (sender, mut results) = add::latest(actors.handles());
 
     sender.send(3);
     sender.send(5);
@@ -99,13 +91,14 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
     let result = results
         .next()
         .await
-        .ok_or_else(|| JsValue::from_str("latest ended early"))?;
+        .ok_or_else(|| JsValue::from_str("latest ended early"))?
+        .unwrap();
 
     if result.get() != 7 {
         return Err(JsValue::from_str("latest did not coalesce"));
     }
 
-    let timed = wait(&actors.handles, 20)
+    let timed = wait(actors.handles(), 20)
         .timeout(Duration::from_millis(1))
         .await;
 
@@ -115,13 +108,13 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
         ));
     }
 
-    if add(&actors.handles, 0).await.get() != 8 || !interval.get() || before.get() < 4 {
+    if add(actors.handles(), 0).await.unwrap().get() != 8 || !interval.get() || before.get() < 4 {
         return Err(JsValue::from_str(
             "timed operation or owner hooks did not run",
         ));
     }
 
-    let report = actors.shutdown().await;
+    let report = actors.stop().await;
     let notified = closing
         .await
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -129,42 +122,36 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
     if report.to_string() != notified.to_string()
         || report.failed()
         || !cleaned.get()
-        || report.actors[0].kind != Some(AktorExecution::BrowserLocal)
+        || report.actors[0].kind != AktorExecution::BrowserLocal
     {
         return Err(JsValue::from_str("browser local cleanup"));
     }
 
     let actors = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
         actors: AktorNew {
-            name: AktorName::new("supplied browser executor"),
-            role: aktors::Counter,
-            kind: AktorKind::Local::<local::clock::Browser>(|future| {
+            name: "supplied browser executor".into(),
+            kind: AktorKind::Local::<local::clock::Browser, _, _>(|future| {
                 wasm_bindgen_futures::spawn_local(future);
-                Ok(())
+                Ok::<(), ((), String)>(())
             }),
-            closures: AktorClosures {
-                start: async || {
-                    Ok::<_, AktorSetupError>(Counter {
-                        value: Rc::new(Cell::new(0)),
-                    })
-                },
-
-                end: (),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 32 },
+            start: AktorInit::Ready(async || Counter {
+                value: Rc::new(Cell::new(0)),
+            }),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
-    })
-    .await
-    .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
+        grace: Duration::from_secs(5),
+    });
+    actors
+        .ready()
+        .await
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
-    let timed = wait(&actors.handles, 10)
+    let timed = wait(actors.handles(), 10)
         .timeout(Duration::from_millis(1))
         .await;
 
@@ -172,27 +159,27 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
         return Err(JsValue::from_str("supplied executor timeout"));
     }
 
-    if add(&actors.handles, 0).await.get() != 1 {
+    if add(actors.handles(), 0).await.unwrap().get() != 1 {
         return Err(JsValue::from_str("supplied executor lost admitted work"));
     }
 
-    let report = actors.shutdown().await;
+    let report = actors.stop().await;
 
-    if report.failed() || report.actors[0].kind != Some(AktorExecution::Local) {
+    if report.failed() || report.actors[0].kind != AktorExecution::Local {
         return Err(JsValue::from_str("supplied executor cleanup"));
     }
 
     let actors = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
         actors: AktorNew {
-            name: AktorName::new("custom browser executor"),
-            role: aktors::Counter,
+            name: "custom browser executor".into(),
             kind: AktorKind::Custom(
                 local::clock::Browser,
                 |future| {
                     wasm_bindgen_futures::spawn_local(future);
-                    Ok(())
+                    Ok::<(), ((), String)>(())
                 },
-                async |mut runner: AktorRunner<'_, Counter, 0, ()>| {
+                async |mut runner: AktorRunner<'_, Counter>| {
                     while let Some(call) = runner.next().await {
                         call.run().await;
                     }
@@ -200,38 +187,32 @@ pub async fn local_setup_check() -> Result<bool, JsValue> {
                     Ok(())
                 },
             ),
-            closures: AktorClosures {
-                start: async || {
-                    Ok::<_, AktorSetupError>(Counter {
-                        value: Rc::new(Cell::new(0)),
-                    })
-                },
-
-                end: (),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 32 },
+            start: AktorInit::Ready(async || Counter {
+                value: Rc::new(Cell::new(0)),
+            }),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
-    })
-    .await
-    .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
+        grace: Duration::from_secs(5),
+    });
+    actors
+        .ready()
+        .await
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
-    if add(&actors.handles, 3).await.get() != 3 {
+    if add(actors.handles(), 3).await.unwrap().get() != 3 {
         return Err(JsValue::from_str("custom browser call"));
     }
 
-    let report = actors.shutdown().await;
+    let report = actors.stop().await;
 
-    Ok(!report.failed() && report.actors[0].kind == Some(AktorExecution::Custom))
+    Ok(!report.failed() && report.actors[0].kind == AktorExecution::Custom)
 }
 
-#[aktor]
+#[aktor(latest)]
 async fn increment(counter: &mut Cell<u32>, by: u32) -> u32 {
     counter.set(counter.get() + by);
     counter.get()
@@ -265,33 +246,34 @@ async fn browser_budget() -> Result<(), JsValue> {
                 if state.get() == 4096 {
                     Ok(())
                 } else {
-                    Err(AktorCleanupError::new("busy owner lost admitted work", ()))
+                    Err(((), String::from("busy owner lost admitted work")))
                 }
             };
 
             macro_rules! check {
                 ($kind:expr) => {{
                     let actors = aktor_start(AktorSetup {
+                        stuck: AktorGroupStuck::KeepRunning,
                         actors: AktorNew {
-                            name: AktorName::new("browser budget"),
-                            role: AktorNoRole,
+                            name: "browser budget".into(),
                             kind: $kind,
-                            closures: AktorClosures {
-                                start: async || Ok::<_, AktorSetupError>(Cell::new(0)),
-                                before_each: Some(before.into()),
-                                end,
+                            start: AktorInit::Ready(async || (Cell::new(0))),
+                            end,
+                            hooks: AktorHooks {
                                 intervals: vec![],
-                                after_each: None,
+                                before_each: before,
+                                after_each: (),
                             },
-                            options: AktorNewOptions { capacity: 4096 },
+                            capacity: NonZeroUsize::new(4096).unwrap(),
+                            stuck: AktorStuck::Kill,
                         },
                         shutdown: |_| {},
-                        options: AktorOptions {
-                            shutdown_grace: Duration::from_secs(5),
-                        },
-                    })
-                    .await
-                    .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
+                        grace: Duration::from_secs(5),
+                    });
+                    actors
+                        .ready()
+                        .await
+                        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
                     observe_budget(actors, entered, count, cleaned, stop, |handle| {
                         increment(handle, 1).send().now_or_never().is_some()
@@ -304,9 +286,9 @@ async fn browser_budget() -> Result<(), JsValue> {
                 0 => check!(AktorKind::BrowserLocal),
                 1 => check!(AktorKind::BevyLocal(&pool)),
                 2 => check!(AktorKind::BevyTask(&pool)),
-                _ => check!(AktorKind::Local::<local::clock::Browser>(|future| {
+                _ => check!(AktorKind::Local::<local::clock::Browser, _, _>(|future| {
                     wasm_bindgen_futures::spawn_local(future);
-                    Ok(())
+                    Ok::<(), ((), String)>(())
                 })),
             };
 
@@ -334,8 +316,9 @@ async fn observe_budget<H, G: setup::group::AktorSetupGroup>(
     send: impl Fn(&H) -> bool,
 ) -> Result<u32, JsValue> {
     for _ in 0..4096 {
-        if !send(&actors.handles) {
-            let report = actors.shutdown().await;
+        if !send(actors.handles()) {
+            G::stop(&actors.killswitch());
+            let report = actors.completion().await.unwrap();
             return Err(JsValue::from_str(&format!("busy admission: {report}")));
         }
     }
@@ -346,15 +329,14 @@ async fn observe_budget<H, G: setup::group::AktorSetupGroup>(
     gloo_timers::future::TimeoutFuture::new(0).await;
     let observed = count.load(Ordering::Relaxed);
 
-    if stop {
-        G::stop(&actors.killswitch());
-    } else {
+    if !stop {
         while count.load(Ordering::Relaxed) < 4096 {
             gloo_timers::future::TimeoutFuture::new(0).await;
         }
     }
 
-    let report = actors.shutdown().await;
+    G::stop(&actors.killswitch());
+    let report = actors.completion().await.unwrap();
 
     if report.failed() || cleaned.load(Ordering::Relaxed) != 1 {
         return Err(JsValue::from_str(&format!("busy cleanup: {report}")));
@@ -374,66 +356,52 @@ async fn gated(counter: &mut Cell<u32>, gate: tokio::sync::oneshot::Receiver<()>
 pub async fn bevy_setup_check() -> Result<bool, JsValue> {
     let pool = bevy_tasks::TaskPool::new();
     let local_setup = AktorNew {
-        name: AktorName::new("Bevy browser local"),
-        role: aktors::Counter,
+        name: "Bevy browser local".into(),
         kind: AktorKind::BevyLocal(&pool),
-        closures: AktorClosures {
-            start: async || {
-                Ok::<_, AktorSetupError>(Counter {
-                    value: Rc::new(Cell::new(0)),
-                })
-            },
-
-            end: (),
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
-        },
-        options: AktorNewOptions { capacity: 32 },
+        start: AktorInit::Ready(async || Counter {
+            value: Rc::new(Cell::new(0)),
+        }),
+        end: (),
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::new(32).unwrap(),
+        stuck: AktorStuck::Kill,
     };
 
     let task_setup = AktorNew {
-        name: AktorName::new("Bevy browser task"),
-        role: AktorNoRole,
+        name: "Bevy browser task".into(),
         kind: AktorKind::BevyTask(&pool),
-        closures: AktorClosures {
-            start: async || Ok::<_, AktorSetupError>(Cell::new(0)),
-
-            end: async |counter: Cell<u32>| {
-                if counter.get() == 7 {
-                    Ok::<_, AktorCleanupError>(())
-                } else {
-                    Err(AktorError::new("Bevy task lost admitted work", ()))
-                }
-            },
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
+        start: AktorInit::Ready(async || Cell::new(0)),
+        end: async |counter: Cell<u32>| {
+            if counter.get() == 7 {
+                Ok(())
+            } else {
+                Err(((), String::from("Bevy task lost admitted work")))
+            }
         },
-        options: AktorNewOptions { capacity: 32 },
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::new(32).unwrap(),
+        stuck: AktorStuck::Kill,
     };
 
     let actors = aktor_start(AktorSetup {
-        actors: aktor_setups! {
-            local: local_setup,
-            task: task_setup,
-        },
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: (local_setup, task_setup),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
-    })
-    .await
-    .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
+        grace: Duration::from_secs(5),
+    });
+    actors
+        .ready()
+        .await
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
-    if add(&actors.handles.local, 2).await.get() != 2
-        || increment(&actors.handles.task, 2).await != 2
+    if add(&actors.handles().0, 2).await.unwrap().get() != 2
+        || increment(&actors.handles().1, 2).await.unwrap() != 2
     {
         return Err(JsValue::from_str("Bevy ordinary calls"));
     }
 
     let (release, gate) = tokio::sync::oneshot::channel();
-    let mut reply = gated(&actors.handles.task, gate).send().await;
+    let mut reply = gated(&actors.handles().1, gate).send().await.unwrap();
     let timed = reply.timeout(Duration::from_millis(1)).await;
 
     if !matches!(timed, Err(AktorTimeoutError { admitted: true, .. })) {
@@ -445,22 +413,22 @@ pub async fn bevy_setup_check() -> Result<bool, JsValue> {
         .send(())
         .map_err(|_| JsValue::from_str("Bevy operation was cancelled"))?;
 
-    let (input, mut output) = increment::latest(&actors.handles.task);
+    let (input, mut output) = increment::latest(&actors.handles().1);
 
     input.send(4);
 
-    let report = actors.shutdown().await;
+    let report = actors.stop().await;
 
-    if report.failed() || output.next().await != Some(7) || output.next().await.is_some() {
+    if report.failed() || output.next().await != Some(Ok(7)) || output.next().await.is_some() {
         return Err(JsValue::from_str("Bevy browser cleanup/latest"));
     }
 
     Ok(report
         .actors
         .iter()
-        .any(|actor| actor.kind == Some(AktorExecution::BevyLocal))
+        .any(|actor| actor.kind == AktorExecution::BevyLocal)
         && report
             .actors
             .iter()
-            .any(|actor| actor.kind == Some(AktorExecution::BevyTask)))
+            .any(|actor| actor.kind == AktorExecution::BevyTask))
 }

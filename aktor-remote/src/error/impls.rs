@@ -1,41 +1,38 @@
 use super::*;
-use aktor::worker::{WorkerCause, WorkerError};
-use std::{fmt, io};
 
-impl Error {
-    pub fn new(outcome: CallError, cause: Cause, diagnostics: impl Into<String>) -> Self {
+impl WireFailure {
+    pub fn rejected(outcome: AktorDeliveryOutcome, cause: Cause, reason: Rejection) -> Self {
         Self {
+            failure_id: None,
             outcome,
             cause,
-            diagnostics: diagnostics.into(),
+            reason,
+            owner_report: None,
         }
     }
-}
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "remote call {:?}: {:?}", self.outcome, self.cause)?;
 
-        if f.alternate() {
-            write!(f, "\n{}", self.diagnostics)?;
+    pub fn closed(error: aktor::AktorDeliveryError, reason: Rejection) -> Self {
+        Self {
+            failure_id: error.failure_id,
+            outcome: error.outcome,
+            cause: Cause::Closed,
+            reason,
+            owner_report: error.failure_id.map(|_| error.report),
         }
-
-        Ok(())
     }
-}
-impl std::error::Error for Error {}
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
-        Self::new(CallError::NotAdmitted, Cause::Connection, error.to_string())
-    }
-}
-impl From<WorkerError> for Error {
-    fn from(error: WorkerError) -> Self {
-        let cause = match &error.cause {
-            WorkerCause::Codec(_) => Cause::Codec,
-            WorkerCause::Closed => Cause::Closed,
-            _ => Cause::Protocol,
-        };
 
-        Self::new(error.outcome, cause, format!("{error:#}"))
+    pub fn received(self) -> ErTree<Rejection> {
+        let error = er_new!(self.reason);
+        match self.owner_report {
+            Some(report) => error.er_save(
+                if self.failure_id.is_some() {
+                    "actor"
+                } else {
+                    "server"
+                },
+                report,
+            ),
+            None => error,
+        }
     }
 }

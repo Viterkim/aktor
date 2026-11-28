@@ -1,123 +1,134 @@
 use super::*;
-use core::fmt;
 
 impl Options {
-    pub fn validate(&self) -> Result<(), WorkerError> {
-        if self.capacity == 0 || self.capacity > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(WorkerError::setup(
-                CallError::NotAdmitted,
-                "worker queue capacity is outside the supported range",
-            ));
-        }
-
-        if self.max_outstanding_bytes == 0
-            || self.max_outstanding_bytes > u32::MAX as usize
-            || self.max_outstanding_bytes > tokio::sync::Semaphore::MAX_PERMITS
-        {
-            return Err(WorkerError::setup(
-                CallError::NotAdmitted,
-                "worker byte budget is outside the supported range",
-            ));
-        }
-
+    pub fn validate(&self) -> Result<(), (WorkerError, String)> {
+        validate_limits(self)
+            .er(|| WorkerError::new(AktorDeliveryOutcome::NotAdmitted, WorkerCause::Setup))?;
         Ok(())
     }
 }
-impl Default for Options {
-    fn default() -> Self {
+
+#[derive(Er)]
+enum LimitsErr {
+    Capacity(usize),
+    ByteBudget(usize),
+}
+fn validate_limits(options: &Options) -> ErResult<(), LimitsErr> {
+    if options.capacity.get() > tokio::sync::Semaphore::MAX_PERMITS {
+        er_bail!(LimitsErr::capacity(options.capacity.get()));
+    }
+
+    if options.max_outstanding_bytes.get() > u32::MAX as usize
+        || options.max_outstanding_bytes.get() > tokio::sync::Semaphore::MAX_PERMITS
+    {
+        er_bail!(LimitsErr::byte_budget(options.max_outstanding_bytes.get()));
+    }
+
+    Ok(())
+}
+impl<T> WorkerError<T> {
+    #[doc(hidden)]
+    pub fn new(outcome: AktorDeliveryOutcome, cause: WorkerCause) -> Self {
         Self {
-            build: String::new(),
-            capacity: 32,
-            max_outstanding_bytes: 4 * 1024 * 1024,
+            outcome,
+            cause,
+            data: None,
+            failure_id: None,
         }
     }
 }
 
-impl<T> WorkerError<T> {
-    #[doc(hidden)]
-    pub fn fmt_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match &self.cause {
-            WorkerCause::Setup => Some("worker setup failed"),
-            WorkerCause::Cleanup => Some("worker cleanup failed"),
-            WorkerCause::Operations { .. } => Some("worker operations do not match"),
-            _ => None,
-        };
-
-        if let Some(message) = message {
-            write!(f, "worker call {:?}: {message}", self.outcome)
-        } else {
-            write!(f, "worker call {:?}: {:?}", self.outcome, self.cause)
-        }
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+impl WireFailure {
+    #[track_caller]
+    pub(crate) fn new(outcome: AktorDeliveryOutcome, cause: WorkerCause) -> Self {
+        let (error, report) = er_new!(WorkerError::new(outcome, cause)).er_split();
+        Self { error, report }
     }
 
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.diagnostics {
-            Some(diagnostics) => f.write_str(&diagnostics.report),
-            None => write!(f, "worker call {:?}: {:?}", self.outcome, self.cause),
-        }
+    #[track_caller]
+    pub(crate) fn setup(outcome: AktorDeliveryOutcome, source: impl Into<String>) -> Self {
+        let (error, report) = crate::report::with_report(
+            WorkerError::new(outcome, WorkerCause::Setup),
+            source.into(),
+        );
+        Self { error, report }
     }
 
-    #[cfg(all(
-        feature = "wasm_browser_workers",
-        target_family = "wasm",
-        target_os = "unknown"
-    ))]
-    #[doc(hidden)]
-    pub fn data_error(mut self, error: WorkerError) -> Self {
-        if let Some(diagnostics) = &mut self.diagnostics {
-            diagnostics.report.push_str("\nOptional lifecycle data: ");
-            diagnostics.report.push_str(&alloc::format!("{error:#}"));
-        }
-        self
+    #[track_caller]
+    pub(super) fn cleanup(outcome: AktorDeliveryOutcome, source: impl Into<String>) -> Self {
+        let (error, report) = crate::report::with_report(
+            WorkerError::new(outcome, WorkerCause::Cleanup),
+            source.into(),
+        );
+        Self { error, report }
     }
 
-    pub fn setup(outcome: CallError, report: impl Into<String>) -> Self {
+    pub(crate) fn without_data<T>(self) -> (WorkerError<T>, String) {
+        let mut error = WorkerError::new(self.error.outcome, self.error.cause);
+        error.failure_id = self.error.failure_id;
+        (error, self.report)
+    }
+
+    pub(super) fn with_outcome(&self, outcome: AktorDeliveryOutcome) -> Self {
+        if self.error.outcome == outcome {
+            return self.clone();
+        }
+
+        let mut error = self.error.clone();
+        error.outcome = outcome;
+        let report = er_new!(error.clone(), self.clone().without_data::<()>()).er_report();
+        Self { error, report }
+    }
+}
+
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+impl From<(WorkerError, String)> for WireFailure {
+    fn from((error, report): (WorkerError, String)) -> Self {
+        let mut wire = WorkerError::new(error.outcome, error.cause);
+        wire.failure_id = error.failure_id;
         Self {
-            outcome,
-            cause: WorkerCause::Setup,
-            diagnostics: Some(crate::AktorDiagnostic::new("worker setup failed", report)),
-            data: None,
+            error: wire,
+            report,
         }
     }
-
-    pub fn cleanup(outcome: CallError, report: impl Into<String>) -> Self {
-        Self {
-            outcome,
-            cause: WorkerCause::Cleanup,
-            diagnostics: Some(crate::AktorDiagnostic::new("worker cleanup failed", report)),
-            data: None,
-        }
+}
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+impl From<WireFailure> for (WorkerError, String) {
+    fn from(failure: WireFailure) -> Self {
+        failure.without_data()
     }
+}
 
-    pub fn new(outcome: CallError, cause: WorkerCause) -> Self {
-        let diagnostics = match &cause {
-            WorkerCause::Operations { .. } => Some(crate::AktorDiagnostic::new(
-                "worker operations do not match",
-                alloc::format!("worker call {outcome:?}: {cause:?}"),
-            )),
-            _ => None,
-        };
-
-        Self {
-            outcome,
-            cause,
-            diagnostics,
-            data: None,
-        }
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+impl From<ErBranch<WorkerError>> for WireFailure {
+    fn from(branch: ErBranch<WorkerError>) -> Self {
+        crate::report::unlocated(branch).into()
     }
-
-    #[cfg(all(
-        feature = "wasm_browser_workers",
-        target_family = "wasm",
-        target_os = "unknown"
-    ))]
-    pub fn without_data<U>(self) -> WorkerError<U> {
-        WorkerError {
-            outcome: self.outcome,
-            cause: self.cause,
-            diagnostics: self.diagnostics,
-            data: None,
-        }
+}
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+impl From<ErTree<WorkerError>> for WireFailure {
+    fn from(tree: ErTree<WorkerError>) -> Self {
+        tree.er_split().into()
     }
 }

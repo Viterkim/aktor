@@ -1,7 +1,8 @@
 #![cfg(feature = "macros")]
 
-use aktor::listener::spawn_local;
-use std::error::Error;
+use aktor::*;
+use core::num::NonZeroUsize;
+use std::time::Duration;
 
 #[path = "get.rs"]
 pub mod get;
@@ -14,28 +15,31 @@ pub struct Database {
 }
 
 #[tokio::test]
-async fn modules() -> Result<(), Box<dyn Error>> {
-    let executor = tokio::task::LocalSet::new();
+async fn modules() {
+    let mut local = Database::default();
 
-    executor
-        .run_until(async {
-            let mut local = Database::default();
+    assert_eq!(post::row(&mut local, "local".into()).await, 0);
 
-            assert_eq!(post::row(&mut local, "local".into()).await, 0);
-
-            let (database, actor) = spawn_local(&executor, Database::default(), 8)?;
-
-            let id = post::row(&database, "BingoManden".into()).await;
-
-            assert_eq!(
-                get::row(&database, id).await.as_deref(),
-                Some("BingoManden")
-            );
-
-            drop(database);
-            actor.await?;
-
-            Ok(())
-        })
+    let started = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: AktorNew {
+            name: "database".into(),
+            kind: AktorKind::TokioThread,
+            start: AktorInit::Ready(async || Database::default()),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
+        },
+        shutdown: |_| {},
+        grace: Duration::from_secs(5),
+    });
+    let id = post::row(started.handles(), "BingoManden".into())
         .await
+        .unwrap();
+
+    assert_eq!(
+        get::row(started.handles(), id).await.unwrap().as_deref(),
+        Some("BingoManden")
+    );
 }

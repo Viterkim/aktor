@@ -12,13 +12,12 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::oneshot;
 
 #[path = "../support/mod.rs"]
 pub mod support;
 
 struct StopOnDrop {
-    kill: KillSwitch,
+    kill: AktorKillSwitch,
     dropped: Arc<AtomicUsize>,
 }
 impl Drop for StopOnDrop {
@@ -30,8 +29,8 @@ impl Drop for StopOnDrop {
 
 #[test]
 fn closed_runtime() {
-    if std::env::var("AKTOR_CHILD").as_deref() != Ok("closed runtime") {
-        let output = support::child("closed_runtime", "closed runtime");
+    if std::env::var("AKTOR_TEST_CASE").as_deref() != Ok("closed runtime") {
+        let output = support::run_test("closed_runtime", "closed runtime");
         assert!(
             output.status.success(),
             "{}",
@@ -45,11 +44,15 @@ fn closed_runtime() {
         .build()
         .unwrap();
     let handle = runtime.handle().clone();
-    let mut group = AktorGroup::with_grace(Duration::from_secs(3));
-    let completion = {
-        let _entered = runtime.enter();
-        group.start_threaded().unwrap()
-    };
+    let started = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: support::thread_actor((), 1),
+        shutdown: |_| {},
+        grace: Duration::from_secs(3),
+    });
+    runtime.block_on(started.ready()).unwrap();
+    let completion = started.completion();
+    let group = started.group();
     drop(runtime);
 
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -60,10 +63,13 @@ fn closed_runtime() {
     {
         let _entered = handle.enter();
         group
-            .spawn_task(async move {
-                let _held = held;
-                core::future::pending::<()>().await;
-            })
+            .spawn_task(
+                async move {
+                    let _held = held;
+                    core::future::pending::<()>().await;
+                },
+                aktor::AktorJob::DropAtStop,
+            )
             .unwrap();
     }
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -76,81 +82,13 @@ fn closed_runtime() {
         tokio::time::timeout(Duration::from_secs(2), completion.wait())
             .await
             .unwrap()
+            .unwrap()
     });
     assert!(report.failed(), "{report}");
 }
 
-struct BrokenDrop;
-impl Drop for BrokenDrop {
-    fn drop(&mut self) {
-        panic!("root capture destructor failed");
-    }
-}
-
-#[tokio::test]
-async fn root_drop() {
-    let (ready, started) = oneshot::channel();
-    let group = AktorGroup::new();
-    let completion = group.completion();
-    let task = tokio::spawn(group.run(
-        async move |_| {
-            let _held = BrokenDrop;
-            ready.send(()).unwrap();
-            core::future::pending::<()>().await;
-            Ok::<(), AktorError>(())
-        },
-        async |_| Ok::<(), AktorCleanupError>(()),
-    ));
-    started.await.unwrap();
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    let report = tokio::time::timeout(Duration::from_secs(3), completion.wait())
-        .await
-        .unwrap();
-    assert!(
-        report
-            .failure
-            .unwrap()
-            .message
-            .contains("root capture destructor failed")
-    );
-
-    let held = BrokenDrop;
-    let group = AktorGroup::new();
-    let completion = group.completion();
-    drop_before_poll(
-        group.run(
-            async move |_| {
-                let _held = held;
-                core::future::pending::<Result<(), AktorError>>().await
-            },
-            async |_| Ok::<(), AktorCleanupError>(()),
-        ),
-        completion,
-    )
-    .await;
-}
-
-async fn drop_before_poll(application: impl std::future::Future, completion: GroupCompletion) {
-    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(application)));
-    assert!(
-        dropped.is_ok(),
-        "unpolled application destruction escaped its owner"
-    );
-    let report = tokio::time::timeout(Duration::from_secs(3), completion.wait())
-        .await
-        .unwrap();
-    assert!(
-        report
-            .failure
-            .unwrap()
-            .message
-            .contains("root capture destructor failed")
-    );
-}
-
 struct ApplicationError {
-    kill: KillSwitch,
+    kill: AktorKillSwitch,
     panic: bool,
 }
 impl fmt::Display for ApplicationError {
@@ -165,11 +103,11 @@ impl fmt::Display for ApplicationError {
 
 #[test]
 fn application_error() {
-    let case = std::env::var("AKTOR_CHILD").ok();
+    let case = std::env::var("AKTOR_TEST_CASE").ok();
     let Some(case) = case.filter(|case| case == "reentrant display" || case == "panicking display")
     else {
         for case in ["reentrant display", "panicking display"] {
-            let output = support::child("application_error", case);
+            let output = support::run_test("application_error", case);
             assert!(
                 output.status.success(),
                 "{}",
@@ -184,32 +122,36 @@ fn application_error() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let mut group = AktorGroup::new();
-        let kill = group.killswitch();
+        let (send, receive) = tokio::sync::oneshot::channel();
         let panic = case == "panicking display";
-        let report = group
-            .start_with(async move |_| {
-                let error = ApplicationError { kill, panic };
-                Err::<(), _>(AktorCleanupError::new(error.to_string(), ()))
-            })
-            .unwrap();
-        group.killswitch().stop();
-        let report = report.await;
+        let started = aktor_start(AktorSetup {
+            stuck: AktorGroupStuck::KeepRunning,
+            actors: support::thread_actor((), 1),
+            shutdown: async move |_| {
+                let error = ApplicationError {
+                    kill: receive.await.unwrap(),
+                    panic,
+                };
+                Err::<(), _>(((), error.to_string()))
+            },
+            grace: Duration::from_secs(5),
+        });
+        started.ready().await.unwrap();
+        assert!(send.send(started.killswitch()).is_ok());
+        let report = started.stop().await;
         assert!(report.failed());
         if panic {
             assert!(
-                report
-                    .failure
-                    .unwrap()
-                    .message
+                report.failures[0]
+                    .error
                     .contains("application error format failed")
             );
         } else {
             assert!(
                 report
-                    .application
+                    .failures
                     .iter()
-                    .any(|error| error.diagnostics == "application error")
+                    .any(|failure| failure.error.contains("application error"))
             );
         }
     });

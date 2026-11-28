@@ -11,7 +11,7 @@ pub fn aktor(overridden: Option<Path>) -> syn::Result<TokenStream> {
     match crate_name("aktor") {
         Ok(FoundCrate::Itself) => Ok(quote!(::aktor)),
         Ok(FoundCrate::Name(name)) => {
-            let name = Ident::new(&name.replace('-', "_"), Span::call_site());
+            let name = syn::parse_str::<Ident>(&format!("r#{}", name.replace('-', "_")))?;
             Ok(quote!(::#name))
         }
         Err(error) => Err(syn::Error::new(

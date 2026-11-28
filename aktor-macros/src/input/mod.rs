@@ -7,9 +7,11 @@ pub mod parse;
 pub struct Options {
     pub crate_path: Option<Path>,
     pub role: Option<Path>,
-    pub data: bool,
-    pub serde: bool,
+    /// The operation's name on the wire and in presets, `module_path!()` when left out.
+    pub name: Option<syn::LitStr>,
     pub remote: bool,
+    /// `.latest()` on this function. Most functions never use it, so its machinery stays out.
+    pub latest: bool,
 }
 
 pub struct Argument {

@@ -2,10 +2,10 @@ use super::*;
 use crate::dispatch::{OwnedState, Read, ReadCall, ReadState, Write, WriteCall, WriteState};
 use core::{future::Future, ops::AsyncFnOnce};
 
-impl<'a, S: 'static, const N: usize, E, I: 'static, O: 'static, Role, Clock> Read<S, I, O, Role>
-    for &'a Handle<S, N, E, Role, Clock>
+impl<'a, S: 'static, I: 'static, O: 'static, Role, Clock> Read<S, I, O, Role>
+    for &'a Handle<S, Role, Clock>
 {
-    type Request = Request<'a, S, N, E, O, Role, Clock>;
+    type Request = Request<'a, S, O, Role, Clock>;
 
     fn dispatch<F>(self, operation: Operation, function: F, input: I) -> Self::Request
     where
@@ -19,10 +19,10 @@ impl<'a, S: 'static, const N: usize, E, I: 'static, O: 'static, Role, Clock> Rea
         )
     }
 }
-impl<'a, S: 'static, const N: usize, E, I: 'static, O: 'static, Role, Clock> Write<S, I, O, Role>
-    for &'a Handle<S, N, E, Role, Clock>
+impl<'a, S: 'static, I: 'static, O: 'static, Role, Clock> Write<S, I, O, Role>
+    for &'a Handle<S, Role, Clock>
 {
-    type Request = Request<'a, S, N, E, O, Role, Clock>;
+    type Request = Request<'a, S, O, Role, Clock>;
 
     fn dispatch<F>(self, operation: Operation, function: F, input: I) -> Self::Request
     where
@@ -32,10 +32,10 @@ impl<'a, S: 'static, const N: usize, E, I: 'static, O: 'static, Role, Clock> Wri
     }
 }
 
-impl<'a, S: 'static, const N: usize, E, I: 'static, O: 'static, Role, Clock> ReadCall<S, I, O, Role>
-    for &'a Handle<S, N, E, Role, Clock>
+impl<'a, S: 'static, I: 'static, O: 'static, Role, Clock> ReadCall<S, I, O, Role>
+    for &'a Handle<S, Role, Clock>
 {
-    type Request<Fut> = Request<'a, S, N, E, O, Role, Clock>;
+    type Request<Fut> = Request<'a, S, O, Role, Clock>;
 
     fn dispatch<F, Fut>(
         self,
@@ -52,10 +52,10 @@ impl<'a, S: 'static, const N: usize, E, I: 'static, O: 'static, Role, Clock> Rea
     }
 }
 
-impl<'a, S: 'static, const N: usize, E, I: 'static, O: 'static, Role, Clock>
-    WriteCall<S, I, O, Role> for &'a Handle<S, N, E, Role, Clock>
+impl<'a, S: 'static, I: 'static, O: 'static, Role, Clock> WriteCall<S, I, O, Role>
+    for &'a Handle<S, Role, Clock>
 {
-    type Request<Fut> = Request<'a, S, N, E, O, Role, Clock>;
+    type Request<Fut> = Request<'a, S, O, Role, Clock>;
 
     fn dispatch<F, Fut>(
         self,
@@ -72,13 +72,9 @@ impl<'a, S: 'static, const N: usize, E, I: 'static, O: 'static, Role, Clock>
     }
 }
 
-impl<S: 'static, const N: usize, E, Role, Clock> ReadState<S, Role>
-    for &Handle<S, N, E, Role, Clock>
-{
+impl<S: 'static, Role, Clock> ReadState<S, Role> for &Handle<S, Role, Clock> {
     type Lease = OwnedState<S>;
 }
-impl<S: 'static, const N: usize, E, Role, Clock> WriteState<S, Role>
-    for &Handle<S, N, E, Role, Clock>
-{
+impl<S: 'static, Role, Clock> WriteState<S, Role> for &Handle<S, Role, Clock> {
     type Lease = OwnedState<S>;
 }

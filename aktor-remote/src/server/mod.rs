@@ -1,10 +1,23 @@
+mod answer;
+mod bind;
+mod failures;
+mod impls;
+mod latest;
+mod service;
+mod sessions;
+
 use crate::{
-    CallError, Cause, Error,
-    connection::{Address, Listener, Stream},
+    AktorDeliveryOutcome, Cause, Rejection, WireFailure,
+    connection::{Address, BufferedStream, ListenAddress, Listener, Stream},
     wire::{self, Message},
 };
 use aktor::{Aktor, listener::Handle, message::call_async, operation::Operation, worker::Registry};
+use er::*;
+use failures::Failures;
+pub use failures::{ServerError, ServerFailure};
+use service::Service;
 use std::{
+    borrow::Cow,
     fs::File,
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -13,51 +26,59 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, UnixListener, UnixStream},
-    sync::{broadcast, watch},
+    sync::watch,
     task::JoinSet,
     time::timeout,
 };
-
-mod bind;
-mod impls;
-mod latest;
-mod service;
-mod sessions;
-use service::Service;
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
     pub build: String,
     pub max_frame: usize,
-    pub max_connections: usize,
+    pub max_connections: core::num::NonZeroUsize,
     pub shutdown_timeout: Duration,
-    /// Bounds handshakes, started frames and reply writes. Quiet connections stay open.
+    /// Time limit for handshakes, frames already started and reply writes.
+    /// Quiet connections stay open.
     pub io_timeout: Duration,
-    pub permissions: u32,
 }
 
 /// Owns the listener and its client sessions. The actor belongs to its existing group.
 pub struct Server {
     pub address: Address,
     stop: watch::Sender<bool>,
-    finished: watch::Receiver<Option<Result<(), Error>>>,
-    errors: broadcast::Sender<Error>,
+    task: tokio::sync::Mutex<ListenerTask>,
+    failures: Failures,
     #[cfg(test)]
     pub pending: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     pub cancelled: Arc<tokio::sync::Notify>,
 }
 
+enum ListenerTask {
+    Running(tokio::task::JoinHandle<()>),
+    Finished(Result<(), (ServerError, String)>),
+}
+
 struct SocketPath {
-    path: PathBuf,
+    path: Option<PathBuf>,
     device: u64,
     inode: u64,
     _lock: File,
 }
 
-pub async fn listen<S: 'static, Role: 'static>(
-    address: impl Into<Address>,
-    actor: &Aktor<S, Role>,
-) -> Result<Server, Error> {
-    Server::listen_with(address, actor, ServerOptions::default()).await
+#[derive(Er)]
+struct UnknownOperationErr {
+    operation: String,
+}
+
+fn preview(value: &str) -> Cow<'_, str> {
+    const LIMIT: usize = 128;
+    if value.len() <= LIMIT {
+        return Cow::Borrowed(value);
+    }
+
+    let end = value.floor_char_boundary(LIMIT);
+    let mut prefix = value[..end].to_owned();
+    prefix.push_str("...");
+    Cow::Owned(prefix)
 }

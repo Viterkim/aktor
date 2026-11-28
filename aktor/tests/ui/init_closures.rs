@@ -1,16 +1,13 @@
 use aktor::*;
+use core::num::NonZeroUsize;
 
 fn missing_end() {
     let _actor = AktorNew {
-        name: AktorName::new("counter"),
-        role: AktorNoRole,
+        name: "counter".into(),
         kind: AktorKind::TokioThread,
-        closures: AktorClosures {
-            start: async || Ok::<_, AktorSetupError>(0_u32),
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
-        },
-        options: Default::default(),
+        start: AktorInit::Ready(async || 0_u32),
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::new(32).unwrap(),
+        stuck: AktorStuck::Kill,
     };
 }

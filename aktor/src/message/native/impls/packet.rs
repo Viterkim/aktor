@@ -1,8 +1,9 @@
 use super::super::*;
 
 impl<F, I, O> Packet<F, I, O> {
-    pub fn new(function: F, input: I) -> Self {
+    pub fn new(function: F, input: I, admission: Option<Arc<crate::queue::Admission>>) -> Self {
         Self {
+            admission,
             data: Mutex::new(Data {
                 function: Some((function, input)),
                 completion: Completion::Waiting(None),
@@ -10,20 +11,23 @@ impl<F, I, O> Packet<F, I, O> {
         }
     }
 
-    pub fn finish(&self, output: Result<O, CallError>) {
+    pub fn finish(&self, output: Result<O, crate::CallLoss>) {
         let mut data = self.data.lock();
 
-        if matches!(data.completion, Completion::Waiting(_)) {
-            let old = std::mem::replace(&mut data.completion, Completion::Ready(output));
+        match data.completion {
+            Completion::Waiting(_) => {
+                let old = std::mem::replace(&mut data.completion, Completion::Ready(output));
 
-            drop(data);
+                drop(data);
 
-            if let Completion::Waiting(Some(waker)) = old {
-                waker.wake();
+                if let Completion::Waiting(Some(waker)) = old {
+                    waker.wake();
+                }
             }
-        } else {
-            drop(data);
-            drop(output);
+            Completion::Ready(_) | Completion::Abandoned | Completion::Consumed => {
+                drop(data);
+                drop(output);
+            }
         }
     }
 }
@@ -36,7 +40,7 @@ where
     fn run<'a>(
         &'a self,
         state: &'a mut S,
-        hooks: &'a mut crate::listener::hooks::AktorHooks<S>,
+        hooks: &'a mut crate::listener::hooks::CallHooks<S>,
         operation: crate::operation::Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
@@ -56,21 +60,25 @@ where
     fn close(&self) {
         let function = self.data.lock().function.take();
         let error = if function.is_some() {
-            CallError::Discarded
+            AktorDeliveryOutcome::Discarded
         } else {
-            CallError::OutcomeUnknown
+            AktorDeliveryOutcome::OutcomeUnknown
         };
 
-        self.finish(Err(error));
+        self.finish(Err(crate::CallLoss(
+            error,
+            self.admission.as_ref().and_then(|a| a.lost.get().cloned()),
+        )));
         drop(function);
     }
 }
 impl<F: Send, I: Send, O: Send> Answer<O> for Packet<F, I, O> {
-    fn try_take(&self) -> Option<Result<O, CallError>> {
+    fn try_take(&self) -> Option<Result<O, crate::CallLoss>> {
         let mut data = self.data.lock();
 
-        if matches!(data.completion, Completion::Waiting(_)) {
-            return None;
+        match data.completion {
+            Completion::Waiting(_) => return None,
+            Completion::Ready(_) | Completion::Abandoned | Completion::Consumed => {}
         }
 
         let old = std::mem::replace(&mut data.completion, Completion::Consumed);
@@ -79,32 +87,36 @@ impl<F: Send, I: Send, O: Send> Answer<O> for Packet<F, I, O> {
 
         match old {
             Completion::Ready(output) => Some(output),
-            _ => consumed(),
+            Completion::Waiting(_) | Completion::Abandoned | Completion::Consumed => consumed(),
         }
     }
 
-    fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<O, CallError>> {
-        let next = cx.waker().clone();
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<O, crate::CallLoss>> {
         let mut data = self.data.lock();
+
+        // One lock per poll. A waker clone is a count bump, the old one drops outside the lock.
+        if let Completion::Waiting(waiting) = &mut data.completion {
+            if waiting
+                .as_ref()
+                .is_some_and(|waker| waker.will_wake(cx.waker()))
+            {
+                return Poll::Pending;
+            }
+
+            let previous = waiting.replace(cx.waker().clone());
+
+            drop(data);
+            drop(previous);
+            return Poll::Pending;
+        }
+
         let old = std::mem::replace(&mut data.completion, Completion::Consumed);
 
+        drop(data);
+
         match old {
-            Completion::Ready(output) => {
-                drop(data);
-                drop(next);
-                Poll::Ready(output)
-            }
-            Completion::Waiting(previous) => {
-                data.completion = Completion::Waiting(Some(next));
-                drop(data);
-                drop(previous);
-                Poll::Pending
-            }
-            _ => {
-                drop(data);
-                drop(next);
-                consumed()
-            }
+            Completion::Ready(output) => Poll::Ready(output),
+            Completion::Waiting(_) | Completion::Abandoned | Completion::Consumed => consumed(),
         }
     }
 
@@ -127,7 +139,7 @@ where
     fn run<'a>(
         &'a self,
         state: &'a mut S,
-        hooks: &'a mut crate::listener::hooks::AktorHooks<S>,
+        hooks: &'a mut crate::listener::hooks::CallHooks<S>,
         operation: crate::operation::Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
@@ -147,21 +159,27 @@ where
     fn close(&self) {
         let function = self.0.data.lock().function.take();
         let error = if function.is_some() {
-            CallError::Discarded
+            AktorDeliveryOutcome::Discarded
         } else {
-            CallError::OutcomeUnknown
+            AktorDeliveryOutcome::OutcomeUnknown
         };
 
-        self.0.finish(Err(error));
+        self.0.finish(Err(crate::CallLoss(
+            error,
+            self.0
+                .admission
+                .as_ref()
+                .and_then(|a| a.lost.get().cloned()),
+        )));
         drop(function);
     }
 }
 impl<F: Send, I: Send, O: Send> Answer<O> for AsyncJob<F, I, O> {
-    fn try_take(&self) -> Option<Result<O, CallError>> {
+    fn try_take(&self) -> Option<Result<O, crate::CallLoss>> {
         self.0.try_take()
     }
 
-    fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<O, CallError>> {
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<O, crate::CallLoss>> {
         self.0.poll(cx)
     }
 

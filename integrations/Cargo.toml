@@ -11,7 +11,7 @@ publish = false
 
 [workspace.dependencies]
 aktor = { path = "../aktor", default-features = false }
-er = { version = "0.8", default-features = false }
+er = { version = "0.10", default-features = false }
 tokio = "1.53.1"
 bevy_tasks = { version = "0.20", features = ["multi_threaded"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,3 +32,8 @@ sqlite-wasm-vfs = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aktor_serve, values(any()))'] }
+
+[patch.crates-io]
+er = { path = "../../er/er" }
+er-macros = { path = "../../er/er-macros" }

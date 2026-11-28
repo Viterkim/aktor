@@ -1,15 +1,2 @@
-postMessage(
-    JSON.stringify({
-        Ready: {
-            version: 0,
-            operations: [],
-            options: {
-                build: 'old bundle',
-                timeout_ms: 5000,
-                capacity: 32,
-                max_payload_bytes: 1048576,
-                max_outstanding_bytes: 4194304
-            }
-        }
-    })
-);
+// Configure with protocol version one, two unit type names and an empty operation list.
+postMessage(new Uint8Array([0, 2, 40, 41, 2, 40, 41, 1, 0, 32, 64, 0]).buffer);

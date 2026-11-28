@@ -1,4 +1,13 @@
-use crate::{AktorError, message::LocalFuture};
+#[doc(hidden)]
+pub mod lock;
+
+mod runtime;
+
+pub use crate::cross_core::{Completion, Handle};
+#[doc(hidden)]
+pub use runtime::Thread;
+
+use crate::{cross_core::OwnerError, message::LocalFuture};
 use alloc::{boxed::Box, collections::BTreeMap};
 use core::{
     cell::RefCell,
@@ -7,14 +16,7 @@ use core::{
 use futures_util::future::{AbortHandle, Abortable};
 use wasm_bindgen::prelude::*;
 
-#[doc(hidden)]
-pub mod lock;
-mod runtime;
-pub use crate::cross_core::{Completion, Handle};
-#[doc(hidden)]
-pub use runtime::Thread;
-
-type Job = Box<dyn FnOnce() -> LocalFuture<'static, Result<(), AktorError>> + Send>;
+type Job = Box<dyn FnOnce() -> LocalFuture<'static, Result<(), (OwnerError, String)>> + Send>;
 
 static JOBS: lock::Mutex<RefCell<BTreeMap<u32, Job>>> =
     lock::Mutex::new(RefCell::new(BTreeMap::new()));
@@ -65,7 +67,7 @@ pub async fn __aktor_thread_start(id: u32) -> Result<(), JsValue> {
 
     match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(JsValue::from_str(&error.diagnostics)),
+        Ok(Err((_, report))) => Err(JsValue::from_str(&report)),
         Err(_) => Err(JsValue::from_str(
             "shared actor cancelled before cleanup completed",
         )),

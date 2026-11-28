@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Timeout, message::Reply};
+use crate::{AktorTimeout, message::RequestSend};
 use core::{
     pin::Pin,
     task::{Context, Poll},
@@ -98,18 +98,18 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Queued<'a, S, I
         .operation(self.operation)
     }
 
-    pub async fn send(self) -> Reply<O> {
-        self.into_request().send().await
+    pub fn send(self) -> RequestSend<'a, S, O> {
+        self.into_request().send()
     }
 
-    pub fn timeout(self, duration: Duration) -> Timeout<Request<'a, S, O>> {
+    pub fn timeout(self, duration: Duration) -> AktorTimeout<Request<'a, S, O>> {
         self.into_request().timeout(duration)
     }
 }
 impl<S: 'static, I: Send + 'static, O: Send + 'static, Role> Future for Queued<'_, S, I, O, Role> {
-    type Output = O;
+    type Output = Result<O, crate::AktorDeliveryError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
         if this.running.is_none() {

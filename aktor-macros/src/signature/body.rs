@@ -8,6 +8,7 @@ pub fn implementation(
     function: &Function,
     names: &mut Names,
     output: &Type,
+    aktor: &TokenStream,
 ) -> syn::Result<(TokenStream, TokenStream)> {
     let signature = &function.signature;
     let mut implementation = signature.clone();
@@ -43,7 +44,6 @@ pub fn implementation(
             quote!(#ident)
         })
         .collect();
-
     arguments.extend(added.iter().map(|_| quote!(_)));
 
     let state_borrow = signature.inputs.first().and_then(|input| match input {
@@ -78,14 +78,40 @@ pub fn implementation(
 
     let name = &names.body;
     let invoke = if arguments.is_empty() {
-        quote!(self::#name::#name)
+        quote!(#name::#name)
     } else {
-        quote!(self::#name::#name::<#(#arguments),*>)
+        quote!(#name::#name::<#(#arguments),*>)
     };
 
     let operation = &signature.ident;
     let attributes = crate::input::attributes::implementation(&function.attributes)?;
     let body = &function.body;
+    let mut declared = output;
+    loop {
+        match declared {
+            Type::Group(group) => declared = &group.elem,
+            Type::Paren(paren) => declared = &paren.elem,
+            _ => break,
+        }
+    }
+
+    let body = if let Type::Path(_) = declared {
+        let statements = &body.stmts;
+        let mut hint = output.clone();
+        InferredOutput.visit_type_mut(&mut hint);
+
+        let marker = crate::names::binding(&mut names.reserved, "__aktor_result_type");
+        let result = crate::names::binding(&mut names.reserved, "__aktor_result");
+        quote!({
+            use #aktor::operation::CallResult as _;
+            let #marker = ::core::marker::PhantomData::<fn(_) -> #hint>;
+            #[allow(unreachable_code)]
+            let #result = (async move { (&&#marker).body({ #(#statements)* }) }).await;
+            (&#marker).finish(#result)
+        })
+    } else {
+        quote!(#body)
+    };
     let implementation = quote! {
         impl #operation::#name {
             #(#attributes)*
@@ -96,4 +122,16 @@ pub fn implementation(
     };
 
     Ok((implementation, invoke))
+}
+
+struct InferredOutput;
+
+impl VisitMut for InferredOutput {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        if let Type::ImplTrait(_) = ty {
+            *ty = parse_quote!(_);
+        } else {
+            visit_mut::visit_type_mut(self, ty);
+        }
+    }
 }

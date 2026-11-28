@@ -1,4 +1,5 @@
 use super::*;
+use core::num::NonZeroUsize;
 
 struct StartupDrop(Arc<AtomicBool>);
 
@@ -49,48 +50,6 @@ fn shutdown() {
             .build()
             .unwrap();
 
-        if mode == "runtime exit run" {
-            let cleaned = Arc::new(AtomicBool::new(false));
-            let cleanup = cleaned.clone();
-            let completed = runtime.block_on(async {
-                let group = AktorGroup::with_grace(Duration::from_millis(200));
-                let completed = group.completion();
-                let (entered, ready) = tokio::sync::oneshot::channel();
-
-                tokio::spawn(group.run(
-                    async move |app| {
-                        let _actor = app
-                            .spawn(AktorArgs::new(
-                                "abandoned run",
-                                || Ok::<_, AktorError>(()),
-                                move |_| {
-                                    cleanup.store(true, Ordering::SeqCst);
-                                    Ok::<_, AktorError>(())
-                                },
-                            ))
-                            .await
-                            .unwrap();
-
-                        entered.send(()).unwrap();
-                        core::future::pending::<Result<(), AktorError>>().await
-                    },
-                    |_| {},
-                ));
-
-                ready.await.unwrap();
-                completed
-            });
-
-            drop(runtime);
-            std::thread::sleep(Duration::from_millis(300));
-
-            let report = completed.try_report().expect("run lost shutdown progress");
-
-            assert!(cleaned.load(Ordering::SeqCst));
-            assert!(!report.timed_out);
-            return;
-        }
-
         if mode == "formatter panic" {
             struct Broken;
             impl std::fmt::Display for Broken {
@@ -106,22 +65,27 @@ fn shutdown() {
             impl std::error::Error for Broken {}
 
             runtime.block_on(async {
-                let mut group = AktorGroup::with_grace(Duration::from_millis(200));
-
-                group.start().unwrap();
-                let actor = group
-                    .spawn(AktorArgs::new(
-                        "broken formatter",
-                        || Ok::<_, AktorError>(()),
-                        |_| Err::<(), _>(AktorError::new(format!("{broken}", broken = Broken), ())),
-                    ))
-                    .await
-                    .unwrap();
+                let group = aktor_start(AktorSetup {
+                    stuck: aktor::AktorGroupStuck::AbortProcess(()),
+                    actors: AktorNew {
+                        name: "broken formatter".into(),
+                        kind: AktorKind::TokioThread,
+                        start: aktor::AktorInit::Ready(async || ()),
+                        end: |_| Err::<(), _>(((), format!("{broken}", broken = Broken))),
+                        hooks: AktorHooks::NONE,
+                        capacity: NonZeroUsize::new(32).unwrap(),
+                        stuck: AktorStuck::Kill,
+                    },
+                    shutdown: |_| {},
+                    grace: Duration::from_millis(200),
+                });
+                group.ready().await.unwrap();
+                let actor = group.handles();
                 let _error = actor.shutdown().await.unwrap_err();
-                let report = group.shutdown().await;
+                let report = group.stop().await;
 
                 assert!(report.to_string().contains("error display broke"));
-                assert!(!report.timed_out);
+                assert!(!report.ran_past_grace());
             });
 
             return;
@@ -131,19 +95,27 @@ fn shutdown() {
             let cleaned = Arc::new(AtomicBool::new(false));
             let cleanup = cleaned.clone();
             let completed = runtime.block_on(async {
-                let mut group = AktorGroup::with_grace(Duration::from_millis(200));
-                let completed = group
-                    .start_with(async move |_| {
+                let started = aktor_start(AktorSetup {
+                    stuck: aktor::AktorGroupStuck::AbortProcess(()),
+                    actors: AktorNew {
+                        name: "abandoned".into(),
+                        kind: AktorKind::TokioThread,
+                        start: aktor::AktorInit::Ready(async move || 7_u32),
+                        end: (),
+                        hooks: AktorHooks::NONE,
+                        capacity: NonZeroUsize::new(32).unwrap(),
+                        stuck: AktorStuck::Kill,
+                    },
+                    shutdown: move |_| {
                         cleanup.store(true, Ordering::SeqCst);
-                        Ok::<_, AktorError>(())
-                    })
-                    .unwrap();
-
-                if mode == "runtime exit actor" {
-                    group.spawn_value("abandoned", 7_u32).await.unwrap();
+                    },
+                    grace: Duration::from_millis(200),
+                });
+                started.ready().await.unwrap();
+                if mode == "runtime exit" {
+                    started.handles().shutdown().await.unwrap();
                 }
-
-                completed
+                started.completion()
             });
 
             drop(runtime);
@@ -153,20 +125,32 @@ fn shutdown() {
                 .enable_all()
                 .build()
                 .unwrap();
-            let report = runtime.block_on(completed.wait());
+            let report = runtime.block_on(completed.wait()).unwrap();
 
             assert!(cleaned.load(Ordering::SeqCst));
             assert!(!report.failed());
-            assert!(!report.timed_out);
+            assert!(!report.ran_past_grace());
             return;
         }
 
         if mode == "stderr failure" {
             std::panic::set_hook(Box::new(|_| {}));
             runtime.block_on(async {
-                let mut group = AktorGroup::with_grace(Duration::from_millis(200));
-                let closing = group.start().unwrap();
-                let actor = group.spawn_value("reporting", 0usize).await.unwrap();
+                let started = aktor_start(AktorSetup {
+                    stuck: aktor::AktorGroupStuck::AbortProcess(()),
+                    actors: AktorNew {
+                        name: "reporting".into(),
+                        kind: AktorKind::TokioThread,
+                        start: aktor::AktorInit::Ready(async move || 0usize),
+                        end: |_| -> () { panic!("report failure") },
+                        hooks: AktorHooks::NONE,
+                        capacity: NonZeroUsize::new(32).unwrap(),
+                        stuck: AktorStuck::Kill,
+                    },
+                    shutdown: |_| {},
+                    grace: Duration::from_millis(200),
+                });
+                started.ready().await.unwrap();
                 let (ready, acquired) = std::sync::mpsc::channel();
 
                 std::thread::spawn(move || {
@@ -179,14 +163,10 @@ fn shutdown() {
 
                 acquired.recv().unwrap();
 
-                aktor::message::call(&actor.handle, |_, ()| panic!("report failure"), ())
-                    .cast()
-                    .await;
+                let report = started.stop().await;
 
-                let report = closing.wait().await;
-
-                assert!(report.failure.unwrap().message.contains("report failure"));
-                assert!(!report.timed_out);
+                assert!(report.failures[0].error.contains("report failure"));
+                assert!(!report.ran_past_grace());
             });
 
             return;
@@ -194,46 +174,42 @@ fn shutdown() {
 
         if mode == "pending setup" {
             runtime.block_on(async {
-                let mut group = AktorGroup::with_grace(Duration::from_secs(1));
-                let kill = group.killswitch();
-                let closing = group.start_with(async |_| Ok::<_, AktorError>(())).unwrap();
                 let entered = Arc::new(Notify::new());
                 let inside = entered.clone();
                 let dropped = Arc::new(AtomicBool::new(false));
                 let cleanup = dropped.clone();
-                let startup = tokio::spawn(async move {
-                    group
-                        .spawn_async(AktorArgs::new(
-                            "pending setup",
-                            async move || {
-                                let _drop = StartupDrop(cleanup);
+                let started = aktor_start(AktorSetup {
+                    stuck: aktor::AktorGroupStuck::AbortProcess(()),
+                    actors: AktorNew {
+                        name: "pending setup".into(),
+                        kind: AktorKind::TokioThread,
+                        start: aktor::AktorInit::Ready(async move || {
+                            let _drop = StartupDrop(cleanup);
 
-                                inside.notify_one();
-                                core::future::pending::<()>().await;
-                                Ok::<_, AktorError>(())
-                            },
-                            async |_| Ok::<_, AktorError>(()),
-                        ))
-                        .await
+                            inside.notify_one();
+                            core::future::pending::<()>().await;
+                        }),
+                        end: async |_| (),
+                        hooks: AktorHooks::NONE,
+                        capacity: NonZeroUsize::new(32).unwrap(),
+                        stuck: AktorStuck::Kill,
+                    },
+                    shutdown: |_| {},
+                    grace: Duration::from_secs(1),
                 });
+                let kill = started.killswitch();
+                let closing = started.completion();
+                let startup = tokio::spawn(async move { started.ready().await.is_err() });
 
                 entered.notified().await;
                 kill.stop();
 
-                let report = closing.wait().await;
+                let report = closing.wait().await.unwrap();
 
                 assert!(dropped.load(Ordering::SeqCst));
-                assert!(report.timed_out);
-                assert!(report.failure.is_none());
-                let result = startup.await.unwrap().map(|_| ());
-                assert!(
-                    matches!(
-                        &result,
-                        Err(error) if matches!(error.error.primary(),
-                            aktor::listener::DedicatedStartError::Closed)
-                    ),
-                    "{result:?}"
-                );
+                assert!(report.ran_past_grace());
+                assert!(report.failures.is_empty());
+                assert!(startup.await.unwrap());
                 tokio::time::sleep(Duration::from_millis(250)).await;
             });
 
@@ -242,44 +218,35 @@ fn shutdown() {
 
         if mode == "settling thread" {
             runtime.block_on(async {
-                let mut group = AktorGroup::with_grace(Duration::from_secs(1));
-                let closing = group.start().unwrap();
-                let lifetime = group.killswitch().track_thread("settling".into());
-                let cancelled = Arc::new(Notify::new());
-                let cancel = cancelled.clone();
-                let (release, released) = tokio::sync::oneshot::channel();
+                struct ThreadExit(Arc<AtomicBool>);
+                impl Drop for ThreadExit {
+                    fn drop(&mut self) {
+                        std::thread::sleep(Duration::from_millis(5));
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                thread_local! {
+                    static EXIT: std::cell::RefCell<Option<ThreadExit>> = const { std::cell::RefCell::new(None) };
+                }
+
                 let finished = Arc::new(AtomicBool::new(false));
-                let thread_finished = finished.clone();
+                let exit = ThreadExit(finished.clone());
+                let started = aktor_start(AktorSetup {
+                    stuck: aktor::AktorGroupStuck::AbortProcess(()),
+                    actors: AktorNew {
+                        name: "settling".into(), kind: AktorKind::TokioThread,
+                        start: aktor::AktorInit::Ready(async move || {
+                            EXIT.set(Some(exit));
 
-                std::thread::spawn(move || {
-                    released.blocking_recv().unwrap();
-                    std::thread::sleep(Duration::from_millis(5));
-                    thread_finished.store(true, Ordering::SeqCst);
-                    drop(lifetime);
-                });
-
-                group
-                    .register_owner(
-                        "settling".into(),
-                        aktor::AktorExecution::TokioThread,
-                        Box::new(|| {}),
-                        Box::new(move || cancel.notify_one()),
-                        Box::pin(async move {
-                            cancelled.notified().await;
-                            release.send(()).unwrap();
-                            aktor::AktorOutcome {
-                                retirement: aktor::RetirementStatus::Unconfirmed,
-                                actor: "settling".into(),
-                                kind: None,
-                                diagnostics: vec![],
-                                timed_out: true,
-                            }
                         }),
-                    )
-                    .unwrap();
+                        end: |_| core::future::pending::<()>(),
+                        hooks: AktorHooks::NONE, capacity: NonZeroUsize::MIN, stuck: AktorStuck::Kill,
+                    },
+                    shutdown: |_| {}, grace: Duration::from_millis(200),
+                });
+                started.ready().await.unwrap();
 
-                group.killswitch().stop();
-                assert!(closing.wait().await.timed_out);
+                assert!(started.stop().await.ran_past_grace());
                 assert!(finished.load(Ordering::SeqCst), "thread was still settling");
                 tokio::time::sleep(Duration::from_millis(150)).await;
             });
@@ -295,23 +262,23 @@ fn shutdown() {
                     _ => Duration::from_millis(300),
                 };
 
-                let mut group = AktorGroup::with_grace(grace);
-                let closing = group.start().unwrap();
-                let lifetime = group.killswitch().track_thread("late".into());
+                let started = aktor_start(AktorSetup {
+                    stuck: aktor::AktorGroupStuck::AbortProcess(()),
+                    actors: AktorNew {
+                        name: "late".into(),
+                        kind: AktorKind::TokioThread,
+                        start: aktor::AktorInit::Ready(async || ()),
+                        end: |_| std::thread::sleep(Duration::from_secs(2)),
+                        hooks: AktorHooks::NONE,
+                        capacity: NonZeroUsize::MIN,
+                        stuck: AktorStuck::Kill,
+                    },
+                    shutdown: |_| {},
+                    grace,
+                });
+                started.ready().await.unwrap();
+                assert!(started.stop().await.ran_past_grace());
 
-                group
-                    .register_owner(
-                        "late".into(),
-                        aktor::AktorExecution::StdThread,
-                        Box::new(|| {}),
-                        Box::new(|| {}),
-                        Box::pin(core::future::pending()),
-                    )
-                    .unwrap();
-
-                group.killswitch().stop();
-                assert!(closing.await.timed_out);
-                drop(lifetime);
                 core::future::pending::<()>().await;
             });
 
@@ -319,9 +286,6 @@ fn shutdown() {
         }
 
         runtime.block_on(async {
-            let group = AktorGroup::with_grace(Duration::from_millis(200));
-            let kill = group.killswitch();
-
             if mode == "stderr" {
                 let (ready, acquired) = std::sync::mpsc::channel();
 
@@ -342,59 +306,46 @@ fn shutdown() {
             );
             let setup_blocks = mode == "setup";
 
-            if setup_blocks {
-                let kill = kill.clone();
-
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(40));
-                    kill.stop();
-                });
-            }
-
-            let _report = group
-                .run(
-                    async |app| {
-                        let _actor = app
-                            .spawn(AktorArgs {
-                                name: "blocking cleanup".into(),
-                                capacity: 1,
-                                setup: move || {
-                                    if setup_blocks {
-                                        loop {
-                                            std::thread::sleep(Duration::from_secs(10));
-                                        }
-                                    }
-
-                                    Ok::<_, AktorError>(())
-                                },
-                                cleanup: move |_| {
-                                    if actor_blocks {
-                                        loop {
-                                            std::thread::sleep(Duration::from_secs(10));
-                                        }
-                                    }
-
-                                    Ok::<_, AktorError>(())
-                                },
-                            })
-                            .await
-                            .unwrap();
-
-                        kill.stop();
-                        core::future::pending::<()>().await;
-                        Ok::<_, AktorError>(())
-                    },
-                    async |_| {
-                        if !actor_blocks && !setup_blocks {
+            let (entered, entering) = tokio::sync::oneshot::channel();
+            let started = aktor_start(AktorSetup {
+                stuck: aktor::AktorGroupStuck::AbortProcess(()),
+                actors: AktorNew {
+                    name: "blocking cleanup".into(),
+                    kind: AktorKind::TokioThread,
+                    start: aktor::AktorInit::Ready(async move || {
+                        if setup_blocks {
+                            entered.send(()).unwrap();
                             loop {
                                 std::thread::sleep(Duration::from_secs(10));
                             }
                         }
-
-                        Ok::<_, AktorError>(())
+                    }),
+                    end: move |_| {
+                        if actor_blocks {
+                            loop {
+                                std::thread::sleep(Duration::from_secs(10));
+                            }
+                        }
                     },
-                )
-                .await;
+                    hooks: AktorHooks::NONE,
+                    capacity: NonZeroUsize::MIN,
+                    stuck: AktorStuck::Kill,
+                },
+                shutdown: async move |_| {
+                    if !actor_blocks && !setup_blocks {
+                        loop {
+                            std::thread::sleep(Duration::from_secs(10));
+                        }
+                    }
+                },
+                grace: Duration::from_millis(200),
+            });
+            if setup_blocks {
+                entering.await.unwrap();
+            } else {
+                started.ready().await.unwrap();
+            }
+            let _report = started.stop().await;
 
             // An uninterruptible actor must still cause exit if the report was ignored.
             std::thread::sleep(Duration::from_secs(10));
@@ -406,7 +357,6 @@ fn shutdown() {
     for mode in [
         "runtime exit",
         "runtime exit actor",
-        "runtime exit run",
         "formatter panic",
         "actor",
         "application",
@@ -422,7 +372,7 @@ fn shutdown() {
         #[cfg(unix)]
         "abort handler",
     ] {
-        let mut child = support::child_command("watchdog::shutdown")
+        let mut process = support::test_command("watchdog::shutdown")
             .env("AKTOR_GROUP_BLOCKING_PROOF", mode)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -432,25 +382,24 @@ fn shutdown() {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
 
         loop {
-            if child.try_wait().unwrap().is_some() {
+            if process.try_wait().unwrap().is_some() {
                 break;
             }
 
             if std::time::Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
+                process.kill().unwrap();
+                process.wait().unwrap();
                 panic!("shutdown watchdog did not stop blocking {mode}");
             }
 
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let output = child.wait_with_output().unwrap();
+        let output = process.wait_with_output().unwrap();
         let forced_exit = !matches!(
             mode,
             "runtime exit"
                 | "runtime exit actor"
-                | "runtime exit run"
                 | "formatter panic"
                 | "pending setup"
                 | "settling thread"
@@ -461,7 +410,7 @@ fn shutdown() {
             String::from_utf8_lossy(&output.stderr)
                 .lines()
                 .any(|line| line == format!("watchdog case: {mode}")),
-            "watchdog child did not enter {mode}"
+            "watchdog process did not enter {mode}"
         );
 
         if forced_exit {
@@ -485,7 +434,80 @@ fn shutdown() {
         }
 
         if !forced_exit {
-            assert!(!String::from_utf8_lossy(&output.stderr).contains("Shutdown deadline reached"));
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("Shutdown ran past its grace")
+            );
         }
     }
+}
+
+#[tokio::test]
+async fn default_callback() {
+    if std::env::var_os("AKTOR_TEST_CASE").is_none() {
+        let output = support::run_test("watchdog::default_callback", "blocked callback");
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        return;
+    }
+
+    let (entered, inside) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let started = aktor_start(AktorSetup {
+        stuck: aktor::AktorGroupStuck::KeepRunning,
+        actors: support::thread_actor((), 1),
+        shutdown: async move |_| {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            Err::<(), _>(((), String::from("late close failure")))
+        },
+        grace: Duration::from_millis(200),
+    });
+    started.ready().await.unwrap();
+    let closing = started.completion();
+    started.killswitch().stop();
+    inside.await.unwrap();
+
+    let (cleaned, cleaning) = tokio::sync::oneshot::channel();
+    let sibling = aktor_start(AktorSetup {
+        stuck: aktor::AktorGroupStuck::KeepRunning,
+        actors: support::thread_actor((), 1),
+        shutdown: move |_| {
+            let _ = cleaned.send(());
+        },
+        grace: Duration::from_secs(1),
+    });
+    sibling.ready().await.unwrap();
+    sibling.killswitch().stop();
+    tokio::time::timeout(Duration::from_secs(2), cleaning)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let report = closing.wait().await.unwrap();
+    assert!(report.ran_past_grace());
+
+    release.send(()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let report = closing.try_report().unwrap();
+
+            if report
+                .failures
+                .iter()
+                .any(|failure| failure.error.contains("late close failure"))
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("late callback error was lost");
 }

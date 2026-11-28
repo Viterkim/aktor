@@ -1,2 +1,2 @@
-expected `Result<u32, AktorError>`
-found `Result<u32, Error>`
+type mismatch resolving
+Result<u32,

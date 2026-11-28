@@ -1,5 +1,4 @@
 use super::*;
-use futures_util::FutureExt;
 
 type DbResult<T> = Result<T, QueryError>;
 
@@ -18,12 +17,12 @@ pub async fn insert(db: &mut Db, row: String) -> usize {
     db.rows.len() - 1
 }
 
-#[aktor]
+#[aktor(latest)]
 pub async fn find(db: &Db, id: usize) -> Option<String> {
     db.rows.get(id).cloned()
 }
 
-#[aktor]
+#[aktor(latest)]
 pub async fn fail(_db: &Db) -> Result<(), QueryError> {
     Err(QueryError)
 }
@@ -51,25 +50,26 @@ async fn composed_task() {
 
 #[tokio::test]
 async fn typed() {
-    let (db, actor) = spawn_thread(Db::default(), 8).unwrap();
+    let (db, _group) = thread_actor(Db::default());
 
-    let id: usize = insert(&db, "BingoManden".into()).await;
-    let row: Option<String> = find(&db, id).await;
+    let id: usize = insert(&db, "BingoManden".into()).await.unwrap();
+    let row: Option<String> = find(&db, id).await.unwrap();
 
     assert_eq!(row.as_deref(), Some("BingoManden"));
-    assert_eq!(fail(&db).await, Err(QueryError));
+    assert_eq!(fail(&db).await, Ok(Err(QueryError)));
 
-    let reply: Reply<DbResult<usize>> = aliased::request(&db).send().await;
+    let reply: Reply<DbResult<usize>> = aliased(&db).send().await.unwrap();
 
-    assert_eq!(reply.await, Ok(1));
+    assert_eq!(reply.await, Ok(Ok(1)));
 
     drop(db);
-    actor.join().unwrap();
 
-    let (db, mut listener) = channel::<Db>(2).unwrap();
+    let (db, _group) = thread_actor(Db {
+        rows: vec!["BingoManden".into(), "BingoKvinde".into()],
+    });
 
     struct Panel {
-        search: find::LatestSender<aktor::message::LatestSender<(usize,)>>,
+        search: find::Sender,
     }
 
     let (search, mut results) = find(&db, 0).latest();
@@ -79,21 +79,20 @@ async fn typed() {
     panel.search.send(0);
     panel.search.send(1);
     other.send();
+    aliased(&db).await.unwrap().unwrap();
 
-    let mut state = Db {
-        rows: vec!["BingoManden".into(), "BingoKvinde".into()],
-    };
-
-    listener.recv().await.unwrap().run(&mut state).await;
-    listener.recv().await.unwrap().run(&mut state).await;
     panel.search.send(0);
-    assert!(results.next().now_or_never().is_none());
-    listener.recv().await.unwrap().run(&mut state).await;
     assert_eq!(
-        results.next().await.flatten().as_deref(),
+        results
+            .next()
+            .await
+            .transpose()
+            .unwrap()
+            .flatten()
+            .as_deref(),
         Some("BingoManden")
     );
-    assert_eq!(other_results.next().await, Some(Err(QueryError)));
+    assert_eq!(other_results.next().await, Some(Ok(Err(QueryError))));
     drop(panel);
     assert_eq!(results.next().await, None);
     drop(other);

@@ -1,39 +1,52 @@
-use super::start_local;
+use super::{closed_local_handle, launch_local};
 use crate::timeout::browser_sleep;
 use crate::{
-    AktorNew, AktorNoRole, AktorSetupError,
+    AktorNew,
     local::{self, Handle},
-    message::LocalFuture,
-    setup::{AktorStart, AktorStartContext, AktorStartError, kind::BrowserLocal},
+    setup::{AktorLaunch, AktorStart, AktorStartContext, AktorStartReason, kind::BrowserLocal},
 };
 use core::ops::AsyncFnOnce;
+use er::*;
 
-impl<S, Start, Role, End, CM> AktorStart<CM> for AktorNew<S, Start, BrowserLocal, Role, End>
+impl<S, Start, End, EM: 'static, E, X, Before, After> AktorStart
+    for AktorNew<S, crate::AktorInit<Start>, BrowserLocal, End, (EM, E), Before, After>
 where
+    Before: crate::setup::closures::EachHook<<BrowserLocal as crate::setup::AktorMode>::Each<S>>,
+    After: crate::setup::closures::EachHook<<BrowserLocal as crate::setup::AktorMode>::Each<S>>,
     S: 'static,
-    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
-    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
+    Start: AsyncFnOnce() -> Result<S, X> + 'static,
+    X: Into<(E, String)> + 'static,
+    E: 'static,
+    End: crate::setup::closures::AktorEndCall<S, EM> + 'static,
 {
     type Group = crate::AktorGroup;
-    type Handles = Handle<S, 0, (), Role, local::clock::Browser>;
-    type Startup = LocalFuture<'static, Result<Self::Handles, AktorStartError>>;
+    type Error = E;
+    type Handles = Handle<S, (), local::clock::Browser>;
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        group.start().map(|_| ()).map_err(Into::into)
+    fn actor_name(&self) -> &str {
+        &self.name
     }
 
-    fn start_in(self, context: AktorStartContext<crate::AktorGroup>) -> Self::Startup {
-        let setup = self.with_role(AktorNoRole);
+    fn begin(&self, group: &mut Self::Group) -> Result<(), (AktorStartReason, String)> {
+        group.start().er_with(|error| error.start_reason())?;
 
-        Box::pin(async move {
-            start_local(
-                setup,
-                context,
-                wasm_bindgen_futures::spawn_local,
-                |duration| Box::pin(browser_sleep(duration)),
-            )
-            .await
-            .map(Handle::with_role)
-        })
+        Ok(())
+    }
+
+    fn closed(name: &str, group: &crate::AktorGroup) -> Self::Handles {
+        closed_local_handle(name, group, false)
+    }
+
+    fn launch(self, context: AktorStartContext<crate::AktorGroup>) -> AktorLaunch<Self> {
+        let this = pair_start!(self, crate::setup::impls::pair_start, EM);
+
+        let completion = context.group.completion();
+        let (handle, ready) = launch_local(
+            this,
+            context,
+            wasm_bindgen_futures::spawn_local,
+            |duration| Box::pin(browser_sleep(duration)),
+        )?;
+        Ok((handle, Box::pin(super::readiness(ready, completion))))
     }
 }

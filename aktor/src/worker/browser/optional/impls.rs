@@ -5,85 +5,60 @@ use core::{
     task::{Context, Poll, ready},
 };
 
-impl<S: 'static, Role: 'static, E> OptionalWorker<S, Role, E> {
-    pub fn new(url: &str) -> Result<Self, WorkerError> {
-        Self::with_options(url, Options::default())
+impl<W: AktorWorkerContract> OptionalWorker<W> {
+    pub(in crate::worker::browser) fn session_worker(
+        &self,
+    ) -> Result<&Worker<W>, (crate::AktorKillSwitch, WireFailure)> {
+        match &self.worker {
+            Ok(worker) => Ok(worker),
+            Err(unavailable) => Err((unavailable.group.clone(), unavailable.failure.error.clone())),
+        }
+    }
+}
+
+impl<W: AktorWorkerContract> OptionalWorker<W> {
+    /// Wrap the outermost future that needs to stop with this worker's group.
+    /// If the group starts closing first, `run` drops that future and returns `None`.
+    pub fn run<F: IntoFuture>(&self, work: F) -> crate::AktorRun<F::IntoFuture> {
+        let work = work.into_future();
+
+        match &self.worker {
+            Ok(worker) => worker.run(work),
+            Err(unavailable) => unavailable.group.run(work),
+        }
     }
 
-    pub fn with_options(url: &str, options: Options) -> Result<Self, WorkerError> {
-        Ok(Self {
-            worker: Ok(Worker::with_policy(url, options, true)?),
-        })
+    /// The registered launch attempt this handle belongs to.
+    pub fn actor_id(&self) -> Option<crate::ActorId> {
+        match &self.worker {
+            Ok(worker) => worker.actor_id(),
+            Err(unavailable) => unavailable.group.registered_id(),
+        }
     }
 
-    pub fn with_config<Config: Serialize>(
-        url: &str,
-        options: Options,
-        config: &Config,
-    ) -> Result<Self, WorkerError> {
-        let config = encode(config)?;
-        let worker = Worker::with_policy(url, options, true)?;
-
-        worker.inner.accepted.set(false);
-        *worker.inner.initialize.borrow_mut() = Some(config);
-        Ok(Self::from_worker(worker))
+    /// Use the group's completion to wait for the shutdown report or confirm that every actor
+    /// has stopped.
+    pub fn group_completion(&self) -> crate::AktorGroupCompletion {
+        match &self.worker {
+            Ok(worker) => worker.group_completion(),
+            Err(unavailable) => unavailable.group.completion(),
+        }
     }
 
-    /// Attach an external join during construction.
-    /// Normal and forced shutdown wait for accepted joins.
-    /// A refused join runs independently and keeps this handle alive until it finishes.
-    pub fn before_shutdown(
-        self,
-        joining: impl Future<Output = Result<(), crate::AktorError>> + 'static,
-    ) -> Result<Self, WorkerError>
-    where
-        E: 'static,
-    {
-        match self.worker {
-            Ok(worker) => Ok(Self::from_worker(worker.before_shutdown(joining)?)),
+    /// Wait for startup with the same rollback reporting as [`Worker::ready`].
+    pub async fn ready(&self) -> Result<&W::Ready, (&WorkerStartError<W::Error>, String)> {
+        match &self.worker {
+            Ok(worker) => worker.ready().await,
             Err(unavailable) => {
-                let error = unavailable.error.clone();
-                let diagnostics = unavailable.completion.diagnostics.clone();
-                drop(ShutdownDependency::new(Some(Box::pin(async move {
-                    let result = joining.await;
-
-                    if let Err(error) = &result {
-                        diagnostics.borrow_mut().push(error.clone());
-                    }
-
-                    drop(unavailable);
-                    result
-                }))));
-
-                Err(error)
+                let (error, text) = &*unavailable.startup;
+                deliver(error.failure().failure_id, &unavailable.group);
+                Err((error, text.clone()))
             }
         }
     }
 
-    pub async fn ready(&self) -> Result<(), WorkerError<E>>
-    where
-        E: DeserializeOwned,
-    {
-        match &self.worker {
-            Ok(worker) => worker.ready().await,
-            Err(unavailable) => Err(unavailable.error.clone().without_data()),
-        }
-    }
-
-    pub fn new_handle(&self) -> Self {
-        Self {
-            worker: self
-                .worker
-                .as_ref()
-                .map(Worker::new_handle)
-                .map_err(|unavailable| Unavailable {
-                    error: unavailable.error.clone(),
-                    completion: unavailable.completion.new_observer(),
-                }),
-        }
-    }
-
-    pub fn shutdown(&self) -> Completion<E> {
+    #[doc(hidden)]
+    pub fn shutdown(&self) -> Completion<W::Error> {
         if let Ok(worker) = &self.worker {
             worker.shutdown();
         }
@@ -91,98 +66,116 @@ impl<S: 'static, Role: 'static, E> OptionalWorker<S, Role, E> {
         self.completion()
     }
 
-    pub fn completion(&self) -> Completion<E> {
+    /// Keep this to observe retirement or wait for this worker's `end`.
+    pub fn completion(&self) -> Completion<W::Error> {
         match &self.worker {
             Ok(worker) => worker.completion(),
-            Err(unavailable) => unavailable.completion.new_observer(),
+            Err(unavailable) => unavailable.completion.clone(),
         }
     }
 
+    /// Request termination after any accepted external join finishes.
+    /// The worker can stay alive while it retains unfinished work.
     pub fn terminate(&self) {
         if let Ok(worker) = &self.worker {
             worker.terminate();
         }
     }
 
-    pub fn request<O: DeserializeOwned + 'static>(
-        &self,
-        operation: &str,
-        input: Result<Vec<u8>, WorkerError>,
-    ) -> OptionalRequest<'_, S, O, Role> {
-        OptionalRequest {
-            request: self
-                .worker
-                .as_ref()
-                .map(|worker| worker.request(operation, input))
-                .map_err(|unavailable| unavailable.error.clone()),
-        }
-    }
-
     pub(crate) fn unavailable(
-        error: WorkerError,
-        dependency: watch::Receiver<Option<Result<(), crate::AktorError>>>,
+        failure: ReadyFailure,
+        name: String,
+        kill: crate::AktorKillSwitch,
+        dependency: Option<JoinReceipt>,
     ) -> Self {
-        let completion = Completion::unavailable(error.clone(), dependency);
+        let completion = Completion::unavailable(
+            failure.error.clone(),
+            name.clone(),
+            kill.clone(),
+            dependency,
+        );
 
         Self {
-            worker: Err(Unavailable { error, completion }),
+            worker: Err(Unavailable {
+                startup: Rc::new(failure.clone().report(WireFailure::without_data)),
+                failure,
+                completion,
+                group: kill,
+                name,
+            }),
         }
     }
 
-    pub(crate) fn into_worker(self) -> Result<Worker<S, Role, E>, WorkerError> {
-        self.worker.map_err(|unavailable| unavailable.error)
-    }
-
-    pub(crate) fn from_worker(worker: Worker<S, Role, E>) -> Self {
+    pub(crate) fn from_worker(worker: Worker<W>) -> Self {
         Self { worker: Ok(worker) }
     }
 }
 
 impl<'a, S, O: 'static, Role> OptionalRequest<'a, S, O, Role> {
-    pub async fn send(self) -> Result<OptionalReply<O>, WorkerError> {
-        Ok(OptionalReply {
-            reply: self.request?.admit().await?,
-        })
+    fn available(
+        &mut self,
+    ) -> Result<&mut WorkerRequest<'a, S, O, Role>, crate::AktorDeliveryError> {
+        match &mut self.request {
+            Ok(request) => Ok(request),
+            Err((group, error)) => {
+                deliver(error.error.failure_id, group);
+                Err(error.with_outcome(AktorDeliveryOutcome::NotAdmitted).into())
+            }
+        }
+    }
+
+    pub fn send(self) -> OptionalRequestSend<'a, S, O, Role> {
+        OptionalRequestSend(self)
     }
 }
-impl<S, O: 'static, Role> Future for OptionalRequest<'_, S, O, Role> {
-    type Output = Result<O, WorkerError>;
+
+impl<'a, S: 'a, Role: 'a> OptionalRequest<'a, S, (), Role> {
+    pub async fn cast(self) -> Result<(), crate::AktorDeliveryError> {
+        self.send().await.map(drop)
+    }
+}
+
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct OptionalRequestSend<'a, S, O, Role = ()>(OptionalRequest<'a, S, O, Role>);
+impl<S, O, Role> Unpin for OptionalRequestSend<'_, S, O, Role> {}
+impl<S, O: 'static, Role> Future for OptionalRequestSend<'_, S, O, Role> {
+    type Output = Result<WorkerReply<O>, crate::AktorDeliveryError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
+        let request = self.get_mut().0.available()?;
 
-        let request = match &mut this.request {
-            Ok(request) => request,
-            Err(error) => return Poll::Ready(Err(error.clone())),
-        };
+        if let Err(error) = ready!(request.poll_checked(cx)) {
+            return Poll::Ready(Err(error.into()));
+        }
 
-        ready!(request.poll_submit(cx)).map_err(WireError::without_data)?;
-
-        match &mut request.reply {
-            Some(reply) => reply.poll_outcome(cx),
-            None => Poll::Ready(Err(WorkerError::new(
-                CallError::NotAdmitted,
+        match request.reply.take() {
+            Some(reply) => Poll::Ready(Ok(reply)),
+            None => Poll::Ready(Err(WireFailure::new(
+                AktorDeliveryOutcome::NotAdmitted,
                 WorkerCause::Closed,
-            ))),
+            )
+            .into())),
         }
     }
 }
-impl<O> Future for OptionalReply<O> {
-    type Output = Result<O, WorkerError>;
+
+impl<S, O: 'static, Role> Future for OptionalRequest<'_, S, O, Role> {
+    type Output = Result<O, crate::AktorDeliveryError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().reply.poll_outcome(cx)
+        Pin::new(self.get_mut().available()?).poll(cx)
     }
 }
 impl<'a, S, O: 'static, Role> crate::call::SendRequest for OptionalRequest<'a, S, O, Role> {
-    type Reply = Result<OptionalReply<O>, WorkerError>;
+    type Reply = WorkerReply<O>;
+    type Send = OptionalRequestSend<'a, S, O, Role>;
 
-    async fn send(self) -> Self::Reply {
-        self.send().await
+    fn send(self) -> Self::Send {
+        self.send()
     }
 }
-impl<'a, S, I: 'a, O: 'static, Role, E, C> Transport<S, I, O, Role, C>
-    for &'a OptionalWorker<S, Role, E>
+impl<'a, S, I: 'a, O: 'static, Role, W: AktorWorkerContract<State = S, Role = Role>, C>
+    Transport<S, I, O, Role, C> for &'a OptionalWorker<W>
 where
     C: Codec<I> + Codec<O>,
 {
@@ -190,17 +183,50 @@ where
 
     fn request(self, operation: Operation, input: I) -> Self::Request {
         OptionalRequest {
-            request: self
-                .worker
-                .as_ref()
-                .map(|worker| Transport::<S, I, O, Role, C>::request(worker, operation, input))
-                .map_err(|unavailable| unavailable.error.clone()),
+            request: match &self.worker {
+                Ok(worker) => Ok(Transport::<S, I, O, Role, C>::request(
+                    worker, operation, input,
+                )),
+                Err(unavailable) => Err((&unavailable.group, unavailable.failure.error.clone())),
+            },
         }
     }
 }
-impl<S: 'static, Role, E> ReadState<S, Role> for &OptionalWorker<S, Role, E> {
-    type Lease = OwnedState<S>;
+impl<W: AktorWorkerContract> Clone for OptionalWorker<W> {
+    fn clone(&self) -> Self {
+        Self {
+            worker: self.worker.clone(),
+        }
+    }
 }
-impl<S: 'static, Role, E> WriteState<S, Role> for &OptionalWorker<S, Role, E> {
-    type Lease = OwnedState<S>;
+impl<S: 'static, W: AktorWorkerContract<State = S>> ReadState<S, W::Role>
+    for &OptionalHandle<W, S>
+{
+    type Lease = OwnedState<W::State>;
+}
+impl<S: 'static, W: AktorWorkerContract<State = S>> WriteState<S, W::Role>
+    for &OptionalHandle<W, S>
+{
+    type Lease = OwnedState<W::State>;
+}
+
+impl<E> Clone for Unavailable<E> {
+    fn clone(&self) -> Self {
+        Self {
+            failure: self.failure.clone(),
+            startup: self.startup.clone(),
+            completion: self.completion.clone(),
+            group: self.group.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
+impl<'a, S: 'a, Role: 'a> crate::call::CastRequest for OptionalRequest<'a, S, (), Role> {
+    type Output = Result<(), crate::AktorDeliveryError>;
+    type Cast = crate::message::LocalFuture<'a, Self::Output>;
+
+    fn cast(self) -> Self::Cast {
+        Box::pin(self.cast())
+    }
 }

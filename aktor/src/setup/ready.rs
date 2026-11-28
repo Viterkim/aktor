@@ -1,10 +1,13 @@
-use alloc::rc::Rc;
+use super::{AktorStartReason, LaunchError, StartFailure};
+use crate::AktorGroupError;
+use alloc::{boxed::Box, rc::Rc};
 use core::{
     cell::{Cell, RefCell},
     future::Future,
     pin::Pin,
     task::{Context, Poll, Waker},
 };
+use er::*;
 
 struct Shared<T> {
     value: RefCell<Option<T>>,
@@ -15,6 +18,30 @@ struct Shared<T> {
 pub struct Sender<T> {
     shared: Rc<Shared<T>>,
 }
+pub(crate) struct Startup<E>(Box<dyn FnOnce(Result<(), StartFailure<E>>)>);
+impl<E> Startup<E> {
+    pub fn send(self, value: Result<(), StartFailure<E>>) {
+        (self.0)(value);
+    }
+}
+
+pub(crate) fn startup<E: 'static>(
+    aborted: impl FnOnce() -> bool + 'static,
+    publish: impl FnOnce(Result<(), StartFailure<E>>) + 'static,
+) -> Startup<E> {
+    Startup(Box::new(move |result| {
+        if result.is_ok() && aborted() {
+            publish(Err(er_new!(
+                LaunchError::new(AktorStartReason::Stopping),
+                AktorGroupError::Stopping
+            )
+            .into()));
+        } else {
+            publish(result);
+        }
+    }))
+}
+
 pub struct Receiver<T> {
     shared: Rc<Shared<T>>,
 }

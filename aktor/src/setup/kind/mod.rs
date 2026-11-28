@@ -1,7 +1,7 @@
 //! Where the actor runs. Use AktorExecution to read the kind from a report.
 
 #[cfg(feature = "local")]
-use crate::{AktorSetupError, local::clock::AktorGroupClock, message::LocalFuture};
+use crate::{local::clock::AktorGroupClock, message::LocalFuture};
 #[cfg(feature = "local")]
 use alloc::rc::Rc;
 #[cfg(feature = "local")]
@@ -38,18 +38,18 @@ pub struct BrowserLocal;
 
 #[cfg(feature = "embassy")]
 pub struct EmbassyLocal {
-    pub spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>>,
+    pub(crate) spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), alloc::string::String>>,
 }
 
 #[cfg(feature = "local")]
 pub struct Local<Clock: AktorGroupClock> {
-    pub spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>>,
+    pub(crate) spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), alloc::string::String>>,
     pub clock: PhantomData<fn() -> Clock>,
 }
 
 #[cfg(feature = "local")]
 pub struct Custom<Clock: AktorGroupClock, Runner> {
-    pub spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>>,
+    pub(crate) spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), alloc::string::String>>,
     pub runner: Runner,
     pub clock: PhantomData<fn() -> Clock>,
 }
@@ -78,18 +78,19 @@ pub use bevy::*;
     target_family = "wasm",
     target_os = "unknown"
 ))]
-pub struct BrowserWebWorker<S> {
+pub struct BrowserWebWorker<C: crate::AktorWorkerContract> {
     pub program: alloc::string::String,
-    pub state: PhantomData<fn() -> S>,
+    state: PhantomData<fn() -> C>,
 }
 
 #[cfg(feature = "embassy_cross_core")]
 pub struct EmbassyCrossCore {
-    pub spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), AktorSetupError>>,
+    pub(crate) spawn: Rc<dyn Fn(LocalFuture<'static, ()>) -> Result<(), alloc::string::String>>,
 }
 
 #[doc(hidden)]
 pub trait AktorMode {
+    type Leave;
     type Each<S: 'static>: ?Sized;
     type Interval<S: 'static>: ?Sized;
 

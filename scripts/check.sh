@@ -2,6 +2,9 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
+# rustc 1.95 hits an incremental ICE on these tests, a full build every time is the cheap fix.
+export CARGO_INCREMENTAL=0
+
 if [[ "${1:-}" == browser ]]; then
     exec bash checks/browser.sh
 fi

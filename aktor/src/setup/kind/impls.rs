@@ -12,6 +12,7 @@ mod tokio {
     }
 
     impl AktorMode for TokioTask {
+        type Leave = ();
         type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
         type Interval<S: 'static> = dyn crate::task::hooks::AktorTaskInterval<S> + Send;
 
@@ -19,6 +20,7 @@ mod tokio {
     }
 
     impl AktorMode for TokioThread {
+        type Leave = ();
         type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S> + Send;
 
@@ -27,6 +29,7 @@ mod tokio {
 
     #[cfg(feature = "local")]
     impl AktorMode for TokioLocal<'_> {
+        type Leave = core::convert::Infallible;
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
@@ -42,6 +45,7 @@ mod standard {
     use super::*;
 
     impl AktorMode for StdThread {
+        type Leave = ();
         type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
         type Interval<S: 'static> = dyn AktorIntervalLogic<S> + Send;
 
@@ -64,6 +68,7 @@ mod bevy {
     }
 
     impl AktorMode for BevyLocal<'_> {
+        type Leave = core::convert::Infallible;
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
@@ -71,6 +76,7 @@ mod bevy {
     }
 
     impl AktorMode for BevyTask<'_> {
+        type Leave = ();
         type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
         type Interval<S: 'static> = dyn crate::task::hooks::AktorTaskInterval<S> + Send;
 
@@ -86,31 +92,45 @@ mod local {
     use super::*;
 
     #[allow(non_snake_case)]
-    pub fn Custom<Clock: crate::local::clock::AktorGroupClock, Runner>(
+    pub fn Custom<
+        Clock: crate::local::clock::AktorGroupClock,
+        Runner,
+        E,
+        X: Into<(E, alloc::string::String)>,
+    >(
         _clock: Clock,
-        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), crate::AktorSetupError>
-        + 'static,
+        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), X> + 'static,
         runner: Runner,
     ) -> Custom<Clock, Runner> {
         Custom {
-            spawn: alloc::rc::Rc::new(spawn),
+            spawn: alloc::rc::Rc::new(move |future| match spawn(future) {
+                Ok(()) => Ok(()),
+                Err(error) => Err(error.into().1),
+            }),
             runner,
             clock: core::marker::PhantomData,
         }
     }
 
     #[allow(non_snake_case)]
-    pub fn Local<Clock: crate::local::clock::AktorGroupClock>(
-        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), crate::AktorSetupError>
-        + 'static,
+    pub fn Local<
+        Clock: crate::local::clock::AktorGroupClock,
+        E,
+        X: Into<(E, alloc::string::String)>,
+    >(
+        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), X> + 'static,
     ) -> Local<Clock> {
         Local {
-            spawn: alloc::rc::Rc::new(spawn),
+            spawn: alloc::rc::Rc::new(move |future| match spawn(future) {
+                Ok(()) => Ok(()),
+                Err(error) => Err(error.into().1),
+            }),
             clock: core::marker::PhantomData,
         }
     }
 
     impl<Clock: crate::local::clock::AktorGroupClock, Runner> AktorMode for Custom<Clock, Runner> {
+        type Leave = core::convert::Infallible;
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
@@ -118,6 +138,7 @@ mod local {
     }
 
     impl<Clock: crate::local::clock::AktorGroupClock> AktorMode for Local<Clock> {
+        type Leave = core::convert::Infallible;
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
@@ -133,16 +154,19 @@ mod embassy {
     use super::*;
 
     #[allow(non_snake_case)]
-    pub fn EmbassyLocal(
-        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), crate::AktorSetupError>
-        + 'static,
+    pub fn EmbassyLocal<E, X: Into<(E, alloc::string::String)>>(
+        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), X> + 'static,
     ) -> EmbassyLocal {
         EmbassyLocal {
-            spawn: alloc::rc::Rc::new(spawn),
+            spawn: alloc::rc::Rc::new(move |future| match spawn(future) {
+                Ok(()) => Ok(()),
+                Err(error) => Err(error.into().1),
+            }),
         }
     }
 
     impl AktorMode for EmbassyLocal {
+        type Leave = core::convert::Infallible;
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
@@ -158,16 +182,19 @@ mod cross_core {
     use super::*;
 
     #[allow(non_snake_case)]
-    pub fn EmbassyCrossCore(
-        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), crate::AktorSetupError>
-        + 'static,
+    pub fn EmbassyCrossCore<E, X: Into<(E, alloc::string::String)>>(
+        spawn: impl Fn(crate::message::LocalFuture<'static, ()>) -> Result<(), X> + 'static,
     ) -> EmbassyCrossCore {
         EmbassyCrossCore {
-            spawn: alloc::rc::Rc::new(spawn),
+            spawn: alloc::rc::Rc::new(move |future| match spawn(future) {
+                Ok(()) => Ok(()),
+                Err(error) => Err(error.into().1),
+            }),
         }
     }
 
     impl AktorMode for EmbassyCrossCore {
+        type Leave = core::convert::Infallible;
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
         const EXECUTION: AktorExecution = AktorExecution::EmbassyCrossCore;
@@ -186,6 +213,7 @@ mod browser {
     use super::*;
 
     impl AktorMode for BrowserLocal {
+        type Leave = core::convert::Infallible;
         type Each<S: 'static> = dyn FnMut(&mut S, Operation);
         type Interval<S: 'static> = dyn AktorIntervalLogic<S>;
 
@@ -200,18 +228,20 @@ mod browser {
 ))]
 mod worker {
     use super::*;
+    use crate::AktorWorkerContract;
 
-    #[allow(non_snake_case)]
-    pub fn BrowserWebWorker<S: 'static>(
+    #[allow(non_snake_case, clippy::type_complexity)]
+    pub fn BrowserWebWorker<C: AktorWorkerContract>(
         program: impl Into<alloc::string::String>,
-    ) -> BrowserWebWorker<S> {
+    ) -> BrowserWebWorker<C> {
         BrowserWebWorker {
             program: program.into(),
-            state: core::marker::PhantomData,
+            state: PhantomData,
         }
     }
 
-    impl<S> AktorMode for BrowserWebWorker<S> {
+    impl<C: AktorWorkerContract> AktorMode for BrowserWebWorker<C> {
+        type Leave = ();
         type Each<T: 'static> = dyn FnMut(&mut T, Operation);
         type Interval<T: 'static> = dyn AktorIntervalLogic<T>;
 
@@ -246,6 +276,7 @@ pub fn BrowserThread(program: impl Into<alloc::string::String>) -> BrowserThread
     target_feature = "atomics"
 ))]
 impl AktorMode for BrowserThread {
+    type Leave = ();
     type Each<S: 'static> = dyn FnMut(&mut S, Operation) + Send;
     type Interval<S: 'static> = dyn AktorIntervalLogic<S> + Send;
 

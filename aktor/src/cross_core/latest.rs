@@ -2,7 +2,6 @@ use super::*;
 use crate::{
     dispatch::OwnedState,
     latest::{SendLatest, Session, TypedSession},
-    message::stopped,
 };
 use core::{
     future::{Future, poll_fn},
@@ -40,34 +39,48 @@ impl<I> LatestSender<I> {
 
 pub struct LatestResults<O> {
     output: Box<dyn Output<O>>,
+    ended: bool,
     status: Arc<Status>,
     changed: Listener,
     completed: Listener,
 }
 impl<O> LatestResults<O> {
-    pub async fn next(&mut self) -> Option<O> {
+    pub async fn next(&mut self) -> Option<Result<O, crate::AktorDeliveryError>> {
         poll_fn(|cx| self.poll(cx)).await
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<O>> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<O, crate::AktorDeliveryError>>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
         self.changed.register(cx);
         self.completed.register(cx);
 
         let state = self.status.state.lock(|state| {
             let state = state.borrow();
-            (state.closing, state.completed.clone())
+            state.completed.as_ref().map(Result::is_err)
         });
 
-        match self.output.poll(state.0, state.1.as_ref()) {
-            Ok(output) => output,
-            Err(()) if self.status.managed() => Poll::Pending,
-            Err(()) => stopped(),
+        match self.output.poll(state) {
+            Ok(Poll::Ready(None)) => {
+                self.ended = true;
+                Poll::Ready(None)
+            }
+            Ok(output) => output.map(|item| item.map(Ok)),
+            Err(outcome) => {
+                self.ended = true;
+                let error = outcome.error(true);
+                Poll::Ready(Some(Err(error)))
+            }
         }
     }
 }
 impl<O> futures_core::Stream for LatestResults<O> {
-    type Item = O;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<O>> {
+    type Item = Result<O, crate::AktorDeliveryError>;
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<O, crate::AktorDeliveryError>>> {
         self.get_mut().poll(cx)
     }
 }
@@ -83,11 +96,7 @@ trait Input<I>: Send + Sync {
     fn close_sender(&self);
 }
 trait Output<O>: Send + Sync {
-    fn poll(
-        &self,
-        closing: bool,
-        completed: Option<&Result<(), AktorError>>,
-    ) -> Result<Poll<Option<O>>, ()>;
+    fn poll(&self, completed: Option<bool>) -> Result<Poll<Option<O>>, crate::CallLoss>;
     fn close_receiver(&self);
 }
 
@@ -108,8 +117,11 @@ struct Slot<I, O> {
     running: bool,
     senders: usize,
     receiver: bool,
-    failed: bool,
+    failed: Option<crate::CallLoss>,
 }
+
+/// What scheduling did. A refused job comes back with its input, both dropped outside the lock.
+type Scheduled<S, I> = Option<Result<(), (Message<S>, Option<I>)>>;
 
 struct LatestJob<S, I, O, F, Role> {
     shared: Arc<Shared<S, I, O, F, Role>>,
@@ -124,11 +136,32 @@ impl<S, I, O, F, Role> Drop for LatestJob<S, I, O, F, Role> {
         let discarded = self.shared.slot.lock(|slot| {
             let mut slot = slot.borrow_mut();
 
+            // The owner refused this job before it ever got queued, there's nothing it lost.
+            if !slot.scheduled && !slot.running {
+                return None;
+            }
+
+            slot.failed = Some(crate::CallLoss(
+                if slot.running {
+                    AktorDeliveryOutcome::OutcomeUnknown
+                } else {
+                    AktorDeliveryOutcome::Discarded
+                },
+                self.shared
+                    .handle
+                    .inner
+                    .status
+                    .state
+                    .lock(|s| s.borrow().lost.clone()),
+            ));
             slot.scheduled = false;
             slot.running = false;
-            slot.failed = true;
-            (slot.pending.take(), slot.output.take())
+            Some((slot.pending.take(), slot.output.take()))
         });
+
+        if discarded.is_none() {
+            return;
+        }
 
         drop(discarded);
         self.shared.changed.notify();
@@ -139,33 +172,38 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, F, Role: 'static> Shared<
 where
     F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
 {
-    fn schedule(&self, slot: &mut Slot<I, O>) -> Option<Result<(), Message<S>>> {
-        if slot.scheduled || slot.running || !slot.receiver || slot.failed || slot.pending.is_none()
+    fn schedule(&self, slot: &mut Slot<I, O>) -> Scheduled<S, I> {
+        if slot.scheduled
+            || slot.running
+            || !slot.receiver
+            || slot.failed.is_some()
+            || slot.pending.is_none()
         {
             return None;
         }
 
         let this = self.this.upgrade()?;
-        let committed = self.handle.inner.commit(
-            Message {
-                operation: self.operation,
-                job: Box::new(LatestJob {
-                    shared: this,
-                    finished: false,
-                }),
-            },
-            true,
-        );
+        let committed = self.handle.inner.commit_service(Message {
+            operation: self.operation,
+            job: Box::new(LatestJob {
+                shared: this,
+                finished: false,
+            }),
+        });
 
+        // The owner only refuses once it's finishing. That input is as late as a send after
+        // close, so the stream just ends instead of counting as lost work.
         slot.scheduled = committed.is_ok();
-        slot.failed |= committed.is_err();
-        Some(committed)
+        Some(match committed {
+            Ok(()) => Ok(()),
+            Err(message) => Err((message, slot.pending.take())),
+        })
     }
 
-    fn publish(&self, committed: Option<Result<(), Message<S>>>) {
+    fn publish(&self, committed: Scheduled<S, I>) {
         match committed {
             Some(Ok(())) => self.handle.inner.changed.notify(),
-            Some(Err(message)) => drop(message),
+            Some(Err(refused)) => drop(refused),
             None => {}
         }
 
@@ -184,7 +222,7 @@ where
             let mut slot = slot.borrow_mut();
 
             if !slot.receiver
-                || slot.failed
+                || slot.failed.is_some()
                 || !self.handle.inner.queue.lock(|queue| queue.borrow().open)
             {
                 return None;
@@ -218,26 +256,32 @@ where
     }
 }
 impl<S, I: Send, O: Send, F: Send, Role> Output<O> for Arc<Shared<S, I, O, F, Role>> {
-    fn poll(
-        &self,
-        closing: bool,
-        completed: Option<&Result<(), AktorError>>,
-    ) -> Result<Poll<Option<O>>, ()> {
+    fn poll(&self, completed: Option<bool>) -> Result<Poll<Option<O>>, crate::CallLoss> {
         self.slot.lock(|slot| {
             let mut slot = slot.borrow_mut();
 
-            if !slot.failed
+            if slot.failed.is_none()
                 && let Some(output) = slot.output.take()
             {
                 return Ok(Poll::Ready(Some(output)));
             }
 
-            if completed.is_some_and(Result::is_err) || (slot.failed && completed.is_some()) {
-                return Err(());
+            if completed == Some(true) || slot.failed.is_some() {
+                return Err(slot.failed.take().unwrap_or_else(|| {
+                    crate::CallLoss(
+                        AktorDeliveryOutcome::OutcomeUnknown,
+                        self.handle.inner.status.state.lock(|s| {
+                            let state = s.borrow();
+                            state
+                                .lost
+                                .clone()
+                                .or_else(|| state.returned.first().cloned())
+                        }),
+                    )
+                }));
             }
 
-            if !slot.failed
-                && (closing || slot.senders == 0)
+            if (completed.is_some() || slot.senders == 0)
                 && slot.pending.is_none()
                 && !slot.scheduled
                 && !slot.running
@@ -275,7 +319,7 @@ where
     fn run<'a>(
         &'a mut self,
         state: &'a mut S,
-        hooks: &'a mut AktorHooks<S>,
+        hooks: &'a mut CallHooks<S>,
         operation: Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
@@ -348,7 +392,7 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static> Session<S,
         F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
     {
         let shared = Arc::new_cyclic(|this| Shared {
-            handle: self.new_handle(),
+            handle: self.clone(),
             slot: Mutex::new(RefCell::new(Slot {
                 revision: 0,
                 pending: None,
@@ -357,7 +401,7 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static> Session<S,
                 running: false,
                 senders: 1,
                 receiver: true,
-                failed: false,
+                failed: None,
             })),
             function: Mutex::new(RefCell::new(Some(function))),
             changed: Arc::new(Event::default()),
@@ -374,6 +418,7 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static, Role: 'static> Session<S,
                 completed: Event::listen(&shared.handle.inner.status.changed),
                 status: shared.handle.inner.status.clone(),
                 output: Box::new(shared),
+                ended: false,
             },
         )
     }

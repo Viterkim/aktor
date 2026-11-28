@@ -3,10 +3,19 @@ use core::{
     future::Future,
     task::{Context, Poll, Waker},
 };
-use std::{io, sync::Arc, task::Wake, thread};
+#[cfg(test)]
+use std::io;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Wake,
+    thread,
+};
 
 impl Driver {
-    pub fn new(standard: bool) -> io::Result<Self> {
+    pub fn new(standard: bool) -> Result<Self, (DriverError, String)> {
         #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
         if standard {
             return Ok(Self::Std);
@@ -16,15 +25,15 @@ impl Driver {
 
         #[cfg(feature = "tokio")]
         {
-            tokio::runtime::Builder::new_current_thread()
+            let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map(Self::Tokio)
+                .er(|| DriverError::Runtime)?;
+
+            Ok(Self::Tokio(runtime))
         }
         #[cfg(not(feature = "tokio"))]
-        Err(io::Error::other(
-            "the Tokio driver requires the tokio feature",
-        ))
+        er_bail!(DriverError::Disabled)
     }
 
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
@@ -37,8 +46,18 @@ impl Driver {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+#[derive(Er)]
+pub(crate) struct CurrentSpawnerErr;
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Er)]
+pub(crate) struct SpawnErr {
+    name: &'static str,
+}
 impl Spawner {
-    pub fn current(standard: bool) -> Result<Self, io::Error> {
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn current(standard: bool) -> ErResult<Self, CurrentSpawnerErr> {
         #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
         if standard {
             return Ok(Self::Std);
@@ -50,25 +69,23 @@ impl Spawner {
         {
             tokio::runtime::Handle::try_current()
                 .map(Self::Tokio)
-                .map_err(io::Error::other)
+                .er(())
         }
         #[cfg(not(feature = "tokio"))]
-        Err(io::Error::other(
-            "the Tokio spawner requires the tokio feature",
-        ))
+        er_bail!(
+            CurrentSpawnerErr,
+            "the Tokio spawner requires the tokio feature"
+        )
     }
 
-    pub fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> io::Result<()> {
-        self.spawn_named("aktor observer", future)
-    }
-
-    pub fn spawn_named(
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn spawn_named(
         &self,
         name: &'static str,
         future: impl Future<Output = ()> + Send + 'static,
-    ) -> io::Result<()> {
+    ) -> ErResult<(), SpawnErr> {
         #[cfg(test)]
-        let failure = check_spawn(name)?;
+        let failure = check_spawn(name).er(name)?;
 
         let _ = name;
 
@@ -86,14 +103,23 @@ impl Spawner {
                 Ok(())
             }
             #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
-            Self::Std => thread::Builder::new()
-                .name(name.into())
-                .spawn(move || {
-                    #[cfg(test)]
-                    FAIL_SPAWN.with(|setting| setting.set(failure));
-                    block_on(future)
-                })
-                .map(|_| ()),
+            Self::Std => {
+                // Futures share the thread, each one keeps its own injected failure.
+                #[cfg(test)]
+                let future = {
+                    let mut future = Box::pin(future);
+
+                    core::future::poll_fn(move |cx| {
+                        let previous = FAIL_SPAWN.with(|setting| setting.replace(failure));
+                        let polled = future.as_mut().poll(cx);
+
+                        FAIL_SPAWN.with(|setting| setting.set(previous));
+                        polled
+                    })
+                };
+
+                super::shared::spawn(Box::pin(future)).er(name)
+            }
         }
     }
 
@@ -136,37 +162,45 @@ thread_local! {
     pub static FAIL_SPAWN_AFTER: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
-struct ThreadWake(thread::Thread);
+struct ThreadWake {
+    thread: thread::Thread,
+    notified: AtomicBool,
+}
 impl Wake for ThreadWake {
     fn wake(self: Arc<Self>) {
-        self.0.unpark();
+        self.wake_by_ref();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
-    }
-}
-
-thread_local! {
-    static THREAD_WAKER: Waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-}
-
-pub fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = THREAD_WAKER
-        .try_with(Waker::clone)
-        .unwrap_or_else(|_| Waker::from(Arc::new(ThreadWake(thread::current()))));
-    let mut context = Context::from_waker(&waker);
-    let mut future = core::pin::pin!(future);
-
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => thread::park(),
+        if !self.notified.swap(true, Ordering::Release) {
+            self.thread.unpark();
         }
     }
 }
 
-#[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    // The park token belongs to the whole thread. The future can eat it with a park of its own,
+    // and so can a nested block_on, so each call keeps its own flag for the wake.
+    let wake = Arc::new(ThreadWake {
+        thread: thread::current(),
+        notified: AtomicBool::new(false),
+    });
+    let waker = Waker::from(wake.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut future = core::pin::pin!(future);
+
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+
+        while !wake.notified.swap(false, Ordering::Acquire) {
+            thread::park();
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub async fn sleep_until(deadline: std::time::Instant) {
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());

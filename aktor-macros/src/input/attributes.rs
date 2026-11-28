@@ -15,14 +15,24 @@ pub fn wrapper(attributes: &[Attribute]) -> syn::Result<Vec<Attribute>> {
                     | "must_use"
                     | "inline"
                     | "cold"
-                    | "track_caller"
             )
         })
     })
 }
 
+/// The `allow` lints for the generated module, it names the same types as the function.
+/// Copying `deny` or `expect` there would hold generated code to rules written for the body.
+pub fn lints(attributes: &[Attribute]) -> syn::Result<Vec<Attribute>> {
+    filter(attributes, |meta| {
+        meta.path().is_ident("allow") || meta.path().is_ident("cfg")
+    })
+}
+
 pub fn implementation(attributes: &[Attribute]) -> syn::Result<Vec<Attribute>> {
-    filter(attributes, |meta| !meta.path().is_ident("deprecated"))
+    filter(attributes, |meta| {
+        let path = meta.path();
+        !path.is_ident("deprecated") && !path.is_ident("track_caller")
+    })
 }
 
 fn filter(attributes: &[Attribute], keep: fn(&Meta) -> bool) -> syn::Result<Vec<Attribute>> {
@@ -61,5 +71,21 @@ fn filter_meta(meta: &Meta, keep: fn(&Meta) -> bool) -> syn::Result<Option<Meta>
         );
     }
 
-    Ok(keep(meta).then(|| meta.clone()))
+    let meta = expect_as_allow(meta);
+
+    Ok(keep(&meta).then_some(meta))
+}
+
+/// The function turns into several items and a lint only fires on some of them, an `expect`
+/// would come back unfulfilled on the rest. `allow` takes the same lints and the same reason.
+fn expect_as_allow(meta: &Meta) -> Meta {
+    let mut meta = meta.clone();
+
+    if let Meta::List(list) = &mut meta
+        && list.path.is_ident("expect")
+    {
+        list.path = parse_quote!(allow);
+    }
+
+    meta
 }

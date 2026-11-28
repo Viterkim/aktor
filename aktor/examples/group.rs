@@ -1,8 +1,11 @@
 use aktor::*;
+use core::num::NonZeroUsize;
 use er::*;
 use std::{
     fs::{File, OpenOptions},
     io::Write,
+    path::PathBuf,
+    time::Duration,
 };
 
 #[derive(Er)]
@@ -13,63 +16,70 @@ async fn append(file: &mut File, text: String) -> ErResult<(), AppendErr> {
 }
 
 #[derive(Er)]
-pub struct OpenErr(pub String);
-fn open_log(path: &str) -> ErResult<File, OpenErr> {
-    OpenOptions::new()
+pub struct OpenErr {
+    pub path: PathBuf,
+}
+fn open_log(path: &str) -> Result<File, (OpenErr, String)> {
+    Ok(OpenOptions::new()
         .append(true)
         .create(true)
         .open(path)
-        .er(|_| path)
+        .er(path)?)
 }
 
 #[derive(Er)]
 pub struct SyncErr;
-fn sync_log(file: File) -> ErResult<(), SyncErr> {
-    file.sync_all().er(())
+fn sync_log(file: File) -> Result<(), (SyncErr, String)> {
+    file.sync_all().er(())?;
+    Ok(())
+}
+
+#[derive(Er)]
+pub struct LogUntilStopErr;
+async fn log_until_stop(log: &Aktor<File>) -> ErResult<(), LogUntilStopErr> {
+    append(log, "application started".into())
+        .await
+        .er(())?
+        .er(())?;
+
+    tokio::signal::ctrl_c().await.er(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn core::error::Error>> {
+async fn main() -> ErMain {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "aktor.log".into());
-    let setup = move || open_log(&path).er_into(|report| report);
-    let cleanup = |file| sync_log(file).er_into(|report| report);
-    let after = async |report: ShutdownReport| {
-        if report.failed() {
-            eprintln!("{report}");
-        }
 
-        println!("application cleanup finished");
-        Ok::<_, AktorCleanupError>(())
-    };
+    let started = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: AktorNew {
+            name: "log".into(),
+            kind: AktorKind::TokioThread,
+            start: AktorInit::Try(async move || open_log(&path)),
+            end: sync_log,
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
+        },
+        shutdown: async |_| println!("application cleanup finished"),
+        grace: Duration::from_secs(5),
+    });
+    started
+        .ready()
+        .await
+        .er_val(|(_, report)| ErMainError.er_save("startup", report))?;
 
-    let mut actors = AktorGroup::new();
-    let kill = actors.killswitch();
-    let closing = actors.start_with(after)?;
-    let log = actors.spawn(AktorArgs::new("log", setup, cleanup)).await?;
+    let logged = started
+        .killswitch()
+        .run(log_until_stop(started.handles()))
+        .await;
 
-    actors.spawn_task(async move {
-        if let Err(error) = append(&log, "application started".into()).await {
-            eprintln!("{}", error.er_report());
-        }
-
-        core::future::pending::<()>().await;
-    })?;
-
-    let ctrl_c = kill.clone();
-    actors.spawn_task(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            ctrl_c.stop();
-        }
-    })?;
-
-    kill.wait_stopping().await;
-    let report = closing.await;
-
-    if report.failed() {
-        return Err(aktor::AktorRunError::from(report).into());
+    if let Some(Err(error)) = logged {
+        eprintln!("{}", error.er_report());
     }
+
+    started.stop().await.into_result().er(())?;
 
     Ok(())
 }

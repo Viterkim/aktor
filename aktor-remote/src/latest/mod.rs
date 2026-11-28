@@ -1,13 +1,20 @@
+mod driver;
+mod impls;
+
+pub use driver::LatestErr;
+
 use crate::{
-    AktorRetryOpts, CallError, Cause, Error,
+    AktorDeliveryOutcome, AktorRetryOptions, Cause,
     client::{Active, Client, Inner},
     wire::{self, Message},
 };
 use aktor::{
+    data::DataError,
     latest::{SendLatest, TypedSession},
     operation::Operation,
     worker::Codec,
 };
+use er::*;
 use std::{
     future::{Future, poll_fn},
     ops::AsyncFnOnce,
@@ -20,21 +27,21 @@ use tokio::{
     time::{Instant, sleep_until, timeout_at},
 };
 
-mod driver;
-mod impls;
+type CodecResult<T> = Result<T, (DataError, String)>;
 
 pub struct LatestSender<I> {
     input: Arc<dyn Input<I> + Send + Sync>,
 }
 
 pub struct LatestResults<I, O> {
+    receipt: crate::receipt::Receipt,
     shared: Arc<Shared<I, O>>,
     driver: Option<tokio::task::JoinHandle<()>>,
 }
 
 trait Input<I> {
     fn send(&self, input: I);
-    fn configure(&self, options: AktorRetryOpts);
+    fn configure(&self, options: AktorRetryOptions);
     fn clone_sender(&self);
     fn close_sender(&self);
 }
@@ -44,6 +51,7 @@ struct Inputs<I, O> {
 }
 
 struct Shared<I, O> {
+    receipt: std::sync::Weak<crate::receipt::Pending>,
     slot: Mutex<Slot<I, O>>,
     changed: Notify,
     cancel: Notify,
@@ -53,12 +61,13 @@ struct Shared<I, O> {
 struct Slot<I, O> {
     revision: u64,
     pending: Option<Pending<I>>,
-    output: Option<Result<O, Error>>,
+    output: Option<ErResult<O, LatestErr>>,
+    terminal: Option<ErTree<LatestErr>>,
     senders: usize,
     receiver: bool,
     finished: bool,
     wake: Option<Waker>,
-    options: AktorRetryOpts,
+    options: AktorRetryOptions,
 }
 
 struct Pending<I> {
@@ -69,10 +78,11 @@ struct Pending<I> {
 #[derive(Clone)]
 struct Update {
     revision: u64,
-    input: Option<Result<Arc<[u8]>, Error>>,
+    // Retries reuse the encoded input after the original value has been dropped.
+    input: Option<CodecResult<Arc<Vec<u8>>>>,
     deadline: Instant,
-    outcome: CallError,
+    outcome: AktorDeliveryOutcome,
     uncertain: bool,
     attempts: usize,
-    options: AktorRetryOpts,
+    options: AktorRetryOptions,
 }

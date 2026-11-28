@@ -1,7 +1,7 @@
 use aktor::*;
 use std::rc::Rc;
 
-#[aktor(crate = aktor)]
+#[aktor(crate = aktor, latest)]
 async fn read(_: &mut u32) -> usize {
     let value = Rc::new(7);
     std::future::ready(()).await;

@@ -1,4 +1,5 @@
 use super::*;
+use core::num::NonZeroUsize;
 use core::task::{Context, Poll};
 use std::{
     sync::{
@@ -10,23 +11,32 @@ use std::{
 
 type TestPacket = Packet<fn(&mut (), ()), (), ()>;
 
-std::thread_local! {
-    static SERVICE_GATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+#[tokio::test]
+async fn admit_during_shutdown() {
+    let (inner, _mailbox) = crate::queue::channel(NonZeroUsize::MIN).unwrap();
+    let handle = crate::listener::Handle::<()>::new(inner);
+    let request = call(&handle, |_, ()| (), ());
+    handle.inner.admission.shutdown();
+
+    assert!(matches!(
+        core::pin::pin!(request.send())
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(aktor::AktorDeliveryError {
+            outcome: AktorDeliveryOutcome::NotAdmitted,
+            ..
+        }))
+    ));
 }
 
-pub fn before_service() {
-    let gate = SERVICE_GATE.with(|gate| gate.borrow_mut().take());
-
-    if let Some(gate) = gate {
-        gate();
-    }
-}
+use crate::queue::latest::SERVICE_GATE;
 
 #[test]
 fn cancelled_sessions() {
     use crate::latest::{SendLatest, Session};
 
-    let (handle, mut listener) = crate::listener::channel::<()>(1).unwrap();
+    let (inner, mailbox) = crate::queue::channel(NonZeroUsize::MIN).unwrap();
+    let handle = crate::listener::Handle::<()>::new(inner);
 
     for _ in 0..1000 {
         let (sender, results) = (&handle).session(
@@ -40,7 +50,7 @@ fn cancelled_sessions() {
         drop((sender, results));
     }
 
-    assert!(listener.try_recv().is_err());
+    assert!(mailbox.receiver.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -48,7 +58,8 @@ async fn latest_publication() {
     use crate::latest::{SendLatest, Session};
     use std::{sync::mpsc, time::Duration};
 
-    let (handle, mut listener) = crate::listener::channel::<usize>(1).unwrap();
+    let (inner, mut mailbox) = crate::queue::channel(NonZeroUsize::MIN).unwrap();
+    let handle = crate::listener::Handle::<usize>::new(inner);
     let (sender, results) = (&handle).session(
         crate::operation::Operation {
             name: "publication",
@@ -78,16 +89,17 @@ async fn latest_publication() {
 
     if entered {
         sender.send(2);
-        listener.close();
+        mailbox.admission.shutdown();
+        mailbox.receiver.close();
     }
 
     let mut state = 0;
 
     if entered {
-        listener.serve(&mut state).await;
+        mailbox.receiver.recv().await.unwrap().run(&mut state).await;
     }
 
-    drop(listener);
+    drop(mailbox);
 
     let _resumed = resume.send(());
 
@@ -124,7 +136,7 @@ fn operation(_: &mut (), _: ()) {}
 
 #[test]
 fn wake() {
-    let packet = Arc::new(TestPacket::new(operation, ()));
+    let packet = Arc::new(TestPacket::new(operation, (), None));
     let callbacks = Arc::new(AtomicUsize::new(0));
     let waker = Waker::from(Arc::new(LockCheckingWake {
         packet: Arc::downgrade(&packet),
@@ -140,7 +152,7 @@ fn wake() {
 
 #[test]
 fn replace() {
-    let packet = Arc::new(TestPacket::new(operation, ()));
+    let packet = Arc::new(TestPacket::new(operation, (), None));
     let callbacks = Arc::new(AtomicUsize::new(0));
     let first_waker = Waker::from(Arc::new(LockCheckingWake {
         packet: Arc::downgrade(&packet),
@@ -164,8 +176,8 @@ fn replace() {
 
     packet.finish(Ok(()));
 
-    assert_eq!(
+    assert!(matches!(
         packet.poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Ok(()))
-    );
+    ));
 }

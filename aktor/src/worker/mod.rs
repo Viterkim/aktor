@@ -1,98 +1,66 @@
-use crate::message::CallError;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-
 #[cfg(all(
     feature = "wasm_browser_workers",
     target_family = "wasm",
     target_os = "unknown"
 ))]
-mod browser;
-pub mod bytes;
-mod codec;
+pub(crate) mod browser;
 mod impls;
 mod registry;
 mod wire;
 
-#[cfg(all(
-    feature = "wasm_browser_workers",
-    target_family = "wasm",
-    target_os = "unknown"
-))]
-pub(crate) use browser::ShutdownDependency;
+pub use crate::dispatch::{Native, Remote};
 #[cfg(all(
     feature = "wasm_browser_workers",
     target_family = "wasm",
     target_os = "unknown"
 ))]
 pub use browser::{
-    Completion, LatestResults, LatestSender, OptionalReply, OptionalRequest, OptionalWorker,
-    Server, Worker, WorkerReply, WorkerRequest, retain_cleanup, retain_setup, serve, serve_for,
-    serve_setup, serve_with, setup_failed,
+    AktorCleanup, Completion, LatestResults, LatestSender, OptionalRequest, OptionalRequestSend,
+    OptionalWorker, Worker, WorkerCleanupError, WorkerEndError, WorkerFailureReceipt, WorkerJoin,
+    WorkerJoinOutcome, WorkerReply, WorkerRequest, WorkerRequestCast, WorkerRequestSend,
+    WorkerStartError, WorkerStartFailure, join,
 };
-pub use codec::{decode, encode};
+#[cfg(all(
+    feature = "wasm_browser_worker_server",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+pub use browser::{AktorReady, AktorServe, ServeFailure, serve_setup};
 #[doc(hidden)]
 pub use inventory;
 pub use registry::Operations;
 #[doc(hidden)]
-pub use registry::{Exporter, Register, Registered, Registration, Registry, dispatch};
+pub use registry::{Exporter, Register, Registered, Registration, Registry};
 #[doc(hidden)]
 pub use wire::Codec;
 
-pub use crate::dispatch::{Native, Remote};
+use crate::message::AktorDeliveryOutcome;
+use er::*;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 0;
 
-#[cfg(all(
-    feature = "wasm_browser_workers",
-    target_family = "wasm",
-    target_os = "unknown"
-))]
-type WireError = WorkerError<Vec<u8>>;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, aktor_macros::AktorData)]
 pub struct Options {
     /// Same on both sides. Change it when the wire data format changes.
     pub build: String,
     /// Ordinary calls waiting for replies, including the running call.
-    pub capacity: usize,
+    pub capacity: core::num::NonZeroUsize,
     /// Soft byte budget for admitted calls. Oversized calls take the whole budget.
     /// Waiting inputs and latest sessions are outside it.
-    pub max_outstanding_bytes: usize,
+    pub max_outstanding_bytes: core::num::NonZeroUsize,
 }
 
-/// Whether the worker's managed resources have retired.
-/// Unconfirmed retirement keeps Aktor's ownership retained automatically.
-#[must_use = "check retirement before releasing or replacing the owner"]
-#[derive(Debug, Clone)]
-pub enum Retirement<E = ()> {
-    Confirmed(Result<(), WorkerError<E>>),
-    Unconfirmed(WorkerError<E>),
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, er::Er)]
-#[er(no_constructors, display = Self::fmt_display, display_alt = Self::fmt_details, debug = Self::fmt_display)]
+/// What went wrong with a worker. Fallible calls return it with the report as `(WorkerError, String)`.
+#[derive(Clone, PartialEq, Eq, Er, aktor_macros::AktorData)]
+#[er(format = "worker call {outcome:?}: {cause}")]
+#[non_exhaustive]
 pub struct WorkerError<T = ()> {
-    pub outcome: CallError,
+    pub outcome: AktorDeliveryOutcome,
     pub cause: WorkerCause,
-    #[er(source, skip)]
-    pub diagnostics: Option<crate::AktorDiagnostic>,
     pub data: Option<T>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkerCause {
-    Closed,
-    Full,
-    Codec(String),
-    Setup,
-    Cleanup,
-    Crashed(String),
-    Protocol,
-    UnknownOperation(String),
-    Operations {
-        expected: Vec<String>,
-        actual: Vec<String>,
-    },
+    /// Identifies a recorded worker failure. A grouped worker uses the same ID in its shutdown report.
+    #[aktor(skip)]
+    pub failure_id: Option<crate::FailureId>,
 }
 
 #[cfg(all(
@@ -100,17 +68,47 @@ pub enum WorkerCause {
     target_family = "wasm",
     target_os = "unknown"
 ))]
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, aktor_macros::AktorData)]
+pub(crate) struct WireFailure {
+    pub(crate) error: WorkerError<Vec<u8>>,
+    pub(crate) report: String,
+}
+
+#[derive(Clone, PartialEq, Eq, ErFormat, aktor_macros::AktorData)]
+pub enum WorkerCause {
+    Closed,
+    Full,
+    Codec,
+    #[er(format = "worker setup failed")]
+    Setup,
+    #[er(format = "worker cleanup failed")]
+    Cleanup,
+    Crashed,
+    Protocol,
+    UnknownOperation(String),
+    #[er(format = "worker operations do not match: expected {expected:?}, got {actual:?}")]
+    Operations {
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
+    /// The browser couldn't prepare a transfer buffer or post the message.
+    Transport,
+}
+
+#[cfg(all(
+    feature = "wasm_browser_workers",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+#[derive(aktor_macros::AktorData)]
 enum Incoming {
     Call {
         id: u64,
         operation: String,
-        #[serde(with = "bytes")]
         input: Vec<u8>,
     },
     Shutdown,
     Initialize {
-        #[serde(with = "bytes")]
         config: Vec<u8>,
     },
 }
@@ -120,51 +118,66 @@ enum Incoming {
     target_family = "wasm",
     target_os = "unknown"
 ))]
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, aktor_macros::AktorData)]
 enum Outgoing {
     Configure {
+        config_type: String,
+        payload_type: String,
         version: u32,
         options: Options,
         operations: Operations,
     },
     Ready {
+        payload_type: String,
+        payload: Vec<u8>,
         version: u32,
         options: Options,
         operations: Operations,
     },
-    SetupFailed(WireError),
+    SetupFailed(WireFailure),
     Started {
         id: u64,
     },
     Answer {
         id: u64,
-        #[serde(with = "bytes::result")]
-        output: Result<Vec<u8>, WireError>,
+        output: Result<Vec<u8>, WireFailure>,
     },
-    Finished(Result<(), WireError>),
+    Finished(Result<(), WireFailure>),
     SetupRetired,
-    Unconfirmed(WireError),
+    Unconfirmed(WireFailure),
+    InitNotRun {
+        version: u32,
+        error: WireFailure,
+    },
+    SetupPending(WireFailure),
+    ReadyFailed(WireFailure),
+    EndReturned(WireFailure),
+    Retired,
 }
 
 #[doc(hidden)]
+#[cfg(not(all(
+    target_family = "wasm",
+    feature = "wasm_browser_workers",
+    not(feature = "wasm_browser_worker_server")
+)))]
 pub async fn run_export<E, C>(
     export: E,
     state: &mut E::State,
     input: &[u8],
-) -> Result<Vec<u8>, WorkerError>
+) -> Result<Vec<u8>, (WorkerError, String)>
 where
     E: crate::dispatch::Export<C>,
     C: Codec<E::Input> + Codec<E::Output>,
 {
-    let input = <C as Codec<E::Input>>::decode(input).map_err(|mut error| {
-        error.outcome = CallError::Discarded;
-        error
+    let input = crate::worker::wire::codec(<C as Codec<E::Input>>::decode(input), || {
+        WorkerError::new(AktorDeliveryOutcome::Discarded, WorkerCause::Codec)
     })?;
 
     let output = export.run(state, input).await;
 
-    <C as Codec<E::Output>>::encode(&output).map_err(|mut error| {
-        error.outcome = CallError::OutcomeUnknown;
-        error
-    })
+    Ok(crate::worker::wire::codec(
+        <C as Codec<E::Output>>::encode(&output),
+        || WorkerError::new(AktorDeliveryOutcome::OutcomeUnknown, WorkerCause::Codec),
+    )?)
 }

@@ -1,8 +1,9 @@
 use super::*;
+use core::num::NonZeroUsize;
 
 #[test]
 fn cancelled() {
-    let (handle, _owner) = crate::local::channel::<(), 1, ()>().unwrap();
+    let (handle, _owner) = crate::local::channel::<(), ()>(NonZeroUsize::MIN);
 
     for _ in 0..1000 {
         let (sender, results) = (&handle).session(

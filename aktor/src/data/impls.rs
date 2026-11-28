@@ -1,322 +1,651 @@
-use super::{AktorData, Owned, Ref, bits, floats};
+use super::types::DataReason;
+use super::{
+    AktorData, AktorMaxLen, DataError, Reader, Writer, bits, charge, fixed, sealed::Sealed,
+};
 use alloc::{
+    borrow::Cow,
     boxed::Box,
     collections::{BTreeMap, BTreeSet, VecDeque},
     string::String,
     vec::Vec,
 };
-use core::{fmt, marker::PhantomData};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{SeqAccess, Visitor},
-    ser::{SerializeSeq, SerializeTuple},
-};
+#[cfg(feature = "std")]
+use core::hash::{BuildHasher, Hash};
+#[cfg(feature = "std")]
+use std::collections::{HashMap, HashSet};
 
-impl<T: AktorData> Serialize for Ref<'_, T> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize_data(serializer)
+impl DataError {
+    #[cold]
+    pub fn new(reason: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            reason: Box::new(DataReason::Message(reason.into())),
+        }
     }
 }
 
-impl<'de, T: AktorData> Deserialize<'de> for Owned<T> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        T::deserialize_data(deserializer).map(Self)
+impl core::error::Error for DataError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        self.reason.source()
+    }
+}
+impl From<core::num::TryFromIntError> for DataError {
+    fn from(error: core::num::TryFromIntError) -> Self {
+        Self {
+            reason: Box::new(DataReason::Integer(error)),
+        }
+    }
+}
+impl From<core::convert::Infallible> for DataError {
+    fn from(error: core::convert::Infallible) -> Self {
+        match error {}
+    }
+}
+impl From<core::str::Utf8Error> for DataError {
+    fn from(error: core::str::Utf8Error) -> Self {
+        Self {
+            reason: Box::new(DataReason::Utf8(error)),
+        }
     }
 }
 
-pub fn serialize_slice<T: AktorData, S: Serializer>(
-    values: &[T],
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+impl From<DataReason> for DataError {
+    fn from(reason: DataReason) -> Self {
+        Self {
+            reason: Box::new(reason),
+        }
+    }
+}
 
-    for value in values {
-        sequence.serialize_element(&Ref(value))?;
+impl AktorData for core::num::NonZeroUsize {
+    const MEMORY: usize = usize::MEMORY;
+
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        self.get().encode_data(writer)
     }
 
-    sequence.end()
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        let value = usize::decode_data(reader)?;
+        Ok(Self::try_from(value)?)
+    }
 }
 
-pub fn deserialize_vec<'de, T: AktorData, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<T>, D::Error> {
-    Vec::<Owned<T>>::deserialize(deserializer)
-        .map(|values| values.into_iter().map(|value| value.0).collect())
+impl AktorData for core::convert::Infallible {
+    fn encode_data(&self, _: &mut Writer) -> Result<(), DataError> {
+        match *self {}
+    }
+
+    fn decode_data(_: &mut Reader<'_>) -> Result<Self, DataError> {
+        Err(DataError::from(super::DataReason::Infallible))
+    }
 }
 
-macro_rules! scalar {
+pub fn encode_slice<T: AktorData>(values: &[T], writer: &mut Writer) -> Result<(), DataError> {
+    writer.length(values.len());
+    values.iter().try_for_each(|value| writer.write(value))
+}
+
+// No size hints on purpose. A count reserves room before a single element arrived, and nested
+// collections would each reserve on their own. Growing as charged elements show up keeps the
+// memory budget honest.
+pub fn decode_vec<T: AktorData>(reader: &mut Reader<'_>, max: usize) -> Result<Vec<T>, DataError> {
+    let count = reader.length()?;
+    super::within(count, max, "values")?;
+
+    let mut values = Vec::new();
+
+    for _ in 0..count {
+        values.push(reader.read()?);
+    }
+
+    Ok(values)
+}
+
+pub fn decode_array<T: AktorData, const N: usize>(
+    reader: &mut Reader<'_>,
+) -> Result<[T; N], DataError> {
+    let mut values = Vec::with_capacity(N);
+
+    for _ in 0..N {
+        values.push(reader.read()?);
+    }
+
+    match values.try_into() {
+        Ok(array) => Ok(array),
+        Err(_) => Err(DataError::from(super::DataReason::ArrayLength)),
+    }
+}
+
+fn copy_array<T: AktorData + Copy + Default, const N: usize>(
+    reader: &mut Reader<'_>,
+) -> Result<[T; N], DataError> {
+    let mut values = [T::default(); N];
+
+    for value in &mut values {
+        *value = reader.read()?;
+    }
+
+    Ok(values)
+}
+
+impl AktorData for () {
+    const MEMORY: usize = 0;
+
+    fn encode_data(&self, _: &mut Writer) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn decode_data(_: &mut Reader<'_>) -> Result<Self, DataError> {
+        Ok(())
+    }
+
+    fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[Self; N], DataError> {
+        copy_array(reader)
+    }
+}
+
+macro_rules! unsigned {
     ($($ty:ty),* $(,)?) => { $(
         impl AktorData for $ty {
-            fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                self.serialize(serializer)
+            const MEMORY: usize = 0;
+
+            #[inline]
+            fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+                writer.unsigned(*self as u64);
+                Ok(())
             }
 
-            fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                Self::deserialize(deserializer)
+            #[inline]
+            fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+                Ok(Self::try_from(reader.unsigned()?)?)
             }
 
-            fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
-                deserializer: D,
-            ) -> Result<[Self; N], D::Error> {
-                copy_array(deserializer)
+            fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[Self; N], DataError> {
+                copy_array(reader)
             }
         }
     )* };
 }
-scalar!(
-    (),
-    i8,
-    i16,
-    i32,
-    i64,
-    i128,
-    isize,
-    u16,
-    u32,
-    u64,
-    u128,
-    usize,
-    char,
-);
+unsigned!(u16, u32, u64, usize);
 
-impl AktorData for String {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.serialize(serializer)
+macro_rules! signed {
+    ($($ty:ty),* $(,)?) => { $(
+        impl AktorData for $ty {
+            const MEMORY: usize = 0;
+
+            #[inline]
+            fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+                writer.signed(*self as i64);
+                Ok(())
+            }
+
+            #[inline]
+            fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+                Ok(Self::try_from(reader.signed()?)?)
+            }
+
+            fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[Self; N], DataError> {
+                copy_array(reader)
+            }
+        }
+    )* };
+}
+signed!(i16, i32, i64, isize);
+
+impl AktorData for u128 {
+    const MEMORY: usize = 0;
+
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.unsigned_wide(*self);
+        Ok(())
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::deserialize(deserializer)
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        reader.unsigned_wide()
+    }
+
+    fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[Self; N], DataError> {
+        copy_array(reader)
+    }
+}
+
+impl AktorData for i128 {
+    const MEMORY: usize = 0;
+
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.signed_wide(*self);
+        Ok(())
+    }
+
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        reader.signed_wide()
+    }
+
+    fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[Self; N], DataError> {
+        copy_array(reader)
+    }
+}
+
+impl AktorData for char {
+    const MEMORY: usize = 0;
+
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.unsigned(u64::from(*self));
+        Ok(())
+    }
+
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        let value = reader.unsigned()?;
+        u32::try_from(value)
+            .ok()
+            .and_then(char::from_u32)
+            .ok_or_else(|| DataError::from(super::DataReason::Character(value)))
+    }
+
+    fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[Self; N], DataError> {
+        copy_array(reader)
+    }
+}
+
+impl AktorData for bool {
+    const MEMORY: usize = 0;
+
+    #[inline]
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.bytes.push(u8::from(*self));
+        Ok(())
+    }
+
+    #[inline]
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        match reader.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => Err(DataError::from(super::DataReason::Boolean(value))),
+        }
+    }
+
+    fn encode_slice(values: &[Self], writer: &mut Writer) -> Result<(), DataError> {
+        bits::encode_slice(values, writer);
+        Ok(())
+    }
+
+    fn decode_vec(reader: &mut Reader<'_>, max: usize) -> Result<Vec<Self>, DataError> {
+        bits::decode_vec(reader, max)
+    }
+
+    fn encode_array<const N: usize>(
+        values: &[Self; N],
+        writer: &mut Writer,
+    ) -> Result<(), DataError> {
+        bits::encode_array(values, writer);
+        Ok(())
+    }
+
+    fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[Self; N], DataError> {
+        bits::decode_array(reader)
+    }
+}
+
+impl AktorData for u8 {
+    const MEMORY: usize = 0;
+
+    #[inline]
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.bytes.push(*self);
+        Ok(())
+    }
+
+    #[inline]
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        reader.byte()
+    }
+
+    fn encode_slice(values: &[Self], writer: &mut Writer) -> Result<(), DataError> {
+        writer.slice(values);
+        Ok(())
+    }
+
+    fn decode_vec(reader: &mut Reader<'_>, max: usize) -> Result<Vec<Self>, DataError> {
+        let bytes = reader.slice()?;
+        super::within(bytes.len(), max, "values")?;
+
+        Ok(bytes.to_vec())
+    }
+
+    fn encode_array<const N: usize>(
+        values: &[Self; N],
+        writer: &mut Writer,
+    ) -> Result<(), DataError> {
+        writer.bytes.extend_from_slice(values);
+        Ok(())
+    }
+
+    fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[Self; N], DataError> {
+        reader.array()
+    }
+}
+
+impl AktorData for i8 {
+    const MEMORY: usize = 0;
+
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.bytes.push(*self as u8);
+        Ok(())
+    }
+
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        Ok(reader.byte()? as i8)
+    }
+
+    fn encode_slice(values: &[Self], writer: &mut Writer) -> Result<(), DataError> {
+        fixed::encode_slice(values, writer, |value| value.to_le_bytes());
+        Ok(())
+    }
+
+    fn decode_vec(reader: &mut Reader<'_>, max: usize) -> Result<Vec<Self>, DataError> {
+        let bytes = reader.slice()?;
+        super::within(bytes.len(), max, "values")?;
+
+        Ok(bytes.iter().map(|&byte| byte as i8).collect())
+    }
+
+    fn encode_array<const N: usize>(
+        values: &[Self; N],
+        writer: &mut Writer,
+    ) -> Result<(), DataError> {
+        writer.bytes.extend(values.iter().map(|&value| value as u8));
+        Ok(())
+    }
+
+    fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[Self; N], DataError> {
+        Ok(reader.array::<N>()?.map(|byte| byte as i8))
     }
 }
 
 macro_rules! float {
     ($($ty:ty),* $(,)?) => { $(
         impl AktorData for $ty {
-            fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                self.serialize(serializer)
+            const MEMORY: usize = 0;
+
+            #[inline]
+            fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+                writer.bytes.extend_from_slice(&self.to_le_bytes());
+                Ok(())
             }
 
-            fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                Self::deserialize(deserializer)
+            #[inline]
+            fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+                Ok(Self::from_le_bytes(reader.array()?))
             }
 
-            fn serialize_slice<S: Serializer>(values: &[Self], serializer: S) -> Result<S::Ok, S::Error> {
-                floats::serialize_slice(values, serializer, |value| value.to_le_bytes())
+            fn encode_slice(values: &[Self], writer: &mut Writer) -> Result<(), DataError> {
+                fixed::encode_slice(values, writer, |value| value.to_le_bytes());
+                Ok(())
             }
 
-            fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Self>, D::Error> {
-                floats::deserialize_vec(deserializer, Self::from_le_bytes)
+            fn decode_vec(reader: &mut Reader<'_>, max: usize) -> Result<Vec<Self>, DataError> {
+                fixed::decode_vec(reader, max, Self::from_le_bytes)
             }
 
-            fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
-                deserializer: D,
-            ) -> Result<[Self; N], D::Error> {
-                copy_array(deserializer)
+            fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[Self; N], DataError> {
+                copy_array(reader)
             }
         }
     )* };
 }
 float!(f32, f64);
 
-impl AktorData for bool {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.serialize(serializer)
+impl AktorData for String {
+    const MEMORY: usize = 0;
+
+    #[inline]
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.slice(self.as_bytes());
+        Ok(())
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::deserialize(deserializer)
+    #[inline]
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        decode_str(reader).map(String::from)
     }
 
-    fn serialize_slice<S: Serializer>(values: &[Self], serializer: S) -> Result<S::Ok, S::Error> {
-        bits::serialize_slice(values, serializer)
-    }
-
-    fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Self>, D::Error> {
-        bits::deserialize_vec(deserializer)
-    }
-
-    fn serialize_array<S: Serializer, const N: usize>(
-        values: &[Self; N],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        bits::serialize_array(values, serializer)
-    }
-
-    fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
-        deserializer: D,
-    ) -> Result<[Self; N], D::Error> {
-        bits::deserialize_array(deserializer)
+    fn decode_max(reader: &mut Reader<'_>, max: usize) -> Result<Self, DataError> {
+        decode_str_max(reader, max).map(String::from)
     }
 }
 
-impl AktorData for u8 {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u8(*self)
+fn decode_str<'a>(reader: &mut Reader<'a>) -> Result<&'a str, DataError> {
+    decode_str_max(reader, usize::MAX)
+}
+
+fn decode_str_max<'a>(reader: &mut Reader<'a>, max: usize) -> Result<&'a str, DataError> {
+    let bytes = reader.slice()?;
+    super::within(bytes.len(), max, "bytes")?;
+
+    Ok(core::str::from_utf8(bytes)?)
+}
+
+impl Sealed for String {}
+impl Sealed for Box<str> {}
+impl Sealed for Cow<'_, str> {}
+impl<T> Sealed for Vec<T> {}
+impl<T> Sealed for Box<[T]> {}
+impl<T: Clone> Sealed for Cow<'_, [T]> {}
+
+impl AktorMaxLen for String {
+    const UNIT: &'static str = "bytes";
+
+    fn max_len_count(&self) -> usize {
+        self.len()
+    }
+}
+
+impl AktorMaxLen for Box<str> {
+    const UNIT: &'static str = "bytes";
+
+    fn max_len_count(&self) -> usize {
+        self.len()
+    }
+}
+
+impl AktorMaxLen for Cow<'_, str> {
+    const UNIT: &'static str = "bytes";
+
+    fn max_len_count(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<T> AktorMaxLen for Vec<T> {
+    fn max_len_count(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<T> AktorMaxLen for Box<[T]> {
+    fn max_len_count(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<T: Clone> AktorMaxLen for Cow<'_, [T]> {
+    fn max_len_count(&self) -> usize {
+        self.len()
+    }
+}
+
+impl AktorData for Box<str> {
+    const MEMORY: usize = 0;
+
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.slice(self.as_bytes());
+        Ok(())
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::deserialize(deserializer)
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        decode_str(reader).map(Box::from)
     }
 
-    fn serialize_slice<S: Serializer>(values: &[Self], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(values)
+    fn decode_max(reader: &mut Reader<'_>, max: usize) -> Result<Self, DataError> {
+        decode_str_max(reader, max).map(Box::from)
+    }
+}
+
+// Decoding always owns the text, so any lifetime works and a borrowing message type can
+// decode as its owned self.
+impl AktorData for Cow<'_, str> {
+    const MEMORY: usize = 0;
+
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.slice(self.as_bytes());
+        Ok(())
     }
 
-    fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Self>, D::Error> {
-        struct Bytes;
-        impl<'de> Visitor<'de> for Bytes {
-            type Value = Vec<u8>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("bytes")
-            }
-
-            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
-                Ok(bytes.to_vec())
-            }
-        }
-
-        deserializer.deserialize_bytes(Bytes)
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        decode_str(reader).map(|text| Cow::Owned(text.into()))
     }
 
-    fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
-        deserializer: D,
-    ) -> Result<[Self; N], D::Error> {
-        copy_array(deserializer)
+    fn decode_max(reader: &mut Reader<'_>, max: usize) -> Result<Self, DataError> {
+        decode_str_max(reader, max).map(|text| Cow::Owned(text.into()))
+    }
+}
+
+impl<T: AktorData + Clone> AktorData for Cow<'_, [T]> {
+    const MEMORY: usize = 0;
+
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        T::encode_slice(self, writer)
+    }
+
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        T::decode_vec(reader, usize::MAX).map(Cow::Owned)
+    }
+
+    fn decode_max(reader: &mut Reader<'_>, max: usize) -> Result<Self, DataError> {
+        T::decode_vec(reader, max).map(Cow::Owned)
     }
 }
 
 impl<T: AktorData> AktorData for Vec<T> {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        T::serialize_slice(self, serializer)
+    const MEMORY: usize = 0;
+
+    #[inline]
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        T::encode_slice(self, writer)
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        T::deserialize_vec(deserializer)
+    #[inline]
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        T::decode_vec(reader, usize::MAX)
+    }
+
+    fn decode_max(reader: &mut Reader<'_>, max: usize) -> Result<Self, DataError> {
+        T::decode_vec(reader, max)
+    }
+}
+
+impl<T: AktorData> AktorData for Box<[T]> {
+    const MEMORY: usize = 0;
+
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        T::encode_slice(self, writer)
+    }
+
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        T::decode_vec(reader, usize::MAX).map(Vec::into_boxed_slice)
+    }
+
+    fn decode_max(reader: &mut Reader<'_>, max: usize) -> Result<Self, DataError> {
+        T::decode_vec(reader, max).map(Vec::into_boxed_slice)
     }
 }
 
 impl<T: AktorData> AktorData for Option<T> {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.as_ref().map(Ref).serialize(serializer)
+    #[inline]
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        match self {
+            Some(value) => {
+                writer.bytes.push(1);
+                writer.write(value)
+            }
+            None => {
+                writer.bytes.push(0);
+                Ok(())
+            }
+        }
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Option::<Owned<T>>::deserialize(deserializer).map(|value| value.map(|value| value.0))
+    #[inline]
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        match reader.byte()? {
+            0 => Ok(None),
+            1 => reader.read().map(Some),
+            value => Err(DataError::from(super::DataReason::OptionTag(value))),
+        }
     }
 }
 
 impl<T: AktorData, E: AktorData> AktorData for Result<T, E> {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.as_ref().map(Ref).map_err(Ref).serialize(serializer)
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        match self {
+            Ok(value) => {
+                writer.bytes.push(0);
+                writer.write(value)
+            }
+            Err(error) => {
+                writer.bytes.push(1);
+                writer.write(error)
+            }
+        }
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Result::<Owned<T>, Owned<E>>::deserialize(deserializer)
-            .map(|value| value.map(|value| value.0).map_err(|value| value.0))
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        match reader.byte()? {
+            0 => reader.read().map(Ok),
+            1 => reader.read().map(Err),
+            value => Err(DataError::from(super::DataReason::ResultTag(value))),
+        }
     }
 }
 
+// The box's own allocation counts too, the pointer was already counted by whoever holds it.
 impl<T: AktorData> AktorData for Box<T> {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.as_ref().serialize_data(serializer)
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        charge(T::MEMORY);
+        self.as_ref().encode_data(writer)
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        T::deserialize_data(deserializer).map(Box::new)
-    }
-}
-fn copy_array<'de, T: AktorData + Copy + Default, D: Deserializer<'de>, const N: usize>(
-    deserializer: D,
-) -> Result<[T; N], D::Error> {
-    struct Array<T, const N: usize>(PhantomData<T>);
-    impl<'de, T: AktorData + Copy + Default, const N: usize> Visitor<'de> for Array<T, N> {
-        type Value = [T; N];
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(formatter, "an array of {N} values")
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        if !charge(T::MEMORY) {
+            return Err(DataError::from(super::DataReason::Memory(
+                reader.memory_limit,
+            )));
         }
 
-        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
-            let mut values = [T::default(); N];
-
-            for (index, value) in values.iter_mut().enumerate() {
-                *value = sequence
-                    .next_element::<Owned<T>>()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?
-                    .0;
-            }
-
-            Ok(values)
-        }
+        T::decode_data(reader).map(Box::new)
     }
-
-    deserializer.deserialize_tuple(N, Array::<T, N>(PhantomData))
-}
-
-pub fn serialize_array<T: AktorData, S: Serializer, const N: usize>(
-    values: &[T; N],
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    let mut tuple = serializer.serialize_tuple(N)?;
-
-    for value in values {
-        tuple.serialize_element(&Ref(value))?;
-    }
-
-    tuple.end()
-}
-
-pub fn deserialize_array<'de, T: AktorData, D: Deserializer<'de>, const N: usize>(
-    deserializer: D,
-) -> Result<[T; N], D::Error> {
-    struct Array<T, const N: usize>(PhantomData<T>);
-    impl<'de, T: AktorData, const N: usize> Visitor<'de> for Array<T, N> {
-        type Value = [T; N];
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(formatter, "an array of {N} elements")
-        }
-
-        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
-            let mut values = Vec::new();
-
-            for index in 0..N {
-                let value = sequence
-                    .next_element::<Owned<T>>()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
-
-                values.push(value.0);
-            }
-
-            values
-                .try_into()
-                .map_err(|_| serde::de::Error::custom("invalid array length"))
-        }
-    }
-
-    deserializer.deserialize_tuple(N, Array::<T, N>(PhantomData))
 }
 
 impl<T: AktorData, const N: usize> AktorData for [T; N] {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        T::serialize_array(self, serializer)
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        T::encode_array(self, writer)
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        T::deserialize_array(deserializer)
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        T::decode_array(reader)
     }
 }
 
 macro_rules! tuple {
     ($(($($ty:ident:$index:tt),+)),* $(,)?) => { $(
         impl<$($ty: AktorData),+> AktorData for ($($ty,)+) {
-            fn serialize_data<Se: Serializer>(&self, serializer: Se) -> Result<Se::Ok, Se::Error> {
-                ($(Ref(&self.$index),)+).serialize(serializer)
+            fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+                $(writer.write(&self.$index)?;)+
+                Ok(())
             }
 
-            fn deserialize_data<'de, De: Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
-                <($(Owned<$ty>,)+)>::deserialize(deserializer).map(|values| ($(values.$index.0,)+))
+            fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+                Ok(($(reader.read::<$ty>()?,)+))
             }
         }
     )* };
@@ -337,159 +666,118 @@ tuple!(
 );
 
 impl<T: AktorData> AktorData for VecDeque<T> {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+    const MEMORY: usize = 0;
 
-        for value in self {
-            sequence.serialize_element(&Ref(value))?;
-        }
-
-        sequence.end()
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.length(self.len());
+        self.iter().try_for_each(|value| writer.write(value))
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserialize_vec(deserializer).map(VecDeque::from)
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        decode_vec(reader, usize::MAX).map(VecDeque::from)
     }
 }
 
 impl<T: AktorData + Ord> AktorData for BTreeSet<T> {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+    const MEMORY: usize = 0;
 
-        for value in self {
-            sequence.serialize_element(&Ref(value))?;
-        }
-
-        sequence.end()
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.length(self.len());
+        self.iter().try_for_each(|value| writer.write(value))
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserialize_vec(deserializer).map(|values| values.into_iter().collect())
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        let count = reader.length()?;
+        let mut values = BTreeSet::new();
+
+        for _ in 0..count {
+            values.insert(reader.read()?);
+        }
+
+        Ok(values)
     }
 }
 
 impl<K: AktorData + Ord, V: AktorData> AktorData for BTreeMap<K, V> {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
+    const MEMORY: usize = 0;
 
-        let mut map = serializer.serialize_map(Some(self.len()))?;
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.length(self.len());
 
         for (key, value) in self {
-            map.serialize_entry(&Ref(key), &Ref(value))?;
+            writer.write(key)?;
+            writer.write(value)?;
         }
 
-        map.end()
+        Ok(())
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Entries<K, V>(PhantomData<(K, V)>);
-        impl<'de, K: AktorData + Ord, V: AktorData> Visitor<'de> for Entries<K, V> {
-            type Value = BTreeMap<K, V>;
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        let count = reader.length()?;
+        let mut values = BTreeMap::new();
 
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a map")
-            }
-
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = BTreeMap::new();
-
-                while let Some((key, value)) = map.next_entry::<Owned<K>, Owned<V>>()? {
-                    values.insert(key.0, value.0);
-                }
-
-                Ok(values)
-            }
+        for _ in 0..count {
+            values.insert(reader.read()?, reader.read()?);
         }
 
-        deserializer.deserialize_map(Entries(PhantomData))
+        Ok(values)
     }
 }
 
-impl<T: AktorData> AktorData for Box<[T]> {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        T::serialize_slice(self, serializer)
-    }
-
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        T::deserialize_vec(deserializer).map(Vec::into_boxed_slice)
-    }
-}
-
-impl<K, V, H> AktorData for std::collections::HashMap<K, V, H>
+#[cfg(feature = "std")]
+impl<K, V, H> AktorData for HashMap<K, V, H>
 where
-    K: AktorData + Eq + core::hash::Hash,
+    K: AktorData + Eq + Hash,
     V: AktorData,
-    H: core::hash::BuildHasher + Default,
+    H: BuildHasher + Default,
 {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
+    const MEMORY: usize = 0;
 
-        let mut map = serializer.serialize_map(Some(self.len()))?;
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.length(self.len());
 
         for (key, value) in self {
-            map.serialize_entry(&Ref(key), &Ref(value))?;
+            writer.write(key)?;
+            writer.write(value)?;
         }
 
-        map.end()
+        Ok(())
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Entries<K, V, H>(PhantomData<(K, V, H)>);
-        impl<'de, K, V, H> Visitor<'de> for Entries<K, V, H>
-        where
-            K: AktorData + Eq + core::hash::Hash,
-            V: AktorData,
-            H: core::hash::BuildHasher + Default,
-        {
-            type Value = std::collections::HashMap<K, V, H>;
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        let count = reader.length()?;
+        let mut values = HashMap::with_hasher(H::default());
 
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a map")
-            }
-
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = std::collections::HashMap::with_hasher(H::default());
-
-                while let Some((key, value)) = map.next_entry::<Owned<K>, Owned<V>>()? {
-                    values.insert(key.0, value.0);
-                }
-
-                Ok(values)
-            }
+        for _ in 0..count {
+            values.insert(reader.read()?, reader.read()?);
         }
 
-        deserializer.deserialize_map(Entries(PhantomData))
+        Ok(values)
     }
 }
 
-impl<T, H> AktorData for std::collections::HashSet<T, H>
+#[cfg(feature = "std")]
+impl<T, H> AktorData for HashSet<T, H>
 where
-    T: AktorData + Eq + core::hash::Hash,
-    H: core::hash::BuildHasher + Default,
+    T: AktorData + Eq + Hash,
+    H: BuildHasher + Default,
 {
-    fn serialize_data<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+    const MEMORY: usize = 0;
 
-        for value in self {
-            sequence.serialize_element(&Ref(value))?;
-        }
-
-        sequence.end()
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
+        writer.length(self.len());
+        self.iter().try_for_each(|value| writer.write(value))
     }
 
-    fn deserialize_data<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let values = deserialize_vec(deserializer)?;
-        let mut set =
-            std::collections::HashSet::with_capacity_and_hasher(values.len(), H::default());
+    // Straight into the table, a staging Vec would hold every value twice.
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        let count = reader.length()?;
+        let mut values = HashSet::with_hasher(H::default());
 
-        set.extend(values);
+        for _ in 0..count {
+            values.insert(reader.read()?);
+        }
 
-        Ok(set)
+        Ok(values)
     }
 }

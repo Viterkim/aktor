@@ -1,5 +1,5 @@
 use super::*;
-use crate::{local, message::LocalFuture};
+use crate::local;
 use core::ops::AsyncFnOnce;
 use kind::BevyLocal;
 #[cfg(target_family = "wasm")]
@@ -7,87 +7,107 @@ use local::clock::Browser as Clock;
 #[cfg(not(target_family = "wasm"))]
 use local::clock::Std as Clock;
 
-impl<'pool, S: 'static, Start, Role, End, CM> AktorStart<CM>
-    for AktorNew<S, Start, BevyLocal<'pool>, Role, End>
+impl<'pool, S: 'static, Start, End, EM: 'static, E, X, Before, After> AktorStart
+    for AktorNew<S, AktorInit<Start>, BevyLocal<'pool>, End, (EM, E), Before, After>
 where
-    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
-    End: crate::setup::closures::AktorEndCall<S, CM> + 'static,
+    Before:
+        crate::setup::closures::EachHook<<BevyLocal<'pool> as crate::setup::AktorMode>::Each<S>>,
+    After: crate::setup::closures::EachHook<<BevyLocal<'pool> as crate::setup::AktorMode>::Each<S>>,
+    Start: AsyncFnOnce() -> Result<S, X> + 'static,
+    X: Into<(E, String)> + 'static,
+    E: Send + 'static,
+    End: crate::setup::closures::AktorEndCall<S, EM> + 'static,
 {
     type Group = crate::AktorGroup;
-    type Handles = local::Handle<S, 0, (), Role, Clock>;
-    type Startup = LocalFuture<'pool, Result<Self::Handles, AktorStartError>>;
+    type Error = E;
+    type Handles = local::Handle<S, (), Clock>;
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            group.start_standard().map(|_| ()).map_err(Into::into)
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            group.start().map(|_| ()).map_err(Into::into)
-        }
+    fn actor_name(&self) -> &str {
+        &self.name
     }
 
-    fn start_in(self, context: AktorStartContext<Self::Group>) -> Self::Startup {
-        let executor = self.kind.executor;
-        let setup = self.with_role(AktorNoRole);
+    fn begin(&self, group: &mut Self::Group) -> Result<(), (AktorStartReason, String)> {
+        begin(group)
+    }
 
-        Box::pin(async move {
-            super::local::start_local::<_, _, _, Clock, _, _>(
-                setup,
-                context,
-                |future| executor.spawn_local(future).detach(),
-                |every| {
-                    use local::clock::AktorGroupClock;
-                    Clock::wait(Clock::deadline(every))
-                },
-            )
-            .await
-            .map(local::Handle::with_role)
-        })
+    fn closed(name: &str, group: &crate::AktorGroup) -> Self::Handles {
+        super::local::closed_local_handle(name, group, true)
+    }
+
+    fn launch(self, context: AktorStartContext<Self::Group>) -> AktorLaunch<Self> {
+        let this = pair_start!(self, crate::setup::impls::pair_start, EM);
+
+        let executor = this.kind.executor;
+        let spawn = move |future| executor.spawn_local(future).detach();
+
+        let completion = context.group.completion();
+        let (handle, ready) =
+            super::local::launch_local::<_, _, _, Clock, _, _, _>(this, context, spawn, |every| {
+                use local::clock::AktorGroupClock;
+                Clock::wait(Clock::deadline(every))
+            })?;
+
+        Ok((handle, Box::pin(super::local::readiness(ready, completion))))
     }
 }
-impl<'pool, S, Start, Fut, Role, End, CM> AktorStart<CM>
-    for AktorNew<S, Start, kind::BevyTask<'pool>, Role, End>
+
+impl<'pool, S, Start, Fut, End, EM: 'static, E, X, Before, After> AktorStart
+    for AktorNew<S, AktorInit<Start>, kind::BevyTask<'pool>, End, (EM, E), Before, After>
 where
+    Before: crate::setup::closures::EachHook<
+            <kind::BevyTask<'pool> as crate::setup::AktorMode>::Each<S>,
+        >,
+    After: crate::setup::closures::EachHook<
+            <kind::BevyTask<'pool> as crate::setup::AktorMode>::Each<S>,
+        >,
     S: Send + 'static,
     Start: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<S, crate::AktorSetupError>> + Send + 'static,
-    End: crate::setup::closures::AktorSendEnd<S, CM>,
+    Fut: Future<Output = Result<S, X>> + Send + 'static,
+    X: Into<(E, String)> + Send + 'static,
+    E: Send + 'static,
+    End: crate::setup::closures::AktorSendEnd<S, EM>,
 {
     type Group = crate::AktorGroup;
-    type Handles = crate::AktorTask<S, Role>;
+    type Error = E;
+    type Handles = crate::AktorTask<S>;
+
+    fn actor_name(&self) -> &str {
+        &self.name
+    }
+
+    fn begin(&self, group: &mut Self::Group) -> Result<(), (AktorStartReason, String)> {
+        begin(group)
+    }
+
+    fn closed(_name: &str, group: &crate::AktorGroup) -> Self::Handles {
+        crate::AktorTask::closed_handle(group.killswitch(), CLOCK)
+    }
+
+    fn launch(self, mut context: AktorStartContext<Self::Group>) -> AktorLaunch<Self> {
+        let this = pair_start!(self, crate::setup::impls::pair_start_fn, EM);
+
+        let executor = this.kind.executor;
+
+        let (handle, started) =
+            crate::task::start_sync_on(this, &mut context.group, CLOCK, |future| {
+                crate::serve::TaskJoin::Bevy(executor.spawn(future))
+            })?;
+
+        Ok((handle, crate::task::ready(started, context.group)))
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+const CLOCK: crate::serve::Clock = crate::serve::Clock::Std;
+#[cfg(target_family = "wasm")]
+const CLOCK: crate::serve::Clock = crate::serve::Clock::Browser;
+
+fn begin(group: &mut crate::AktorGroup) -> Result<(), (AktorStartReason, String)> {
     #[cfg(not(target_family = "wasm"))]
-    type Startup =
-        Pin<Box<dyn Future<Output = Result<Self::Handles, AktorStartError>> + Send + 'pool>>;
+    let started = group.start_standard();
     #[cfg(target_family = "wasm")]
-    type Startup = LocalFuture<'pool, Result<Self::Handles, AktorStartError>>;
+    let started = group.start();
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError> {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            group.start_standard().map(|_| ()).map_err(Into::into)
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            group.start().map(|_| ()).map_err(Into::into)
-        }
-    }
-
-    fn start_in(self, mut context: AktorStartContext<Self::Group>) -> Self::Startup {
-        let executor = self.kind.executor;
-        let setup = self.with_role(AktorNoRole);
-        #[cfg(not(target_family = "wasm"))]
-        let clock = crate::task::TaskClock::Std;
-        #[cfg(target_family = "wasm")]
-        let clock = crate::task::TaskClock::Browser;
-
-        Box::pin(async move {
-            crate::task::start_on(setup, &mut context.group, clock, |future| {
-                crate::task::TaskJoin::Bevy(executor.spawn(future))
-            })
-            .await
-            .map(crate::AktorTask::with_role)
-        })
-    }
+    started.er_with(|error| error.start_reason())?;
+    Ok(())
 }

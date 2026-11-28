@@ -1,175 +1,105 @@
+use super::receipt::Stage;
 use super::*;
-use core::fmt;
 
-#[cfg(any(
-    test,
-    all(
-        any(feature = "tokio", feature = "std_thread"),
-        not(target_family = "wasm")
-    )
-))]
-pub fn diagnostics(error: &(dyn core::error::Error + 'static)) -> String {
-    fn source_diagnostics(error: &(dyn core::error::Error + 'static)) -> String {
-        let mut output = String::new();
-        let mut source = Some(error);
-
-        for _ in 0..64 {
-            let Some(error) = source else {
-                return output;
-            };
-            if !output.is_empty() {
-                output.push_str("\ncaused by: ");
-            }
-            output.push_str(&alloc::format!("{error:#}"));
-            source = error.source();
-        }
-
-        if source.is_some() {
-            output.push_str("\ncaused by: ... (source chain truncated)");
-        }
-        output
-    }
-
-    let render = || source_diagnostics(error);
-    #[cfg(feature = "std")]
-    {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)) {
-            Ok(diagnostics) => diagnostics,
-            Err(payload) => {
-                let message = alloc::format!(
-                    "error formatter panicked: {}",
-                    crate::panic::panic_message(&payload)
-                );
-
-                crate::panic::dispose_secondary(payload);
-                message
-            }
-        }
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        render()
+// `start` can return anything that turns into `(E, String)`, like an ErResult. The launch code
+// underneath only knows the pair, so it gets a `start` that converts (see `pair_start!`).
+pub(crate) fn pair_start<S, Start, X, E>(
+    start: Start,
+) -> impl AsyncFnOnce() -> Result<S, (E, String)>
+where
+    Start: AsyncFnOnce() -> Result<S, X>,
+    X: Into<(E, String)>,
+{
+    async move || match start().await {
+        Ok(state) => Ok(state),
+        Err(error) => Err(error.into()),
     }
 }
 
-struct StartupDetails<'a> {
-    primary: &'a str,
-    report: Option<&'a crate::ShutdownReport>,
-    source_is_failure: bool,
+/// The same for the kinds that take `FnOnce() -> impl Future`.
+#[cfg(any(feature = "bevy", all(feature = "tokio", not(target_family = "wasm"))))]
+pub(crate) fn pair_start_fn<Start, Fut, E>(start: Start) -> impl FnOnce() -> PairStart<Fut, E>
+where
+    Start: FnOnce() -> Fut,
+{
+    move || PairStart {
+        started: Box::pin(start()),
+        error: core::marker::PhantomData,
+    }
 }
-impl fmt::Display for StartupDetails<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("actor startup failed")?;
 
-        if let Some(report) = &self.report {
-            if let Some(failure) = &report.failure {
-                if self.source_is_failure {
-                    write!(f, " for {}", failure.actor)?;
-                } else {
-                    write!(
-                        f,
-                        "\n{} failed during {}:\n{}",
-                        failure.actor, failure.phase, failure.message
-                    )?;
-                }
-            }
+/// A `start` future whose error turns into `(E, String)` when it's done. Built once per actor.
+#[cfg(any(feature = "bevy", all(feature = "tokio", not(target_family = "wasm"))))]
+pub(crate) struct PairStart<Fut, E> {
+    started: core::pin::Pin<Box<Fut>>,
+    error: core::marker::PhantomData<fn() -> E>,
+}
+#[cfg(any(feature = "bevy", all(feature = "tokio", not(target_family = "wasm"))))]
+impl<Fut, S, X, E> Future for PairStart<Fut, E>
+where
+    Fut: Future<Output = Result<S, X>>,
+    X: Into<(E, String)>,
+{
+    type Output = Result<S, (E, String)>;
 
-            for actor in &report.actors {
-                for diagnostic in &actor.diagnostics {
-                    write!(f, "\n{} cleanup:\n{}", actor.actor, diagnostic.diagnostics)?;
-                }
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        self.started.as_mut().poll(cx).map(|result| match result {
+            Ok(state) => Ok(state),
+            Err(error) => Err(error.into()),
+        })
+    }
+}
 
-                if actor.timed_out {
-                    write!(f, "\n{} rollback did not finish", actor.actor)?;
-                }
-            }
-
-            for diagnostic in &report.application {
-                write!(f, "\nApplication shutdown:\n{}", diagnostic.diagnostics)?;
-            }
-
-            if report.timed_out {
-                write!(f, "\nRollback deadline reached")?;
-            }
+impl<S: 'static, Kind: AktorMode> AktorInterval<S, Kind> {
+    pub fn new(
+        every: Duration,
+        run: impl Into<AktorClosure<Kind::Interval<S>>>,
+    ) -> Result<Self, (crate::AktorIntervalError, String)> {
+        if every.is_zero() {
+            er_bail!(crate::AktorIntervalError);
         }
 
-        write!(f, "\n{}", self.primary)?;
-
-        Ok(())
+        Ok(Self {
+            every,
+            run: run.into(),
+        })
     }
 }
 
-impl AktorStartupError {
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.diagnostics.report)
-    }
-
-    pub fn from_failure(
-        error: AktorStartError,
-        primary: String,
-        report: Option<Box<crate::ShutdownReport>>,
-        source_is_failure: bool,
-    ) -> Self {
-        let details = alloc::format!(
-            "{}",
-            StartupDetails {
-                primary: &primary,
-                report: report.as_deref(),
-                source_is_failure,
-            }
-        );
-
-        Self {
-            error,
-            diagnostics: Box::new(crate::AktorDiagnostic::new(
-                "actor initialization failed",
-                details,
-            )),
-            report,
-            source_is_failure,
-        }
-    }
+impl<S: 'static, Kind: AktorMode> AktorHooks<S, Kind> {
+    /// No intervals, nothing before or after each call. Most actors have none.
+    pub const NONE: Self = Self {
+        intervals: Vec::new(),
+        before_each: (),
+        after_each: (),
+    };
 }
 
-impl AktorName {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
-    }
-}
-
-impl Default for AktorNewOptions {
-    fn default() -> Self {
-        Self { capacity: 32 }
-    }
-}
-
-impl Default for AktorOptions {
-    fn default() -> Self {
-        Self {
-            shutdown_grace: Duration::from_secs(5),
-        }
-    }
-}
-
-impl<S: 'static, Start, Kind: AktorMode, Role, End> AktorNew<S, Start, Kind, Role, End> {
-    pub fn with_role<NewRole>(self, role: NewRole) -> AktorNew<S, Start, Kind, NewRole, End> {
-        AktorNew {
-            name: self.name,
-            role,
-            kind: self.kind,
-            closures: self.closures,
-            options: self.options,
-        }
-    }
-
+impl<S: 'static, Start, Kind: AktorMode, End, Signature, Before, After>
+    AktorNew<S, Start, Kind, End, Signature, Before, After>
+{
     pub fn execution(&self) -> AktorExecution {
         Kind::EXECUTION
     }
 }
 
-impl<Handles, Group: AktorSetupGroup> AktorStarted<Handles, Group> {
-    pub fn killswitch(&self) -> Group::KillSwitch {
+impl<Handles, Group: AktorSetupGroup, E: 'static> AktorStarted<Handles, Group, E> {
+    /// Move out the handles while keeping the group and its startup result. This lets you
+    /// keep local handles on their executor and send the native group owner to another task.
+    pub fn into_parts(self) -> (AktorStarted<(), Group, E>, Handles) {
+        let started = AktorStarted {
+            handles: (),
+            group: self.group,
+            readiness: self.readiness,
+        };
+
+        (started, self.handles)
+    }
+
+    pub fn killswitch(&self) -> Group::AktorKillSwitch {
         self.group.killswitch()
     }
 
@@ -177,9 +107,46 @@ impl<Handles, Group: AktorSetupGroup> AktorStarted<Handles, Group> {
         self.group.completion()
     }
 
-    pub fn shutdown(&self) -> Group::Closing {
-        Group::stop(&self.group.killswitch());
-        self.group.closing()
+    pub fn handles(&self) -> &Handles {
+        &self.handles
+    }
+
+    pub fn group(&self) -> &Group {
+        &self.group
+    }
+
+    /// Every waiter borrows the same startup receipt or initializer error.
+    pub async fn ready(&self) -> Result<&crate::AktorStartup, (&AktorStartError<E>, String)> {
+        self.readiness.wait(&self.group).await
+    }
+}
+
+impl<Handles, Group: AktorSetupGroup, E: 'static> AktorSpawned<Handles, Group, E> {
+    /// Take the handles early after checking that the group accepted registration.
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(
+        self,
+    ) -> Result<(AktorSpawned<(), Group, E>, Handles), (AktorStartError<E>, String)> {
+        let readiness = self.readiness.split()?;
+        Ok((
+            AktorSpawned {
+                handles: (),
+                group: self.group,
+                readiness,
+            },
+            self.handles,
+        ))
+    }
+
+    /// Wait for startup and take the handles, including handles with a single owned result.
+    pub async fn ready(self) -> Result<Handles, (AktorStartError<E>, String)> {
+        self.readiness.into_ready(&self.group).await?;
+        Ok(self.handles)
+    }
+
+    /// Read the initialization evidence for this spawn, including when its handles have moved.
+    pub async fn receipt(&self) -> Result<&crate::AktorStartup, (&AktorStartError<E>, String)> {
+        self.readiness.wait(&self.group).await
     }
 }
 
@@ -191,273 +158,138 @@ impl<Group: AktorSetupGroup> Clone for AktorStartContext<Group> {
     }
 }
 
-pub fn aktor_start<Setups, Shutdown, ShutdownOutput, ShutdownMode, StartMode>(
-    setup: AktorSetup<Setups, Shutdown, ShutdownOutput>,
-) -> AktorStartup<Setups, StartMode>
-where
-    Setups: AktorStart<StartMode>,
-    Setups::Group: shutdown::AktorShutdown<Shutdown, ShutdownOutput, ShutdownMode>,
-    Shutdown: FnOnce(crate::ShutdownReport) -> ShutdownOutput + 'static,
+#[cfg(any(
+    all(
+        any(feature = "tokio", feature = "std_thread"),
+        not(target_family = "wasm")
+    ),
+    all(
+        any(feature = "browser_local", feature = "wasm_browser_workers"),
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
+impl<Handles, E: 'static> AktorStarted<Handles, crate::AktorGroup, E> {
+    /// Start shutdown now and return the report by the group shutdown deadline.
+    pub fn stop(&self) -> impl Future<Output = crate::AktorShutdownReport> + Send + 'static {
+        self.group.stop()
+    }
+    pub fn stop_released(
+        &self,
+    ) -> impl Future<Output = Result<crate::AktorRetired, (crate::AktorRetirementError, String)>>
+    + Send
+    + 'static {
+        self.group.stop_released()
+    }
+}
+
+#[cfg(feature = "local")]
+impl<Handles, Clock: crate::local::clock::AktorGroupClock, E: 'static>
+    AktorStarted<Handles, crate::local::AktorGroup<Clock>, E>
 {
-    let mut group = Setups::Group::new(setup.options.shutdown_grace);
+    /// Start shutdown now and return the report by the group shutdown deadline.
+    pub fn stop(&self) -> impl Future<Output = crate::AktorShutdownReport> + 'static {
+        self.group.stop()
+    }
+    pub fn stop_released(
+        &self,
+    ) -> impl Future<Output = Result<crate::AktorRetired, (crate::AktorRetirementError, String)>> + 'static
+    {
+        self.group.stop_released()
+    }
+}
 
+/// Start actors. Nothing waits here, the handles come back right away and calls queue until
+/// `start` is done. Await `.ready()` when you want the typed start error.
+///
+/// What you get back owns the actors, dropping it stops them all.
+pub fn aktor_start<Setups, Shutdown, ShutdownOutput, ShutdownMode>(
+    setup: AktorSetup<Setups, Shutdown, ShutdownOutput>,
+) -> AktorStarted<Setups::Handles, Setups::Group, Setups::Error>
+where
+    Setups: AktorStart,
+    Setups::Group: shutdown::AktorShutdown<Shutdown, ShutdownOutput, ShutdownMode>,
+    Shutdown: FnOnce(crate::AktorShutdownReport) -> ShutdownOutput + 'static,
+{
+    start_group(Setups::Group::new(setup.grace, setup.stuck), setup)
+}
+
+fn start_group<Setups, Shutdown, ShutdownOutput, ShutdownMode>(
+    mut group: Setups::Group,
+    setup: AktorSetup<Setups, Shutdown, ShutdownOutput>,
+) -> AktorStarted<Setups::Handles, Setups::Group, Setups::Error>
+where
+    Setups: AktorStart,
+    Setups::Group: shutdown::AktorShutdown<Shutdown, ShutdownOutput, ShutdownMode>,
+    Shutdown: FnOnce(crate::AktorShutdownReport) -> ShutdownOutput + 'static,
+{
     group.track_startup();
-    let registered = shutdown::AktorShutdown::on_shutdown(&group, setup.shutdown);
-    let mut startup = AktorStartup {
-        mode: core::marker::PhantomData,
-        killswitch: group.killswitch(),
-        completion: group.completion(),
-        begin: true,
-        group: Some(group),
-        setup: Some(Box::new(setup.actors)),
-        starting: None,
-        failure: None,
-        shutdown: None,
-    };
 
-    if let Err(error) = registered {
-        startup.setup = None;
-        startup.failure = Some(Box::new(error.into()));
+    let kill = group.killswitch();
+    let name = String::from(setup.actors.actor_name());
+    let actors = setup.actors;
+    let fallback = actors.fallback();
 
-        if let Some(group) = &startup.group {
-            Setups::Group::stop(&startup.killswitch);
-            startup.shutdown = Some(Box::pin(group.closing()));
+    let launched = (|| {
+        shutdown::AktorShutdown::on_shutdown(&group, setup.shutdown)
+            .er_with(|error| LaunchError::new(error.start_reason()))?;
+        if let Err((reason, text)) = actors.begin(&mut group) {
+            let id = Setups::Group::startup_id(&kill).unwrap_or_else(|| {
+                Setups::Group::fail_startup(
+                    &kill,
+                    crate::AktorFailureInput::new(
+                        crate::AktorFailureSource::GroupDriver,
+                        text.clone(),
+                    ),
+                )
+            });
+            return Err((
+                LaunchError {
+                    failure_id: Some(id),
+                    ..LaunchError::new(reason)
+                },
+                text,
+            ));
         }
-    }
+        actors.launch(AktorStartContext {
+            group: group.registration(),
+        })
+    })();
 
-    startup
-}
+    match launched {
+        Ok((handles, ready)) => AktorStarted {
+            handles,
+            group,
+            readiness: Stage::Starting(Setups::Group::observe_ready(ready, kill, name)).into(),
+        },
+        Err(mut error) => {
+            group::identify::<Setups::Group, _>(&kill, name, &mut error);
+            Setups::Group::stop(&kill);
 
-/// Add prepared actors to a group whose shutdown listener is already running.
-/// Failure or cancellation after startup begins stops the whole group, including existing actors.
-pub async fn aktor_start_in<Setup: AktorStart<Mode>, Mode>(
-    group: &Setup::Group,
-    setup: Setup,
-) -> Result<Setup::Handles, AktorStartupError> {
-    if let Err(error) = group.check_started() {
-        let error = AktorStartError::from(error);
-        let diagnostics = Setup::diagnostics(&error);
-
-        return Err(AktorStartupError::from_failure(
-            error,
-            diagnostics,
-            None,
-            false,
-        ));
-    }
-
-    let mut group = group.registration();
-
-    group.track_startup();
-
-    let startup = AktorStartup {
-        mode: core::marker::PhantomData,
-        begin: false,
-        killswitch: group.killswitch(),
-        completion: group.completion(),
-        group: Some(group),
-        setup: Some(Box::new(setup)),
-        starting: None,
-        failure: None,
-        shutdown: None,
-    };
-
-    startup.await.map(|started| started.handles)
-}
-
-impl<E: 'static> AktorStartError<E> {
-    #[doc(hidden)]
-    pub fn source_is_setup(&self) -> bool {
-        match self {
-            Self::Init(_) | Self::Setup(_) => true,
-            #[cfg(all(
-                any(feature = "tokio", feature = "std_thread"),
-                not(target_family = "wasm")
-            ))]
-            Self::Thread(
-                crate::listener::DedicatedStartError::Panicked { .. }
-                | crate::listener::DedicatedStartError::InvalidCapacity,
-            ) => true,
-            #[cfg(all(
-                any(feature = "tokio", feature = "std_thread"),
-                not(target_family = "wasm")
-            ))]
-            Self::Startup(error) => match error.error.primary() {
-                crate::listener::DedicatedStartError::Init(_)
-                | crate::listener::DedicatedStartError::Panicked { .. }
-                | crate::listener::DedicatedStartError::InvalidCapacity => true,
-                crate::listener::DedicatedStartError::Startup { .. }
-                | crate::listener::DedicatedStartError::Observer { .. }
-                | crate::listener::DedicatedStartError::NotStarted
-                | crate::listener::DedicatedStartError::Closed
-                | crate::listener::DedicatedStartError::NoRuntime
-                | crate::listener::DedicatedStartError::ThreadNotCreated(_)
-                | crate::listener::DedicatedStartError::Thread(_) => false,
-            },
-            #[cfg(feature = "local")]
-            Self::Local(crate::local::OwnerError {
-                error:
-                    crate::local::OwnerFailure::Setup(_) | crate::local::OwnerFailure::SetupPanic(_),
-                ..
-            }) => true,
-            _ => false,
+            AktorStarted {
+                handles: fallback(&group),
+                group,
+                readiness: Stage::Failed(error).into(),
+            }
         }
     }
 }
 
-impl<E: 'static> From<AktorSetupError> for AktorStartError<E> {
-    fn from(error: AktorSetupError) -> Self {
-        Self::Setup(error)
-    }
-}
-
-pub fn start_diagnostics(error: &AktorStartError) -> String {
-    match error {
-        AktorStartError::Init(error) => error.diagnostics.clone(),
-        AktorStartError::Setup(error) => error.diagnostics.clone(),
-        #[cfg(feature = "local")]
-        AktorStartError::Local(error) => alloc::format!("{error:#}"),
-        #[cfg(all(
-            any(feature = "tokio", feature = "std_thread"),
-            not(target_family = "wasm")
-        ))]
-        AktorStartError::Thread(_) => diagnostics(error),
-        #[cfg(all(
-            any(feature = "tokio", feature = "std_thread"),
-            not(target_family = "wasm")
-        ))]
-        AktorStartError::Startup(error) => alloc::format!("{error:#}"),
-    }
-}
-
-pub fn validation_error<Group: AktorSetupGroup>(
+pub(crate) fn validation_error<Group: AktorSetupGroup, E>(
     group: &Group,
     actor: &str,
     kind: AktorExecution,
-    error: AktorStartError,
-) -> AktorStartError {
-    Group::fail_startup(
+    mut failure: StartFailure<E>,
+) -> StartFailure<E> {
+    group.validate_attempt(actor, kind);
+    failure.0.failure_id = Some(Group::fail_startup(
         &group.killswitch(),
-        crate::AktorFailureReport {
-            actor: actor.into(),
-            kind: Some(kind),
-            phase: "setup".into(),
-            message: start_diagnostics(&error),
-        },
-    );
-    error
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core::error::Error;
-    use core::fmt::Write;
-
-    #[derive(Debug)]
-    struct Cause {
-        source: Option<Box<Cause>>,
-        cycle: bool,
-        panic: bool,
-    }
-    impl fmt::Display for Cause {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("initialization cause")
-        }
-    }
-    impl Error for Cause {
-        fn source(&self) -> Option<&(dyn Error + 'static)> {
-            if self.panic {
-                panic!("source panic sentinel");
-            }
-
-            if self.cycle {
-                Some(self)
-            } else {
-                self.source.as_deref().map(|source| source as &dyn Error)
-            }
-        }
-    }
-
-    struct Output(String);
-    impl Write for Output {
-        fn write_str(&mut self, text: &str) -> fmt::Result {
-            if self.0.len() + text.len() > 4096 {
-                return Err(fmt::Error);
-            }
-
-            self.0.push_str(text);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn sources() {
-        let public = |cause| {
-            let captured = crate::AktorFailure::from(AktorSetupError::new(diagnostics(&cause), ()));
-            let error = AktorStartError::Init(captured);
-
-            let diagnostics = start_diagnostics(&error);
-
-            AktorStartupError::from_failure(error, diagnostics, None, false)
-        };
-        let finite = public(Cause {
-            source: Some(Box::new(Cause {
-                source: None,
-                cycle: false,
-                panic: false,
-            })),
-            cycle: false,
-            panic: false,
-        });
-
-        assert_eq!(
-            alloc::format!("{finite:#}")
-                .matches("initialization cause")
-                .count(),
-            2
-        );
-
-        #[cfg(feature = "std")]
-        {
-            let hostile = public(Cause {
-                source: None,
-                cycle: false,
-                panic: true,
-            });
-            let output = alloc::format!("{hostile:#}");
-
-            assert!(output.contains("actor startup failed"));
-            assert!(output.contains("error formatter panicked: source panic sentinel"));
-            assert_eq!(alloc::format!("{hostile:?}"), "actor startup failed");
-        }
-
-        let captured = crate::AktorFailure::from(AktorSetupError::new(
-            diagnostics(&Cause {
-                source: None,
-                cycle: true,
-                panic: false,
-            }),
-            (),
-        ));
-        let mut output = Output(String::new());
-
-        output
-            .write_str(&captured.diagnostics)
-            .expect("captured source walk exceeded its output budget");
-        assert!(output.0.ends_with("(source chain truncated)"));
-        assert!(captured.diagnostics.contains("source chain truncated"));
-        assert!(!alloc::format!("{captured:?}").contains("source chain truncated"));
-
-        let cyclic = public(Cause {
-            source: None,
-            cycle: true,
-            panic: false,
-        });
-        let mut output = Output(String::new());
-
-        write!(output, "{cyclic:#}").expect("source walk exceeded its output budget");
-        assert!(output.0.ends_with("(source chain truncated)"));
-        assert_eq!(alloc::format!("{cyclic:?}"), "actor startup failed");
-    }
+        crate::AktorFailureInput::actor(
+            actor.into(),
+            kind,
+            crate::AktorPhase::Start,
+            failure.1.clone(),
+        ),
+    ));
+    failure
 }

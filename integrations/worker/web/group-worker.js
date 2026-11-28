@@ -11,18 +11,28 @@ await init();
 
 const parameters = new URL(location.href).searchParams;
 
-if (parameters.has('unconfirmed')) {
+if (parameters.has('bootstrap_result')) {
+    const result = new BroadcastChannel('aktor-bootstrap');
+    try {
+        await start_group_worker(true, false, false);
+        result.postMessage('cleanup succeeded');
+    } catch (report) {
+        result.postMessage(String(report));
+    } finally {
+        result.close();
+    }
+} else if (parameters.has('unconfirmed')) {
     await start_unconfirmed_worker(Number(parameters.get('unconfirmed')));
 } else if (parameters.has('rollback')) {
     await start_rejected_worker();
 } else if (parameters.has('configured')) {
-    await start_group_setup_worker();
+    await start_group_setup_worker(parameters.get('mode') || '');
 } else if (parameters.has('fail_setup')) {
-    typed_setup_failed();
+    await typed_setup_failed();
 } else if (parameters.has('other')) {
-    start_role_worker();
+    await start_role_worker();
 } else {
-    start_group_worker(
+    await start_group_worker(
         parameters.get('fail_cleanup') === 'true',
         parameters.get('wrong_data') === 'true',
         parameters.get('fail_data') === 'true'

@@ -2,17 +2,19 @@ use super::super::*;
 use core::{future::poll_fn, task::ready};
 
 impl<'a, S: 'static, O> Request<'a, S, O> {
-    pub fn timeout(self, duration: core::time::Duration) -> crate::Timeout<Self> {
+    pub fn timeout(self, duration: core::time::Duration) -> crate::AktorTimeout<Self> {
         let standard = self.admission.is_standard();
 
-        crate::Timeout::queued(
+        crate::AktorTimeout::queued(
             self,
             duration,
             |request| crate::timeout::WaitStatus {
-                admitted: matches!(
-                    request.submission,
-                    Submission::Submitted | Submission::Consumed
-                ),
+                admitted: match request.submission {
+                    Submission::Submitted | Submission::Consumed => true,
+                    Submission::Unsent(_) | Submission::Waiting { .. } | Submission::Closed => {
+                        false
+                    }
+                },
             },
             standard,
         )
@@ -29,64 +31,29 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
         self
     }
 
-    /// Queue the call and keep its reply for later.
-    pub async fn send(mut self) -> Reply<O> {
-        if !poll_fn(|cx| self.poll_submit(cx)).await {
-            if self.admission.group().is_some() {
-                self.admission.rejected();
-                core::future::pending::<()>().await;
-            }
-
-            if self.sender.is_closed() {
-                self.reply.wait_closed().await;
-            }
-
-            stopped();
-        }
-
-        self.reply
+    #[cfg(feature = "transport")]
+    #[doc(hidden)]
+    pub fn forward(mut self) -> Self {
+        self.reply.receive = false;
+        self
     }
 
-    /// Wait for admission, returning a reply whose outcome can be observed before cleanup.
-    pub async fn admit(mut self) -> Result<Reply<O>, CallError> {
-        if poll_fn(|cx| self.poll_submit(cx)).await {
-            Ok(self.reply)
-        } else {
-            Err(CallError::NotAdmitted)
-        }
+    pub fn send(self) -> RequestSend<'a, S, O> {
+        RequestSend(Some(self))
     }
 
     fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
         loop {
-            if let Some(available) = &mut self.available {
-                ready!(available.as_mut().poll(cx));
-                self.available = None;
-            }
-
             if matches!(self.submission, Submission::Unsent(_)) {
                 let old = std::mem::replace(&mut self.submission, Submission::Consumed);
 
                 if let Submission::Unsent(message) = old {
                     let sender = self.sender;
-                    let Some(epoch) = self.admission.epoch() else {
-                        if sender.is_closed() {
-                            self.submission = Submission::Closed;
-                            drop(message);
-                            return Poll::Ready(false);
-                        }
-
-                        let mut changed = self.admission.watch();
-                        let mut finished = self.reply.finished.clone();
-                        let admission = self.admission;
-
-                        self.submission = Submission::Unsent(message);
-                        self.available = Some(Box::pin(async move {
-                            if admission.epoch().is_none() && !sender.is_closed() {
-                                tokio::select! { _ = changed.changed() => (), _ = finished.changed() => () }
-                            }
-                        }));
-                        continue;
-                    };
+                    if self.admission.phase().is_closing() {
+                        self.submission = Submission::Closed;
+                        drop(message);
+                        return Poll::Ready(false);
+                    }
 
                     if let Ok(permit) = sender.try_reserve() {
                         #[cfg(feature = "tokio")]
@@ -98,7 +65,7 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
                             return Poll::Pending;
                         }
 
-                        match self.admission.admit(epoch, permit, message) {
+                        match self.admission.admit(permit, message) {
                             Ok(()) => {
                                 self.submission = Submission::Submitted;
                                 return Poll::Ready(true);
@@ -110,23 +77,9 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
                         }
                     }
 
-                    let mut changed = self.admission.watch();
-                    let admission = self.admission;
-
                     self.submission = Submission::Waiting {
                         message,
-                        admission: Box::pin(async move {
-                            if admission.epoch() != Some(epoch) {
-                                return Err(());
-                            }
-
-                            tokio::select! {
-                                biased;
-                                _ = changed.changed() => Err(()),
-                                permit = sender.reserve() => permit.map_err(|_| ()),
-                            }
-                        }),
-                        epoch,
+                        admission: Box::pin(async move { sender.reserve().await.ok() }),
                     };
                 }
             }
@@ -139,11 +92,11 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
                 Submission::Unsent(_) => continue,
             };
 
-            let old = std::mem::replace(&mut self.submission, Submission::Closed);
+            let old = std::mem::replace(&mut self.submission, Submission::Consumed);
 
-            if let Submission::Waiting { message, epoch, .. } = old {
+            if let Submission::Waiting { message, .. } = old {
                 match permit {
-                    Ok(permit) => match self.admission.admit(epoch, permit, message) {
+                    Some(permit) => match self.admission.admit(permit, message) {
                         Ok(()) => {
                             self.submission = Submission::Submitted;
                             return Poll::Ready(true);
@@ -151,26 +104,35 @@ impl<'a, S: 'static, O> Request<'a, S, O> {
                         Err(message) if !self.sender.is_closed() => {
                             self.submission = Submission::Unsent(message)
                         }
-                        Err(_) => return Poll::Ready(false),
+                        Err(message) => {
+                            self.submission = Submission::Closed;
+                            drop(message);
+                            return Poll::Ready(false);
+                        }
                     },
-                    Err(_) if !self.sender.is_closed() => {
+                    None if !self.sender.is_closed() => {
                         self.submission = Submission::Unsent(message)
                     }
-                    Err(_) => return Poll::Ready(false),
+                    None => {
+                        self.submission = Submission::Closed;
+                        drop(message);
+                        return Poll::Ready(false);
+                    }
                 }
             }
         }
     }
 }
 impl<S: 'static, O> Future for Request<'_, S, O> {
-    type Output = O;
+    type Output = Result<O, crate::AktorDeliveryError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        if !ready!(this.poll_submit(cx)) && this.admission.group().is_some() {
-            this.admission.rejected();
-            return Poll::Pending;
+        if !ready!(this.poll_submit(cx)) {
+            return Poll::Ready(Err(this
+                .admission
+                .call_error(AktorDeliveryOutcome::NotAdmitted, this.reply.receive)));
         }
 
         let output = ready!(Pin::new(&mut this.reply).poll(cx));
@@ -179,13 +141,11 @@ impl<S: 'static, O> Future for Request<'_, S, O> {
         Poll::Ready(output)
     }
 }
-impl<S: 'static> Request<'_, S, ()> {
+impl<'a, S: 'static> Request<'a, S, ()> {
     #[doc(hidden)]
     pub async fn run_interval(mut self) -> bool {
         let admitted = poll_fn(|cx| {
-            if matches!(self.admission.phase(), crate::queue::Phase::Closing { .. })
-                || self.sender.is_closed()
-            {
+            if self.admission.phase().is_closing() || self.sender.is_closed() {
                 return Poll::Ready(false);
             }
 
@@ -194,14 +154,53 @@ impl<S: 'static> Request<'_, S, ()> {
         .await;
 
         if admitted {
-            self.reply.await;
+            return self.reply.await.is_ok();
         }
 
         admitted
     }
 
     /// Submit without waiting for completion.
-    pub async fn cast(self) {
-        drop(self.send().await);
+    pub fn cast(self) -> RequestCast<'a, S> {
+        RequestCast(self.send())
+    }
+}
+
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct RequestSend<'a, S, O>(Option<Request<'a, S, O>>);
+impl<S, O> Unpin for RequestSend<'_, S, O> {}
+impl<S: 'static, O> Future for RequestSend<'_, S, O> {
+    type Output = Result<Reply<O>, crate::AktorDeliveryError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let Some(request) = &mut this.0 else {
+            consumed();
+        };
+
+        let admitted = ready!(request.poll_submit(cx));
+        let Some(request) = this.0.take() else {
+            consumed();
+        };
+
+        if admitted {
+            Poll::Ready(Ok(request.reply))
+        } else {
+            Poll::Ready(Err(request.admission.call_error(
+                AktorDeliveryOutcome::NotAdmitted,
+                request.reply.receive,
+            )))
+        }
+    }
+}
+
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct RequestCast<'a, S>(RequestSend<'a, S, ()>);
+impl<S> Unpin for RequestCast<'_, S> {}
+impl<S: 'static> Future for RequestCast<'_, S> {
+    type Output = Result<(), crate::AktorDeliveryError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx).map_ok(drop)
     }
 }

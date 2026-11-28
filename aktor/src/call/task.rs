@@ -1,5 +1,5 @@
 use super::*;
-use crate::task::{AktorTaskReply, AktorTaskRequest, AktorTaskState};
+use crate::task::{AktorTaskCast, AktorTaskReply, AktorTaskRequest, AktorTaskSend, AktorTaskState};
 use core::time::Duration;
 
 impl<'a, S, I, O, Fut, Role> SendRequest for AktorTaskRequest<'a, S, I, O, Fut, Role>
@@ -10,9 +10,10 @@ where
     Fut: Future<Output = (AktorTaskState<S>, O)> + Send + 'static,
 {
     type Reply = AktorTaskReply<O>;
+    type Send = AktorTaskSend<'a, S, I, O, Fut, Role>;
 
-    async fn send(self) -> Self::Reply {
-        self.send().await
+    fn send(self) -> Self::Send {
+        self.send()
     }
 }
 impl<'a, S, I, O, Fut, Role> TimeoutRequest for AktorTaskRequest<'a, S, I, O, Fut, Role>
@@ -22,7 +23,7 @@ where
     O: Send + 'static,
     Fut: Future<Output = (AktorTaskState<S>, O)> + Send + 'static,
 {
-    type Timed = crate::Timeout<Self>;
+    type Timed = crate::AktorTimeout<Self>;
 
     fn timeout(self, duration: Duration) -> Self::Timed {
         self.timeout(duration)
@@ -34,9 +35,10 @@ where
     I: Send + 'static,
     Fut: Future<Output = (AktorTaskState<S>, ())> + Send + 'static,
 {
-    type Output = ();
+    type Output = Result<(), crate::AktorDeliveryError>;
+    type Cast = AktorTaskCast<'a, S, I, Fut, Role>;
 
-    async fn cast(self) {
-        drop(self.send().await);
+    fn cast(self) -> Self::Cast {
+        self.cast()
     }
 }

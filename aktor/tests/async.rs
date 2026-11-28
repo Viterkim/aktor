@@ -1,8 +1,8 @@
 #![cfg(feature = "macros")]
 
-use aktor::message::call;
-use aktor::owner::OwnerFailure;
+use aktor::owner::OwnerError;
 use aktor::*;
+use core::num::NonZeroUsize;
 use std::{cell::RefCell, rc::Rc, sync::Arc, thread, time::Duration};
 use tokio::sync::oneshot;
 
@@ -10,6 +10,17 @@ struct State {
     values: Rc<RefCell<Vec<u32>>>,
     owner: thread::ThreadId,
     timer: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+fn start<Actors: AktorStart<Group = AktorGroup>>(
+    actors: Actors,
+) -> AktorStarted<Actors::Handles, AktorGroup, Actors::Error> {
+    aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors,
+        shutdown: |_| {},
+        grace: Duration::from_secs(5),
+    })
 }
 
 #[aktor]
@@ -46,46 +57,40 @@ async fn finish(state: &mut State) -> usize {
 async fn ownership() {
     let cleaned = Arc::new(parking_lot::Mutex::new(None));
     let observed = cleaned.clone();
-    let database = Arc::new(
-        Aktor::spawn_async(SpawnArgs {
-            name: "async owner".into(),
-            capacity: 2,
-            failure: FailurePolicy::Unwind,
-            setup: async || {
-                let state = State {
-                    values: Rc::new(RefCell::new(Vec::new())),
-                    owner: thread::current().id(),
-                    timer: Box::pin(tokio::time::sleep(Duration::from_millis(100))),
-                };
+    let actors = start(AktorNew {
+        name: "async owner".into(),
+        kind: AktorKind::TokioThread,
+        start: AktorInit::Ready(async || {
+            let state = State {
+                values: Rc::new(RefCell::new(Vec::new())),
+                owner: thread::current().id(),
+                timer: Box::pin(tokio::time::sleep(Duration::from_millis(100))),
+            };
 
-                tokio::time::sleep(Duration::from_millis(1)).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
 
-                Ok::<_, aktor::AktorError>(state)
-            },
-            cleanup: move |state: State| {
-                let observed = observed.clone();
-
-                async move {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    assert_eq!(thread::current().id(), state.owner);
-                    *observed.lock() = Some(state.values.borrow().clone());
-
-                    Ok::<_, aktor::AktorError>(())
-                }
-            },
-        })
-        .await
-        .unwrap(),
-    );
+            state
+        }),
+        end: async move |state: State| {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert_eq!(thread::current().id(), state.owner);
+            *observed.lock() = Some(state.values.borrow().clone());
+        },
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::new(2).unwrap(),
+        stuck: AktorStuck::Kill,
+    });
+    actors.ready().await.unwrap();
+    let database = actors.handles();
 
     let (started, running) = oneshot::channel();
     let (release, blocked) = oneshot::channel();
-    let first_handle = database.new_handle().new_handle();
+    let first_handle = database.handle();
     let first = tokio::spawn(async move { wait(&first_handle, started, blocked).await });
 
     running.await.unwrap();
 
-    let mut second = finish::request(&*database).send().await;
+    let mut second = finish(database).send().await.unwrap();
 
     assert!(
         tokio::time::timeout(Duration::from_millis(10), &mut second)
@@ -93,29 +98,18 @@ async fn ownership() {
             .is_err()
     );
 
-    let closing = database.clone();
-    let completion = database.completion();
-    let mut shutdown = tokio::spawn(async move { closing.shutdown().await });
-
-    assert!(
-        tokio::time::timeout(Duration::from_millis(10), &mut shutdown)
-            .await
-            .is_err()
-    );
-
-    shutdown.abort();
-    assert!(shutdown.await.unwrap_err().is_cancelled());
-
     release.send(()).unwrap();
-    assert_eq!(first.await.unwrap(), 1);
-    assert_eq!(second.await, 2);
+    assert_eq!(first.await.unwrap(), Ok(1));
+    assert_eq!(second.await, Ok(2));
+
+    let completion = database.completion();
+    drop(actors);
     completion.wait().await.unwrap();
-    database.shutdown().await.unwrap();
 
     assert_eq!(*cleaned.lock(), Some(vec![1, 2]));
 }
 
-#[aktor]
+#[aktor(latest)]
 async fn fail(state: &mut State) {
     tokio::task::yield_now().await;
     state.values.borrow_mut().push(9);
@@ -126,44 +120,35 @@ async fn fail(state: &mut State) {
 async fn panic_after_await() {
     let cleaned = Arc::new(parking_lot::Mutex::new(None));
     let observed = cleaned.clone();
-    let database = Aktor::spawn_async(SpawnArgs {
+    let actors = start(AktorNew {
         name: "async failure".into(),
-        capacity: 1,
-        failure: FailurePolicy::Unwind,
-        setup: async || {
-            Ok::<_, aktor::AktorError>(State {
-                values: Rc::new(RefCell::new(Vec::new())),
-                owner: thread::current().id(),
-                timer: Box::pin(tokio::time::sleep(Duration::from_millis(1))),
-            })
+        kind: AktorKind::TokioThread,
+        start: AktorInit::Ready(async || State {
+            values: Rc::new(RefCell::new(Vec::new())),
+            owner: thread::current().id(),
+            timer: Box::pin(tokio::time::sleep(Duration::from_millis(1))),
+        }),
+        end: async move |state: State| {
+            tokio::task::yield_now().await;
+            *observed.lock() = Some(state.values.borrow().clone());
+
+            Err::<(), _>(((), String::from("cleanup failed too")))
         },
-        cleanup: move |state: State| {
-            let observed = observed.clone();
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::MIN,
+        stuck: AktorStuck::Kill,
+    });
+    actors.ready().await.unwrap();
+    let database = actors.handles();
 
-            async move {
-                tokio::task::yield_now().await;
-                *observed.lock() = Some(state.values.borrow().clone());
+    // A grouped actor's lost reply parks, so only send it.
+    drop(fail(database).send().await.unwrap());
 
-                Err(aktor::AktorCleanupError::new("cleanup failed too", ()))
-            }
-        },
-    })
-    .await
-    .unwrap();
-
-    use futures_util::FutureExt;
-    assert!(
-        std::panic::AssertUnwindSafe(fail(&database))
-            .catch_unwind()
-            .await
-            .is_err()
-    );
-
-    let error = database.completion.wait().await.unwrap_err();
+    let (error, report) = database.completion.wait().await.unwrap_err();
 
     assert!(error.physically_joined());
 
-    let OwnerFailure::PanickedWithCleanup { cause, cleanup } = &error.error else {
+    let OwnerError::PanickedWithCleanup { cause } = &*error else {
         panic!("expected operation panic and cleanup failure")
     };
 
@@ -171,10 +156,6 @@ async fn panic_after_await() {
         cause.payload.lock().downcast_ref::<&str>(),
         Some(&"after await")
     );
-    assert_eq!(cleanup.errors[0].diagnostics, "cleanup failed too");
-
-    assert_eq!(error.to_string(), "actor thread failed; cleanup failed");
-    let report = format!("{error:#}");
 
     assert!(report.contains("after await"));
     assert!(report.contains("cleanup failed too"));
@@ -183,54 +164,25 @@ async fn panic_after_await() {
 
 #[tokio::test]
 async fn completion() {
-    let database = Aktor::spawn(SpawnArgs {
+    let actors = start(AktorNew {
         name: "owned cleanup".into(),
-        capacity: 1,
-        failure: FailurePolicy::Unwind,
-        setup: || Ok::<_, aktor::AktorError>(0usize),
-        cleanup: |_| {
-            Err(aktor::AktorCleanupError::new(
-                "database connection stayed open",
-                (),
-            ))
-        },
-    })
-    .await
-    .unwrap();
+        kind: AktorKind::TokioThread,
+        start: AktorInit::Ready(async || 0usize),
+        end: async |_| Err::<(), _>(((), String::from("database connection stayed open"))),
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::MIN,
+        stuck: AktorStuck::Kill,
+    });
+    actors.ready().await.unwrap();
 
-    let handle = database.new_handle();
-    let completion = database.completion.new_observer();
+    let completion = actors.handles().completion();
+    drop(actors);
 
-    drop(database);
-
-    let reply = call(
-        &handle,
-        |state, ()| {
-            *state = 1;
-            *state
-        },
-        (),
-    )
-    .send()
-    .await;
-
-    drop(handle);
-
-    assert_eq!(reply.await, 1);
-
-    let first = completion.wait().await.unwrap_err();
-    let second = completion.wait().await.unwrap_err();
+    let (first, report) = completion.wait().await.unwrap_err();
+    let (second, repeated) = completion.wait().await.unwrap_err();
 
     assert!(Arc::ptr_eq(&first, &second));
-
-    let OwnerFailure::Cleanup(error) = &first.error else {
-        panic!("expected cleanup error")
-    };
-
-    assert_eq!(
-        error.errors[0].diagnostics,
-        "database connection stayed open"
-    );
-    assert_eq!(first.to_string(), "actor cleanup failed 1 time(s)");
-    assert!(format!("{first:#}").contains("database connection stayed open"));
+    assert!(matches!(&*first, OwnerError::Cleanup));
+    assert!(report.contains("database connection stayed open"));
+    assert!(repeated.contains("database connection stayed open"));
 }

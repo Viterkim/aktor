@@ -1,19 +1,31 @@
 use super::*;
-use crate::{dispatch::Export, message::LocalFuture};
+use crate::dispatch::Export;
+#[cfg(any(
+    not(target_family = "wasm"),
+    feature = "wasm_browser_worker_server",
+    feature = "testing"
+))]
+use crate::message::LocalFuture;
+#[cfg(any(not(target_family = "wasm"), feature = "wasm_browser_worker_server"))]
+use core::any::Any;
 use core::{
-    any::{Any, TypeId, type_name},
+    any::{TypeId, type_name},
     marker::PhantomData,
 };
 
 pub struct Registration(pub fn() -> Option<Registered>);
 inventory::collect!(Registration);
 
-type Run = for<'a> fn(&'a mut dyn Any, &'a [u8]) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>;
+#[cfg(any(not(target_family = "wasm"), feature = "wasm_browser_worker_server"))]
+type Run = for<'a> fn(
+    &'a mut dyn Any,
+    &'a [u8],
+) -> LocalFuture<'a, Result<Vec<u8>, (WorkerError, String)>>;
 #[cfg(feature = "testing")]
 type MockRun = for<'a> fn(
     &'a mut crate::testing::Handlers,
     &'a [u8],
-) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>;
+) -> LocalFuture<'a, Result<Vec<u8>, (WorkerError, String)>>;
 
 pub struct Registered {
     name: &'static str,
@@ -23,7 +35,8 @@ pub struct Registered {
     output: &'static str,
     codec: &'static str,
     remote: bool,
-    run: Run,
+    #[cfg(any(not(target_family = "wasm"), feature = "wasm_browser_worker_server"))]
+    run: Option<Run>,
     #[cfg(feature = "testing")]
     mock: MockRun,
 }
@@ -39,16 +52,17 @@ impl Registered {
         )
     }
 
+    #[cfg(any(not(target_family = "wasm"), feature = "wasm_browser_worker_server"))]
     pub fn execute<'a>(
         &self,
         state: &'a mut dyn Any,
         input: &'a [u8],
-    ) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>> {
-        (self.run)(state, input)
+    ) -> LocalFuture<'a, Result<Vec<u8>, (WorkerError, String)>> {
+        (self.run.unwrap_or(unserved))(state, input)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, aktor_macros::AktorData)]
 pub struct Operations(pub Vec<String>);
 impl Operations {
     pub fn for_remote<S: 'static, Role: 'static>() -> Self {
@@ -77,6 +91,12 @@ impl Operations {
     }
 }
 
+#[derive(Er)]
+pub struct CollectOperationsErr {
+    pub operation: &'static str,
+    pub msg: &'static str,
+}
+
 pub struct Registry(Vec<Registered>);
 impl Registry {
     #[cfg(feature = "testing")]
@@ -85,15 +105,21 @@ impl Registry {
         handlers: &mut crate::testing::Handlers,
         name: String,
         input: Vec<u8>,
-    ) -> Result<Vec<u8>, WorkerError> {
-        let operation = self.resolve(&name).ok_or_else(|| {
-            WorkerError::new(CallError::NotAdmitted, WorkerCause::UnknownOperation(name))
+    ) -> Result<Vec<u8>, (WorkerError, String)> {
+        let operation = self.resolve(&name).er(|| {
+            WorkerError::new(
+                AktorDeliveryOutcome::NotAdmitted,
+                WorkerCause::UnknownOperation(name),
+            )
         })?;
         (operation.mock)(handlers, &input).await
     }
 
-    pub fn for_remote<S: 'static, Role: 'static>() -> Result<Self, WorkerError> {
-        Self::collect(registered::<S, Role>().filter(|operation| operation.remote))
+    pub fn for_remote<S: 'static, Role: 'static>() -> Result<Self, (WorkerError, String)> {
+        Ok(
+            Self::collect(registered::<S, Role>().filter(|operation| operation.remote))
+                .er(|| WorkerError::new(AktorDeliveryOutcome::NotAdmitted, WorkerCause::Setup))?,
+        )
     }
 
     pub fn resolve(&self, name: &str) -> Option<&Registered> {
@@ -113,25 +139,45 @@ impl Registry {
             .map(|index| &self.0[index])
     }
 
-    pub fn for_actor<S: 'static, Role: 'static>() -> Result<Self, WorkerError> {
-        Self::collect(registered::<S, Role>())
+    pub fn for_actor<S: 'static, Role: 'static>() -> Result<Self, (WorkerError, String)> {
+        Ok(Self::collect(registered::<S, Role>())
+            .er(|| WorkerError::new(AktorDeliveryOutcome::NotAdmitted, WorkerCause::Setup))?)
     }
 
-    fn collect(operations: impl Iterator<Item = Registered>) -> Result<Self, WorkerError> {
+    fn collect(
+        operations: impl Iterator<Item = Registered>,
+    ) -> ErResult<Self, CollectOperationsErr> {
         let mut operations: Vec<_> = operations.collect();
 
         operations.sort_unstable_by_key(|operation| operation.name);
 
         for pair in operations.windows(2) {
             if pair[0].name == pair[1].name {
-                return Err(WorkerError::setup(
-                    CallError::NotAdmitted,
-                    format!("duplicate worker operation {:?}", pair[0].name),
+                er_bail!(CollectOperationsErr::new(
+                    pair[0].name,
+                    "duplicate worker operation, functions declared inside other functions share \
+                     their module's name. Give one of them #[aktor(name = \"...\")]",
                 ));
             }
         }
 
         Ok(Self(operations))
+    }
+
+    #[cfg(all(
+        feature = "wasm_browser_worker_server",
+        target_family = "wasm",
+        target_os = "unknown"
+    ))]
+    pub(super) fn check_handlers(&self) -> ErResult<(), CollectOperationsErr> {
+        if let Some(operation) = self.0.iter().find(|operation| operation.run.is_none()) {
+            er_bail!(CollectOperationsErr::new(
+                operation.name,
+                "aktor_serve excludes this operation's state"
+            ));
+        }
+
+        Ok(())
     }
 
     pub fn operations(&self) -> Operations {
@@ -141,14 +187,18 @@ impl Registry {
         Operations(operations)
     }
 
+    #[cfg(any(not(target_family = "wasm"), feature = "wasm_browser_worker_server"))]
     pub async fn dispatch<S: 'static>(
         &self,
         state: &mut S,
         name: String,
         input: Vec<u8>,
-    ) -> Result<Vec<u8>, WorkerError> {
-        let operation = self.resolve(&name).ok_or_else(|| {
-            WorkerError::new(CallError::Discarded, WorkerCause::UnknownOperation(name))
+    ) -> Result<Vec<u8>, (WorkerError, String)> {
+        let operation = self.resolve(&name).er(|| {
+            WorkerError::new(
+                AktorDeliveryOutcome::Discarded,
+                WorkerCause::UnknownOperation(name),
+            )
         })?;
 
         operation.execute(state, &input).await
@@ -160,11 +210,12 @@ pub struct Exporter<E, C = crate::dispatch::DataCodec> {
     pub export: PhantomData<(E, C)>,
 }
 
+#[doc(hidden)]
 pub trait Register {
-    fn register(self) -> Option<Registered>;
+    fn register<const SERVE: bool>(self) -> Option<Registered>;
 }
 impl<E, C> Register for &Exporter<E, C> {
-    fn register(self) -> Option<Registered> {
+    fn register<const SERVE: bool>(self) -> Option<Registered> {
         None
     }
 }
@@ -175,7 +226,7 @@ where
     E::Role: 'static,
     E::Input: 'static,
 {
-    fn register(self) -> Option<Registered> {
+    fn register<const SERVE: bool>(self) -> Option<Registered> {
         Some(Registered {
             name: self.name,
             state: TypeId::of::<E::State>(),
@@ -184,7 +235,8 @@ where
             output: type_name::<E::Output>(),
             codec: <C as Codec<E::Input>>::NAME,
             remote: E::REMOTE,
-            run: run::<E, C>,
+            #[cfg(any(not(target_family = "wasm"), feature = "wasm_browser_worker_server"))]
+            run: if SERVE { Some(run::<E, C>) } else { None },
             #[cfg(feature = "testing")]
             mock: run_mock::<E, C>,
         })
@@ -195,40 +247,55 @@ where
 fn run_mock<'a, E, C>(
     handlers: &'a mut crate::testing::Handlers,
     input: &'a [u8],
-) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>
+) -> LocalFuture<'a, Result<Vec<u8>, (WorkerError, String)>>
 where
     E: Export<C>,
     E::Input: 'static,
     C: Codec<E::Input> + Codec<E::Output>,
 {
     Box::pin(async move {
-        let input = <C as Codec<E::Input>>::decode(input).map_err(|mut error| {
-            error.outcome = CallError::Discarded;
-            error
+        let input = crate::worker::wire::codec(<C as Codec<E::Input>>::decode(input), || {
+            WorkerError::new(AktorDeliveryOutcome::Discarded, WorkerCause::Codec)
         })?;
         let output = handlers
             .run(E::NAME, Box::new(input))
             .await
-            .map_err(|error| {
+            .er_with(|error| {
                 WorkerError::new(
-                    CallError::Discarded,
-                    WorkerCause::UnknownOperation(error.operation),
+                    AktorDeliveryOutcome::Discarded,
+                    WorkerCause::UnknownOperation(error.operation.clone()),
                 )
             })?;
         let output = output
             .downcast::<E::Output>()
-            .map_err(|_| WorkerError::new(CallError::OutcomeUnknown, WorkerCause::Protocol))?;
-        <C as Codec<E::Output>>::encode(&output).map_err(|mut error| {
-            error.outcome = CallError::OutcomeUnknown;
-            error
-        })
+            .ok()
+            .er(|| WorkerError::new(AktorDeliveryOutcome::OutcomeUnknown, WorkerCause::Protocol))?;
+
+        Ok(crate::worker::wire::codec(
+            <C as Codec<E::Output>>::encode(&output),
+            || WorkerError::new(AktorDeliveryOutcome::OutcomeUnknown, WorkerCause::Codec),
+        )?)
     })
 }
 
+#[cfg(any(not(target_family = "wasm"), feature = "wasm_browser_worker_server"))]
+fn unserved<'a>(
+    _: &'a mut dyn Any,
+    _: &'a [u8],
+) -> LocalFuture<'a, Result<Vec<u8>, (WorkerError, String)>> {
+    Box::pin(async {
+        er_bail!(
+            WorkerError::new(AktorDeliveryOutcome::Discarded, WorkerCause::Setup),
+            "this worker's aktor_serve selector excludes the requested state"
+        )
+    })
+}
+
+#[cfg(any(not(target_family = "wasm"), feature = "wasm_browser_worker_server"))]
 fn run<'a, E, C>(
     state: &'a mut dyn Any,
     input: &'a [u8],
-) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>>
+) -> LocalFuture<'a, Result<Vec<u8>, (WorkerError, String)>>
 where
     E: Export<C> + Default,
     C: Codec<E::Input> + Codec<E::Output>,
@@ -236,7 +303,7 @@ where
     Box::pin(async move {
         let state = state
             .downcast_mut::<E::State>()
-            .ok_or_else(|| WorkerError::new(CallError::Discarded, WorkerCause::Protocol))?;
+            .er(|| WorkerError::new(AktorDeliveryOutcome::Discarded, WorkerCause::Protocol))?;
 
         run_export::<E, C>(E::default(), state, input).await
     })
@@ -251,35 +318,71 @@ fn registered<S: 'static, Role: 'static>() -> impl Iterator<Item = Registered> {
         })
 }
 
-pub async fn dispatch<S: 'static, Role: 'static>(
-    state: &mut S,
-    name: String,
-    input: Vec<u8>,
-) -> Result<Vec<u8>, WorkerError> {
-    Registry::for_actor::<S, Role>()?
-        .dispatch(state, name, input)
-        .await
+// Worker builds register ordinary calls too. Native transport only needs explicit remote exports.
+#[doc(hidden)]
+#[macro_export]
+#[cfg(feature = "wasm_browser_workers")]
+macro_rules! __aktor_register_worker {
+    ($export:ty, $function:ident, $name:expr, $codec:ty, $serve:meta) => {
+        $crate::__aktor_register!($export, $function, $name, $codec, $serve);
+    };
 }
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __aktor_register {
-    ($export:ty, $name:expr, $codec:ty, true) => {
+#[cfg(not(feature = "wasm_browser_workers"))]
+macro_rules! __aktor_register_worker {
+    ($($operation:tt)*) => {};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __aktor_require_codec {
+    ($export:ty, $codec:ty) => {
         const _: () = {
             fn require_codec<E, C>()
             where
                 E: $crate::dispatch::Export<C>,
                 C: $crate::worker::Codec<E::Input> + $crate::worker::Codec<E::Output>,
-            {}
+            {
+            }
 
             let _ = require_codec::<$export, $codec>;
         };
-        $crate::__aktor_register!($export, $name, $codec);
     };
-    ($export:ty, $name:expr, $codec:ty, false) => {
-        $crate::__aktor_register!($export, $name, $codec);
+}
+
+#[doc(hidden)]
+#[macro_export]
+#[cfg(all(aktor_serve_selected, target_family = "wasm"))]
+macro_rules! __aktor_serve {
+    ($serve:meta) => {{
+        #[allow(unexpected_cfgs)]
+        let selected = ::core::cfg!($serve);
+        selected
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+#[cfg(not(all(aktor_serve_selected, target_family = "wasm")))]
+macro_rules! __aktor_serve {
+    ($serve:meta) => {
+        true
     };
-    ($export:ty, $name:expr, $codec:ty) => {
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __aktor_register {
+    ($export:ty, $function:ident, $name:expr, $codec:ty, true, $serve:meta) => {
+        $crate::__aktor_require_codec!($export, $codec);
+        $crate::__aktor_register!($export, $function, $name, $codec, $serve);
+    };
+    ($export:ty, $function:ident, $name:expr, $codec:ty, false, $serve:meta) => {
+        $crate::__aktor_register_worker!($export, $function, $name, $codec, $serve);
+    };
+    ($export:ty, $function:ident, $name:expr, $codec:ty, $serve:meta) => {
         const _: () = {
             fn registration() -> ::core::option::Option<$crate::worker::Registered> {
                 use $crate::worker::Register as _;
@@ -288,36 +391,23 @@ macro_rules! __aktor_register {
                 (&&$crate::worker::Exporter::<$export, $codec> {
                     name: $name,
                     export: ::core::marker::PhantomData,
-                }).register()
+                }).register::<{ $crate::__aktor_serve!($serve) }>()
             }
 
-            #[cfg(not(target_family = "wasm"))]
             $crate::worker::inventory::submit! {
                 $crate::worker::Registration(registration)
             }
 
             #[cfg(target_family = "wasm")]
-            const _: () = {
-                static NODE: $crate::worker::inventory::Node = $crate::worker::inventory::Node {
-                    value: &$crate::worker::Registration(registration),
-                    next: ::core::cell::UnsafeCell::new(::core::option::Option::None),
-                    initialized: ::core::sync::atomic::AtomicBool::new(false),
-                };
-
-                // Exporting the constructor also pulls its object out of dependency archives.
-                #[unsafe(export_name = ::core::concat!(
-                    "__aktor_register_", ::core::module_path!(), "@", ::core::env!("CARGO_PKG_VERSION"),
-                    ":", ::core::line!(), ":", ::core::column!()
-                ))]
-                pub extern "C" fn initialize() {
-                    // NODE.value is the Registration stored in NODE. Inventory guards repeat calls.
-                    unsafe { $crate::worker::inventory::ErasedNode::submit(NODE.value, &NODE) }
-                }
-
-                #[used]
-                #[unsafe(link_section = ".init_array")]
-                static CTOR: extern "C" fn() = initialize;
-            };
+            #[allow(unsafe_code)]
+            // Pull registrations from dependency archives into the Wasm module.
+            #[unsafe(export_name = ::core::concat!(
+                "__aktor_register_", ::core::module_path!(), "@", ::core::env!("CARGO_PKG_VERSION"),
+                ":", ::core::file!(), ":", ::core::line!(), ":", ::core::column!(), ":", ::core::stringify!($function)
+            ))]
+            pub extern "C" fn anchor() {
+                ::core::hint::black_box(registration as fn() -> _);
+            }
         };
     };
 }
@@ -334,7 +424,7 @@ mod tests {
     fn first<'a>(
         state: &'a mut dyn Any,
         _: &'a [u8],
-    ) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>> {
+    ) -> LocalFuture<'a, Result<Vec<u8>, (WorkerError, String)>> {
         Box::pin(async move {
             state.downcast_mut::<State>().unwrap().0 += 1;
             Ok(Vec::new())
@@ -344,7 +434,7 @@ mod tests {
     fn second<'a>(
         state: &'a mut dyn Any,
         _: &'a [u8],
-    ) -> LocalFuture<'a, Result<Vec<u8>, WorkerError>> {
+    ) -> LocalFuture<'a, Result<Vec<u8>, (WorkerError, String)>> {
         Box::pin(async move {
             state.downcast_mut::<State>().unwrap().0 += 17;
             Ok(Vec::new())
@@ -360,13 +450,13 @@ mod tests {
             output: "()",
             codec: "",
             remote: false,
-            run,
+            run: Some(run),
             #[cfg(feature = "testing")]
             mock: |_, _| {
                 Box::pin(async {
-                    Err(WorkerError::new(
-                        CallError::NotAdmitted,
-                        WorkerCause::Protocol,
+                    er_bail!(WorkerError::new(
+                        AktorDeliveryOutcome::NotAdmitted,
+                        WorkerCause::Protocol
                     ))
                 })
             },
@@ -384,26 +474,27 @@ mod tests {
 
         assert!(Registry::for_actor::<State, Duplicate>().is_err());
 
-        let error = dispatch::<State, Duplicate>(&mut state, "same operation".into(), Vec::new())
-            .await
-            .unwrap_err();
-
-        assert!(format!("{error:#}").contains("same operation"));
-        assert_eq!(state.0, 0);
-
-        dispatch::<State, First>(&mut state, "same operation".into(), Vec::new())
+        let first = Registry::for_actor::<State, First>().unwrap();
+        first
+            .dispatch(&mut state, "same operation".into(), Vec::new())
             .await
             .unwrap();
-        dispatch::<State, Second>(&mut state, "same operation".into(), Vec::new())
+        Registry::for_actor::<State, Second>()
+            .unwrap()
+            .dispatch(&mut state, "same operation".into(), Vec::new())
             .await
             .unwrap();
         assert_eq!(state.0, 18);
 
-        let unknown = dispatch::<State, First>(&mut state, "unknown".into(), Vec::new())
+        let unknown = first
+            .dispatch(&mut state, "unknown".into(), Vec::new())
             .await
             .unwrap_err();
 
-        assert!(format!("{unknown}").contains("unknown"));
+        assert_eq!(
+            unknown.0.cause,
+            WorkerCause::UnknownOperation("unknown".into())
+        );
         assert_eq!(state.0, 18);
     }
 

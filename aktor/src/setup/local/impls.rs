@@ -1,22 +1,27 @@
 use super::super::*;
 use super::Completion;
+use crate::panic::panic_tree;
 use crate::setup::intervals::{LocalInterval, LocalIntervals};
 use crate::{
-    AktorError, AktorFailureReport, AktorOutcome, KillSwitch,
-    group::shutdown::{contain_drop, panic_message},
-    local::{self, Handle, hooks::AktorHooks},
+    AktorFailureInput, AktorStuck, OwnerOutcome,
+    group::shutdown::contain_drop,
+    local::{self, Handle, hooks::CallHooks},
     message::LocalFuture,
     operation::Operation,
     setup::closures::AktorEndCall,
 };
-use alloc::format;
 use core::ops::AsyncFnOnce;
+use er::*;
 use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
 use tokio::sync::{oneshot, watch};
 
+#[derive(Er)]
+enum LocalOwnerErr {
+    ObserverGone,
+}
 impl Completion {
-    fn publish(&mut self, outcome: AktorOutcome) {
+    fn publish(&mut self, outcome: OwnerOutcome) {
         if let Some(completed) = self.completed.take() {
             let _sent = completed.send(outcome);
         }
@@ -25,102 +30,95 @@ impl Completion {
 impl Drop for Completion {
     fn drop(&mut self) {
         if self.completed.is_some() {
-            let primary = self.kill.fail(AktorFailureReport {
-                kind: Some(self.kind),
-                actor: self.name.clone(),
-                phase: "owner".into(),
-                message: "local actor task cancelled".into(),
-            });
-
-            self.publish(AktorOutcome {
-                retirement: crate::RetirementStatus::Unconfirmed,
-                kind: Some(self.kind),
-                actor: self.name.clone(),
-                diagnostics: if primary {
-                    Vec::new()
-                } else {
-                    vec![AktorError::new("local actor task cancelled", ())]
-                },
-                timed_out: false,
+            // This sits in the same future as the state, the executor dropping one drops both.
+            self.publish(OwnerOutcome {
+                retirement: crate::AktorRetirement::Terminated,
+                init: crate::AktorInitEvidence::Unknown,
+                ran_past_grace: false,
             });
         }
     }
 }
 
-pub async fn start_local<S, Start, Kind, Clock, End, CM>(
-    setup: AktorNew<S, Start, Kind, AktorNoRole, End>,
+pub fn closed_local_handle<S: 'static, Clock: 'static>(
+    name: &str,
+    group: &crate::AktorGroup,
+    standard: bool,
+) -> Handle<S, (), Clock> {
+    let (handle, owner) = local::closed_channel::<S, Clock>();
+    handle.manage_on(
+        name.into(),
+        crate::AktorExecution::Local,
+        group.killswitch(),
+        standard,
+    );
+    drop(owner);
+    handle
+}
+
+type LocalReady<E> = oneshot::Receiver<Result<(), StartFailure<E>>>;
+type LocalLaunch<S, Clock, E> = Result<(Handle<S, (), Clock>, LocalReady<E>), StartFailure<E>>;
+
+pub fn launch_local<S, Start, Kind, Clock, End, CM, E>(
+    setup: crate::setup::Prepared<S, Start, Kind, End, CM>,
     mut context: AktorStartContext<crate::AktorGroup>,
     spawn: impl Fn(LocalFuture<'static, ()>),
     sleep: fn(Duration) -> LocalFuture<'static, ()>,
-) -> Result<Handle<S, 0, (), (), Clock>, AktorStartError>
+) -> LocalLaunch<S, Clock, E>
 where
     S: 'static,
     Clock: 'static,
-    Kind:
-        AktorMode<Each<S> = dyn FnMut(&mut S, Operation), Interval<S> = dyn AktorIntervalLogic<S>>,
-    Start: AsyncFnOnce() -> Result<S, crate::AktorSetupError> + 'static,
+    Kind: AktorMode<
+            Leave = core::convert::Infallible,
+            Each<S> = dyn FnMut(&mut S, Operation),
+            Interval<S> = dyn AktorIntervalLogic<S>,
+        >,
+    Start: AsyncFnOnce() -> Result<S, (E, String)> + 'static,
+    E: 'static,
     End: AktorEndCall<S, CM> + 'static,
 {
     let AktorNew {
         name,
-        role: _,
         kind: _,
-        closures,
-        options,
-    } = setup;
-
-    let name = name.name;
-    let AktorClosures {
         start,
-        mut end,
+        end,
+        hooks,
+        capacity,
+        stuck: AktorStuck::Kill,
+    } = setup;
+    let AktorHooks {
         intervals,
         before_each,
         after_each,
-    } = closures;
-
-    if intervals.iter().any(|interval| interval.every.is_zero()) {
-        return Err(validation_error(
-            &context.group,
-            &name,
-            Kind::EXECUTION,
-            AktorStartError::Setup(AktorError::new("interval duration must be positive", ())),
-        ));
-    }
-
-    if options.capacity == 0 {
-        return Err(validation_error(
-            &context.group,
-            &name,
-            Kind::EXECUTION,
-            AktorStartError::Setup(AktorError::new(
-                crate::message::AktorStateError::InvalidCapacity.to_string(),
-                (),
-            )),
-        ));
-    }
+    } = hooks;
 
     let LocalIntervals {
         scheduled: intervals,
         retained,
     } = LocalIntervals::new(intervals);
-    let (handle, mut owner) = local::channel_with_clock::<S, 0, (), Clock>(options.capacity)
-        .map_err(|error| AktorStartError::Setup(AktorError::new(error.to_string(), ())))?;
+    let (handle, mut owner) = local::channel_with_clock::<S, (), Clock>(capacity);
 
-    owner.hooks = AktorHooks {
-        before_each: before_each.map(|hook| hook.0),
-        after_each: after_each.map(|hook| hook.0),
+    owner.hooks = CallHooks {
+        before_each,
+        after_each,
         intervals: retained,
     };
 
     let kill = context.group.killswitch();
 
-    handle.manage(name.clone(), kill.clone());
+    handle.manage_on(
+        name.clone(),
+        Kind::EXECUTION,
+        kill.clone(),
+        Kind::EXECUTION == crate::AktorExecution::BevyLocal,
+    );
 
-    let alive = handle.new_handle();
+    let control = handle.downgrade();
     let (closing, mut closed) = watch::channel(false);
     let (forcing, mut forced) = watch::channel(false);
     let (completed, outcome) = oneshot::channel();
     let label = name.clone();
+    let observer = kill.clone();
 
     context
         .group
@@ -133,26 +131,45 @@ where
             Box::new(move || {
                 forcing.send_replace(true);
             }),
+            None,
+            None,
             Box::pin(async move {
-                outcome.await.unwrap_or_else(|_| AktorOutcome {
-                    retirement: crate::RetirementStatus::Unconfirmed,
-                    kind: Some(Kind::EXECUTION),
-                    actor: label,
-                    diagnostics: vec![AktorError::new("local actor observer stopped", ())],
-                    timed_out: false,
+                outcome.await.unwrap_or_else(|_| {
+                    observer.fail(AktorFailureInput::actor(
+                        label.clone(),
+                        Kind::EXECUTION,
+                        crate::AktorPhase::Join,
+                        er_new!(LocalOwnerErr::ObserverGone).er_report(),
+                    ));
+                    OwnerOutcome {
+                        retirement: crate::AktorRetirement::StillRunning,
+                        init: crate::AktorInitEvidence::Unknown,
+                        ran_past_grace: false,
+                    }
                 })
             }),
         )
-        .map_err(AktorStartError::Setup)?;
+        .er_with(|error| LaunchError::new(error.start_reason()))?;
 
     let mut completion = Completion {
         name,
-        kind: Kind::EXECUTION,
         kill: kill.clone(),
         completed: Some(completed),
     };
 
-    let (ready, initialized) = super::super::ready::channel();
+    let (sent, initialized) = oneshot::channel();
+    let receipt = alloc::rc::Rc::new(core::cell::RefCell::new(Some(sent)));
+    let publishing = receipt.clone();
+    let checking = kill.clone();
+    let ready = super::super::ready::startup(
+        move || checking.is_startup_aborted(),
+        move |result| {
+            let sender = publishing.borrow_mut().take();
+            if let Some(sent) = sender {
+                let _sent = sent.send(result);
+            }
+        },
+    );
     let startup_kill = kill.clone();
     let startup_name = completion.name.clone();
 
@@ -164,7 +181,15 @@ where
                     let result = match start().await {
                         Ok(state) => Ok(state),
                         Err(error) => {
-                            Err(startup_kill.startup_error(startup_name, Kind::EXECUTION, error))
+                            let mut failure = LaunchError::init(error);
+                            let primary = startup_kill.startup_error(
+                                startup_name,
+                                Kind::EXECUTION,
+                                failure.1.clone(),
+                            );
+
+                            failure.0.failure_id = Some(primary);
+                            Err((failure, primary))
                         }
                     };
 
@@ -186,123 +211,157 @@ where
         );
 
         let mut stopping = false;
-        let mut report = AktorOutcome {
-            retirement: crate::RetirementStatus::Unconfirmed,
-            kind: Some(Kind::EXECUTION),
-            actor: completion.name.clone(),
-            diagnostics: Vec::new(),
-            timed_out: false,
+        let mut cancelling = false;
+        let mut report = OwnerOutcome {
+            retirement: crate::AktorRetirement::StillRunning,
+            init: crate::AktorInitEvidence::Unknown,
+            ran_past_grace: false,
         };
 
         loop {
             tokio::select! {
                 biased;
                 result = &mut driver => {
-                    match result {
-                        Ok(Ok(())) => {},
-                        Ok(Err(error)) => {
-                            match error.error {
-                                local::OwnerFailure::SetupDiagnostic(_, true) => {},
-                                local::OwnerFailure::SetupDiagnostic(error, false) => report.diagnostics.push(error),
-                                local::OwnerFailure::CleanupFailure(error) => {
-                                    if !error.primary {
-                                        report.diagnostics.push(AktorError::new(error.diagnostics, ()));
-                                    }
-                                },
-                                error => report.diagnostics.push(AktorError::new(format!("{error:#}"), ())),
-                            }
-                        },
-                        Err(payload) => {
-                            let message = panic_message(&payload);
-
-                            let first = completion.kill.fail(AktorFailureReport {
-                                kind: Some(Kind::EXECUTION),
-                                actor: report.actor.clone(),
-                                phase: "operation".into(),
-                                message: message.clone(),
-                            });
-                            if !first && !retained.panic_reported() {
-                                report.diagnostics.push(AktorError::new(format!("operation: {message}"), ()));
-                            }
-                            contain_drop(payload, &completion.kill, "local panic drop");
-                        },
+                    if let Err(payload) = result {
+                        if !payload.is::<local::panic::Reported>() {
+                            completion.kill.fail(AktorFailureInput::actor(
+                                completion.name.clone(),
+                                Kind::EXECUTION,
+                                crate::AktorPhase::Runner,
+                                panic_tree(&payload).er_report(),
+                            ));
+                        }
+                        contain_drop(payload, &completion.kill, crate::AktorFailureSource::Actor { id: (),
+                            name: completion.name.clone(),
+                            kind: Kind::EXECUTION,
+                            phase: crate::AktorPhase::Drop,
+                        });
                     }
                     break;
                 },
                 changed = closed.changed(), if !stopping => {
                     if changed.is_err() || *closed.borrow_and_update() {
                         stopping = true;
-                        alive.shutdown();
+                        control.shutdown();
                     }
                 },
-                changed = forced.changed() => {
+                // Its grace is up, the calls go and `end` still gets its own grace.
+                changed = forced.changed(), if !cancelling => {
                     if changed.is_err() || *forced.borrow_and_update() {
-                        report.timed_out = true;
-                        report.retirement = crate::RetirementStatus::Unconfirmed;
-                        break;
+                        cancelling = true;
+                        control.cancel_calls();
                     }
                 },
             }
         }
 
+        report.ran_past_grace = retained.ran_past_grace();
         report.retirement = if retained.cleanup_completed() {
-            crate::RetirementStatus::Confirmed
+            crate::AktorRetirement::Released
         } else {
-            crate::RetirementStatus::Unconfirmed
+            crate::AktorRetirement::Terminated
         };
-        report.diagnostics.extend(retained.diagnostics());
-        contain_drop(driver, &completion.kill, "local owner drop");
-        contain_drop(alive, &completion.kill, "local handle drop");
+        report.init = retained.init();
+        contain_drop(
+            driver,
+            &completion.kill,
+            crate::AktorFailureSource::Actor {
+                id: (),
+                name: completion.name.clone(),
+                kind: Kind::EXECUTION,
+                phase: crate::AktorPhase::Drop,
+            },
+        );
+        drop(control);
+
+        let sender = receipt.borrow_mut().take();
+        if let Some(sent) = sender {
+            let failure = match retained.observe().await {
+                Err((error, report)) => er_new!(
+                    LaunchError::new(
+                        if matches!(*error.cause, crate::local::OwnerError::Cancelled) {
+                            AktorStartReason::Stopping
+                        } else {
+                            AktorStartReason::Init
+                        }
+                    ),
+                    (error.without_data(), report)
+                ),
+                Ok(()) => er_new!(
+                    LaunchError::new(AktorStartReason::Stopping),
+                    LocalSetupErr::Stopped
+                ),
+            };
+            let _sent = sent.send(Err(failure.into()));
+        }
+
         completion.publish(report);
     }));
 
-    match initialized.await {
-        Some(result) => result?,
-        None => {
-            let error = handle.completion().wait().await.err().unwrap_or_else(|| {
-                local::OwnerFailure::Runner(AktorError::new(
-                    "local actor stopped during startup",
-                    (),
-                ))
-                .into()
-            });
-
-            return Err(AktorStartError::Local(error));
-        }
-    }
-
     for interval in intervals {
-        spawn(schedule(interval, handle.new_handle(), kill.clone(), sleep));
+        spawn(schedule(interval, handle.downgrade(), sleep));
     }
 
-    Ok(handle)
+    spawn(crate::group::keeper(
+        handle.clone(),
+        context.group.completion(),
+    ));
+
+    Ok((handle, initialized))
 }
 
-fn schedule<S: 'static, Clock: 'static, C: 'static>(
+pub async fn readiness<E: 'static>(
+    mut initialized: LocalReady<E>,
+    completion: crate::AktorGroupCompletion,
+) -> Result<(), StartFailure<E>> {
+    let result = tokio::select! {
+        biased;
+        result = &mut initialized => result.ok(),
+        _ = completion.wait() => initialized.try_recv().ok(),
+    };
+
+    match result {
+        Some(result) => result,
+        None => er_bail!(
+            LaunchError::new(AktorStartReason::Stopping),
+            LocalSetupErr::Stopped
+        ),
+    }
+}
+
+fn schedule<S: 'static, Clock: 'static>(
     interval: LocalInterval<S>,
-    handle: Handle<S, 0, C, (), Clock>,
-    kill: KillSwitch,
+    handle: local::WeakHandle<S, (), Clock>,
     sleep: fn(Duration) -> LocalFuture<'static, ()>,
 ) -> LocalFuture<'static, ()> {
     let every = interval.every;
     let callback = interval.callback;
 
     Box::pin(async move {
+        let Some(starting) = handle.upgrade() else {
+            return;
+        };
+        tokio::select! {
+            biased;
+            _ = starting.wait_closing() => return,
+            ready = starting.observe_ready() => if ready.is_err() { return },
+        }
+        drop(starting);
+
         loop {
             tokio::select! {
                 biased;
-                _ = kill.wait_stopping() => break,
                 _ = handle.wait_closing() => break,
                 _ = sleep(every) => {},
             }
 
-            let callback = callback.clone();
-            let operation = Operation {
-                name: "interval",
-                caller: std::panic::Location::caller(),
+            let Some(strong) = handle.upgrade() else {
+                break;
             };
+            let callback = callback.clone();
+            let operation = Operation::INTERVAL;
             let request = local::Request::new(
-                &handle,
+                &strong,
                 operation,
                 async move |state: &mut S, ()| {
                     let Some(callback) = callback.upgrade() else {
@@ -320,8 +379,7 @@ fn schedule<S: 'static, Clock: 'static, C: 'static>(
 
             tokio::select! {
                 biased;
-                _ = kill.wait_stopping() => break,
-                _ = handle.wait_closing() => break,
+                _ = strong.wait_closing() => break,
                 admitted = request.run_interval() => {
                     if !admitted { break; }
                 },

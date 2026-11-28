@@ -1,4 +1,5 @@
 use aktor::*;
+use core::num::NonZeroUsize;
 use core::time::Duration;
 
 struct Database;
@@ -11,28 +12,20 @@ async fn read(state: &usize) -> usize {
 
 async fn queued() {
     let actors = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
         actors: AktorNew {
-
-            name: AktorName::new("audio"),
-            role: Audio,
+            name: "audio".into(),
             kind: AktorKind::TokioThread,
-            closures: AktorClosures {
-start: async || Ok::<_, AktorSetupError>(0_usize),
-
-                end: (),
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
-            },
-            options: AktorNewOptions { capacity: 32 },
+            start: AktorInit::Ready(async || 0_usize),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
-    })
-    .await
-    .unwrap();
+        grace: Duration::from_secs(5),
+    });
 
-    let _request = read(&actors.handles);
+    let audio = actors.handles().clone().with_role::<Audio>();
+    let _request = read(&audio);
 }

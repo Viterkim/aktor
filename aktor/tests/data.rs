@@ -1,6 +1,5 @@
 #![cfg(all(feature = "macros", feature = "transport"))]
-use aktor::{AktorData, data, worker};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use aktor::{AktorData, data};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[derive(AktorData, Debug, PartialEq)]
@@ -14,8 +13,7 @@ struct Nested<r#T> {
     rows: Vec<Result<T, Choice>>,
     pair: (u32, Option<String>),
 }
-#[derive(AktorData, Serialize, Deserialize, Debug, PartialEq)]
-#[serde(untagged)]
+#[derive(AktorData, Debug, PartialEq)]
 enum Choice {
     Empty,
     Text(String),
@@ -66,11 +64,6 @@ where
 impl<T: AktorData> Value for Qualified<T> {
     type Item = T;
 }
-#[derive(AktorData, Serialize, Deserialize)]
-struct Custom {
-    value: u64,
-}
-
 #[derive(Default)]
 struct Cache {
     hits: usize,
@@ -86,23 +79,9 @@ struct Local<T> {
     #[aktor(skip)]
     _cache: T,
 }
-#[derive(AktorData, Serialize, Deserialize)]
-struct Visible {
-    value: u64,
-    #[aktor(skip)]
-    note: String,
-}
-#[derive(AktorData, Serialize, Deserialize)]
-struct Hidden {
-    value: u64,
-    #[aktor(skip)]
-    #[serde(skip)]
-    cache: Cache,
-}
-#[derive(AktorData, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(AktorData, Debug, PartialEq)]
 struct Receipt {
     id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     provenance: Option<String>,
 }
 #[derive(AktorData)]
@@ -121,20 +100,157 @@ struct BorrowedCache<'de> {
     #[aktor(skip)]
     cache: &'de str,
 }
-#[derive(AktorData)]
-struct OwnSerde {
-    value: u64,
-}
-impl Serialize for OwnSerde {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str("user-format")
+#[test]
+fn recursive_field_bounds() {
+    struct Device;
+    impl Value for Device {
+        type Item = u8;
     }
-}
-impl<'de> Deserialize<'de> for OwnSerde {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let _ = String::deserialize(deserializer)?;
-        Ok(Self { value: 0 })
+
+    #[derive(AktorData)]
+    struct Node<C: Value> {
+        entry: (C::Item, Option<Box<Self>>),
     }
+    let node = Node::<Device> { entry: (19, None) };
+    let bytes = data::encode(&node).unwrap();
+    assert_eq!(data::decode::<Node<Device>>(&bytes).unwrap().entry.0, 19);
+}
+
+#[test]
+fn same_named_wire_type() {
+    mod wire {
+        #[derive(aktor::AktorData)]
+        pub struct Packet<T>(pub T);
+    }
+
+    #[derive(AktorData)]
+    struct Packet<T>(Option<wire::Packet<T>>);
+
+    let bytes = data::encode(&Packet(Some(wire::Packet(5u8)))).unwrap();
+    assert_eq!(data::decode::<Packet<u8>>(&bytes).unwrap().0.unwrap().0, 5);
+}
+
+#[test]
+fn field_type_macro() {
+    #[derive(AktorData)]
+    struct __Ref(u8);
+
+    macro_rules! field_type {
+        () => {
+            __Ref
+        };
+    }
+
+    #[derive(AktorData)]
+    struct Value(field_type!());
+
+    let bytes = data::encode(&Value(__Ref(7))).unwrap();
+    assert_eq!(data::decode::<Value>(&bytes).unwrap().0.0, 7);
+}
+
+#[test]
+fn generic_field_type_macro() {
+    macro_rules! field_type {
+        ($ty:ty) => { Option<$ty> };
+    }
+
+    #[derive(AktorData)]
+    struct Field<T>(field_type!(T));
+
+    let bytes = data::encode(&Field(Some(7u8))).unwrap();
+    assert_eq!(data::decode::<Field<u8>>(&bytes).unwrap().0, Some(7));
+}
+
+#[test]
+fn recursive_default_argument() {
+    struct Marker;
+    impl Value for Marker {
+        type Item = u8;
+    }
+
+    #[derive(AktorData)]
+    struct Node<M: Value, T = u8> {
+        value: T,
+        children: Vec<Node<M>>,
+        marker: M::Item,
+    }
+
+    let node = Node::<Marker, u16> {
+        value: 512,
+        children: vec![Node {
+            value: 7,
+            children: Vec::new(),
+            marker: 3,
+        }],
+        marker: 4,
+    };
+    let bytes = data::encode(&node).unwrap();
+    assert_eq!(
+        data::decode::<Node<Marker, u16>>(&bytes).unwrap().children[0].value,
+        7
+    );
+}
+
+#[test]
+fn self_projection() {
+    #[derive(AktorData)]
+    struct Projected<C: Value>(
+        <Self as Value>::Item,
+        #[aktor(skip)] core::marker::PhantomData<C>,
+    );
+
+    impl<C: Value> Value for Projected<C> {
+        type Item = C::Item;
+    }
+
+    struct Device;
+    impl Value for Device {
+        type Item = u32;
+    }
+
+    let bytes = data::encode(&Projected::<Device>(17, core::marker::PhantomData)).unwrap();
+    assert_eq!(data::decode::<Projected<Device>>(&bytes).unwrap().0, 17);
+}
+
+#[test]
+#[allow(non_upper_case_globals)]
+fn constants_in_scope() {
+    const __aktor_serializer: u8 = 7;
+    const __aktor_deserializer: u8 = 8;
+    const __aktor_wire: u8 = 9;
+    const __aktor_field_1: u8 = 10;
+
+    #[derive(AktorData, Debug, PartialEq)]
+    enum Value {
+        Sample([u8; 4]),
+    }
+
+    roundtrip(Value::Sample([
+        __aktor_serializer,
+        __aktor_deserializer,
+        __aktor_wire,
+        __aktor_field_1,
+    ]));
+}
+
+#[test]
+#[allow(non_upper_case_globals)]
+fn constants_in_type_macro() {
+    const __aktor_serializer: usize = 1;
+    const __aktor_deserializer: usize = 2;
+
+    macro_rules! bytes {
+        () => {
+            [u8; __aktor_serializer + __aktor_deserializer]
+        };
+    }
+
+    #[derive(AktorData, Debug, PartialEq)]
+    struct Packet<T>(T)
+    where
+        T: Into<bytes!()>;
+
+    roundtrip(Packet([4, 5, 6]));
 }
 
 fn roundtrip<T: AktorData + PartialEq + std::fmt::Debug>(value: T) {
@@ -244,34 +360,25 @@ fn values() {
 
 #[test]
 fn representation() {
-    let custom = OwnSerde { value: 99 };
-    assert_eq!(
-        data::decode::<OwnSerde>(&data::encode(&custom).unwrap())
-            .unwrap()
-            .value,
-        99
-    );
-    assert_eq!(
-        worker::decode::<String>(&worker::encode(&custom).unwrap()).unwrap(),
-        "user-format"
-    );
+    #[derive(AktorData, Debug, PartialEq)]
+    #[repr(u8)]
+    enum State {
+        Ready = 7,
+        Closed = 19,
+    }
 
-    let visible = Visible {
-        value: 7,
-        note: "ordinary Serde keeps it".into(),
-    };
-    assert_eq!(
-        worker::decode::<Visible>(&worker::encode(&visible).unwrap())
-            .unwrap()
-            .note,
-        visible.note
-    );
-    assert!(
-        data::decode::<Visible>(&data::encode(&visible).unwrap())
-            .unwrap()
-            .note
-            .is_empty()
-    );
+    assert_eq!(data::encode(&State::Closed).unwrap(), [1]);
+    assert_eq!(data::decode::<State>(&[0]).unwrap(), State::Ready);
+
+    for byte in 0..=u8::MAX {
+        let bits: [bool; 8] = std::array::from_fn(|bit| byte & (1 << bit) != 0);
+        assert_eq!(data::decode::<Vec<bool>>(&[2, byte, 1]).unwrap(), bits);
+    }
+
+    let signed = vec![-128i8, -1, 0, 127];
+    let encoded = [4, 128, 255, 0, 127];
+    assert_eq!(data::encode(&signed).unwrap(), encoded);
+    assert_eq!(data::decode::<Vec<i8>>(&encoded).unwrap(), signed);
 
     let borrowed = BorrowedCache {
         value: 31,
@@ -297,18 +404,6 @@ fn representation() {
     let bytes = data::encode(&only).unwrap();
     assert!(bytes.is_empty());
 
-    let hidden = Hidden {
-        value: 21,
-        cache: Cache { hits: 99 },
-    };
-    assert_eq!(
-        worker::decode::<Hidden>(&worker::encode(&hidden).unwrap())
-            .unwrap()
-            .cache
-            .hits,
-        0
-    );
-
     for value in [
         WithCache::Named {
             value: 7,
@@ -324,12 +419,6 @@ fn representation() {
             WithCache::Empty => {}
         }
     }
-
-    let custom = Custom { value: 5 };
-    assert_eq!(
-        data::encode(&custom).unwrap(),
-        postcard::to_allocvec(&custom).unwrap()
-    );
 }
 
 #[test]
@@ -337,10 +426,6 @@ fn optional_provenance() {
     for provenance in [None, Some("attachment owner".into())] {
         let receipt = Receipt { id: 7, provenance };
 
-        assert_eq!(
-            worker::decode::<Receipt>(&worker::encode(&receipt).unwrap()).unwrap(),
-            receipt
-        );
         roundtrip(receipt);
     }
 }
@@ -354,11 +439,12 @@ fn bounds() {
         };
     }
 
-    let bytes = postcard::to_allocvec(&data::Ref(&node)).unwrap();
+    // Some, Some, Some... None, what the encoder would have written without its limits.
+    let bytes = [[1; 140].as_slice(), &[0]].concat();
     assert!(data::encode(&node).is_err());
 
     let error = data::decode::<Node>(&bytes).err().unwrap();
-    assert!(error.to_string().contains("Codec"));
+    assert!(matches!(*error.0.reason, data::DataReason::Depth(_)));
 
     for count in [0, 1, 100, 500] {
         roundtrip(vec![(); count]);
@@ -368,18 +454,25 @@ fn bounds() {
         roundtrip(values);
     }
 
+    // Three bytes that use the whole budget, decoding can't need more than encoding did.
+    roundtrip(vec![Ok::<[(); 349], ()>([(); 349]); 2]);
+
+    // Boxes take memory while encoding to nothing, the bytes in front can't pay for this many.
+    assert!(data::encode(&(vec![7u8; 1 << 16], vec![Box::new(()); 4_000_000])).is_err());
+
+    // A count of 1000 and nothing after it, the elements encode to nothing.
+    let bytes = [0xe8, 0x07];
+
     let values = vec![(); 1_000];
-    let bytes = postcard::to_allocvec(&data::Ref(&values)).unwrap();
     assert!(data::decode::<Vec<()>>(&bytes).is_err());
     assert!(data::encode(&values).is_err());
 
     let values = (0..1_000).map(|_| (Unit, ((), Unit))).collect::<Vec<_>>();
-    let bytes = postcard::to_allocvec(&data::Ref(&values)).unwrap();
     assert!(data::decode::<Vec<(Unit, ((), Unit))>>(&bytes).is_err());
     assert!(data::encode(&values).is_err());
     assert!(data::encode(&vec![(); usize::MAX]).is_err());
 
-    let encoded_count = postcard::to_allocvec(&u32::MAX).unwrap();
+    let encoded_count = [0xff, 0xff, 0xff, 0xff, 0x0f];
     assert!(data::decode::<Vec<()>>(&encoded_count).is_err());
     assert!(data::decode::<Vec<String>>(&encoded_count).is_err());
     assert!(data::decode::<bool>(&[7]).is_err());
@@ -390,4 +483,44 @@ fn bounds() {
     assert!(data::decode::<Vec<bool>>(&[1, 0]).is_err());
     assert!(data::decode::<[bool; 1]>(&[2]).is_err());
     assert!(data::decode::<Vec<f64>>(&[1, 0]).is_err());
+}
+
+#[derive(Debug, PartialEq, Eq, AktorData)]
+enum WireError {
+    Static(std::borrow::Cow<'static, str>),
+    Bytes(std::borrow::Cow<'static, [u8]>),
+    Label(Box<str>),
+}
+
+#[test]
+fn cow_and_boxed_str() {
+    use std::borrow::Cow;
+
+    roundtrip(Cow::Borrowed("static error"));
+    roundtrip(Cow::<str>::Owned(String::from("owned error")));
+    roundtrip(Cow::Borrowed(&[1_u8, 2, 3, 4][..]));
+    roundtrip(Cow::Borrowed(&[10_u32, 20][..]));
+    roundtrip(Box::<str>::from("boxed"));
+    roundtrip(WireError::Static(Cow::Borrowed("invalid tag")));
+    roundtrip(WireError::Static(Cow::Owned(String::from("bad file"))));
+    roundtrip(WireError::Bytes(Cow::Borrowed(&[9_u8, 8, 7][..])));
+    roundtrip(WireError::Label(Box::from("seal")));
+}
+
+#[test]
+fn max_len() {
+    #[derive(AktorData)]
+    struct Loose {
+        bytes: Vec<u8>,
+    }
+    #[derive(AktorData)]
+    struct Capped {
+        #[aktor(max_len = 4)]
+        bytes: Vec<u8>,
+    }
+
+    let long = data::encode(&Loose { bytes: vec![0; 5] }).unwrap();
+
+    assert!(data::decode::<Capped>(&long).is_err());
+    assert!(data::encode(&Capped { bytes: vec![0; 5] }).is_err());
 }

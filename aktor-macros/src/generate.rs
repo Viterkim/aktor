@@ -1,37 +1,47 @@
 use crate::{input, names, path, signature};
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::visit_mut::VisitMut;
 use syn::{FnArg, parse_quote};
+use syn::{visit::Visit, visit_mut::VisitMut};
 
 pub fn expand(options: input::Options, mut function: input::Function) -> syn::Result<TokenStream> {
     if crate::worker::supports(&function)? {
         return crate::worker::expand(options, function);
     }
 
-    if options.data || options.serde || options.remote {
+    if options.remote {
         return Err(syn::Error::new_spanned(
             &function.signature,
-            if options.remote {
-                "#[aktor(remote)] needs concrete owned arguments and an owned result"
-            } else {
-                "explicit transport options need concrete owned arguments and an owned result"
-            },
+            "#[aktor(remote)] needs concrete owned arguments and an owned result",
         ));
     }
 
+    let wire_name = options
+        .name
+        .as_ref()
+        .map_or_else(|| quote!(::core::module_path!()), |name| quote!(#name));
     let aktor = path::aktor(options.crate_path)?;
     let role = options
         .role
         .map_or_else(|| quote!(()), |role| quote!(#role));
     let mut names = names::Names::new(&function.signature, &function.body, quote!(#aktor #role));
     let output = signature::output(&function.signature);
-    let (implementation, invoke) = signature::implementation(&function, &mut names, &output)?;
+    let (implementation, invoke) =
+        signature::implementation(&function, &mut names, &output, &aktor)?;
     let output = signature::dispatch_output(output);
-    let mut opaque_output = OpaqueOutput(false);
+    let mut opaque_output = signature::HasImplTrait(false);
 
-    syn::visit::Visit::visit_type(&mut opaque_output, &output);
+    opaque_output.visit_type(&output);
 
+    if options.latest && opaque_output.0 {
+        return Err(syn::Error::new_spanned(
+            &function.signature.output,
+            "`latest` needs a concrete result, not `impl Trait`",
+        ));
+    }
+
+    // Most functions never use `.latest()`, its sender, factory and session stay out of them.
+    let with_latest = options.latest;
     let latest_factory = names::binding(&mut names.reserved, "__AktorLatestFactory");
     let latest_state = names::binding(&mut names.reserved, "__AktorLatestState");
     let latest_input = names::binding(&mut names.reserved, "__AktorLatestInput");
@@ -174,119 +184,47 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             ));
         };
 
+        let factory = match with_latest {
+            true => quote!(, #name::#latest_factory<
+                    #(#factory_arguments,)*
+                    #state_type,
+                    #input_type,
+                    #output,
+                    #role,
+                    <#target as #lease_trait>::Lease,
+                    impl ::core::future::Future<
+                        Output = (<#target as #lease_trait>::Lease, #output)
+                    > + #future_lifetime
+                >),
+            false => quote!(, #aktor::latest::AddAktorLatest),
+        };
+
         function.signature.output = parse_quote!(-> #aktor::call::Call<
             #target,
             #input_type,
-            #raw,
-            #name::#latest_factory<
-                #(#factory_arguments,)*
-                #state_type,
-                #input_type,
-                #output,
-                #role,
-                <#target as #lease_trait>::Lease,
-                impl ::core::future::Future<
-                    Output = (<#target as #lease_trait>::Lease, #output)
-                > + #future_lifetime
-            >
+            #raw
+            #factory
         >);
     }
 
     let attributes = crate::input::attributes::wrapper(&function.attributes)?;
+    let lints = crate::input::attributes::lints(&function.attributes)?;
     let visibility = &function.visibility;
+
+    // Docs instead of an allow, so `forbid(missing_docs)` crates can use `pub` functions too.
+    let module_docs = format!(
+        "More ways to call `{}`, like `.latest()` and test handlers.",
+        function
+            .signature
+            .ident
+            .to_string()
+            .trim_start_matches("r#")
+    );
     let signature = &function.signature;
     let name = &signature.ident;
-    let generic_arguments = signature::arguments(&signature.generics);
-
-    let wrapper = quote! {
-        #(#attributes)*
-        #[allow(clippy::extra_unused_lifetimes)]
-        #[track_caller]
-        #visibility #signature {
-            #name::request::<#(#generic_arguments),*>(#parameter, #(#bindings),*)
-        }
-    };
-
-    let bindings = &names.arguments;
-    let parameter = state_name;
-
-    let mut request = signature.clone();
-
-    request.ident = parse_quote!(request);
-
-    for (argument, binding) in request
-        .inputs
-        .iter_mut()
-        .zip(::core::iter::once(parameter).chain(bindings.iter()))
-    {
-        if let FnArg::Typed(argument) = argument {
-            *argument.pat = parse_quote!(#binding);
-        }
-    }
-
-    let mut scope =
-        signature::scope::Child::new(&["request", "latest", "LatestSender"], &request.generics);
-
-    scope.visit_signature_mut(&mut request);
-
-    if !opaque_output.0
-        && let syn::ReturnType::Type(_, ty) = &mut request.output
-        && let syn::Type::Path(path) = &mut **ty
-        && let Some(segment) = path.path.segments.last_mut()
-        && let syn::PathArguments::AngleBracketed(arguments) = &mut segment.arguments
-        && let Some(syn::GenericArgument::Type(syn::Type::Path(factory))) =
-            arguments.args.last_mut()
-        && let Some(name) = factory.path.segments.last().cloned()
-    {
-        factory.path.segments = ::core::iter::once(name).collect();
-    }
-
-    let mut state_type = state_type.clone();
-
-    scope.visit_type_mut(&mut state_type);
-
-    let mut input_type = input_type.clone();
-
-    scope.visit_type_mut(&mut input_type);
-
-    let mut role: syn::Type = syn::parse2(role)?;
-
-    scope.visit_type_mut(&mut role);
-
-    let mut aktor: syn::Path = syn::parse2(aktor)?;
-
-    scope.visit_path_mut(&mut aktor);
-
-    let dispatch = if state.mutable {
-        if opaque_output.0 {
-            quote!(#aktor::dispatch::WriteOpaque)
-        } else {
-            quote!(#aktor::dispatch::WriteCall)
-        }
-    } else {
-        if opaque_output.0 {
-            quote!(#aktor::dispatch::ReadOpaque)
-        } else {
-            quote!(#aktor::dispatch::ReadCall)
-        }
-    };
-
-    let mut relocated_output = output.clone();
-
-    scope.visit_type_mut(&mut relocated_output);
-
-    let dispatch_type = if opaque_output.0 {
-        quote!(#dispatch<#state_type, #input_type, #role>)
-    } else {
-        quote!(#dispatch<#state_type, #input_type, #relocated_output, #role>)
-    };
-
-    let lease_trait = if state.mutable {
-        quote!(#aktor::dispatch::WriteState<#state_type, #role>)
-    } else {
-        quote!(#aktor::dispatch::ReadState<#state_type, #role>)
-    };
-
+    let outer_aktor = aktor.clone();
+    let outer_invoke = quote!(#name::#invoke);
+    let inner_bindings = &names.arguments;
     let state_reference = if state.mutable {
         quote!(&mut #state_type)
     } else {
@@ -307,14 +245,92 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
     let factory = quote! {
         |#lease_binding: <#target as #lease_trait>::Lease, #input_name: #input_type| async move {
+            let (#(#inner_bindings,)*) = #input_name;
+            let #output_name = #outer_invoke(#lease_reference, #(#inner_bindings),*).await;
+            (#state_name, #output_name)
+        },
+    };
+
+    let dispatch_body = quote! {
+        <#target as #dispatch_type>::dispatch(
+            #parameter, #operation_name,
+            async move |#state_name: #state_reference, #input_name: #input_type| {
+                let (#(#inner_bindings,)*) = #input_name;
+                #outer_invoke(#state_name, #(#inner_bindings),*).await
+            },
+            #input_name,
+            #factory
+        )
+    };
+
+    let operation = quote!(#aktor::operation::Operation {
+        name: #name::NAME, caller: ::core::panic::Location::caller(),
+    });
+    let request_factory = if with_latest {
+        quote!(#name::#latest_factory { factory: #factory marker: ::core::marker::PhantomData })
+    } else if opaque_output.0 {
+        quote!(())
+    } else {
+        quote!(#aktor::latest::AddAktorLatest)
+    };
+    let wrapper = quote! {
+        #(#attributes)*
+        #[allow(clippy::extra_unused_lifetimes)]
+        #[track_caller]
+        #visibility #signature {
+            #aktor::call::Call::new(
+                #parameter, (#(#bindings,)*), #operation,
+                |#parameter: #target, #input_name: #input_type, #operation_name| { #dispatch_body },
+                #request_factory,
+            )
+        }
+    };
+
+    let bindings = &names.arguments;
+    let parameter = state_name;
+
+    let mut request = signature.clone();
+
+    let mut scope =
+        signature::scope::NestedModule::new(&["NAME", "latest", "Sender"], &request.generics);
+
+    scope.visit_signature_mut(&mut request);
+
+    let mut state_type = state_type.clone();
+
+    scope.visit_type_mut(&mut state_type);
+
+    let mut input_type = input_type.clone();
+
+    scope.visit_type_mut(&mut input_type);
+
+    let mut role: syn::Type = syn::parse2(role)?;
+
+    scope.visit_type_mut(&mut role);
+
+    let mut aktor: syn::Path = syn::parse2(aktor)?;
+
+    scope.visit_path_mut(&mut aktor);
+
+    let lease_trait = if state.mutable {
+        quote!(#aktor::dispatch::WriteState<#state_type, #role>)
+    } else {
+        quote!(#aktor::dispatch::ReadState<#state_type, #role>)
+    };
+
+    let factory = quote! {
+        |#lease_binding: <#target as #lease_trait>::Lease, #input_name: #input_type| async move {
             let (#(#bindings,)*) = #input_name;
             let #output_name = #invoke(#lease_reference, #(#bindings),*).await;
             (#state_name, #output_name)
         },
     };
 
-    let latest = if opaque_output.0 {
-        TokenStream::new()
+    let latest = if !with_latest {
+        quote! {
+            #[doc(hidden)]
+            pub fn latest<#target: #aktor::latest::Marked>(_: #target) {}
+        }
     } else {
         let mut session_output = output.clone();
 
@@ -359,6 +375,11 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
         let (sender_impl, _, sender_where) = sender_generics.split_for_impl();
         let sender_type = quote!(<#(#arguments,)* #latest_inner>);
+        let mut declaration = sender_generics.clone();
+        declaration.params.pop();
+        declaration
+            .params
+            .push(parse_quote!(#latest_inner = #aktor::latest::DefaultSender<#input_type>));
         let mut send_generics = sender_generics.clone();
 
         send_generics
@@ -379,6 +400,9 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
         latest_signature.ident = parse_quote!(latest);
         latest_signature.inputs = latest_signature.inputs.into_iter().take(1).collect();
+        if let FnArg::Typed(argument) = &mut latest_signature.inputs[0] {
+            *argument.pat = parse_quote!(#parameter);
+        }
         latest_signature.generics = user_generics.clone();
         latest_signature.generics.params.push(parse_quote!(#target));
 
@@ -452,7 +476,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
         let (latest_impl, _, latest_where) = start_generics.split_for_impl();
 
         latest_signature.output = parse_quote!(-> (
-            self::LatestSender<
+            self::Sender<
                 #(#arguments,)*
                 <#target as #aktor::latest::TypedSession<
                     #state_type, #input_type, #session_output, <#target as #lease_trait>::Lease, #role
@@ -467,10 +491,15 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
             >>::Results
         ));
 
+        let factory_visibility = signature::scope::nested_visibility(visibility);
+
         quote! {
             #[doc(hidden)]
-            pub struct #latest_factory #factory_impl #factory_where {
+            /// Builds each run of a `latest()` session.
+            #factory_visibility struct #latest_factory #factory_impl #factory_where {
+                /// The function behind this session.
                 pub factory: fn(#latest_lease, #latest_input) -> #latest_future,
+                /// The types the session works with.
                 pub marker: ::core::marker::PhantomData<
                     fn(#(#markers),*) -> (#latest_state, #latest_input, #latest_output, #latest_role)
                 >,
@@ -481,7 +510,7 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                     #role, #latest_lease, #latest_future
                 > #latest_where
             {
-                type Sender = self::LatestSender<
+                type Sender = self::Sender<
                     #(#arguments,)*
                     <#target as #aktor::latest::TypedSession<
                         #state_type, #input_type, #session_output, #latest_lease, #role
@@ -505,91 +534,64 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
                         },
                         self.factory,
                     );
-                    let #sender_name = self::LatestSender { inner: #inner_name, marker: ::core::marker::PhantomData };
+                    let #sender_name = self::Sender { inner: #inner_name, marker: ::core::marker::PhantomData };
 
 
                     (#sender_name, #results_name)
                 }
             }
 
-            pub struct LatestSender #sender_impl #sender_where {
+            /// Sends the newest input to a `latest()` session.
+            #factory_visibility struct Sender #declaration #sender_where {
+                /// The session underneath.
                 pub inner: #latest_inner,
                 marker: ::core::marker::PhantomData<fn(#(#markers),*)>,
             }
-            impl #send_impl self::LatestSender #sender_type #send_where {
-                pub fn send(&self, #(#bindings: #input_types),*) {
+            // The bound sits on the method, its arguments give `&'a [T]` the implied `T: 'a`.
+            impl #sender_impl self::Sender #sender_type #sender_where {
+                /// Replace the input that's still waiting with this one.
+                pub fn send(&self, #(#bindings: #input_types),*)
+                where
+                    #latest_inner: #aktor::latest::SendLatest<#input_type>,
+                {
                     #aktor::latest::SendLatest::send(&self.inner, (#(#bindings,)*));
                 }
             }
-            impl #send_impl #aktor::latest::SendLatest<#input_type> for self::LatestSender #sender_type #send_where {
+            impl #send_impl #aktor::latest::SendLatest<#input_type> for self::Sender #sender_type #send_where {
                 fn send(&self, #input_name: #input_type) {
                     #aktor::latest::SendLatest::send(&self.inner, #input_name);
                 }
             }
-            impl #clone_impl ::core::clone::Clone for self::LatestSender #sender_type #clone_where {
+            impl #clone_impl ::core::clone::Clone for self::Sender #sender_type #clone_where {
                 fn clone(&self) -> Self {
                     Self { inner: self.inner.clone(), marker: ::core::marker::PhantomData }
                 }
             }
 
+            /// Keep only the newest input and read the results as they finish.
             #[track_caller]
             pub #latest_signature {
                 let (#inner_name, #results_name) = #aktor::latest::TypedSession::session(
                     #parameter,
-                    #aktor::operation::Operation { name: ::core::module_path!(), caller: ::core::panic::Location::caller() },
+                    #aktor::operation::Operation { name: #wire_name, caller: ::core::panic::Location::caller() },
                     async move |#state_name: &mut #state_type, #input_name| {
                         let (#(#bindings,)*) = #input_name;
                         #invoke(#state_name, #(#bindings),*).await
                     },
                     #factory
                 );
-                (self::LatestSender { inner: #inner_name, marker: ::core::marker::PhantomData }, #results_name)
+                (self::Sender { inner: #inner_name, marker: ::core::marker::PhantomData }, #results_name)
             }
         }
     };
 
-    let dispatch_body = quote! {
-        <#target as #dispatch_type>::dispatch(
-            #parameter, #operation_name,
-            async move |#state_name: #state_reference, #input_name: #input_type| {
-                let (#(#bindings,)*) = #input_name;
-                #invoke(#state_name, #(#bindings),*).await
-            },
-            #input_name,
-            #factory
-        )
-    };
-
-    let operation = quote!(#aktor::operation::Operation {
-        name: ::core::module_path!(), caller: ::core::panic::Location::caller(),
-    });
-    let request_body = if opaque_output.0 {
-        quote! {
-            #aktor::call::Call::new(
-                #parameter,
-                (#(#bindings,)*),
-                #operation,
-                |#parameter: #target, #input_name: #input_type, #operation_name| {
-                    #dispatch_body
-                },
-                ()
-            )
-        }
-    } else {
-        quote! {
-            #aktor::call::Call::new(
-                #parameter, (#(#bindings,)*), #operation,
-                |#parameter: #target, #input_name: #input_type, #operation_name| { #dispatch_body },
-                #latest_factory { factory: #factory marker: ::core::marker::PhantomData },
-            )
-        }
-    };
-
-    Ok(quote! {
+    Ok(quote! { #outer_aktor::__aktor_body! {
         #wrapper
 
         #implementation
 
+        #(#lints)*
+        #[doc = #module_docs]
         #visibility mod #name {
             use super::*;
 
@@ -599,18 +601,8 @@ pub fn expand(options: input::Options, mut function: input::Function) -> syn::Re
 
             #latest
 
-            #[track_caller]
-            #[allow(clippy::extra_unused_lifetimes)]
-            pub #request {
-                #request_body
-            }
+            #[doc(hidden)]
+            pub const NAME: &str = #wire_name;
         }
-    })
-}
-
-struct OpaqueOutput(bool);
-impl<'ast> syn::visit::Visit<'ast> for OpaqueOutput {
-    fn visit_type_impl_trait(&mut self, _: &'ast syn::TypeImplTrait) {
-        self.0 = true;
-    }
+    } })
 }

@@ -1,52 +1,46 @@
 use super::{
-    Shape,
-    bounds::{NormalizeSelf, RenameLifetime, add_bounds},
-    parse::check_variant,
+    Member, Shape,
+    bounds::add_bounds,
+    parse::{check_variant, is_packed, options},
 };
 use crate::{names, path};
-use proc_macro2::TokenStream;
-use quote::{ToTokens, quote};
-use std::collections::HashSet;
-use syn::{Data, DeriveInput, Fields, GenericParam, Type, parse_quote, visit_mut::VisitMut};
+use proc_macro2::{Literal, TokenStream};
+use quote::{ToTokens, quote, quote_spanned};
+use std::{
+    collections::HashSet,
+    hash::{DefaultHasher, Hash, Hasher},
+};
+use syn::{Data, DeriveInput, Ident, parse_quote, spanned::Spanned};
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
-    let mut overridden = None;
-
-    for attribute in &input.attrs {
-        if attribute.path().is_ident("aktor") {
-            attribute.parse_nested_meta(|meta| {
-                if meta.path.is_ident("crate") {
-                    if overridden.is_some() {
-                        return Err(meta.error("duplicate aktor(crate = path)"));
-                    }
-
-                    overridden = Some(meta.value()?.parse()?);
-                    Ok(())
-                } else {
-                    Err(meta.error("expected aktor(crate = path) on the type"))
-                }
-            })?;
-        }
-    }
-
-    let aktor = path::aktor(overridden)?;
-    let serde = quote!(#aktor::data::__serde);
-    let serde_path = syn::LitStr::new(&serde.to_string(), proc_macro2::Span::call_site());
-    let mut reserved = HashSet::new();
-
-    names::collect(input.to_token_stream(), &mut reserved);
-
-    let reference = names::binding(&mut reserved, "__AktorWireRef");
-    let owned = names::binding(&mut reserved, "__AktorWireOwned");
-    let marker = names::binding(&mut reserved, "__aktor_marker");
-    let local = names::binding(&mut reserved, "__aktor_wire");
-    let serializer = names::binding(&mut reserved, "__AktorSerializer");
-    let deserializer = names::binding(&mut reserved, "__AktorDeserializer");
-    let lifetime_name = names::binding(&mut reserved, "__aktor_wire_lifetime");
-    let lifetime = syn::Lifetime::new(&format!("'{lifetime_name}"), lifetime_name.span());
-
+    let options = options(&input.attrs)?;
+    let aktor = path::aktor(options.krate)?;
+    let data = quote!(#aktor::data);
     let name = &input.ident;
     let mut generics = input.generics.clone();
+
+    let mut reserved = HashSet::new();
+    let tokens = input.to_token_stream();
+    let macro_syntax = names::collect(tokens.clone(), &mut reserved);
+
+    // Names produced inside a caller's macro are invisible here. Keep the impl bounds in
+    // their original scope and avoid reusing a predictable parameter name in that scope.
+    let suffix = macro_syntax.then(|| {
+        let mut hash = DefaultHasher::new();
+        tokens.to_string().hash(&mut hash);
+        format!("_{:016x}", hash.finish())
+    });
+    let suffix = suffix.unwrap_or_default();
+    let writer = names::binding(&mut reserved, &format!("__aktor_writer{suffix}"));
+    let reader = names::binding(&mut reserved, &format!("__aktor_reader{suffix}"));
+
+    // The inference can't see through a type alias, so a written bound replaces it entirely.
+    let bounded = options.bound.is_some();
+
+    if let Some(bound) = options.bound {
+        generics.make_where_clause().predicates.extend(bound);
+    }
+
     let mut shapes = Vec::new();
     let variants = match input.data {
         Data::Struct(structure) => {
@@ -74,256 +68,183 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         }
     };
 
-    add_bounds(&mut generics, name, &shapes, &aktor);
+    if !bounded {
+        add_bounds(&mut generics, name, &shapes, &aktor);
+    }
+
+    // A max_len field goes through the checked write and read, spanned at the field so a
+    // field without a length gets AktorMaxLen's message right there.
+    let write = |field: &Member, value: TokenStream| match &field.max_len {
+        Some(max) => {
+            let ty = &field.ty;
+            quote_spanned!(field.ty.span()=> #data::write_max::<#ty>(#writer, #value, #max)?;)
+        }
+        None => quote!(#data::Writer::write(#writer, #value)?;),
+    };
+    let read = |field: &Member| match &field.max_len {
+        Some(max) => {
+            let ty = &field.ty;
+            quote_spanned!(field.ty.span()=> #data::read_max::<#ty>(#reader, #max)?)
+        }
+        None => quote!(#data::Reader::read(#reader)?),
+    };
+    let restore = |shape: &Shape, prefix: TokenStream| {
+        let values = shape
+            .members
+            .iter()
+            .map(|field| match field.skip {
+                true => quote!(::core::default::Default::default()),
+                false => read(field),
+            })
+            .collect();
+
+        shape.construct(prefix, values)
+    };
+
+    let (encode, decode) = match variants {
+        None => {
+            let shape = &shapes[0];
+            let packed = is_packed(&input.attrs);
+            let active: Vec<_> = shape.members.iter().filter(|field| !field.skip).collect();
+
+            if packed && !generics.params.is_empty() {
+                for field in &active {
+                    let ty = &field.ty;
+                    generics
+                        .make_where_clause()
+                        .predicates
+                        .push(parse_quote!(#ty: ::core::marker::Copy));
+                }
+            }
+
+            if packed && let Some(field) = active.iter().find(|field| field.max_len.is_some()) {
+                return Err(syn::Error::new_spanned(
+                    &field.ty,
+                    "packed structs send Copy fields, there's no length for max_len to check",
+                ));
+            }
+
+            let writes = active.iter().map(|field| {
+                let member = &field.name;
+
+                match packed {
+                    true => {
+                        quote_spanned!(field.ty.span()=> #data::write_packed(#writer, self.#member)?;)
+                    }
+                    false => write(field, quote!(&self.#member)),
+                }
+            });
+            let restored = restore(shape, quote!(Self));
+
+            (
+                quote! {
+                    #(#writes)*
+                    ::core::result::Result::Ok(())
+                },
+                quote!(::core::result::Result::Ok(#restored)),
+            )
+        }
+        Some(variants) if variants.is_empty() => (
+            quote!(match *self {}),
+            quote!(::core::result::Result::Err(#data::DataError::from(#data::DataReason::EmptyEnum))),
+        ),
+        Some(variants) => {
+            let field_count = shapes
+                .iter()
+                .map(|shape| shape.members.len())
+                .max()
+                .unwrap_or(0);
+            let bindings: Vec<Ident> = (1..=field_count)
+                .map(|index| names::binding(&mut reserved, &format!("__aktor_field_{index}")))
+                .collect();
+            let mut writes = Vec::new();
+            let mut reads = Vec::new();
+
+            for (index, (variant, shape)) in variants.iter().zip(&shapes).enumerate() {
+                let index = Literal::usize_unsuffixed(index);
+                let pattern = shape
+                    .members
+                    .iter()
+                    .zip(&bindings)
+                    .map(|(field, binding)| match field.skip {
+                        true => quote!(_),
+                        false => quote!(#binding),
+                    })
+                    .collect();
+                let pattern = shape.construct(quote!(Self::#variant), pattern);
+                let fields = shape
+                    .members
+                    .iter()
+                    .zip(&bindings)
+                    .filter(|(field, _)| !field.skip)
+                    .map(|(field, binding)| write(field, quote!(#binding)));
+
+                writes.push(quote! {
+                    #pattern => {
+                        #data::Writer::length(#writer, #index);
+                        #(#fields)*
+                    }
+                });
+
+                let restored = restore(shape, quote!(Self::#variant));
+                reads.push(quote!(#index => #restored));
+            }
+
+            (
+                quote! {
+                    #[allow(unused_imports)]
+                    use ::core::mem::{#(drop as #bindings),*};
+
+                    match self {
+                        #(#writes)*
+                    }
+
+                    ::core::result::Result::Ok(())
+                },
+                quote! {
+                    ::core::result::Result::Ok(match #data::Reader::length(#reader)? {
+                        #(#reads,)*
+                        tag => {
+                            return ::core::result::Result::Err(
+                                #data::DataError::from(#data::DataReason::Variant(tag)),
+                            );
+                        }
+                    })
+                },
+            )
+        }
+    };
 
     let (implementation, arguments, bounds) = generics.split_for_impl();
-    let decode_lifetime_name = names::binding(&mut reserved, "__aktor_decode_lifetime");
-    let decode_lifetime = syn::Lifetime::new(
-        &format!("'{decode_lifetime_name}"),
-        decode_lifetime_name.span(),
-    );
-    let renamed_lifetime_name = names::binding(&mut reserved, "__aktor_type_lifetime");
-    let renamed_lifetime = syn::Lifetime::new(
-        &format!("'{renamed_lifetime_name}"),
-        renamed_lifetime_name.span(),
-    );
-    let mut helper_generics = generics.clone();
-    let mut helper_shapes = shapes.clone();
-    let original: Type = parse_quote!(#name #arguments);
-
-    NormalizeSelf(&original).visit_generics_mut(&mut helper_generics);
-    RenameLifetime(&renamed_lifetime).visit_generics_mut(&mut helper_generics);
-
-    for shape in &mut helper_shapes {
-        for field in &mut shape.members {
-            NormalizeSelf(&original).visit_type_mut(&mut field.ty);
-            RenameLifetime(&renamed_lifetime).visit_type_mut(&mut field.ty);
+    // A constant in the caller's module can turn a parameter into a constant pattern.
+    // An opaque macro in the impl bounds still needs the caller's value names.
+    let opaque_bounds =
+        macro_syntax && names::collect(quote!(#implementation #bounds), &mut HashSet::new());
+    let parameter_imports = (!opaque_bounds).then(|| {
+        quote! {
+            #[allow(unused_imports)]
+            use ::core::mem::{drop as #writer, drop as #reader};
         }
-    }
-
-    let (owned_impl, helper_arguments, owned_bounds) = helper_generics.split_for_impl();
-    let mut borrowed = helper_generics.clone();
-    borrowed.params.insert(0, parse_quote!(#lifetime));
-    let (borrowed_impl, _, borrowed_bounds) = borrowed.split_for_impl();
-
-    let mut inferred = generics.clone();
-    inferred.params.insert(0, parse_quote!(#lifetime));
-
-    if let Some(GenericParam::Lifetime(parameter)) = inferred.params.first_mut() {
-        parameter.lifetime = syn::Lifetime::new("'_", proc_macro2::Span::call_site());
-    }
-
-    let (_, borrowed_args, _) = inferred.split_for_impl();
-
-    let (helpers, serialize, deserialize) = if let Some(variants) = variants {
-        let refs = helper_shapes
-            .iter()
-            .map(|shape| shape.helper(&aktor, Some(&lifetime)));
-        let values = helper_shapes.iter().map(|shape| shape.helper(&aktor, None));
-        let mut writes = Vec::new();
-        let mut reads = Vec::new();
-
-        for (variant, shape) in variants.iter().zip(&shapes) {
-            let bindings: Vec<_> = shape
-                .members
-                .iter()
-                .map(|_| names::binding(&mut reserved, "__aktor_field"))
-                .collect();
-
-            let pattern_values = shape
-                .members
-                .iter()
-                .zip(&bindings)
-                .map(|(field, binding)| {
-                    if field.skip {
-                        quote!(_)
-                    } else {
-                        quote!(#binding)
-                    }
-                })
-                .collect();
-            let pattern = shape.construct(quote!(Self::#variant), pattern_values, true);
-            let wire_values = shape
-                .members
-                .iter()
-                .zip(&bindings)
-                .filter(|(field, _)| !field.skip)
-                .map(|(_, binding)| quote!(#aktor::data::Ref(#binding)))
-                .collect();
-            let wire = shape.construct(quote!(#reference::#variant), wire_values, false);
-            writes.push(quote!(#pattern => #wire));
-
-            let read_values = shape
-                .members
-                .iter()
-                .zip(&bindings)
-                .filter(|(field, _)| !field.skip)
-                .map(|(_, binding)| quote!(#binding))
-                .collect();
-            let read_pattern = shape.construct(quote!(#owned::#variant), read_values, false);
-            let restored = shape
-                .members
-                .iter()
-                .zip(&bindings)
-                .map(|(field, binding)| {
-                    if field.skip {
-                        quote!(::core::default::Default::default())
-                    } else {
-                        quote!(#binding.0)
-                    }
-                })
-                .collect();
-            let restored = shape.construct(quote!(Self::#variant), restored, true);
-            reads.push(quote!(#read_pattern => #restored));
-        }
-
-        let helpers = quote! {
-            #[allow(non_camel_case_types)]
-            #[derive(#serde::Serialize)]
-            #[serde(crate = #serde_path, bound = "")]
-            enum #reference #borrowed_impl #borrowed_bounds {
-                #(#variants #refs,)*
-                #[serde(skip)]
-                #marker(::core::marker::PhantomData<&#lifetime #name #helper_arguments>),
-            }
-
-            #[allow(non_camel_case_types)]
-            #[derive(#serde::Deserialize)]
-            #[serde(crate = #serde_path, bound = "")]
-            enum #owned #owned_impl #owned_bounds {
-                #(#variants #values,)*
-                #[serde(skip)]
-                #marker(::core::marker::PhantomData<fn() -> #name #helper_arguments>),
-            }
-        };
-
-        let serialize = quote! {
-            let #local: #reference #borrowed_args = match self { #(#writes,)* };
-            #serde::Serialize::serialize(&#local, serializer)
-        };
-
-        let deserialize = quote! {
-            let #local: #owned #arguments = #serde::Deserialize::deserialize(deserializer)?;
-            ::core::result::Result::Ok(match #local {
-                #(#reads,)*
-                #owned::#marker(_) => return ::core::result::Result::Err(#serde::de::Error::custom("invalid AktorData variant")),
-            })
-        };
-
-        (helpers, serialize, deserialize)
-    } else {
-        let shape = &shapes[0];
-        let active: Vec<_> = shape.members.iter().filter(|field| !field.skip).collect();
-        let wire_fields: Vec<_> = active
-            .iter()
-            .enumerate()
-            .map(|(index, field)| match &shape.fields {
-                Fields::Named(_) => field.name.clone(),
-                _ => syn::Member::Unnamed(index.into()),
-            })
-            .collect();
-        let types: Vec<_> = helper_shapes[0]
-            .members
-            .iter()
-            .filter(|field| !field.skip)
-            .map(|field| &field.ty)
-            .collect();
-
-        let helpers = match &shape.fields {
-            Fields::Named(_) => quote! {
-                #[derive(#serde::Serialize)]
-                #[serde(crate = #serde_path, bound = "")]
-                struct #reference #borrowed_impl #borrowed_bounds {
-                    #(#wire_fields: #aktor::data::Ref<#lifetime, #types>,)*
-                    #[serde(skip)]
-                    #marker: ::core::marker::PhantomData<&#lifetime #name #helper_arguments>,
-                }
-
-                #[derive(#serde::Deserialize)]
-                #[serde(crate = #serde_path, bound = "")]
-                struct #owned #owned_impl #owned_bounds {
-                    #(#wire_fields: #aktor::data::Owned<#types>,)*
-                    #[serde(skip)]
-                    #marker: ::core::marker::PhantomData<fn() -> #name #helper_arguments>,
-                }
-            },
-            _ => quote! {
-                #[derive(#serde::Serialize)]
-                #[serde(crate = #serde_path, bound = "")]
-                struct #reference #borrowed_impl (
-                    #(#aktor::data::Ref<#lifetime, #types>,)*
-                    #[serde(skip)]
-                    ::core::marker::PhantomData<&#lifetime #name #helper_arguments>
-                ) #borrowed_bounds;
-
-                #[derive(#serde::Deserialize)]
-                #[serde(crate = #serde_path, bound = "")]
-                struct #owned #owned_impl (
-                    #(#aktor::data::Owned<#types>,)*
-                    #[serde(skip)]
-                    ::core::marker::PhantomData<fn() -> #name #helper_arguments>
-                ) #owned_bounds;
-            },
-        };
-
-        let serialize = match &shape.fields {
-            Fields::Named(_) => {
-                let fields = active.iter().map(|field| {
-                    let field = &field.name;
-                    quote!(#field: #aktor::data::Ref(&self.#field))
-                });
-                quote!(let #local = #reference { #(#fields,)* #marker: ::core::marker::PhantomData::<&Self> };)
-            }
-            _ => {
-                let fields = active.iter().map(|field| {
-                    let field = &field.name;
-                    quote!(#aktor::data::Ref(&self.#field))
-                });
-                quote!(let #local = #reference(#(#fields,)* ::core::marker::PhantomData::<&Self>);)
-            }
-        };
-        let serialize = quote! { #serialize #serde::Serialize::serialize(&#local, serializer) };
-
-        let mut active_index = 0;
-        let restored = shape
-            .members
-            .iter()
-            .map(|field| {
-                if field.skip {
-                    quote!(::core::default::Default::default())
-                } else {
-                    let wire_field = &wire_fields[active_index];
-                    active_index += 1;
-                    quote!(#local.#wire_field.0)
-                }
-            })
-            .collect();
-        let restored = shape.construct(quote!(Self), restored, true);
-        let deserialize = quote! {
-            let #local: #owned #arguments = #serde::Deserialize::deserialize(deserializer)?;
-            ::core::result::Result::Ok(#restored)
-        };
-
-        (helpers, serialize, deserialize)
-    };
+    });
 
     Ok(quote! {
         const _: () = {
-            #[allow(non_camel_case_types)]
-            #helpers
+            #parameter_imports
 
             impl #implementation #aktor::AktorData for #name #arguments #bounds {
-                fn serialize_data<#serializer: #serde::Serializer>(
+                #[inline]
+                fn encode_data(
                     &self,
-                    serializer: #serializer,
-                ) -> ::core::result::Result<#serializer::Ok, #serializer::Error> {
-                    #serialize
+                    #writer: &mut #data::Writer,
+                ) -> ::core::result::Result<(), #data::DataError> {
+                    #encode
                 }
 
-                fn deserialize_data<#decode_lifetime, #deserializer: #serde::Deserializer<#decode_lifetime>>(
-                    deserializer: #deserializer,
-                ) -> ::core::result::Result<Self, #deserializer::Error> {
-                    #deserialize
+                #[inline]
+                fn decode_data(
+                    #reader: &mut #data::Reader<'_>,
+                ) -> ::core::result::Result<Self, #data::DataError> {
+                    #decode
                 }
             }
         };

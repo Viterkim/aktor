@@ -7,12 +7,12 @@ pub type AktorEach<S> = Box<dyn FnMut(&mut S, Operation)>;
 pub type IntervalCallback<S> =
     Rc<RefCell<Option<crate::AktorClosure<dyn crate::setup::AktorIntervalLogic<S>>>>>;
 
-pub struct AktorHooks<S> {
+pub struct CallHooks<S> {
     pub before_each: Option<AktorEach<S>>,
     pub after_each: Option<AktorEach<S>>,
     pub intervals: Vec<IntervalCallback<S>>,
 }
-impl<S> Default for AktorHooks<S> {
+impl<S> Default for CallHooks<S> {
     fn default() -> Self {
         Self {
             before_each: None,
@@ -21,7 +21,7 @@ impl<S> Default for AktorHooks<S> {
         }
     }
 }
-impl<S> AktorHooks<S> {
+impl<S> CallHooks<S> {
     pub fn before(&mut self, state: &mut S, operation: Operation) {
         if let Some(before) = &mut self.before_each {
             before(state, operation);

@@ -1,13 +1,11 @@
-use super::*;
-use crate::message::stopped;
-use core::pin::Pin;
-use core::task::Context;
-
-use crate::latest::{SendLatest, Session};
-use core::{future::poll_fn, ops::AsyncFnOnce};
-
 #[cfg(test)]
 mod tests;
+
+use super::*;
+use crate::latest::{SendLatest, Session};
+use core::pin::Pin;
+use core::task::Context;
+use core::{future::poll_fn, ops::AsyncFnOnce};
 
 pub struct LatestSender<I> {
     input: Rc<dyn Input<I>>,
@@ -35,14 +33,17 @@ pub struct LatestResults<O> {
     output: Rc<dyn Output<O>>,
 }
 impl<O> LatestResults<O> {
-    pub async fn next(&mut self) -> Option<O> {
+    pub async fn next(&mut self) -> Option<Result<O, crate::AktorDeliveryError>> {
         poll_fn(|cx| self.output.poll(cx)).await
     }
 }
 impl<O> futures_core::Stream for LatestResults<O> {
-    type Item = O;
+    type Item = Result<O, crate::AktorDeliveryError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<O>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<O, crate::AktorDeliveryError>>> {
         self.output.poll(cx)
     }
 }
@@ -59,12 +60,12 @@ trait Input<I> {
 }
 
 trait Output<O> {
-    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>>;
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<Result<O, crate::AktorDeliveryError>>>;
     fn close_receiver(&self);
 }
 
-struct Shared<S, I, O, F, Role, const N: usize, E, Clock> {
-    handle: Handle<S, N, E, Role, Clock>,
+struct Shared<S, I, O, F, Role, Clock> {
+    handle: Handle<S, Role, Clock>,
     state: RefCell<Slot<I, O>>,
     function: RefCell<F>,
     operation: crate::operation::Operation,
@@ -80,15 +81,15 @@ struct Slot<I, O> {
     running: bool,
     senders: usize,
     receiver: bool,
-    failed: bool,
+    failed: Option<crate::CallLoss>,
     wake: Option<Waker>,
 }
 
-struct LatestJob<S, I, O, F, Role, const N: usize, E, Clock> {
-    shared: Rc<Shared<S, I, O, F, Role, N, E, Clock>>,
+struct LatestJob<S, I, O, F, Role, Clock> {
+    shared: Rc<Shared<S, I, O, F, Role, Clock>>,
     finished: bool,
 }
-impl<S, I, O, F, Role, const N: usize, E, Clock> Drop for LatestJob<S, I, O, F, Role, N, E, Clock> {
+impl<S, I, O, F, Role, Clock> Drop for LatestJob<S, I, O, F, Role, Clock> {
     fn drop(&mut self) {
         if self.finished {
             return;
@@ -96,26 +97,30 @@ impl<S, I, O, F, Role, const N: usize, E, Clock> Drop for LatestJob<S, I, O, F, 
 
         let mut slot = self.shared.state.borrow_mut();
 
+        slot.failed = Some(crate::CallLoss(
+            if slot.running {
+                AktorDeliveryOutcome::OutcomeUnknown
+            } else {
+                AktorDeliveryOutcome::Discarded
+            },
+            self.shared.handle.inner.completion.lost.get().cloned(),
+        ));
         slot.scheduled = false;
         slot.running = false;
-        slot.failed = true;
 
         let pending = slot.pending.take();
         let output = slot.output.take();
         let wake = slot.wake.take();
 
         drop(slot);
-        drop(pending);
-        drop(output);
-
         if let Some(wake) = wake {
-            wake.wake();
+            crate::local::wake(wake);
         }
+        drop((pending, output));
     }
 }
 
-impl<S: 'static, I: 'static, O: 'static, Role, F, const N: usize, E: 'static, Clock: 'static>
-    Shared<S, I, O, F, Role, N, E, Clock>
+impl<S: 'static, I: 'static, O: 'static, Role, F, Clock: 'static> Shared<S, I, O, F, Role, Clock>
 where
     Role: 'static,
     F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + 'static,
@@ -127,7 +132,7 @@ where
             if slot.scheduled
                 || slot.running
                 || !slot.receiver
-                || slot.failed
+                || slot.failed.is_some()
                 || slot.pending.is_none()
             {
                 return;
@@ -142,7 +147,7 @@ where
         };
 
         self.handle.inner.service(Message {
-            _operation: self.operation,
+            operation: self.operation,
             job: Box::new(LatestJob {
                 shared: this,
                 finished: false,
@@ -150,23 +155,15 @@ where
         });
     }
 }
-impl<
-    S: 'static,
-    I: 'static,
-    O: 'static,
-    Role: 'static,
-    F,
-    const N: usize,
-    E: 'static,
-    Clock: 'static,
-> Input<I> for Shared<S, I, O, F, Role, N, E, Clock>
+impl<S: 'static, I: 'static, O: 'static, Role: 'static, F, Clock: 'static> Input<I>
+    for Shared<S, I, O, F, Role, Clock>
 where
     F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + 'static,
 {
     fn send(&self, input: I) {
         let mut slot = self.state.borrow_mut();
 
-        if !slot.receiver || slot.failed || !self.handle.inner.open.get() {
+        if !slot.receiver || slot.failed.is_some() || !self.handle.inner.open.get() {
             return;
         }
 
@@ -195,45 +192,68 @@ where
         drop(slot);
 
         if let Some(wake) = wake {
-            wake.wake();
+            crate::local::wake(wake);
         }
     }
 }
-impl<S, I, O, F, Role, const N: usize, E, Clock> Output<O>
-    for Shared<S, I, O, F, Role, N, E, Clock>
-{
-    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>> {
+impl<S, I, O, F, Role, Clock> Output<O> for Shared<S, I, O, F, Role, Clock> {
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<Result<O, crate::AktorDeliveryError>>> {
         let replacement = cx.waker().clone();
         let mut slot = self.state.borrow_mut();
 
-        if let Some(output) = slot.output.take() {
-            return Poll::Ready(Some(output));
+        if !slot.receiver {
+            return Poll::Ready(None);
         }
 
-        if self
+        if slot.failed.is_none()
+            && let Some(output) = slot.output.take()
+        {
+            return Poll::Ready(Some(Ok(output)));
+        }
+
+        // A job cut by the owner leaves its input lost, even when `end` went fine after it.
+        let finished = self
             .handle
             .inner
             .completion
             .result
             .borrow()
             .as_ref()
-            .is_some_and(Result::is_err)
-        {
-            drop(slot);
+            .map(Result::is_err);
 
-            if self.handle.inner.lost() {
-                return Poll::Pending;
-            }
-
-            stopped();
+        if let Some(outcome) = slot.failed.take().or_else(|| {
+            finished.filter(|failed| *failed).map(|_| {
+                crate::CallLoss(
+                    AktorDeliveryOutcome::OutcomeUnknown,
+                    self.handle
+                        .inner
+                        .completion
+                        .lost
+                        .get()
+                        .cloned()
+                        .or_else(|| {
+                            self.handle
+                                .inner
+                                .completion
+                                .returned
+                                .borrow()
+                                .first()
+                                .cloned()
+                        }),
+                )
+            })
+        }) {
+            slot.receiver = false;
+            let error = outcome.error(true);
+            return Poll::Ready(Some(Err(error)));
         }
 
-        if !slot.failed
-            && (slot.senders == 0 || !self.handle.inner.open.get())
+        if (slot.senders == 0 || finished.is_some())
             && slot.pending.is_none()
             && !slot.running
             && !slot.scheduled
         {
+            slot.receiver = false;
             return Poll::Ready(None);
         }
 
@@ -264,16 +284,8 @@ impl<S, I, O, F, Role, const N: usize, E, Clock> Output<O>
     }
 }
 
-impl<
-    S: 'static,
-    I: 'static,
-    O: 'static,
-    Role: 'static,
-    F,
-    const N: usize,
-    E: 'static,
-    Clock: 'static,
-> Job<S> for LatestJob<S, I, O, F, Role, N, E, Clock>
+impl<S: 'static, I: 'static, O: 'static, Role: 'static, F, Clock: 'static> Job<S>
+    for LatestJob<S, I, O, F, Role, Clock>
 where
     F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + 'static,
 {
@@ -284,7 +296,7 @@ where
     fn run<'a>(
         &'a mut self,
         state: &'a mut S,
-        hooks: &'a mut hooks::AktorHooks<S>,
+        hooks: &'a mut hooks::CallHooks<S>,
         operation: Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
@@ -329,17 +341,17 @@ where
             let wake = slot.wake.take();
 
             drop(slot);
-            drop(discarded);
-            self.shared.schedule();
-
             if let Some(wake) = wake {
-                wake.wake();
+                crate::local::wake(wake);
             }
+
+            self.shared.schedule();
+            drop(discarded);
         })
     }
 }
-impl<S: 'static, I: 'static, O: 'static, Role: 'static, const N: usize, E: 'static, Clock: 'static>
-    Session<S, I, O, Role> for &Handle<S, N, E, Role, Clock>
+impl<S: 'static, I: 'static, O: 'static, Role: 'static, Clock: 'static> Session<S, I, O, Role>
+    for &Handle<S, Role, Clock>
 {
     type Sender = LatestSender<I>;
     type Results = LatestResults<O>;
@@ -352,40 +364,38 @@ impl<S: 'static, I: 'static, O: 'static, Role: 'static, const N: usize, E: 'stat
     where
         F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
     {
-        let shared = Rc::new_cyclic(
-            |this: &Weak<Shared<S, I, O, F, Role, N, E, Clock>>| Shared {
-                handle: self.new_handle(),
-                state: RefCell::new(Slot {
-                    revision: 0,
-                    pending: None,
-                    output: None,
-                    scheduled: false,
-                    running: false,
-                    senders: 1,
-                    receiver: true,
-                    failed: false,
-                    wake: None,
-                }),
-                function: RefCell::new(function),
-                operation,
-                this: this.clone(),
-                wake_callback: Rc::new({
-                    let weak = this.clone();
+        let shared = Rc::new_cyclic(|this: &Weak<Shared<S, I, O, F, Role, Clock>>| Shared {
+            handle: self.clone(),
+            state: RefCell::new(Slot {
+                revision: 0,
+                pending: None,
+                output: None,
+                scheduled: false,
+                running: false,
+                senders: 1,
+                receiver: true,
+                failed: None,
+                wake: None,
+            }),
+            function: RefCell::new(function),
+            operation,
+            this: this.clone(),
+            wake_callback: Rc::new({
+                let weak = this.clone();
 
-                    move || {
-                        weak.upgrade().is_some_and(|shared| {
-                            let wake = shared.state.borrow_mut().wake.take();
+                move || {
+                    weak.upgrade().is_some_and(|shared| {
+                        let wake = shared.state.borrow_mut().wake.take();
 
-                            if let Some(wake) = wake {
-                                wake.wake();
-                            }
+                        if let Some(wake) = wake {
+                            crate::local::wake(wake);
+                        }
 
-                            true
-                        })
-                    }
-                }),
-            },
-        );
+                        true
+                    })
+                }
+            }),
+        });
 
         self.inner.register_session(&shared.wake_callback);
         (
@@ -397,8 +407,8 @@ impl<S: 'static, I: 'static, O: 'static, Role: 'static, const N: usize, E: 'stat
     }
 }
 
-impl<S: 'static, I, O, Lease, Role, E, const N: usize, Clock, Wire>
-    crate::latest::TypedSession<S, I, O, Lease, Role, Wire> for &Handle<S, N, E, Role, Clock>
+impl<S: 'static, I, O, Lease, Role, Clock, Wire>
+    crate::latest::TypedSession<S, I, O, Lease, Role, Wire> for &Handle<S, Role, Clock>
 where
     Self: crate::latest::Session<S, I, O, Role>,
 {

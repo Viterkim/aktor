@@ -4,16 +4,21 @@ use tokio::net::UdpSocket;
 #[tokio::test]
 async fn packets() {
     let (actors, actor) = actor().await;
-    let server = listen(Address::Udp("127.0.0.1:0".parse().unwrap()), &actor)
-        .await
-        .unwrap();
+    let server = Server::listen(
+        Address::Udp("127.0.0.1:0".parse().unwrap()),
+        &actor,
+        server_options(),
+    )
+    .await
+    .unwrap();
     let Address::Udp(address) = server.address else {
         panic!("not a UDP listener")
     };
     let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     backend.connect(address).await.unwrap();
-    let client = Client::<State>::new(Address::Udp(front.local_addr().unwrap()));
+    let client =
+        Client::<State>::new(Address::Udp(front.local_addr().unwrap()), client_options()).unwrap();
     let relay = tokio::spawn(async move {
         let mut incoming = [0; 65536];
         let mut outgoing = [0; 65536];
@@ -66,10 +71,10 @@ async fn packets() {
         .unwrap()
         .unwrap();
     assert_eq!(result, bytes);
-    assert_eq!(read(&actor).await.0, 1);
+    assert_eq!(read(&actor).await.unwrap().0, 1);
 
     relay.abort();
     let _ = relay.await;
     server.shutdown().await.unwrap();
-    actors.shutdown().await;
+    let _ = actors.stop().await;
 }

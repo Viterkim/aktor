@@ -1,5 +1,7 @@
 use super::*;
 use aktor::cross_core;
+use core::future::IntoFuture;
+use core::num::NonZeroUsize;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use std::{
     future::poll_fn,
@@ -53,9 +55,11 @@ pub async fn check(spawner: Spawner) {
     shutdown_timeout().await;
     interval_delay().await;
     interval_fairness().await;
-    stopping_startup().await;
+    stopping_startup(true).await;
+    stopping_startup(false).await;
     startup_origin().await;
     reply_wake().await;
+    stuck_call_end(spawner).await;
 
     let stored = Rc::new(RefCell::new(Vec::new()));
     let cleaned = stored.clone();
@@ -66,66 +70,55 @@ pub async fn check(spawner: Spawner) {
     let before = Rc::new(Cell::new(0));
     let log = before.clone();
     let setup = AktorNew {
-        name: AktorName::new("shared sensor"),
-        role: AktorNoRole,
+        name: "shared sensor".into(),
         kind: AktorKind::EmbassyCrossCore(move |future| {
-            spawner.spawn(
-                setup_driver(future)
-                    .map_err(|_| AktorSetupError::new("no shared driver slot", ()))?,
-            );
-            Ok(())
+            spawner.spawn(setup_driver(future).er(())?);
+            Ok::<(), (crate::SpawnDriverErr, String)>(())
         }),
-        closures: AktorClosures {
-            start: async || {
-                Ok::<_, AktorSetupError>(Sensor {
-                    readings: Rc::new(RefCell::new(Vec::new())),
-                })
-            },
-
-            end: async move |sensor: Sensor| {
-                *cleaned.borrow_mut() = sensor.readings.borrow().clone();
-                Ok::<_, AktorCleanupError>(())
-            },
-            intervals: vec![AktorInterval {
-                every: Duration::from_millis(1),
-                run: (async move |_: &mut Sensor| {
+        start: aktor::AktorInit::Ready(async || Sensor {
+            readings: Rc::new(RefCell::new(Vec::new())),
+        }),
+        end: async move |sensor: Sensor| {
+            *cleaned.borrow_mut() = sensor.readings.borrow().clone();
+        },
+        hooks: AktorHooks {
+            intervals: vec![
+                AktorInterval::new(Duration::from_millis(1), async move |_: &mut Sensor| {
                     ticks.set(ticks.get() + 1);
                     ticked.signal(());
                 })
-                .into(),
-            }],
-            before_each: Some(
-                (move |_: &mut Sensor, _: operation::Operation| log.set(log.get() + 1)).into(),
-            ),
-            after_each: None,
+                .unwrap(),
+            ],
+            before_each: move |_: &mut Sensor, _: operation::Operation| log.set(log.get() + 1),
+            after_each: (),
         },
-        options: AktorNewOptions { capacity: 1 },
+        capacity: NonZeroUsize::MIN,
+        stuck: AktorStuck::Kill,
     };
 
     let actors = aktor_start(AktorSetup {
+        stuck: aktor::AktorGroupStuck::KeepRunning,
         actors: setup,
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
-    })
-    .await
-    .unwrap();
+        grace: Duration::from_secs(5),
+    });
+    actors.ready().await.unwrap();
 
     interval_ready.wait().await;
     assert!(intervals.get() > 0);
-    assert!(record(&actors.handles, 0).await.is_err());
+    assert!(record(actors.handles(), 0).await.unwrap().is_err());
     assert_eq!(
-        record_many(&actors.handles, vec![4, 5])
+        record_many(actors.handles(), vec![4, 5])
             .await
-            .unwrap_report(),
+            .unwrap()
+            .er_unwrap(),
         2
     );
 
     let entered = Arc::new(Signal::new());
     let released = Arc::new(Signal::new());
     let prepared: SharedGate = Arc::new(Signal::new());
-    let caller = actors.handles.clone();
+    let caller = actors.handles().clone();
     let in_call = entered.clone();
     let release = released.clone();
     let queued = prepared.clone();
@@ -133,13 +126,13 @@ pub async fn check(spawner: Spawner) {
     let done = finished.clone();
     let caller = thread::spawn(move || {
         run(async move {
-            let mut held = hold_shared(&caller, in_call, release).send().await;
+            let mut held = hold_shared(&caller, in_call, release).send().await.unwrap();
             let timeout = held.timeout(Duration::from_millis(1)).await.unwrap_err();
 
             assert!(timeout.admitted);
             drop(held);
 
-            let ordinary = record(&caller, 2).send().await;
+            let ordinary = record(&caller, 2).send().await.unwrap();
 
             assert!(record(&caller, 3).send().now_or_never().is_none());
 
@@ -149,8 +142,8 @@ pub async fn check(spawner: Spawner) {
             input.send(10);
             input.send(11);
             queued.signal(());
-            assert!(output.next().await.unwrap().is_ok());
-            assert!(ordinary.await.is_ok());
+            assert!(output.next().await.unwrap().unwrap().is_ok());
+            assert!(ordinary.await.unwrap().is_ok());
             assert!(output.next().await.is_none());
             drop(input);
             done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -162,13 +155,10 @@ pub async fn check(spawner: Spawner) {
     actors.killswitch().stop();
     released.signal(());
 
-    let report = actors.shutdown().await;
+    let report = actors.stop().await;
 
     assert!(!report.failed(), "{report}");
-    assert_eq!(
-        report.actors[0].kind,
-        Some(AktorExecution::EmbassyCrossCore)
-    );
+    assert_eq!(report.actors[0].kind, AktorExecution::EmbassyCrossCore);
 
     while !finished.load(std::sync::atomic::Ordering::SeqCst) {
         Timer::after_millis(1).await;
@@ -178,22 +168,23 @@ pub async fn check(spawner: Spawner) {
     assert_eq!(*stored.borrow(), [4, 5, 1, 11, 2]);
     assert!(before.get() >= 6);
 
-    let (handle, owner) = cross_core::channel::<Sensor>(1).unwrap();
+    let (handle, owner) = cross_core::channel::<Sensor>(NonZeroUsize::MIN);
     let (input, mut output) = record::latest(&handle);
 
     assert!(output.next().now_or_never().is_none());
     drop(owner);
     assert!(handle.completion().await.is_err());
-    assert!(support::panics(output.next()).await);
+    assert!(output.next().await.unwrap().is_err());
+    assert!(output.next().await.is_none());
     drop(input);
     assert!(handle.downgrade().upgrade().is_none());
 
-    let (handle, owner) = cross_core::channel::<Sensor>(1).unwrap();
-    let mut request = record::request(&handle, 85);
+    let (handle, owner) = cross_core::channel::<Sensor>(NonZeroUsize::MIN);
+    let mut request = record(&handle, 85).into_future();
 
     assert!(support::poll(&mut request).is_pending());
 
-    let reply = request.send().await;
+    let reply = request.send().await.unwrap();
     let completion = handle.shutdown();
 
     owner
@@ -211,34 +202,29 @@ pub async fn check(spawner: Spawner) {
         .await
         .unwrap();
 
-    assert_eq!(reply.await.unwrap_report(), 1);
+    assert_eq!(reply.await.unwrap().er_unwrap(), 1);
     assert!(completion.await.is_ok());
 
     let actors = aktor_start(AktorSetup {
-        actors: aktor_setups! {
-            shared: shared_sensor_setup(spawner),
-            local: sensor_setup(spawner),
-        },
+        stuck: aktor::AktorGroupStuck::KeepRunning,
+        actors: (shared_sensor_setup(spawner), sensor_setup(spawner)),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
-    })
-    .await
-    .unwrap();
+        grace: Duration::from_secs(5),
+    });
+    actors.ready().await.unwrap();
 
-    assert_eq!(record(&actors.handles.local, 4).await.unwrap_report(), 1);
+    assert_eq!(record(&actors.handles().1, 4).await.unwrap().er_unwrap(), 1);
 
     let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let callers: Vec<_> = (0..4)
         .map(|caller| {
-            let handle = actors.handles.shared.clone();
+            let handle = actors.handles().0.clone();
             let done = done.clone();
 
             thread::spawn(move || {
                 run(async move {
                     for _ in 0..8 {
-                        record(&handle, caller + 1).await.unwrap_report();
+                        record(&handle, caller + 1).await.unwrap().er_unwrap();
                     }
 
                     done.fetch_add(1, Ordering::SeqCst);
@@ -256,23 +242,28 @@ pub async fn check(spawner: Spawner) {
     }
 
     assert_eq!(
-        record_many(&actors.handles.shared, vec![])
+        record_many(&actors.handles().0, vec![])
             .await
-            .unwrap_report(),
+            .unwrap()
+            .er_unwrap(),
         32
     );
 
-    let shared = actors.handles.shared.clone();
-    let (reply, owner) = (record(&shared, 85).send().await, actors.shutdown());
+    let shared = actors.handles().0.clone();
+    let (reply, owner) = (record(&shared, 85).send().await.unwrap(), actors.stop());
     let report = owner.await;
 
     assert!(!report.failed());
-    assert_eq!(reply.await.unwrap_report(), 33);
+    assert_eq!(reply.await.unwrap().er_unwrap(), 33);
     cancellation().await;
 }
 
 async fn shutdown_timeout() {
-    fn expired(future: impl Future<Output = Result<usize, AktorTimeoutError>>) {
+    fn expired(
+        future: impl Future<
+            Output = Result<Result<usize, aktor::AktorDeliveryError>, AktorTimeoutError>,
+        >,
+    ) {
         let mut timeout = Box::pin(future);
 
         assert!(support::poll(&mut timeout).is_pending());
@@ -287,7 +278,7 @@ async fn shutdown_timeout() {
             let group = aktor::embassy::AktorGroup::new();
             let readings = Rc::new(RefCell::new(Vec::new()));
             let stored = readings.clone();
-            let (handle, mut owner) = cross_core::channel::<Sensor>(1).unwrap();
+            let (handle, mut owner) = cross_core::channel::<Sensor>(NonZeroUsize::MIN);
 
             if managed {
                 owner.manage("closing sensor".into(), group.killswitch());
@@ -302,7 +293,7 @@ async fn shutdown_timeout() {
 
             let entered = Arc::new(Signal::new());
             let released = Arc::new(Signal::new());
-            let mut request = hold_shared(&handle, entered.clone(), released.clone());
+            let mut request = hold_shared(&handle, entered.clone(), released.clone()).into_future();
 
             assert!(support::poll(&mut request).is_pending());
             assert!(support::poll(&mut running).is_pending());
@@ -315,7 +306,7 @@ async fn shutdown_timeout() {
             }
 
             if reply_only {
-                expired(request.send().await.timeout(Duration::ZERO))
+                expired(request.send().await.unwrap().timeout(Duration::ZERO))
             } else {
                 expired(request.timeout(Duration::ZERO))
             }
@@ -327,16 +318,10 @@ async fn shutdown_timeout() {
             completed.await.unwrap();
 
             let waiting = record(&handle, 0).send();
-            if managed {
-                assert!(waiting.now_or_never().is_none());
-            } else {
-                assert!(
-                    std::panic::AssertUnwindSafe(waiting)
-                        .catch_unwind()
-                        .await
-                        .is_err()
-                );
-            }
+            assert_eq!(
+                waiting.await.err().unwrap().outcome,
+                aktor::AktorDeliveryOutcome::NotAdmitted
+            );
 
             assert_eq!(*readings.borrow(), [1]);
         }
@@ -347,14 +332,11 @@ async fn interval_delay() {
     let ticks = Rc::new(Cell::new(0));
     let tick = ticks.clone();
     let every = Duration::from_millis(100);
-    let (handle, mut owner) = cross_core::channel::<Sensor>(1).unwrap();
+    let (handle, mut owner) = cross_core::channel::<Sensor>(NonZeroUsize::MIN);
 
-    owner
-        .set_intervals(vec![(
-            every,
-            (async move |_: &mut Sensor| tick.set(tick.get() + 1)).into(),
-        )])
-        .unwrap();
+    owner.set_intervals(vec![
+        AktorInterval::new(every, async move |_: &mut Sensor| tick.set(tick.get() + 1)).unwrap(),
+    ]);
 
     let mut running = Box::pin(owner.run_with(
         async || {
@@ -372,7 +354,8 @@ async fn interval_delay() {
 
     let entered = Arc::new(Signal::new());
     let released = Arc::new(Signal::new());
-    let mut request = Box::pin(hold_shared(&handle, entered.clone(), released.clone()));
+    let mut request =
+        Box::pin(hold_shared(&handle, entered.clone(), released.clone()).into_future());
 
     assert!(support::poll(&mut request).is_pending());
     assert!(support::poll(&mut running).is_pending());
@@ -396,41 +379,33 @@ async fn cancellation() {
     let cleaned = Rc::new(Cell::new(false));
     let cleanup = cleaned.clone();
     let setup = AktorNew {
-        name: AktorName::new("cancelled shared sensor"),
-        role: AktorNoRole,
+        name: "cancelled shared sensor".into(),
         kind: AktorKind::EmbassyCrossCore(move |future| {
             *stored.borrow_mut() = Some(future);
-            Ok(())
+            Ok::<(), ((), String)>(())
         }),
-        closures: AktorClosures {
-            start: async || {
-                Ok::<_, AktorSetupError>(Sensor {
-                    readings: Rc::new(RefCell::new(Vec::new())),
-                })
-            },
-
-            end: async move |_: Sensor| {
-                cleanup.set(true);
-                Ok::<_, AktorCleanupError>(())
-            },
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
+        start: aktor::AktorInit::Ready(async || Sensor {
+            readings: Rc::new(RefCell::new(Vec::new())),
+        }),
+        end: async move |_: Sensor| {
+            cleanup.set(true);
         },
-        options: AktorNewOptions { capacity: 32 },
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::new(32).unwrap(),
+        stuck: AktorStuck::Kill,
     };
 
-    let startup = aktor_start(AktorSetup {
+    let actors = aktor_start(AktorSetup {
+        stuck: aktor::AktorGroupStuck::KeepRunning,
         actors: setup,
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_secs(5),
     });
-    let completion = startup.completion();
-    let mut startup = Box::pin(startup);
-    let actors = core::future::poll_fn(|cx| {
-        let result = startup.as_mut().poll(cx);
+    let completion = actors.completion();
+    let mut ready = Box::pin(actors.ready());
+
+    core::future::poll_fn(|cx| {
+        let result = ready.as_mut().poll(cx);
 
         if let Some(driver) = driver.borrow_mut().as_mut() {
             assert!(driver.as_mut().poll(cx).is_pending());
@@ -440,12 +415,14 @@ async fn cancellation() {
     })
     .await
     .unwrap();
+    drop(ready);
 
-    let (input, mut output) = record::latest(&actors.handles);
+    let (input, mut output) = record::latest(actors.handles());
     let entered = Arc::new(Signal::new());
-    let mut reply = hold_shared(&actors.handles, entered.clone(), Arc::new(Signal::new()))
+    let reply = hold_shared(actors.handles(), entered.clone(), Arc::new(Signal::new()))
         .send()
-        .await;
+        .await
+        .unwrap();
 
     assert!(
         driver
@@ -459,26 +436,22 @@ async fn cancellation() {
     entered.wait().await;
     drop(driver.borrow_mut().take());
 
-    let report = completion.await;
+    let report = completion.await.unwrap();
 
     assert!(report.failed());
     assert!(!cleaned.get());
-    assert!(support::poll(&mut reply).is_pending());
-
-    let mut timeout = Box::pin(reply.timeout(Duration::ZERO));
-
-    assert!(support::poll(&mut timeout).is_pending());
-    let Poll::Ready(Err(_)) = support::poll(&mut timeout) else {
-        panic!("reply did not time out after its driver stopped");
-    };
-    drop(timeout);
-    assert!(output.next().now_or_never().is_none());
+    assert_eq!(
+        reply.await.unwrap_err().failure_id,
+        Some(report.failures[0].id)
+    );
+    assert!(output.next().await.unwrap().is_err());
+    assert!(output.next().await.is_none());
     drop(input);
 }
 
 async fn callbacks() {
     struct Reenter {
-        input: record::LatestSender<cross_core::LatestSender<(u32,)>>,
+        input: record::Sender<cross_core::LatestSender<(u32,)>>,
         sent: std::sync::atomic::AtomicBool,
     }
     impl Wake for Reenter {
@@ -493,7 +466,7 @@ async fn callbacks() {
         }
     }
     struct DropSender {
-        _input: record::LatestSender<cross_core::LatestSender<(u32,)>>,
+        _input: record::Sender<cross_core::LatestSender<(u32,)>>,
         dropped: Arc<std::sync::atomic::AtomicBool>,
     }
     // This waker tests destruction, including the sender it owns.
@@ -508,7 +481,7 @@ async fn callbacks() {
         }
     }
 
-    let (handle, owner) = cross_core::channel::<Sensor>(1).unwrap();
+    let (handle, owner) = cross_core::channel::<Sensor>(NonZeroUsize::MIN);
     let (input, mut output) = record::latest(&handle);
     let waker = Waker::from(Arc::new(Reenter {
         input: input.clone(),
@@ -555,7 +528,7 @@ async fn callbacks() {
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending()
     );
-    assert_eq!(output.next().await.unwrap().unwrap_report(), 1);
+    assert_eq!(output.next().await.unwrap().unwrap().er_unwrap(), 1);
 
     let complete = handle.shutdown();
 
@@ -564,8 +537,8 @@ async fn callbacks() {
 }
 
 async fn reply_wake() {
-    let (handle, owner) = cross_core::channel::<Sensor>(1).unwrap();
-    let mut reply = record(&handle, 1).send().await;
+    let (handle, owner) = cross_core::channel::<Sensor>(NonZeroUsize::MIN);
+    let mut reply = record(&handle, 1).send().await.unwrap();
 
     assert!(reply.try_take().is_none());
 
@@ -597,7 +570,7 @@ async fn reply_wake() {
         count.0.load(Ordering::Relaxed) > 0,
         "try_take replaced the shared reply waker"
     );
-    assert_eq!(reply.try_take().unwrap().unwrap_report(), 1);
+    assert_eq!(reply.try_take().unwrap().unwrap().er_unwrap(), 1);
     assert!(reply.try_take().is_none());
     completed.await.unwrap();
 }
@@ -606,14 +579,11 @@ async fn interval_fairness() {
     let every = Duration::from_millis(1);
     let ticks = Rc::new(Cell::new(0));
     let tick = ticks.clone();
-    let (handle, mut owner) = cross_core::channel::<Sensor>(4).unwrap();
+    let (handle, mut owner) = cross_core::channel::<Sensor>(NonZeroUsize::new(4).unwrap());
 
-    owner
-        .set_intervals(vec![(
-            every,
-            (async move |_: &mut Sensor| tick.set(tick.get() + 1)).into(),
-        )])
-        .unwrap();
+    owner.set_intervals(vec![
+        AktorInterval::new(every, async move |_: &mut Sensor| tick.set(tick.get() + 1)).unwrap(),
+    ]);
 
     let entered = Arc::new(Signal::new());
     let release = Arc::new(Signal::new());
@@ -634,7 +604,8 @@ async fn interval_fairness() {
         replies.push(
             hold_shared(&handle, entered.clone(), release.clone())
                 .send()
-                .await,
+                .await
+                .unwrap(),
         );
     }
 
@@ -658,7 +629,7 @@ async fn interval_fairness() {
             assert!(support::poll(&mut running).is_pending());
 
             if let Poll::Ready(Some(result)) = support::poll(Box::pin(results.next())) {
-                result.unwrap_report();
+                result.unwrap().er_unwrap();
                 ran_latest = index < 3;
                 break;
             }
@@ -679,7 +650,7 @@ async fn interval_fairness() {
     .unwrap();
 
     for reply in replies {
-        reply.await;
+        reply.await.unwrap();
     }
 
     drop(input);
@@ -692,17 +663,14 @@ async fn interval_fairness() {
 
     let ticks = Rc::new(Cell::new(0));
     let tick = ticks.clone();
-    let (handle, mut owner) = cross_core::channel::<Sensor>(1).unwrap();
+    let (handle, mut owner) = cross_core::channel::<Sensor>(NonZeroUsize::MIN);
 
-    owner
-        .set_intervals(vec![(
-            every,
-            (async move |_: &mut Sensor| {
-                tick.set(tick.get() + 1);
-            })
-            .into(),
-        )])
-        .unwrap();
+    owner.set_intervals(vec![
+        AktorInterval::new(every, async move |_: &mut Sensor| {
+            tick.set(tick.get() + 1);
+        })
+        .unwrap(),
+    ]);
 
     let mut running = Box::pin(owner.run_with(
         async || {
@@ -731,7 +699,7 @@ async fn interval_fairness() {
     running.await.unwrap();
 }
 
-async fn stopping_startup() {
+async fn stopping_startup(finish: bool) {
     let driver = Rc::new(RefCell::new(None));
     let stored = driver.clone();
     let entered = Rc::new(Signal::<NoopRawMutex, ()>::new());
@@ -740,62 +708,58 @@ async fn stopping_startup() {
     let gate = release.clone();
     let cleaned = Rc::new(Cell::new(0));
     let end = cleaned.clone();
-    let startup = aktor_start(AktorSetup {
+    let started = aktor_start(AktorSetup {
+        stuck: aktor::AktorGroupStuck::KeepRunning,
         actors: AktorNew {
-            name: AktorName::new("stopping shared setup"),
-            role: AktorNoRole,
+            name: "stopping shared setup".into(),
             kind: AktorKind::EmbassyCrossCore(move |future| {
                 *stored.borrow_mut() = Some(future);
-                Ok(())
+                Ok::<(), ((), String)>(())
             }),
-            closures: AktorClosures {
-                start: async move || {
-                    begin.signal(());
-                    gate.wait().await;
-                    Ok::<_, AktorSetupError>(0_u32)
-                },
-                end: async move |_: u32| {
-                    end.set(end.get() + 1);
-                    Ok::<_, AktorCleanupError>(())
-                },
-
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
+            start: aktor::AktorInit::Ready(async move || {
+                begin.signal(());
+                gate.wait().await;
+                0_u32
+            }),
+            end: async move |_: u32| {
+                end.set(end.get() + 1);
             },
-            options: AktorNewOptions { capacity: 32 },
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: Duration::from_secs(5),
-        },
+        grace: Duration::from_millis(20),
     });
 
-    let kill = startup.killswitch();
-    let completion = startup.completion();
-    let mut startup = Box::pin(startup);
+    let kill = started.killswitch();
+    let completion = started.completion();
+    let mut ready = Box::pin(started.ready());
 
-    assert!(support::poll(&mut startup).is_pending());
+    assert!(support::poll(&mut ready).is_pending());
     assert!(support::poll(driver.borrow_mut().as_mut().unwrap()).is_pending());
     entered.wait().await;
     kill.stop();
-    release.signal(());
+    if finish {
+        release.signal(());
+    }
 
     let result = poll_fn(|cx| {
         if let Some(driver) = driver.borrow_mut().as_mut() {
             let _result = driver.as_mut().poll(cx);
         }
 
-        startup.as_mut().poll(cx)
+        ready.as_mut().poll(cx)
     })
     .await;
 
-    assert!(result.is_err(), "stopping shared setup returned a handle");
+    assert!(result.is_err(), "stopping startup came back ready");
 
-    let report = completion.await;
+    let report = completion.await.unwrap();
 
-    assert!(!report.timed_out, "{report}");
-    assert_eq!(cleaned.get(), 1);
+    assert!(report.released(), "{report}");
+    assert_eq!(report.ran_past_grace(), !finish);
+    assert_eq!(cleaned.get(), u32::from(finish));
 }
 
 async fn startup_origin() {
@@ -808,39 +772,33 @@ async fn startup_origin() {
             .on_shutdown(move |report| *observed.borrow_mut() = Some(report))
             .unwrap();
 
-        let mut driver = Box::pin(group.listen().unwrap());
+        let mut driver = Box::pin(group.listen(async |_| ()).unwrap());
         let release = Rc::new(Signal::<NoopRawMutex, ()>::new());
         let gate = release.clone();
-        let mut opening = Box::pin(aktor_start_in(
-            &group,
-            AktorNew {
-                name: AktorName::new("bad settings"),
-                role: AktorNoRole,
-                kind: AktorKind::EmbassyCrossCore(|_| Ok(())),
-                closures: AktorClosures {
-                    start: async move || {
-                        gate.wait().await;
-                        Err::<u32, _>(AktorSetupError::new("invalid settings", ()))
-                    },
-                    end: (),
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
-                },
-                options: Default::default(),
-            },
-        ));
+        let spawned = group.spawn(AktorNew {
+            name: "bad settings".into(),
+            kind: AktorKind::EmbassyCrossCore(|_| Ok::<(), ((), String)>(())),
+            start: aktor::AktorInit::Try(async move || {
+                gate.wait().await;
+                Err::<u32, _>(((), String::from("invalid settings")))
+            }),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
+        });
+        let mut opening = Box::pin(spawned.ready());
 
         assert!(support::poll(&mut opening).is_pending());
         assert!(support::poll(&mut driver).is_pending());
 
         if runtime_failure {
-            group.killswitch().fail(aktor::AktorFailureReport {
-                actor: "existing actor".into(),
-                kind: Some(AktorExecution::EmbassyCrossCore),
-                phase: "operation".into(),
-                message: "earlier runtime failure".into(),
-            });
+            group.killswitch().fail(aktor::AktorFailureInput::actor(
+                "existing actor".into(),
+                AktorExecution::EmbassyCrossCore,
+                aktor::AktorPhase::Runner,
+                "earlier runtime failure".into(),
+            ));
         }
 
         release.signal(());
@@ -854,7 +812,86 @@ async fn startup_origin() {
         .unwrap();
         let notification = notification.borrow_mut().take().unwrap();
 
-        assert_eq!(notification.startup, !runtime_failure, "{notification}");
-        assert_eq!(error.report.unwrap().startup, notification.startup);
+        assert_eq!(
+            matches!(notification.stop_cause, aktor::StopCause::StartupFailure(_)),
+            !runtime_failure,
+            "{notification}"
+        );
+        assert_eq!(
+            matches!(
+                error
+                    .0
+                    .startup()
+                    .unwrap()
+                    .report
+                    .as_ref()
+                    .unwrap()
+                    .stop_cause,
+                aktor::StopCause::StartupFailure(_)
+            ),
+            matches!(notification.stop_cause, aktor::StopCause::StartupFailure(_))
+        );
     }
+}
+
+// A call that never finishes gets cut after the grace, and `end` still runs.
+async fn stuck_call_end(spawner: Spawner) {
+    let ended = Rc::new(Cell::new(false));
+    let cleaned = ended.clone();
+    let setup = AktorNew {
+        name: "stuck sensor".into(),
+        kind: AktorKind::EmbassyCrossCore(move |future| {
+            spawner.spawn(setup_driver(future).er(())?);
+            Ok::<(), (crate::SpawnDriverErr, String)>(())
+        }),
+        start: aktor::AktorInit::Ready(async || Sensor {
+            readings: Rc::new(RefCell::new(Vec::new())),
+        }),
+        end: async move |_: Sensor| {
+            cleaned.set(true);
+        },
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::MIN,
+        stuck: AktorStuck::Kill,
+    };
+
+    let actors = aktor_start(AktorSetup {
+        stuck: aktor::AktorGroupStuck::KeepRunning,
+        actors: setup,
+        shutdown: |_| {},
+        grace: Duration::from_millis(10),
+    });
+    actors.ready().await.unwrap();
+
+    let entered = Arc::new(Signal::new());
+    let never: SharedGate = Arc::new(Signal::new());
+    let caller = actors.handles().clone();
+    let in_call = entered.clone();
+    let caller = thread::spawn(move || {
+        run(async move {
+            let mut held = hold_shared(&caller, in_call, never).send().await.unwrap();
+            held.timeout(Duration::from_secs(3))
+                .await
+                .unwrap()
+                .unwrap_err()
+        })
+    });
+
+    entered.wait().await;
+    let report = actors.stop().await;
+
+    assert!(
+        ended.get(),
+        "end didn't run after the stuck call was cut: {report}"
+    );
+    assert!(
+        report.ran_past_grace(),
+        "the cut call should show in the report: {report}"
+    );
+
+    let delivery = caller.join().unwrap();
+    assert_eq!(
+        delivery.outcome,
+        aktor::AktorDeliveryOutcome::OutcomeUnknown
+    );
 }

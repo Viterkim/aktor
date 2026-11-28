@@ -2,11 +2,11 @@ use super::*;
 use crate::dispatch::{CallOutput, Read, ReadOpaque, Write, WriteOpaque};
 use core::ops::AsyncFnOnce;
 
-impl<'a, S: 'static, const N: usize, E, I: 'static, Role, Clock> ReadOpaque<S, I, Role>
-    for &'a Handle<S, N, E, Role, Clock>
+impl<'a, S: 'static, I: 'static, Role, Clock> ReadOpaque<S, I, Role>
+    for &'a Handle<S, Role, Clock>
 {
     type Output<Fut: Future>
-        = Request<'a, S, N, E, <Fut::Output as CallOutput>::Output, Role, Clock>
+        = Request<'a, S, <Fut::Output as CallOutput>::Output, Role, Clock>
     where
         Fut::Output: CallOutput;
 
@@ -27,11 +27,11 @@ impl<'a, S: 'static, const N: usize, E, I: 'static, Role, Clock> ReadOpaque<S, I
     }
 }
 
-impl<'a, S: 'static, const N: usize, E, I: 'static, Role, Clock> WriteOpaque<S, I, Role>
-    for &'a Handle<S, N, E, Role, Clock>
+impl<'a, S: 'static, I: 'static, Role, Clock> WriteOpaque<S, I, Role>
+    for &'a Handle<S, Role, Clock>
 {
     type Output<Fut: Future>
-        = Request<'a, S, N, E, <Fut::Output as CallOutput>::Output, Role, Clock>
+        = Request<'a, S, <Fut::Output as CallOutput>::Output, Role, Clock>
     where
         Fut::Output: CallOutput;
 

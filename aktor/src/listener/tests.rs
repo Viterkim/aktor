@@ -1,5 +1,8 @@
 use super::*;
-use crate::message::call;
+use crate::latest::{SendLatest, Session};
+use crate::message::{LatestSender, call};
+use crate::queue;
+use core::num::NonZeroUsize;
 use futures_util::FutureExt;
 use std::{
     future::Future,
@@ -21,6 +24,7 @@ impl Wake for ReenterAdmission {
             call(&self.handle, |state, ()| *state += 1, ())
                 .cast()
                 .now_or_never()
+                .unwrap()
                 .unwrap();
         }
     }
@@ -28,106 +32,110 @@ impl Wake for ReenterAdmission {
 
 #[tokio::test]
 async fn reentrant_wake() {
-    let (handle, mut listener) = spawn::channel::<usize>(2).unwrap();
+    let (handle, mut mailbox) = queue::channel(NonZeroUsize::new(2).unwrap()).unwrap();
+    let handle = Handle::<usize>::new(handle);
     let wake = Arc::new(ReenterAdmission {
-        handle: handle.new_handle(),
+        handle: handle.clone(),
         called: AtomicBool::new(false),
     });
     let waker = Waker::from(wake.clone());
 
-    let mut receiver = Box::pin(listener.recv());
+    let mut receiver = Box::pin(mailbox.receiver.recv());
 
     assert!(matches!(
         receiver.as_mut().poll(&mut Context::from_waker(&waker)),
         Poll::Pending
     ));
 
-    call(&handle, |state, ()| *state += 1, ()).cast().await;
+    call(&handle, |state, ()| *state += 1, ())
+        .cast()
+        .await
+        .unwrap();
 
     drop(receiver);
 
     let mut state = 0;
 
     for _ in 0..2 {
-        listener.try_recv().unwrap().run(&mut state).await;
+        mailbox.receiver.try_recv().unwrap().run(&mut state).await;
     }
 
     assert_eq!(state, 2);
 }
 
+#[test]
+fn capacity() {
+    let max = tokio::sync::Semaphore::MAX_PERMITS;
+
+    assert!(matches!(
+        queue::channel::<()>(NonZeroUsize::new(max + 1).unwrap()),
+        Err(crate::message::AktorStateError::CapacityTooLarge)
+    ));
+
+    for capacity in [1, max] {
+        assert!(queue::channel::<()>(NonZeroUsize::new(capacity).unwrap()).is_ok());
+    }
+}
+
+struct LatestWake {
+    sender: LatestSender<usize>,
+    entered: AtomicBool,
+}
+impl Wake for LatestWake {
+    fn wake(self: Arc<Self>) {
+        if !self.entered.swap(true, Ordering::SeqCst) {
+            self.sender.send(2);
+        }
+    }
+}
+
 #[tokio::test]
-#[cfg(feature = "tokio")]
-async fn failed_owner_permit() {
-    let executor = tokio::task::LocalSet::new();
+async fn latest_wake() {
+    let (inner, mut mailbox) = queue::channel(NonZeroUsize::MIN).unwrap();
+    let handle = Handle::<usize>::new(inner);
+    let (sender, mut output) = (&handle).session(
+        crate::operation::Operation {
+            name: "callback",
+            caller: std::panic::Location::caller(),
+        },
+        async |state, input: usize| {
+            *state = input;
+            input
+        },
+    );
 
-    executor
-        .run_until(async {
-            let (handle, task) =
-                spawn::spawn_local_with_policy(&executor, 0usize, 2, FailurePolicy::Unwind)
-                    .unwrap();
-            let permit = handle.inner.sender.reserve().await.unwrap();
+    let wake = Arc::new(LatestWake {
+        sender: sender.clone(),
+        entered: AtomicBool::new(false),
+    });
+    let waker = Waker::from(wake.clone());
+    let mut receiver = Box::pin(mailbox.receiver.recv());
 
-            call(&handle, |_, ()| panic!("operation failed"), ())
-                .cast()
-                .await;
+    assert!(
+        receiver
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
 
-            assert!(task.await.is_err());
-            drop(permit);
+    sender.send(1);
+    drop(receiver);
 
-            let (handle, thread) =
-                spawn::spawn_thread_with_policy(0usize, 2, FailurePolicy::Unwind).unwrap();
-            let permit = handle.inner.sender.reserve().await.unwrap();
+    let mut state = 0;
 
-            call(&handle, |_, ()| panic!("operation failed"), ())
-                .cast()
-                .await;
+    mailbox.receiver.try_recv().unwrap().run(&mut state).await;
+    assert_eq!(output.next().await, Some(Ok(2)));
+    assert!(mailbox.receiver.try_recv().is_err());
+}
 
-            assert!(thread.join_async().await.is_err());
-            drop(permit);
+#[test]
+fn secondary_panic_payload() {
+    struct BrokenDrop;
+    impl Drop for BrokenDrop {
+        fn drop(&mut self) {
+            panic!("secondary payload destructor");
+        }
+    }
 
-            let (handle, _, thread) = lifecycle::spawn::spawn(SpawnArgs {
-                name: "permit".into(),
-                capacity: 2,
-                failure: FailurePolicy::Unwind,
-                setup: || Ok::<_, ()>(0usize),
-                cleanup: |_| Ok::<_, ()>(()),
-            })
-            .await
-            .unwrap();
-
-            let permit = handle.inner.sender.reserve().await.unwrap();
-
-            call(&handle, |_, ()| panic!("operation failed"), ())
-                .cast()
-                .await;
-
-            assert!(thread.join_async().await.is_err());
-            drop(permit);
-
-            let (handle, thread) = spawn::spawn_runner(
-                SpawnArgs {
-                    name: "custom permit".into(),
-                    capacity: 2,
-                    failure: FailurePolicy::Unwind,
-                    setup: || Ok::<_, ()>(0usize),
-                    cleanup: |_, _: Result<(), RunError<()>>| (),
-                },
-                |listener, state| {
-                    listener.serve_blocking(state);
-                    Ok(())
-                },
-            )
-            .await
-            .unwrap();
-
-            let permit = handle.inner.sender.reserve().await.unwrap();
-
-            call(&handle, |_, ()| panic!("operation failed"), ())
-                .cast()
-                .await;
-
-            assert!(thread.join_async().await.is_err());
-            drop(permit);
-        })
-        .await
+    crate::panic::dispose_secondary(Box::new(BrokenDrop));
 }

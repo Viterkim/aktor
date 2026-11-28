@@ -1,6 +1,9 @@
+mod impls;
+
 use crate::{
-    AktorRetryOpts, CallError, Cause, Error, Request,
-    connection::{Address, Stream},
+    AktorDeliveryOutcome, AktorRetryOptions, Cause, Request,
+    connection::{Address, BufferedStream, Stream, idle},
+    request::RetryOptionsErr,
     wire::{self, Message},
 };
 use aktor::{
@@ -8,48 +11,61 @@ use aktor::{
     operation::Operation,
     worker::{Codec, Operations},
 };
+use er::*;
+use impls::AttemptErr;
+pub use impls::ClientOptionsError;
 use std::{marker::PhantomData, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, oneshot, watch},
-    time::{Instant, sleep, sleep_until, timeout},
+    time::{Instant, sleep, sleep_until},
 };
-
-mod impls;
 
 #[derive(Clone, Debug)]
 pub struct ClientOptions {
-    /// Change on both sides when a transported type changes its wire layout.
+    /// Change this on both sides when a type's wire layout changes.
     pub build: String,
-    /// Includes queueing, reconnecting and waiting for the reply.
+    /// Time for queueing, reconnecting and waiting for the reply.
     pub timeout: Duration,
     pub retry_delay: Duration,
     pub max_frame: usize,
 }
 
 pub struct Client<S, Role = ()> {
-    pub inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
     state: PhantomData<fn() -> (S, Role)>,
 }
 
-pub struct Inner {
+pub(crate) struct Inner {
     address: Address,
     pub options: ClientOptions,
     operations: Operations,
+    pub frames: crate::wire::FrameReader,
     #[cfg(feature = "udp")]
     udp: tokio::sync::OnceCell<crate::udp::Socket>,
     connection: Mutex<Connection>,
 }
 
 struct Connection {
-    stream: Option<Active>,
+    idle: Vec<Active>,
     next: u64,
 }
 
-pub struct Active {
-    pub stream: Stream,
-    pub max_frame: usize,
+// Each idle connection reserves a slot on the server.
+const IDLE: usize = 4;
+
+enum Tried {
+    Answered(ErResult<Vec<u8>, AttemptErr>),
+    Options(ErTree<RetryOptionsErr>),
+    Elapsed,
 }
 
-pub async fn connect<S: 'static>(address: impl Into<Address>) -> Result<Client<S>, Error> {
-    Client::connect_with(address, ClientOptions::default()).await
+pub(crate) struct Active {
+    pub stream: BufferedStream,
+    pub max_frame: usize,
+    pub compress: bool,
+}
+
+struct Exchange<'a> {
+    client: &'a Inner,
+    active: Option<Active>,
 }

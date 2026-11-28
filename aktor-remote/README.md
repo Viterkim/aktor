@@ -1,14 +1,16 @@
 # Aktor remote
 
-Your service owns the resource. Other processes call its functions over Unix sockets, TCP or UDP. Runs on Unix with Tokio.
+`aktor-remote` is remote IPC with the same patterns as normal `aktor`, letting one service own a resource while other processes call its functions over Unix sockets, TCP or UDP/uTP (Unix + Tokio).
 
 ```toml
-aktor-remote = "0.0.12"
+[dependencies]
+aktor = { version = "0.0.13", features = ["tokio"] }
+aktor-remote = "0.0.13"
 ```
 
 ## Shared functions
 
-Put the functions in a crate the server and client both use:
+Your `#[aktor(remote)]` functions can live in a shared crate that both the server and client depend on:
 
 ```rust
 #[aktor(remote)]
@@ -18,50 +20,68 @@ pub async fn set_target(power: &mut PowerManager, target: i32) -> i32 {
 }
 ```
 
-Derive AktorData on your argument and result types. Plain #[aktor] helpers stay local.
+Your own arg and reply types just need `#[derive(AktorData)]`, and normal `#[aktor]` functions stay local only.
 
 ## Server
 
-Start the actor as usual, then let clients use it:
+Start the actor and wait for it to open before accepting clients.
 
 ```rust
-let actors = aktor_start(power_setup).await?;
-let server = Server::listen_with("/run/power.sock", &actors.handles, ServerOptions {
+let power = aktor_start(AktorSetup {
+    stuck: aktor::AktorGroupStuck::KeepRunning,
+    actors: power_setup,
+    shutdown: |report| eprintln!("{report}"),
+    grace: Duration::from_secs(5),
+});
+power.ready().await?;
+
+let socket = Address::Unix(aktor_remote::UnixListenerOptions { path: "/run/power.sock".into(), permissions: 0o600 });
+let server = Server::listen(socket, power.handles(), ServerOptions {
     build: "power-v1".into(),
-    ..Default::default()
+    max_frame: 4 * 1024 * 1024,
+    max_connections: core::num::NonZeroUsize::new(32).unwrap(),
+    shutdown_timeout: Duration::from_secs(5),
+    io_timeout: Duration::from_secs(5),
 }).await?;
 ```
 
-All clients queue on that actor. Await server.shutdown() before actors.shutdown() so clients stop submitting work before the actor closes.
+The server example uses `From<(E, String)>` on its application error so `?` carries both startup and listen failures to `main`, where it prints the report once. [Server example](../integrations/remote/src/bin/server.rs)
+
+Every connected client queues work on the same actor. Pass a testing `Mock` to the same listener to run those calls against its handlers.
+
+Call `server.shutdown().await?` before stopping the actor group to let admitted work finish. On failure, `ServerError::Shutdown { failures }` contains each failed cast, session and listener error since startup. The accompanying report keeps the details.
 
 ## Client
 
 ```rust
-let power = Client::<PowerManager>::with_options("/run/power.sock", ClientOptions {
+let socket = Address::Unix("/run/power.sock".into());
+let power = Client::<PowerManager>::new(socket, ClientOptions {
     build: "power-v1".into(),
-    ..Default::default()
+    timeout: Duration::from_secs(5),
+    retry_delay: Duration::from_millis(100),
+    max_frame: 4 * 1024 * 1024,
 })?;
 
 let target = set_target(&power, 10).await?;
 ```
 
-The ? is for delivery. Use .await?? for a function returning Result.
+A delivery failure gives you an `AktorDeliveryError`. Its `outcome` tells you whether the call was refused, discarded, or might have run. If the owner failed, the report and `failure_id` identify that failure on the server. A successful delivery gives you whatever your function returned, including its own `Result`. A latest stream ends after a delivery error. Open a new session on the same client to send updates to a replacement owner.
 
-Calls connect as needed and get one attempt with five seconds. To retry:
+The first call opens the connection. Each call gets one attempt with the timeout in `ClientOptions`. Give it more attempts when the operation is safe to repeat.
 
 ```rust
 let target = set_target(&power, 10)
-    .retry(AktorRetryOpts {
-        attempts: 4,
+    .retry(AktorRetryOptions {
+        attempts: core::num::NonZeroUsize::new(4).unwrap(),
         timeout: Duration::from_secs(5),
     })
     .await?;
 ```
 
-That's four attempts including the first call. A lost reply can mean the work already ran, so retrying can run it twice. The function's own errors don't trigger retries.
+`attempts` includes the first try, and a lost reply can mean the call already ran so retries might run it again (your function's own `Err` doesn't trigger a retry).
 
 ## TCP / UDP
 
-Pass Address::Tcp("127.0.0.1:4700".parse()?) on both sides. Address::Udp uses reliable, ordered uTP and needs the udp feature. Neither provides TLS or authentication. Unix sockets default to 0600 permissions.
+For TCP you can pass `Address::Tcp("127.0.0.1:4700".parse()?)` on both sides, or `Address::Udp` for reliable ordered uTP (needs the `udp` feature). Neither TCP nor uTP has TLS or auth, and `ServerOptions.permissions` sets the Unix socket mode.
 
-Change build on both sides when you change transported types, the handshake can't detect reordered fields. The server needs every remote function the client links for that state and role.
+Whenever you change wire types you should bump `build` on both sides (the handshake checks function names and types, but reordering fields can still change the bytes).

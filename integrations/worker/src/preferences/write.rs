@@ -2,7 +2,7 @@ use super::StorageError;
 use aktor::*;
 use rusqlite::Connection;
 
-#[aktor]
+#[aktor(latest)]
 pub async fn write(
     db: &mut Connection,
     key: String,

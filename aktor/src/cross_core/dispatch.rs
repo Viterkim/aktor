@@ -12,7 +12,9 @@ impl<S: 'static, Role> ReadState<S, Role> for &Handle<S, Role> {
 impl<S: 'static, Role> WriteState<S, Role> for &Handle<S, Role> {
     type Lease = OwnedState<S>;
 }
-impl<'a, S: 'static, I: 'static, O: 'static, Role> ReadCall<S, I, O, Role> for &'a Handle<S, Role> {
+impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> ReadCall<S, I, O, Role>
+    for &'a Handle<S, Role>
+{
     type Request<Fut> = Request<'a, S, I, O, Role>;
 
     fn dispatch<F, Fut>(
@@ -29,7 +31,7 @@ impl<'a, S: 'static, I: 'static, O: 'static, Role> ReadCall<S, I, O, Role> for &
         Request::new(self, operation, Box::new(ReadBody(function)), input)
     }
 }
-impl<'a, S: 'static, I: 'static, O: 'static, Role> WriteCall<S, I, O, Role>
+impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> WriteCall<S, I, O, Role>
     for &'a Handle<S, Role>
 {
     type Request<Fut> = Request<'a, S, I, O, Role>;

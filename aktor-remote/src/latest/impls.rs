@@ -21,7 +21,7 @@ impl<I> SendLatest<I> for LatestSender<I> {
 }
 
 impl<I, O> LatestResults<I, O> {
-    pub async fn next(&mut self) -> Option<Result<O, Error>> {
+    pub async fn next(&mut self) -> Option<Result<O, aktor::AktorDeliveryError>> {
         poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
     }
 
@@ -40,46 +40,81 @@ impl<I, O> LatestResults<I, O> {
         self.shared.lock().output.is_some()
     }
 }
+fn public<O>(output: ErResult<O, LatestErr>) -> Result<O, aktor::AktorDeliveryError> {
+    match output {
+        Ok(value) => Ok(value),
+        Err(error) => Err(aktor::AktorDeliveryError {
+            failure_id: error.top.failure_id,
+            outcome: error.top.outcome,
+            report: error.er_report(),
+        }),
+    }
+}
+
 impl<I, O> futures_core::Stream for LatestResults<I, O> {
-    type Item = Result<O, Error>;
+    type Item = Result<O, aktor::AktorDeliveryError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let replacement = cx.waker().clone();
-        if let Some(driver) = self.driver.as_mut()
-            && let Poll::Ready(result) = Pin::new(driver).poll(cx)
-        {
-            self.driver = None;
-            if let Err(error) = result {
-                let outcome = self
-                    .shared
-                    .pending()
-                    .map_or(CallError::NotAdmitted, |update| update.outcome);
-                self.shared
-                    .fail(Error::new(outcome, Cause::Closed, error.to_string()));
-            }
-        }
-
-        let mut slot = self.shared.lock();
-
-        if let Some(output) = slot.output.take() {
-            return Poll::Ready(Some(output));
-        }
-        if slot.finished {
-            return Poll::Ready(None);
-        }
-
-        let previous = slot.wake.replace(replacement);
-        drop(slot);
-        drop(previous);
-        Poll::Pending
+        let this = self.as_mut().get_mut();
+        this.receipt
+            .poll(cx, |cx| {
+                poll_output(&this.shared, &mut this.driver, cx).map(Option::transpose)
+            })
+            .map(Result::transpose)
     }
+}
+
+fn poll_output<I, O>(
+    shared: &Shared<I, O>,
+    driver: &mut Option<tokio::task::JoinHandle<()>>,
+    cx: &mut Context<'_>,
+) -> Poll<Option<Result<O, aktor::AktorDeliveryError>>> {
+    let replacement = cx.waker().clone();
+    if let Some(task) = driver.as_mut()
+        && let Poll::Ready(result) = Pin::new(task).poll(cx)
+    {
+        *driver = None;
+
+        if let Err(error) = result {
+            shared.fail(er_new!(
+                LatestErr {
+                    failure_id: None,
+                    outcome: AktorDeliveryOutcome::NotAdmitted,
+                    cause: Cause::Closed,
+                    msg: "latest driver stopped"
+                },
+                error
+            ));
+        }
+    }
+
+    let mut slot = shared.lock();
+
+    if let Some(output) = slot.output.take() {
+        return Poll::Ready(Some(public(output)));
+    }
+    if let Some(error) = slot.terminal.take() {
+        return Poll::Ready(Some(public(Err(error))));
+    }
+    if slot.finished {
+        return Poll::Ready(None);
+    }
+
+    let previous = slot.wake.replace(replacement);
+    drop(slot);
+    drop(previous);
+    Poll::Pending
 }
 impl<I, O> Drop for LatestResults<I, O> {
     fn drop(&mut self) {
         let discarded = {
             let mut slot = self.shared.lock();
             slot.receiver = false;
-            (slot.pending.take(), slot.output.take())
+            (
+                slot.pending.take(),
+                slot.output.take(),
+                slot.terminal.take(),
+            )
         };
         self.shared.changed.notify_one();
         self.shared.cancel.notify_one();
@@ -89,7 +124,7 @@ impl<I, O> Drop for LatestResults<I, O> {
 
 impl<I: Send, O: Send> Input<I> for Inputs<I, O> {
     fn send(&self, input: I) {
-        let discarded = {
+        let (pending, output, wake) = {
             let mut slot = self.shared.lock();
             if !slot.receiver || slot.finished {
                 return;
@@ -100,27 +135,50 @@ impl<I: Send, O: Send> Input<I> for Inputs<I, O> {
             };
             slot.revision = revision;
             let options = slot.options;
-            let update = Pending {
-                input: Some(input),
-                update: Update {
-                    revision,
-                    input: None,
-                    deadline: Instant::now()
-                        .checked_add(options.timeout)
-                        .unwrap_or_else(Instant::now),
-                    outcome: CallError::NotAdmitted,
-                    uncertain: false,
-                    attempts: 0,
-                    options,
-                },
-            };
-            (slot.pending.replace(update), slot.output.take())
+            match options.deadline(Instant::now()) {
+                Ok(deadline) => {
+                    let update = Pending {
+                        input: Some(input),
+                        update: Update {
+                            revision,
+                            input: None,
+                            deadline,
+                            outcome: AktorDeliveryOutcome::NotAdmitted,
+                            uncertain: false,
+                            attempts: 0,
+                            options,
+                        },
+                    };
+                    (slot.pending.replace(update), slot.output.take(), None)
+                }
+                Err(error) => {
+                    let error = er_new!(
+                        LatestErr {
+                            failure_id: None,
+                            outcome: AktorDeliveryOutcome::NotAdmitted,
+                            cause: Cause::Protocol,
+                            msg: "check retry options"
+                        },
+                        error
+                    );
+
+                    slot.finished = true;
+                    (
+                        slot.pending.take(),
+                        slot.output.replace(Err(error)),
+                        slot.wake.take(),
+                    )
+                }
+            }
         };
         self.shared.changed.notify_one();
-        drop(discarded);
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+        drop((pending, output));
     }
 
-    fn configure(&self, options: AktorRetryOpts) {
+    fn configure(&self, options: AktorRetryOptions) {
         self.shared.lock().options = options;
     }
 
@@ -135,29 +193,29 @@ impl<I: Send, O: Send> Input<I> for Inputs<I, O> {
 }
 
 impl<I, O> Shared<I, O> {
-    pub fn encode(
-        &self,
-        revision: u64,
-        encode: fn(&I) -> Result<Vec<u8>, Error>,
-    ) -> Option<Update> {
+    pub fn encode(&self, revision: u64, encode: fn(&I) -> CodecResult<Vec<u8>>) -> Option<Update> {
         let input = {
             let mut slot = self.lock();
             let pending = slot.pending.as_mut()?;
             if pending.update.revision != revision {
                 return None;
             }
-            pending.input.take()
-        };
-        if let Some(input) = input {
-            let encoded = encode(&input).map(Arc::from);
-            let mut slot = self.lock();
-            let pending = slot.pending.as_mut()?;
-            if pending.update.revision != revision {
-                return None;
+
+            match pending.input.take() {
+                Some(input) => input,
+                None => return Some(pending.update.clone()),
             }
-            pending.update.input = Some(encoded);
+        };
+        let encoded = encode(&input).map(Arc::new);
+
+        let mut slot = self.lock();
+        let pending = slot.pending.as_mut()?;
+        if pending.update.revision != revision {
+            return None;
         }
-        self.pending()
+
+        pending.update.input = Some(encoded);
+        Some(pending.update.clone())
     }
 
     pub fn attempt(&self, revision: u64) {
@@ -169,14 +227,37 @@ impl<I, O> Shared<I, O> {
     }
 
     pub fn retry(&self, revision: u64) {
-        if let Some(pending) = &mut self.lock().pending
-            && pending.update.revision == revision
-        {
-            pending.update.uncertain |= pending.update.outcome == CallError::OutcomeUnknown;
-            pending.update.attempts += 1;
-            pending.update.deadline = Instant::now()
-                .checked_add(pending.update.options.timeout)
-                .unwrap_or_else(Instant::now);
+        let mut slot = self.lock();
+        let Some(pending) = slot
+            .pending
+            .as_mut()
+            .filter(|pending| pending.update.revision == revision)
+        else {
+            return;
+        };
+
+        let update = &mut pending.update;
+        update.uncertain |= update.outcome == AktorDeliveryOutcome::OutcomeUnknown;
+        match update.options.deadline(Instant::now()) {
+            Ok(deadline) => {
+                update.attempts += 1;
+                update.deadline = deadline;
+            }
+            Err(error) => {
+                drop(slot);
+
+                let error = er_new!(
+                    LatestErr {
+                        failure_id: None,
+                        outcome: AktorDeliveryOutcome::NotAdmitted,
+                        cause: Cause::Protocol,
+                        msg: "check retry options"
+                    },
+                    error
+                );
+
+                self.publish(revision, Err(error));
+            }
         }
     }
 
@@ -193,23 +274,40 @@ impl<I, O> Shared<I, O> {
 
     pub fn closing(&self) -> bool {
         let slot = self.lock();
-        !slot.receiver || (slot.senders == 0 && slot.pending.is_none())
+        slot.finished || !slot.receiver || (slot.senders == 0 && slot.pending.is_none())
     }
 
-    pub fn publish(&self, revision: u64, mut output: Result<O, Error>) {
+    pub fn publish(&self, revision: u64, output: ErResult<O, LatestErr>) {
         let mut slot = self.lock();
+
         if !slot.receiver || slot.revision != revision || slot.pending.is_none() {
             return;
         }
 
-        if let Some(pending) = &slot.pending
-            && pending.update.uncertain
-            && let Err(error) = &mut output
-        {
-            error.outcome = CallError::OutcomeUnknown;
-        }
+        // An earlier try might have reached the server, so this one can't say it didn't run.
+        let uncertain = slot
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.update.uncertain);
+        let output = match output {
+            Err(error) if uncertain => {
+                let cause = error.top.cause;
+
+                Err(er_new!(
+                    LatestErr {
+                        failure_id: error.top.failure_id,
+                        outcome: AktorDeliveryOutcome::OutcomeUnknown,
+                        cause,
+                        msg: "an earlier try may have run"
+                    },
+                    error
+                ))
+            }
+            output => output,
+        };
 
         let pending = slot.pending.take();
+        slot.finished |= output.is_err();
         let discarded = slot.output.replace(output);
         let wake = slot.wake.take();
         drop(slot);
@@ -231,25 +329,49 @@ impl<I, O> Shared<I, O> {
         }
     }
 
-    pub fn fail(&self, mut error: Error) {
+    pub fn fail(&self, error: ErTree<LatestErr>) {
         let mut slot = self.lock();
-        if slot
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.update.uncertain)
-        {
-            error.outcome = CallError::OutcomeUnknown;
+        if slot.finished || !slot.receiver {
+            return;
         }
+
         let pending = slot.pending.take();
-        let discarded = slot.output.replace(Err(error));
+
+        let error = match &pending {
+            Some(pending) => {
+                let outcome = match pending.update.uncertain {
+                    true => AktorDeliveryOutcome::OutcomeUnknown,
+                    false => error.top.outcome,
+                };
+                let cause = error.top.cause;
+
+                er_new!(
+                    LatestErr {
+                        failure_id: error.top.failure_id,
+                        outcome,
+                        cause,
+                        msg: "the pending update"
+                    },
+                    error
+                )
+            }
+            None => error,
+        };
+
+        let discarded = slot.terminal.replace(error);
+        slot.finished = true;
+        let wake = slot.wake.take();
         drop(slot);
+
         drop((pending, discarded));
-        self.finish();
+        if let Some(wake) = wake {
+            wake.wake();
+        }
     }
 }
 
-impl<S, I: Send + 'static, O: Send + 'static, Lease, Role, C> TypedSession<S, I, O, Lease, Role, C>
-    for &Client<S, Role>
+impl<S, I: Send + 'static, O: Send + 'static, Lease, Role, C>
+    TypedSession<S, I, O, Lease, Role, aktor::dispatch::RemoteCodec<C>> for &Client<S, Role>
 where
     C: Codec<I> + Codec<O>,
 {
@@ -274,17 +396,20 @@ pub fn start<I: Send + 'static, O: Send + 'static, C: Codec<I> + Codec<O>>(
     inner: Arc<Inner>,
     operation: Operation,
 ) -> (LatestSender<I>, LatestResults<I, O>) {
+    let receipt = crate::receipt::Receipt::default();
     let shared = Arc::new(Shared {
+        receipt: Arc::downgrade(&receipt.pending),
         slot: Mutex::new(Slot {
             revision: 0,
             pending: None,
             output: None,
+            terminal: None,
             senders: 1,
             receiver: true,
             finished: false,
             wake: None,
-            options: AktorRetryOpts {
-                attempts: 1,
+            options: AktorRetryOptions {
+                attempts: core::num::NonZeroUsize::MIN,
                 timeout: inner.options.timeout,
             },
         }),
@@ -300,23 +425,34 @@ pub fn start<I: Send + 'static, O: Send + 'static, C: Codec<I> + Codec<O>>(
             inner,
             shared.clone(),
             operation,
-            |input| C::encode(input).map_err(Into::into),
-            C::decode_output,
+            C::encode,
+            C::decode,
         ))),
-        Err(_) => {
-            shared.fail(Error::new(
-                CallError::NotAdmitted,
-                Cause::Closed,
-                "remote latest needs a Tokio runtime",
+        Err(error) => {
+            shared.fail(er_new!(
+                LatestErr {
+                    failure_id: None,
+                    outcome: AktorDeliveryOutcome::NotAdmitted,
+                    cause: Cause::Closed,
+                    msg: "remote latest needs a Tokio runtime"
+                },
+                error
             ));
             None
         }
     };
-    (LatestSender { input }, LatestResults { shared, driver })
+    (
+        LatestSender { input },
+        LatestResults {
+            shared,
+            driver,
+            receipt,
+        },
+    )
 }
 
 impl<I> aktor::call::RetryRequest for LatestSender<I> {
-    type Options = AktorRetryOpts;
+    type Options = AktorRetryOptions;
 
     fn retry(self, options: Self::Options) -> Self {
         self.input.configure(options);

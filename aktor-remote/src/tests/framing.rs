@@ -9,6 +9,7 @@ use tokio::io::AsyncWrite;
 struct Broken {
     bytes: Vec<u8>,
     limit: usize,
+    vectored: bool,
 }
 impl AsyncWrite for Broken {
     fn poll_write(
@@ -31,17 +32,87 @@ impl AsyncWrite for Broken {
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+
+    fn is_write_vectored(&self) -> bool {
+        self.vectored
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        assert!(self.vectored);
+        let mut written = 0;
+        for bytes in bufs {
+            let count = bytes.len().min(self.limit - self.bytes.len());
+            self.bytes.extend_from_slice(&bytes[..count]);
+            written += count;
+        }
+        Poll::Ready(Ok(written))
+    }
 }
 
 #[tokio::test]
 async fn incomplete() {
-    for limit in [2, 8] {
-        let mut writer = Broken {
-            bytes: Vec::new(),
-            limit,
+    let payload = [7; 32];
+    let mut expected = 32u32.to_be_bytes().to_vec();
+    expected.extend_from_slice(&payload);
+
+    for vectored in [false, true] {
+        for limit in [2, 8] {
+            let mut writer = Broken {
+                bytes: Vec::new(),
+                limit,
+                vectored,
+            };
+            assert!(wire::write_bytes(&mut writer, &payload).await.is_err());
+            assert_eq!(writer.bytes, expected[..limit]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn trailing_bytes() {
+    let mut bytes = wire::encode(&wire::Message::Admitted { id: 1 }, wire::MAX_FRAME).er_unwrap();
+    bytes.push(0);
+    let mut framed = (bytes.len() as u32).to_be_bytes().to_vec();
+    framed.extend(bytes);
+    assert_eq!(
+        wire::read(&mut framed.as_slice(), wire::MAX_FRAME)
+            .await
+            .err()
+            .unwrap()
+            .top
+            .cause,
+        Cause::Protocol
+    );
+}
+#[tokio::test]
+async fn reuse_received_frame() {
+    let frames = wire::FrameReader::default();
+    let mut stream = Vec::new();
+    let inputs = [vec![11; 128 * 1024], vec![23; 8192]];
+
+    for input in &inputs {
+        let message = wire::Message::Call {
+            id: 1,
+            operation: "echo".into(),
+            input: input.as_slice().into(),
         };
-        wire::write_bytes(&mut writer, &[0; 32]).await.unwrap_err();
-        assert_eq!(writer.bytes.len(), limit);
+        wire::write(&mut stream, &message, wire::MAX_FRAME)
+            .await
+            .er_unwrap();
+    }
+
+    let mut reader = stream.as_slice();
+    for expected in inputs {
+        let wire::Message::Call { input, .. } =
+            frames.read(&mut reader, wire::MAX_FRAME).await.er_unwrap()
+        else {
+            panic!("wrong message");
+        };
+        assert_eq!(input, expected);
     }
 }
 
@@ -49,19 +120,38 @@ async fn incomplete() {
 async fn compressed() {
     use crate::{packet, wire::Message};
 
-    let value = vec![17; 65536];
+    // Patterned like real traffic. A buffer of one repeated byte goes uncompressed, its ratio is
+    // past what a receiver accepts.
+    let mut seed = 17_u32;
+    let value: Vec<u8> = (0..65536)
+        .map(|index| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if index % 64 < 4 {
+                (seed >> 24) as u8
+            } else {
+                0
+            }
+        })
+        .collect();
     let message = Message::Call {
         id: 1,
         operation: "echo".into(),
-        input: value.clone(),
+        input: value.as_slice().into(),
     };
-    let raw = wire::encode(&message, wire::MAX_FRAME).unwrap();
+    let raw = wire::encode(&message, wire::MAX_FRAME).er_unwrap();
     let packed = packet::encode(raw.clone());
-    assert!(packed.len() < raw.len() / 8);
+    assert!(packed.len() < raw.len() / 2);
     let mut framed = (packed.len() as u32).to_be_bytes().to_vec();
     framed.extend_from_slice(&packed);
 
-    let Message::Call { input, .. } = wire::read(&mut framed.as_slice(), raw.len()).await.unwrap()
+    let handshake = wire::FrameReader::default()
+        .read_handshake(&mut framed.as_slice())
+        .await;
+    assert_eq!(handshake.err().unwrap().top.cause, Cause::Protocol);
+
+    let Message::Call { input, .. } = wire::read(&mut framed.as_slice(), raw.len())
+        .await
+        .er_unwrap()
     else {
         panic!("wrong message");
     };

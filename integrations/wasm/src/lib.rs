@@ -1,4 +1,5 @@
 use aktor::*;
+use core::num::NonZeroUsize;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 use er::*;
 use futures_util::future::join;
@@ -18,7 +19,7 @@ struct Line(String);
 #[derive(Er)]
 struct AppendErr;
 
-#[aktor]
+#[aktor(latest)]
 async fn append(state: &mut State, line: Line) -> ErResult<String, AppendErr> {
     if line.0.is_empty() {
         er_bail!(AppendErr);
@@ -71,28 +72,35 @@ impl embassy_time_driver::Driver for Clock {
 #[cfg(target_family = "wasm")]
 embassy_time_driver::time_driver_impl!(static CLOCK:Clock=Clock);
 
+fn lines(
+    name: &str,
+    end: impl AsyncFnOnce(State) + 'static,
+) -> impl embassy::AktorDefinition<embassy::Handle<State, ()>> {
+    AktorNew {
+        name: name.into(),
+        kind: AktorKind::EmbassyLocal(|_| Err(((), "group driver already running".into()))),
+        start: AktorInit::Ready(async || State {
+            text: String::new(),
+        }),
+        end,
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::MIN,
+        stuck: AktorStuck::Kill,
+    }
+}
+
 async fn listening() -> Result<(), &'static str> {
     let mut actors = embassy::AktorGroup::new();
     let kill = actors.killswitch();
-    let closing = actors
-        .listen_with(async |_| Ok::<_, AktorError>(()))
-        .map_err(|_| "listener")?;
-    let setup = async || {
-        Ok::<_, AktorError>(State {
-            text: String::new(),
-        })
-    };
+    let closing = actors.listen(async |_| ()).map_err(|_| "listener")?;
+    let spawned = actors.spawn(lines("lines", async |_| ()));
+    let (_startup, actor) = spawned.into_parts().unwrap();
 
-    let cleanup = async |_| Ok::<_, AktorError>(());
-    let mut args = AktorArgs::new("lines", setup, cleanup);
-
-    args.capacity = 1;
-
-    let actor = actors.spawn::<State, 1, ()>(args).map_err(|_| "actor")?;
     let work = async {
         let value = append(&actor, Line("ordinary startup".into()))
             .await
-            .unwrap_report();
+            .unwrap()
+            .er_unwrap();
 
         drop(actors);
         value
@@ -114,23 +122,16 @@ async fn listening() -> Result<(), &'static str> {
 async fn grouped() -> Result<(), &'static str> {
     let cleaned = Rc::new(Cell::new(false));
     let cleanup = cleaned.clone();
-    let value = embassy::AktorGroup::new()
-        .run(
-            async move |group| {
+    let mut group = embassy::AktorGroup::new();
+    let closing = group.listen(async |_| ()).map_err(|_| "local group")?;
+    let killswitch = group.killswitch();
+    let work = async {
+        let value = killswitch
+            .run(async move {
                 let actor = group
-                    .spawn::<State, 1, ()>(AktorArgs {
-                        name: "lines".into(),
-                        capacity: 1,
-                        setup: async || {
-                            Ok(State {
-                                text: String::new(),
-                            })
-                        },
-                        cleanup: async move |_| {
-                            cleanup.set(true);
-                            Ok(())
-                        },
-                    })
+                    .spawn(lines("lines", async move |_| cleanup.set(true)))
+                    .ready()
+                    .await
                     .unwrap();
 
                 let (sender, mut results) = append::latest(&actor);
@@ -138,48 +139,48 @@ async fn grouped() -> Result<(), &'static str> {
                 sender.send(Line("b".into()));
                 sender.send(Line("c".into()));
                 drop(sender);
-                assert_eq!(results.next().await.unwrap().unwrap_report(), "c");
+                assert_eq!(results.next().await.unwrap().unwrap().er_unwrap(), "c");
                 assert!(results.next().await.is_none());
-                Ok::<_, AktorError>(17)
-            },
-            async |_| Ok::<_, AktorError>(()),
-        )
-        .await
-        .map_err(|_| "local group")?;
+                17
+            })
+            .await;
+
+        killswitch.stop();
+        value
+    };
+    let (report, value) = join(closing, work).await;
+
+    if report.failed() {
+        return Err("local group");
+    }
 
     if value != Some(17) || !cleaned.get() {
         return Err("local group cleanup");
     }
 
-    let timed = embassy::AktorGroup::with_grace(core::time::Duration::from_micros(10))
-        .run(
-            async |group| {
+    let mut group = embassy::AktorGroup::with_grace(core::time::Duration::from_micros(10));
+    let closing = group.listen(async |_| ()).map_err(|_| "group timeout")?;
+    let killswitch = group.killswitch();
+    let work = async {
+        killswitch
+            .run(async move {
                 let actor = group
-                    .spawn::<State, 1, ()>(AktorArgs {
-                        name: "stuck cleanup".into(),
-                        capacity: 1,
-                        setup: async || {
-                            Ok(State {
-                                text: String::new(),
-                            })
-                        },
-                        cleanup: async |_| {
-                            core::future::pending::<()>().await;
-                            Ok(())
-                        },
-                    })
+                    .spawn(lines("stuck cleanup", async |_| {
+                        core::future::pending().await
+                    }))
+                    .ready()
+                    .await
                     .unwrap();
 
-                append(&actor, Line("a".into())).await.unwrap_report();
-                Ok::<_, AktorError>(())
-            },
-            async |_| Ok::<_, AktorError>(()),
-        )
-        .await
-        .err()
-        .ok_or("group timeout")?;
+                append(&actor, Line("a".into())).await.unwrap().er_unwrap();
+            })
+            .await;
 
-    if !timed.report.timed_out {
+        killswitch.stop();
+    };
+    let (timed, ()) = join(closing, work).await;
+
+    if !timed.ran_past_grace() {
         return Err("group timeout outcome");
     }
 
@@ -191,8 +192,8 @@ async fn timeout_limits() -> Result<(), &'static str> {
         yield_once().await;
     }
 
-    let (actor, owner) = embassy::channel::<State, 1, ()>().map_err(|_| "timeout channel")?;
-    let mut reply = append::request(&actor, Line("kept".into())).send().await;
+    let (actor, owner) = embassy::channel::<State, ()>(NonZeroUsize::MIN);
+    let mut reply = append(&actor, Line("kept".into())).send().await.unwrap();
     let mut context = Context::from_waker(Waker::noop());
 
     let mut request =
@@ -279,7 +280,7 @@ async fn timeout_limits() -> Result<(), &'static str> {
                 if state.text == "kept" {
                     Ok(())
                 } else {
-                    Err(AktorCleanupError::new("timed out operation was lost", ()))
+                    Err(((), "timed out operation was lost".into()))
                 }
             },
         )
@@ -297,39 +298,29 @@ async fn local_setup() -> Result<(), &'static str> {
     let ended = cleaned.clone();
     let work = async move {
         let actors = aktor_start(AktorSetup {
+            stuck: AktorGroupStuck::KeepRunning,
             actors: AktorNew {
-                name: AktorName::new("host executor"),
-                role: AktorNoRole,
-                kind: AktorKind::Local::<local::clock::Embassy>(move |future| {
+                name: "host executor".into(),
+                kind: AktorKind::Local::<local::clock::Embassy, _, _>(move |future| {
                     spawner.borrow_mut().push(future);
-                    Ok(())
+                    Ok::<(), ((), String)>(())
                 }),
-                closures: AktorClosures {
-                    start: async || {
-                        Ok::<_, AktorSetupError>(State {
-                            text: String::new(),
-                        })
-                    },
-
-                    end: async move |_: State| {
-                        ended.set(true);
-                        Ok::<_, AktorCleanupError>(())
-                    },
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: AktorInit::Ready(async || State {
+                    text: String::new(),
+                }),
+                end: async move |_: State| {
+                    ended.set(true);
                 },
-                options: AktorNewOptions { capacity: 32 },
+                hooks: AktorHooks::NONE,
+                capacity: NonZeroUsize::new(32).unwrap(),
+                stuck: AktorStuck::Kill,
             },
             shutdown: |_| {},
-            options: AktorOptions {
-                shutdown_grace: core::time::Duration::from_secs(5),
-            },
-        })
-        .await
-        .map_err(|_| "host setup")?;
+            grace: core::time::Duration::from_secs(5),
+        });
+        actors.ready().await.map_err(|_| "host setup")?;
 
-        let (input, mut output) = append::latest(&actors.handles);
+        let (input, mut output) = append::latest(actors.handles());
 
         input.send(Line("a".into()));
         input.send(Line("b".into()));
@@ -338,23 +329,25 @@ async fn local_setup() -> Result<(), &'static str> {
             .next()
             .await
             .ok_or("host latest ended")?
-            .unwrap_report();
+            .unwrap()
+            .er_unwrap();
 
         if latest != "b" {
             return Err("host latest input");
         }
 
-        if append(&actors.handles, Line("c".into()))
+        if append(actors.handles(), Line("c".into()))
             .await
-            .unwrap_report()
+            .unwrap()
+            .er_unwrap()
             != "bc"
         {
             return Err("host ordinary input");
         }
 
-        let report = actors.shutdown().await;
+        let report = actors.stop().await;
 
-        if report.failed() || report.actors[0].kind != Some(AktorExecution::Local) {
+        if report.failed() || report.actors[0].kind != AktorExecution::Local {
             return Err("host cleanup report");
         }
 
@@ -384,7 +377,7 @@ async fn exercise() -> Result<(), &'static str> {
     local_setup().await?;
     timeout_limits().await?;
 
-    let (actor, owner) = embassy::channel::<State, 1, &'static str>().map_err(|_| "channel")?;
+    let (actor, owner) = embassy::channel::<State, &'static str>(NonZeroUsize::MIN);
     let cleaned = Rc::new(Cell::new(false));
     let cleanup = cleaned.clone();
     let run = owner.run_with(
@@ -406,42 +399,52 @@ async fn exercise() -> Result<(), &'static str> {
 
         let error = append(&actor, Line(String::new()))
             .await
+            .unwrap()
             .err()
             .ok_or("domain error")?;
 
-        if !error.er_report_string().contains("AppendErr") {
+        if !error.er_report().contains("AppendErr") {
             return Err("diagnostics");
         }
 
         let started = Rc::new(Signal::new());
         let release = Rc::new(Signal::new());
-        let running = hold::request(&actor, started.clone(), release.clone())
+        let running = hold(&actor, started.clone(), release.clone())
             .send()
-            .await;
+            .await
+            .unwrap();
 
         started.wait().await;
 
-        drop(append::request(&actor, Line("b".into())).send().await);
+        drop(append(&actor, Line("b".into())).send().await.unwrap());
 
-        let waiting = append::request(&actor, Line("c".into()));
+        let waiting = append(&actor, Line("c".into()));
 
         release.signal(());
 
-        if running.await.map_err(|_| "running call")? != "a" {
+        if running.await.unwrap().map_err(|_| "running call")? != "a" {
             return Err("running output");
         }
 
-        if waiting.send().await.await.map_err(|_| "queued call")? != "abc" {
+        if waiting
+            .send()
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+            .map_err(|_| "queued call")?
+            != "abc"
+        {
             return Err("queued output");
         }
 
-        let last = append::request(&actor, Line("d".into())).send().await;
+        let last = append(&actor, Line("d".into())).send().await.unwrap();
         let completed = actor.shutdown();
-        let observer = completed.new_observer();
+        let observer = completed.clone();
 
         drop(actor);
 
-        if last.await.map_err(|_| "last call")? != "abcd" {
+        if last.await.unwrap().map_err(|_| "last call")? != "abcd" {
             return Err("last output");
         }
 
@@ -460,9 +463,9 @@ async fn exercise() -> Result<(), &'static str> {
         return Err("cleanup");
     }
 
-    let (actor, owner) =
-        embassy::channel::<State, 1, ErTree<AppendErr>>().map_err(|_| "cleanup channel")?;
-    let completion = actor.shutdown();
+    let (actor, owner) = embassy::channel::<State, ErTree<AppendErr>>(NonZeroUsize::MIN);
+    let completion = owner.completion();
+    drop(actor.shutdown());
     let result = owner
         .run(
             State {
@@ -471,40 +474,38 @@ async fn exercise() -> Result<(), &'static str> {
             async |_| {
                 let tree = ErTree::new(AppendErr, ["backup folder is read only"]);
 
-                Err(AktorCleanupError {
-                    diagnostics: tree.er_report_string(),
-                    data: tree,
-                })
+                let report = tree.er_report();
+                Err((tree, report))
             },
         )
         .await;
 
-    let error = result.err().ok_or("cleanup failure")?;
+    let (_, report) = result.err().ok_or("cleanup failure")?;
 
-    if !format!("{error:#}").contains("backup folder is read only") {
+    if !report.contains("backup folder is read only") {
         return Err("cleanup diagnostics");
     }
 
-    let typed = completion
+    let (typed, _) = completion
         .wait_with_data()
         .await
         .err()
         .ok_or("typed cleanup observation")?;
-    let embassy::OwnerFailure::Cleanup(cleanup) = &*typed.error else {
+    let embassy::OwnerError::Cleanup(cleanup) = &*typed.cause else {
         return Err("cleanup kind");
     };
 
-    if cleanup.data.er_snapshot().entries.len() != 2 {
+    if cleanup.er_snapshot().entries.len() != 2 {
         return Err("cleanup structure");
     }
 
-    let observed = completion
+    let (observed, _) = completion
         .wait_with_data()
         .await
         .err()
         .ok_or("cleanup observation")?;
 
-    if !Rc::ptr_eq(&typed.error, &observed.error) {
+    if !Rc::ptr_eq(&typed.cause, &observed.cause) {
         return Err("retained cleanup failure");
     }
 
@@ -580,4 +581,11 @@ mod tests {
             assert_eq!(super::check(), Ok(()));
         }
     }
+}
+
+#[cfg(target_family = "wasm")]
+#[unsafe(no_mangle)]
+pub extern "C" fn aktor_producer(high: u64, low: u64) {
+    let producer = (u128::from(high) << 64) | u128::from(low);
+    FailureId::set_producer(core::num::NonZeroU128::new(producer).unwrap()).unwrap();
 }

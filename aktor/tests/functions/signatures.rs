@@ -1,7 +1,8 @@
 use super::*;
+use core::num::NonZeroUsize;
 
 #[allow(clippy::toplevel_ref_arg)]
-#[aktor]
+#[aktor(latest)]
 async fn patterns(
     _: &usize,
     (a, b): (usize, usize),
@@ -95,13 +96,13 @@ mod named_parameters {
     use super::*;
 
     #[allow(non_snake_case)]
-    #[aktor]
+    #[aktor(latest)]
     pub async fn echo(NAME: &usize, value: usize) -> usize {
         *NAME + value
     }
 
     #[allow(non_snake_case)]
-    #[aktor]
+    #[aktor(latest)]
     pub async fn value(_: &usize, NAME: usize) -> usize {
         NAME
     }
@@ -126,22 +127,21 @@ async fn signatures() {
     assert_eq!(named_parameters::value(&7, 17).await, 17);
     assert_eq!(named_parameters::generic(&7, 1usize).await, 8);
 
-    let (handle, owner) = spawn_thread(7usize, 1).unwrap();
+    let (handle, _group) = thread_actor(7usize);
 
-    assert_eq!(named_parameters::echo(&handle, 1).await, 8);
-    assert_eq!(named_parameters::value(&handle, 17).await, 17);
-    assert_eq!(named_parameters::generic(&handle, 1usize).await, 8);
+    assert_eq!(named_parameters::echo(&handle, 1).await, Ok(8));
+    assert_eq!(named_parameters::value(&handle, 17).await, Ok(17));
+    assert_eq!(named_parameters::generic(&handle, 1usize).await, Ok(8));
 
     let (sender, mut results) = named_parameters::value(&handle, 27).latest();
 
-    assert_eq!(results.next().await, Some(27));
+    assert_eq!(results.next().await, Some(Ok(27)));
     drop((sender, results));
 
     let (sender, mut results) = named_parameters::echo(&handle, 2).latest();
 
-    assert_eq!(results.next().await, Some(9));
+    assert_eq!(results.next().await, Some(Ok(9)));
     drop((sender, results, handle));
-    owner.join().unwrap();
 
     siblings::__aktor_read_body();
     siblings::__aktor_generic_body();
@@ -153,12 +153,10 @@ async fn signatures() {
     assert_eq!(state_borrows::length(&state).await, 3);
     assert_eq!(state_borrows::append(&mut state).await, 4);
 
-    let (handle, owner) = spawn_thread(state, 1).unwrap();
+    let (handle, _group) = thread_actor(state);
 
-    assert_eq!(state_borrows::length(&handle).await, 4);
-    assert_eq!(state_borrows::append(&handle).await, 5);
-    drop(handle);
-    owner.join().unwrap();
+    assert_eq!(state_borrows::length(&handle).await, Ok(4));
+    assert_eq!(state_borrows::append(&handle).await, Ok(5));
 }
 
 #[aktor]
@@ -173,7 +171,7 @@ struct Target(usize);
 struct T(usize);
 struct M(usize);
 
-#[aktor(actor = __AktorTarget)]
+#[aktor(role = __AktorTarget)]
 async fn collision(state: &Target, first: T, second: M) -> usize {
     state.0 + first.0 + second.0
 }
@@ -186,7 +184,7 @@ mod relative {
     pub struct Role;
 
     pub mod queries {
-        #[aktor::aktor(actor = super::Role)]
+        #[aktor::aktor(role = super::Role)]
         pub async fn read(state: &super::State, value: super::Value) -> super::Value {
             super::Value(state.0 + value.0)
         }
@@ -226,7 +224,7 @@ async fn r#type(_: &usize, __aktor_state: usize, __aktor_input: usize) -> usize 
     __aktor_state + __aktor_input
 }
 
-#[aktor]
+#[aktor(latest)]
 async fn locals(
     function: &mut usize,
     operation: usize,
@@ -240,7 +238,7 @@ async fn locals(
     *function
 }
 
-#[aktor]
+#[aktor(latest)]
 async fn generic_locals<T: Into<usize> + Send + 'static>(
     operation: &mut usize,
     inner: T,
@@ -286,15 +284,12 @@ async fn names() {
         4
     );
 
-    let (handle, actor) = spawn_thread(shadowed::Send, 1).unwrap();
+    let (handle, _group) = thread_actor(shadowed::Send);
 
-    assert_eq!(shadowed::length(&handle, [0; shadowed::NAME]).await, 4);
-
-    drop(handle);
-    actor.join().unwrap();
+    assert_eq!(shadowed::length(&handle, [0; shadowed::NAME]).await, Ok(4));
 }
 
-#[aktor]
+#[aktor(latest)]
 async fn by_name(_: &std::rc::Rc<usize>, name: impl AsRef<str>) -> String {
     name.as_ref().to_owned()
 }
@@ -318,33 +313,32 @@ async fn inputs() {
         text
     );
 
-    let (handle, _actor, thread) = spawn(SpawnArgs {
+    let (handle, _group) = start(AktorNew {
         name: "inputs".into(),
-        capacity: 1,
-        failure: FailurePolicy::Abort,
-        setup: || Ok::<_, ()>(std::rc::Rc::new(0)),
-        cleanup: |_| Ok::<_, ()>(()),
-    })
-    .await
-    .unwrap();
+        kind: AktorKind::TokioThread,
+        start: aktor::AktorInit::Ready(async || std::rc::Rc::new(0)),
+        end: (),
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::new(32).unwrap(),
+        stuck: AktorStuck::Kill,
+    });
 
     let (sender, mut results) = by_name(&handle, String::from("search")).latest();
 
-    assert_eq!(results.next().await, Some(String::from("search")));
+    assert_eq!(results.next().await, Some(Ok(String::from("search"))));
 
     let cloned = sender.clone();
 
     cloned.send(String::from("new search"));
-    assert_eq!(results.next().await, Some(String::from("new search")));
+    assert_eq!(results.next().await, Some(Ok(String::from("new search"))));
     drop(cloned);
     drop(sender);
     drop(results);
 
-    let reply = by_name::request(&handle, text).send().await;
+    let reply = by_name(&handle, text).send().await.unwrap();
 
     drop(handle);
-    assert_eq!(tokio::spawn(reply).await.unwrap(), "name");
-    thread.join_async().await.unwrap().unwrap();
+    assert_eq!(tokio::spawn(reply).await.unwrap().unwrap(), "name");
 }
 
 #[aktor]
@@ -363,46 +357,34 @@ async fn state() {
 
     assert_eq!(state_length(&text).await, 11);
 
-    let (handle, _actor, thread) = spawn(SpawnArgs {
+    let (handle, _group) = start(AktorNew {
         name: "state".into(),
-        capacity: 1,
-        failure: FailurePolicy::Abort,
-        setup: || Ok::<_, ()>(std::rc::Rc::<str>::from("BingoManden")),
-        cleanup: |_| Ok::<_, ()>(()),
-    })
-    .await
-    .unwrap();
+        kind: AktorKind::TokioThread,
+        start: aktor::AktorInit::Ready(async || std::rc::Rc::<str>::from("BingoManden")),
+        end: (),
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::new(32).unwrap(),
+        stuck: AktorStuck::Kill,
+    });
 
-    assert_eq!(state_length::<std::rc::Rc<str>, _>(&handle).await, 11);
-
-    drop(handle);
-    thread.join_async().await.unwrap().unwrap();
+    assert_eq!(state_length::<std::rc::Rc<str>, _>(&handle).await, Ok(11));
 }
 
 #[tokio::test]
 async fn anonymous() {
-    let executor = tokio::task::LocalSet::new();
+    use std::borrow::Cow;
 
-    executor
-        .run_until(async {
-            use std::borrow::Cow;
+    let text = String::from("Haandboldfuglen");
 
-            let text = String::from("Haandboldfuglen");
+    assert_eq!(length(&0, Cow::Borrowed(&text)).await, 15);
+    assert_eq!(
+        mapped(&0, text.as_str(), |s| s.len(), |s| s.len()).await,
+        30
+    );
 
-            assert_eq!(length(&0, Cow::Borrowed(&text)).await, 15);
-            assert_eq!(
-                mapped(&0, text.as_str(), |s| s.len(), |s| s.len()).await,
-                30
-            );
+    let (handle, _group) = thread_actor(0usize);
 
-            let (handle, task) = spawn_local(&executor, 0, 8).unwrap();
-
-            assert_eq!(length(&handle, Cow::Owned(text)).await, 15);
-
-            drop(handle);
-            task.await.unwrap();
-        })
-        .await
+    assert_eq!(length(&handle, Cow::Owned(text)).await, Ok(15));
 }
 
 #[aktor]
@@ -418,18 +400,18 @@ async fn mapped(
 
 struct Inner(u32, std::marker::PhantomPinned);
 
-#[aktor]
+#[aktor(latest)]
 async fn put(_: &mut usize, value: Inner) -> u32 {
     value.0
 }
 
-#[aktor]
+#[aktor(latest)]
 async fn keep<Latest: Send + 'static>(_: &usize, value: Latest) -> Latest {
     value
 }
 
-#[aktor]
-async fn echo<LatestSender: Send + 'static>(_: &usize, value: LatestSender) -> LatestSender {
+#[aktor(latest)]
+async fn echo<Sender: Send + 'static>(_: &usize, value: Sender) -> Sender {
     value
 }
 
@@ -437,14 +419,14 @@ async fn echo<LatestSender: Send + 'static>(_: &usize, value: LatestSender) -> L
 mod helpers {
     use super::*;
 
-    pub struct LatestSender(pub u8);
+    pub struct Sender(pub u8);
 
-    #[aktor]
-    pub async fn concrete(_: &usize, value: LatestSender) -> u8 {
+    #[aktor(latest)]
+    pub async fn concrete(_: &usize, value: Sender) -> u8 {
         value.0
     }
 
-    #[aktor]
+    #[aktor(latest)]
     pub async fn binders<r#request, const r#latest: usize>(
         _: &usize,
         value: request,
@@ -459,71 +441,73 @@ mod helpers {
 
 #[tokio::test]
 async fn latest_names() {
-    let (handle, owner) = spawn_thread(0usize, 1).unwrap();
+    let (handle, _group) = thread_actor(0usize);
 
-    assert_eq!(locals(&handle, 1, 2, 3, 4, 5, 6).await, 21);
-    assert_eq!(
-        generic_locals::request(&handle, 1usize, 2, 3, 4, 5, 6).await,
-        21
-    );
+    assert_eq!(locals(&handle, 1, 2, 3, 4, 5, 6).await, Ok(21));
+    assert_eq!(generic_locals(&handle, 1usize, 2, 3, 4, 5, 6).await, Ok(21));
 
     let (sender, mut output) = locals(&handle, 1, 2, 3, 4, 5, 6).latest();
 
-    assert_eq!(output.next().await, Some(21));
+    assert_eq!(output.next().await, Some(Ok(21)));
     drop(sender);
     drop(output);
 
     let (sender, mut output) = generic_locals(&handle, 1usize, 2, 3, 4, 5, 6).latest();
 
-    assert_eq!(output.next().await, Some(21));
+    assert_eq!(output.next().await, Some(Ok(21)));
     drop(sender);
     drop(output);
 
     assert_eq!(
         put(&handle, Inner(12, std::marker::PhantomPinned)).await,
-        12
+        Ok(12)
     );
 
     let (sender, mut results) = put(&handle, Inner(17, std::marker::PhantomPinned)).latest();
     let (generic, mut found) = keep(&handle, String::from("query")).latest();
 
-    assert_eq!(found.next().await.as_deref(), Some("query"));
+    assert_eq!(
+        found.next().await.transpose().unwrap().as_deref(),
+        Some("query")
+    );
     drop(generic);
     drop(found);
 
     assert_eq!(echo(&0usize, 7u8).await, 7);
-    assert_eq!(echo::request(&handle, 8u8).await, 8);
+    assert_eq!(echo(&handle, 8u8).await, Ok(8));
 
     let (echo_sender, mut found) = echo(&handle, 9u8).latest();
 
-    assert_eq!(found.next().await, Some(9));
+    assert_eq!(found.next().await, Some(Ok(9)));
     drop(echo_sender);
     drop(found);
 
-    assert_eq!(
-        helpers::concrete(&handle, helpers::LatestSender(7)).await,
-        7
-    );
+    assert_eq!(helpers::concrete(&handle, helpers::Sender(7)).await, Ok(7));
 
     let (bound_sender, mut found) = helpers::binders::<_, 17, _>(&handle, [8u8]).latest();
 
-    assert_eq!(found.next().await, Some((Some(8), 17)));
+    assert_eq!(found.next().await, Some(Ok((Some(8), 17))));
     bound_sender.send([9]);
-    assert_eq!(found.next().await, Some((Some(9), 17)));
+    assert_eq!(found.next().await, Some(Ok((Some(9), 17))));
     drop(bound_sender);
     drop(found);
 
     let (pattern, mut matched) = patterns(&handle, (1, 2), "a".into(), "b".into(), ()).latest();
 
-    assert_eq!(matched.next().await.as_deref(), Some("1:2:ab"));
+    assert_eq!(
+        matched.next().await.transpose().unwrap().as_deref(),
+        Some("1:2:ab")
+    );
     pattern.send((3, 4), "c".into(), "d".into(), ());
-    assert_eq!(matched.next().await.as_deref(), Some("3:4:cd"));
+    assert_eq!(
+        matched.next().await.transpose().unwrap().as_deref(),
+        Some("3:4:cd")
+    );
     drop(pattern);
     drop(matched);
 
-    assert_eq!(results.next().await, Some(17));
+    assert_eq!(results.next().await, Some(Ok(17)));
     drop(sender);
     drop(results);
     drop(handle);
-    owner.join().unwrap();
 }

@@ -1,5 +1,9 @@
-use aktor::{AktorGroup, aktor};
+#[cfg(not(test))]
+use aktor::{AktorHooks, AktorKind, AktorNew, AktorStuck};
+use aktor::{AktorSetup, aktor, aktor_start};
+use er::*;
 use rusqlite::Connection;
+use std::time::Duration;
 
 #[cfg(not(test))]
 type Database = aktor::Aktor<Connection>;
@@ -9,10 +13,13 @@ type Database = aktor::testing::Mock<Connection>;
 struct App {
     database: Database,
 }
+#[derive(Er)]
+struct AddUserErr;
+
 impl App {
-    async fn add_user(&self, name: String) -> rusqlite::Result<String> {
-        let id = insert(&self.database, name).await?;
-        load(&self.database, id).await
+    async fn add_user(&self, name: String) -> ErResult<String, AddUserErr> {
+        let id = insert(&self.database, name).await.er(())?.er(())?;
+        load(&self.database, id).await.er(())?.er(())
     }
 }
 
@@ -31,23 +38,50 @@ async fn load(database: &Connection, id: i64) -> rusqlite::Result<String> {
 
 #[cfg(not(test))]
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut actors = AktorGroup::new();
-    let _completion = actors.start_with(|_| {})?;
-    let connection = Connection::open_in_memory()?;
-    connection.execute_batch("CREATE TABLE user (name TEXT)")?;
+async fn main() -> ErMain {
+    let started = aktor_start(AktorSetup {
+        stuck: aktor::AktorGroupStuck::KeepRunning,
+        actors: AktorNew {
+            name: "sqlite".into(),
+            kind: AktorKind::TokioThread,
+            start: aktor::AktorInit::Try(async || open()),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: core::num::NonZeroUsize::new(32).unwrap(),
+            stuck: AktorStuck::Kill,
+        },
+        shutdown: |_| {},
+        grace: Duration::from_secs(5),
+    });
+    started
+        .ready()
+        .await
+        .er_val(|(_, report)| ErMainError.er_save("startup", report))?;
+
     let app = App {
-        database: actors.spawn_value("sqlite", connection).await?,
+        database: started.handles().clone(),
     };
 
-    let result = app.add_user("Katten".into()).await;
-    let report = actors.shutdown().await;
-    if report.failed() {
-        return Err(aktor::AktorRunError::from(report).into());
-    }
+    println!("{}", app.add_user("Katten".into()).await.er(())?);
+    started.group().stop().await.into_result().er(())?;
 
-    println!("{}", result?);
     Ok(())
+}
+
+#[cfg(not(test))]
+#[derive(Er)]
+struct OpenErr {
+    step: &'static str,
+}
+
+#[cfg(not(test))]
+fn open() -> Result<Connection, (OpenErr, String)> {
+    let connection = Connection::open_in_memory().er("open")?;
+    connection
+        .execute_batch("CREATE TABLE user (name TEXT)")
+        .er("create table")?;
+
+    Ok(connection)
 }
 
 #[cfg(test)]
@@ -55,26 +89,30 @@ mod tests {
     use super::*;
     use aktor::testing::Preset;
 
-    fn successful() -> Preset<Connection> {
-        Preset::new()
-            .on(insert::handler(async |_| Ok(7)))
-            .on(load::handler(async |_| Ok("Katten".into())))
-    }
-
     #[tokio::test]
-    async fn load_failure() {
-        let mut actors = AktorGroup::new();
-        let _completion = actors.start_with(|_| {}).unwrap();
-        let database = successful()
-            .on(load::handler(async |_| Err(rusqlite::Error::InvalidQuery)))
-            .start(&mut actors)
-            .await
-            .unwrap();
-        let app = App { database };
+    async fn load_failure() -> ErTest {
+        let started = aktor_start(AktorSetup {
+            stuck: aktor::AktorGroupStuck::KeepRunning,
+            actors: Preset::new([
+                insert::handler(async |_| Ok(7)),
+                load::handler(async |_| Err(rusqlite::Error::InvalidQuery)),
+            ]),
+            shutdown: |_| {},
+            grace: Duration::from_secs(5),
+        });
 
-        assert!(app.add_user("Katten".into()).await.is_err());
+        let app = App {
+            database: started.handles().clone(),
+        };
 
-        let report = actors.shutdown().await;
-        assert!(!report.failed(), "{report}");
+        let result = app.add_user("Katten".into()).await;
+        let error = er_assert_err!(result);
+        assert!(matches!(
+            error.er_find::<rusqlite::Error>(),
+            Some(rusqlite::Error::InvalidQuery)
+        ));
+        started.group().stop().await.into_result().er_test()?;
+
+        Ok(())
     }
 }

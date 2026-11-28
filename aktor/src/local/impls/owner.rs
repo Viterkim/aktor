@@ -1,10 +1,11 @@
 use super::super::*;
 use super::runner;
 
-impl<S, const N: usize, E> Owner<S, N, E> {
+impl<S, E> Owner<S, E> {
     pub fn completion(&self) -> Completion<E> {
         Completion {
             inner: self.inner.completion.clone(),
+            result: self.inner.result.clone(),
         }
     }
 
@@ -13,12 +14,12 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         self,
         setup: Setup,
         cleanup: Cleanup,
-    ) -> Result<(), OwnerError>
+    ) -> Result<(), (OwnerError, String)>
     where
         Setup: FnOnce() -> SetupFuture,
-        SetupFuture: Future<Output = Result<S, crate::AktorSetupError<E>>>,
+        SetupFuture: Future<Output = Result<S, (E, String)>>,
         Cleanup: FnOnce(S) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), crate::AktorCleanupError<E>>>,
+        CleanupFuture: Future<Output = Result<(), (E, String)>>,
     {
         self.run_with_custom(setup, cleanup, runner::serve).await
     }
@@ -28,10 +29,10 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         self,
         state: S,
         cleanup: Cleanup,
-    ) -> Result<(), OwnerError>
+    ) -> Result<(), (OwnerError, String)>
     where
         Cleanup: FnOnce(S) -> CleanupFuture,
-        CleanupFuture: Future<Output = Result<(), crate::AktorCleanupError<E>>>,
+        CleanupFuture: Future<Output = Result<(), (E, String)>>,
     {
         self.run_custom(state, cleanup, runner::serve).await
     }
@@ -41,14 +42,7 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         #[cfg(feature = "std")]
         {
             let report = |payload: &Box<dyn std::any::Any + Send>| {
-                self.inner
-                    .completion
-                    .diagnostics
-                    .borrow_mut()
-                    .push(crate::AktorError::new(
-                        crate::panic::panic_message(payload),
-                        (),
-                    ));
+                self.inner.save_panic(crate::AktorPhase::Drop, payload);
             };
 
             let primary = crate::local::panic::discard_hooks(hooks, report);
@@ -61,14 +55,13 @@ impl<S, const N: usize, E> Owner<S, N, E> {
         drop(hooks);
     }
 }
-impl<S, const N: usize, E> Drop for Owner<S, N, E> {
+impl<S, E> Drop for Owner<S, E> {
     fn drop(&mut self) {
         #[cfg(feature = "std")]
         {
             let report = |payload: &Box<dyn std::any::Any + Send>| {
-                let error = crate::AktorError::new(crate::panic::panic_message(payload), ());
-                self.inner.fail(&OwnerFailure::Runner(error.clone()));
-                self.inner.completion.diagnostics.borrow_mut().push(error);
+                self.inner
+                    .report_panic(crate::AktorPhase::Drop, payload, true);
             };
 
             let hooks = core::mem::take(&mut self.hooks);
@@ -82,7 +75,9 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
 
             if unfinished
                 && let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.inner.finish(Err(Rc::new(OwnerFailure::Cancelled)));
+                    let failure = OwnerError::Cancelled.observed();
+                    self.inner.cancelled();
+                    self.inner.finish(Err(failure));
                 }))
             {
                 report(&payload);
@@ -90,21 +85,23 @@ impl<S, const N: usize, E> Drop for Owner<S, N, E> {
                 if primary.is_none() {
                     primary = Some(payload);
                 } else {
-                    crate::panic::dispose_secondary(payload);
+                    self.inner.dispose_panic(payload);
                 }
             }
 
             if let Some(payload) = primary {
                 if std::thread::panicking() {
-                    crate::panic::dispose_secondary(payload);
+                    self.inner.dispose_panic(payload);
                 } else {
-                    std::panic::resume_unwind(payload);
+                    self.inner.resume(payload);
                 }
             }
         }
         #[cfg(not(feature = "std"))]
         if self.inner.completion.result.borrow().is_none() {
-            self.inner.finish(Err(Rc::new(OwnerFailure::Cancelled)));
+            let failure = OwnerError::Cancelled.observed();
+            self.inner.cancelled();
+            self.inner.finish(Err(failure));
         }
     }
 }

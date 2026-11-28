@@ -1,75 +1,57 @@
-use crate::message::Message;
-use crate::queue::{Admission, HandleInner, mailbox};
-use core::marker::PhantomData;
-use er::Er;
-use std::{
-    io,
-    sync::{Arc, Weak},
-    thread,
-};
-use tokio::sync::{mpsc, watch};
-
-pub mod failure;
-pub use crate::operation::hooks;
 mod impls;
-#[doc(hidden)]
-pub mod lifecycle;
-mod running;
-mod spawn;
-mod teardown;
 #[cfg(test)]
 mod tests;
 
-use failure::Failures;
-pub use failure::{Failure, FailureKind, FailurePolicy, Operation, RunError};
-pub use lifecycle::spawn::{spawn, spawn_async, spawn_async_with_hooks};
-pub use lifecycle::{AbandonedSetup, AktorControl, CleanupErrors, LifecycleError, ReplaceError};
-pub use spawn::channel;
-#[cfg(feature = "tokio")]
-pub use spawn::{
-    spawn_local, spawn_local_with_policy, spawn_runner, spawn_thread, spawn_thread_with_policy,
+pub use crate::operation::Operation;
+pub use crate::operation::hooks;
+pub use crate::owner_tasks::{
+    AktorOwnerTask, AktorStopping, aktor_spawn, aktor_spawn_local, aktor_stopping,
 };
-#[cfg(feature = "tokio")]
-use spawn::{startup_cause, startup_join};
+pub use crate::panic::Failure;
 
-/// Setup and cleanup run on the actor thread.
-pub struct SpawnArgs<Setup, Cleanup> {
-    pub name: String,
-    pub capacity: usize,
-    pub failure: FailurePolicy,
-    pub setup: Setup,
-    pub cleanup: Cleanup,
-}
+use crate::message::Message;
+use crate::queue::HandleInner;
+use core::marker::PhantomData;
+use er::*;
+use std::{
+    sync::{Arc, Weak},
+    thread,
+};
+use tokio::sync::watch;
 
 pub struct Handle<S, Role = ()> {
-    pub inner: Arc<HandleInner<S>>,
+    pub(crate) inner: Arc<HandleInner<Message<S>>>,
     role: PhantomData<fn() -> Role>,
 }
 
 pub struct WeakHandle<S, Role = ()> {
-    inner: Weak<HandleInner<S>>,
+    inner: Weak<HandleInner<Message<S>>>,
     role: PhantomData<fn() -> Role>,
 }
 
-pub struct Listener<S> {
-    pub name: String,
-    pub hooks: hooks::AktorHooks<S>,
-    receiver: mailbox::Receiver<S>,
-    pub failure: FailurePolicy,
-    admission: Arc<Admission>,
-    handles: watch::Receiver<()>,
-    // Held until cleanup and the queued messages have been dropped.
-    _finished: watch::Sender<()>,
+#[doc(hidden)]
+pub struct Dedicated<S> {
+    thread: OwnerThread<Option<S>>,
+    finished: watch::Receiver<bool>,
 }
 
-pub struct Dedicated<S> {
-    thread: thread::JoinHandle<Option<S>>,
-    finished: watch::Receiver<()>,
+#[cfg(not(target_family = "wasm"))]
+type ThreadLife = crate::group::ThreadLife;
+/// The browser group doesn't count threads, there's nothing to hold.
+#[cfg(target_family = "wasm")]
+struct ThreadLife;
+
+/// An owner thread with its entry in the group's list of running threads. The entry stays
+/// until the OS join returns, and that join waits for thread local destructors too.
+struct OwnerThread<T> {
+    thread: Option<thread::JoinHandle<T>>,
+    life: Option<ThreadLife>,
+    reap: fn(thread::JoinHandle<T>, ThreadLife),
 }
 
 #[derive(Clone)]
 pub struct CompletionObserver {
-    finished: watch::Receiver<()>,
+    finished: watch::Receiver<bool>,
 }
 
 #[derive(Er)]
@@ -78,43 +60,4 @@ pub struct DedicatedJoinError {
     /// The OS join completed, including a thread that panicked.
     pub physically_joined: bool,
     pub payload: parking_lot::Mutex<Box<dyn std::any::Any + Send>>,
-}
-
-#[derive(Clone, Er)]
-pub enum StartupJoin {
-    /// The OS join returned normally.
-    Joined,
-    /// Inspect physically_joined to distinguish a joined panic from a failed join task.
-    Failed(#[er(source, skip)] Arc<DedicatedJoinError>),
-}
-
-#[derive(Er)]
-pub enum DedicatedStartError<E> {
-    /// Setup failed after the thread started. Includes the thread's join result.
-    Startup {
-        #[er(source, skip)]
-        cause: Box<DedicatedStartError<E>>,
-        #[er(skip)]
-        join: StartupJoin,
-    },
-    #[cfg(not(target_family = "wasm"))]
-    /// Scheduling the completion observer failed after the owner started.
-    Observer {
-        #[er(source, skip)]
-        cause: io::Error,
-        #[er(skip)]
-        completion: Result<(), Arc<crate::owner::OwnerError>>,
-    },
-    NotStarted,
-    Closed,
-    NoRuntime,
-    InvalidCapacity,
-    ThreadNotCreated(#[er(source, skip)] io::Error),
-    Thread(#[er(source, skip)] io::Error),
-    Init(#[er(source, skip)] E),
-    Panicked {
-        actor: String,
-        #[er(source, skip)]
-        cause: DedicatedJoinError,
-    },
 }

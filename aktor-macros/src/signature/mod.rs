@@ -24,6 +24,8 @@ pub struct Captures {
     pub added: Vec<TokenStream>,
 }
 
+pub struct HasImplTrait(pub bool);
+
 pub struct DispatchOutput;
 
 pub struct Borrows<'a> {

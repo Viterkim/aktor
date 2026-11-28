@@ -1,9 +1,8 @@
 use aktor::AktorData;
 
-#[derive(AktorData, aktor::data::__serde::Serialize)]
-#[serde(crate = "aktor::data::__serde")]
+#[derive(AktorData)]
 #[aktor(crate = aktor)]
 pub enum Message {
-    #[serde(skip)]
+    #[aktor(skip)]
     Secret,
 }

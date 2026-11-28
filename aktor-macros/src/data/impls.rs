@@ -1,78 +1,47 @@
-use super::{Member, Shape, parse::skipped};
+use super::{Member, Shape, Style, parse::field_options};
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::Fields;
 
 impl Shape {
     pub fn parse(fields: Fields) -> syn::Result<Self> {
+        let style = match &fields {
+            Fields::Named(_) => Style::Named,
+            Fields::Unnamed(_) => Style::Tuple,
+            Fields::Unit => Style::Unit,
+        };
         let members = fields
-            .iter()
+            .into_iter()
             .enumerate()
             .map(|(index, field)| {
+                let (skip, max_len) = field_options(&field)?;
                 Ok(Member {
                     name: field
                         .ident
-                        .clone()
                         .map_or_else(|| syn::Member::Unnamed(index.into()), syn::Member::Named),
-                    ty: field.ty.clone(),
-                    skip: skipped(field)?,
+                    ty: field.ty,
+                    skip,
+                    max_len,
                 })
             })
             .collect::<syn::Result<Vec<_>>>()?;
 
-        Ok(Self { fields, members })
+        Ok(Self { style, members })
     }
 
-    pub fn helper(&self, aktor: &TokenStream, lifetime: Option<&syn::Lifetime>) -> TokenStream {
-        let fields = self
-            .members
-            .iter()
-            .filter(|field| !field.skip)
-            .map(|field| {
-                let ty = &field.ty;
-                let ty = if let Some(lifetime) = lifetime {
-                    quote!(#aktor::data::Ref<#lifetime, #ty>)
-                } else {
-                    quote!(#aktor::data::Owned<#ty>)
-                };
-
-                let name = &field.name;
-
-                match &self.fields {
-                    Fields::Named(_) => quote!(#name: #ty),
-                    _ => ty,
-                }
-            });
-
-        match &self.fields {
-            Fields::Named(_) => quote!({ #(#fields,)* }),
-            Fields::Unnamed(_) => quote!((#(#fields,)*)),
-            Fields::Unit => quote!(),
-        }
-    }
-
-    pub fn construct(
-        &self,
-        prefix: TokenStream,
-        values: Vec<TokenStream>,
-        include_skipped: bool,
-    ) -> TokenStream {
-        let members = self
-            .members
-            .iter()
-            .filter(|field| include_skipped || !field.skip);
-
-        match &self.fields {
-            Fields::Named(_) => {
-                let fields = members.zip(values).map(|(member, value)| {
+    /// The variant or struct built from one value per member, skipped ones included.
+    pub fn construct(&self, prefix: TokenStream, values: Vec<TokenStream>) -> TokenStream {
+        match self.style {
+            Style::Named => {
+                let fields = self.members.iter().zip(values).map(|(member, value)| {
                     let name = &member.name;
                     quote!(#name: #value)
                 });
 
                 quote!(#prefix { #(#fields,)* })
             }
-            Fields::Unnamed(_) => quote!(#prefix(#(#values,)*)),
-            Fields::Unit => prefix,
+            Style::Tuple => quote!(#prefix(#(#values,)*)),
+            Style::Unit => prefix,
         }
     }
 }

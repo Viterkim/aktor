@@ -1,9 +1,72 @@
 use super::super::*;
-use crate::message::AktorStateError;
 
 impl<S, Role> Handle<S, Role> {
+    pub fn new(inner: Arc<HandleInner<Message<S>>>) -> Self {
+        Self {
+            inner,
+            role: PhantomData,
+        }
+    }
+
+    /// Run a job beside this actor's calls. Its capacity bounds the number of unfinished jobs.
+    #[track_caller]
+    pub fn spawn<O, E>(
+        &self,
+        work: impl Future<Output = O> + Send + 'static,
+        policy: crate::AktorJob,
+    ) -> Result<crate::AktorOwnerTask<O::Value>, (crate::AktorSpawnError, String)>
+    where
+        O: crate::AktorJobOutput<E> + 'static,
+        O::Value: Send + 'static,
+    {
+        self.inner.spawn(work, policy)
+    }
+
+    /// Wrap the outermost future that needs to stop with this actor's group.
+    /// If the group starts closing first, `run` drops that future and returns `None`.
+    pub fn run<F: IntoFuture>(&self, work: F) -> crate::AktorRun<F::IntoFuture> {
+        let work = work.into_future();
+
+        match self.inner.admission.group() {
+            Some(kill) => kill.run(work),
+            None => crate::AktorRun::ungrouped(work),
+        }
+    }
+
+    /// The registered launch attempt this handle belongs to.
+    pub fn actor_id(&self) -> Option<crate::ActorId> {
+        self.inner
+            .admission
+            .group()
+            .and_then(|kill| kill.registered_id())
+    }
+
+    /// Use the group's completion to wait for the shutdown report or confirm that every actor
+    /// has stopped. Returns `None` if the actor has no group.
+    pub fn group_completion(&self) -> Option<crate::AktorGroupCompletion> {
+        self.inner.admission.group().map(|kill| kill.completion())
+    }
+
     pub fn is_closed(&self) -> bool {
         self.inner.sender.is_closed()
+    }
+
+    #[cfg(feature = "transport")]
+    #[doc(hidden)]
+    pub fn delivery_receipt(
+        &self,
+        id: crate::FailureId,
+    ) -> impl FnOnce() + Send + 'static + use<S, Role> {
+        let receipt = self
+            .inner
+            .admission
+            .group()
+            .and_then(|group| group.delivery(id));
+        move || {
+            if let Some(receipt) = receipt {
+                receipt.receive();
+            }
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -11,7 +74,7 @@ impl<S, Role> Handle<S, Role> {
     }
 
     /// Another handle to the same actor.
-    pub fn new_handle(&self) -> Self {
+    fn new_handle(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             role: PhantomData,
@@ -45,11 +108,7 @@ impl<S, Role> Handle<S, Role> {
         let mut finished = self.inner.finished.clone();
 
         loop {
-            if matches!(
-                self.inner.admission.phase(),
-                crate::queue::Phase::Closing { .. }
-            ) || self.inner.sender.is_closed()
-            {
+            if self.inner.admission.phase().is_closing() || self.inner.sender.is_closed() {
                 return;
             }
 
@@ -68,17 +127,22 @@ impl<S, Role> Handle<S, Role> {
 }
 
 impl<S, Role> WeakHandle<S, Role> {
-    pub fn upgrade(&self) -> Result<Handle<S, Role>, AktorStateError> {
-        let inner = self.inner.upgrade().ok_or(AktorStateError::Closed)?;
+    pub fn upgrade(&self) -> Option<Handle<S, Role>> {
+        let inner = self.inner.upgrade()?;
 
         if inner.sender.is_closed() {
-            return Err(AktorStateError::Closed);
+            return None;
         }
 
-        Ok(Handle {
+        Some(Handle {
             inner,
             role: PhantomData,
         })
+    }
+}
+impl<S, Role> Clone for Handle<S, Role> {
+    fn clone(&self) -> Self {
+        self.new_handle()
     }
 }
 impl<S, Role> Clone for WeakHandle<S, Role> {

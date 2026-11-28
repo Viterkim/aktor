@@ -10,14 +10,30 @@ let initializing = false;
 let retired = false;
 let destroy;
 
-self.addEventListener('error', event => {
-    if (retired) event.preventDefault();
+function finish(outcome, orderly = true) {
+    if (retired) return;
+
+    // Pending Promise callbacks must never enter Wasm after this last call.
+    retired = true;
+
+    try {
+        if (orderly && destroy) destroy();
+        outcome.retired = orderly && (!initializing || !!destroy);
+    } catch (error) {
+        outcome.destruction = String(error?.stack || error);
+    }
+
+    self.postMessage(outcome);
     self.close();
+}
+
+self.addEventListener('error', event => {
+    event.preventDefault();
+    finish({ error: String(event.error?.stack || event.message || 'shared actor worker failed') }, false);
 });
 self.addEventListener('unhandledrejection', event => {
-    if (retired) event.preventDefault();
-    else self.postMessage({ error: String(event.reason) });
-    self.close();
+    event.preventDefault();
+    finish({ error: String(event.reason?.stack || event.reason) }, false);
 });
 
 self.onmessage = async ({ data }) => {
@@ -27,8 +43,7 @@ self.onmessage = async ({ data }) => {
         if (exports) {
             bindings.__aktor_thread_cancel(job);
         } else if (!initializing) {
-            self.postMessage({ error: 'actor worker cancelled during startup' });
-            self.close();
+            finish({ error: 'actor worker cancelled during startup' });
         }
 
         return;
@@ -37,6 +52,7 @@ self.onmessage = async ({ data }) => {
     job = data.job;
 
     let outcome;
+    let orderly = true;
 
     try {
         bindings = await import(data.program);
@@ -44,6 +60,7 @@ self.onmessage = async ({ data }) => {
         if (stopping) throw new Error('actor worker cancelled during startup');
         initializing = true;
         const instantiate = WebAssembly.instantiate;
+        let threadDestroy;
 
         // wasm-bindgen keeps these exports in its callback closures too.
         WebAssembly.instantiate = async (module, imports) => {
@@ -51,7 +68,7 @@ self.onmessage = async ({ data }) => {
             if (module !== data.module) return instance;
 
             const guarded = { ...instance.exports };
-            destroy = guarded.__wbindgen_thread_destroy;
+            threadDestroy = guarded.__wbindgen_thread_destroy;
 
             for (const [name, value] of Object.entries(guarded)) {
                 if (typeof value !== 'function') continue;
@@ -72,27 +89,19 @@ self.onmessage = async ({ data }) => {
             WebAssembly.instantiate = instantiate;
         }
 
-        if (exports.memory !== data.memory || !destroy) {
+        if (exports.memory !== data.memory || !threadDestroy) {
             throw new Error('actor worker did not import the shared memory');
         }
 
+        destroy = threadDestroy;
         if (stopping) throw new Error('actor worker cancelled during startup');
         await bindings.__aktor_thread_start(job);
         outcome = { done: true };
     } catch (error) {
+        orderly = !(error instanceof WebAssembly.RuntimeError);
         outcome = { error: String(error?.stack || error) };
     } finally {
-        try {
-            // Pending Promise callbacks must never enter Wasm after this last call.
-            retired = true;
-            if (destroy) destroy();
-            outcome.retired = true;
-        } catch (error) {
-            outcome = { error: String(error?.stack || error) };
-        }
-
-        self.postMessage(outcome);
-        self.close();
+        finish(outcome, orderly);
     }
 };
 `;
@@ -116,12 +125,22 @@ export function openThread(program, module, memory, job) {
     const finished = new Promise((resolve, reject) => {
         worker.onmessage = ({ data }) => {
             thread.retired = data.retired === true;
+            thread.destruction = data.destruction;
             if (data.done) resolve();
-            else reject(new Error(data.error));
+            else reject(data.error);
         };
         worker.onerror = event => {
             event.preventDefault();
-            reject(new Error(event.message || 'shared actor worker failed'));
+            let source = event.filename || program;
+
+            if (event.lineno) {
+                source += `:${event.lineno}`;
+                if (event.colno) source += `:${event.colno}`;
+            } else if (event.colno) {
+                source += ` (column ${event.colno})`;
+            }
+
+            reject(String(event.error?.stack || `${source}: ${event.message || 'shared actor worker failed'}`));
         };
     });
 
@@ -134,6 +153,8 @@ export function openThread(program, module, memory, job) {
     thread.finished = finished;
     return thread;
 }
+
+export function destructionError(thread) { return thread.destruction; }
 
 export function threadRetired(thread) {
     return thread.retired;
@@ -159,6 +180,9 @@ extern "C" {
         job: u32,
     ) -> Result<Thread, JsValue>;
 
+    #[wasm_bindgen(js_name = destructionError)]
+    pub fn destruction(thread: &Thread) -> Option<String>;
+
     #[wasm_bindgen(js_name = threadRetired)]
     pub fn retired(thread: &Thread) -> bool;
 
@@ -178,6 +202,10 @@ impl Thread {
         wasm_bindgen_futures::JsFuture::from(finished(self))
             .await
             .map(|_| ())
+    }
+
+    pub fn destruction_error(&self) -> Option<String> {
+        destruction(self)
     }
 
     pub fn retirement_received(&self) -> bool {

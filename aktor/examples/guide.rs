@@ -1,9 +1,8 @@
-use aktor::listener::{spawn, spawn_local};
 use aktor::*;
+use core::num::NonZeroUsize;
+use er::*;
 use rusqlite::Connection;
 use std::time::Duration;
-
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub struct Counter(pub u32);
 
@@ -21,97 +20,109 @@ pub async fn clear(counter: &mut Counter) {
 
 pub struct Main;
 
-#[aktor(actor = Main)]
+#[aktor(role = Main)]
 pub async fn main_count(counter: &Counter) -> u32 {
     counter.0
 }
 
-async fn counters(executor: &tokio::task::LocalSet) -> Result<()> {
-    let (handle, task) = spawn_local(executor, Counter(0), 8)?;
+async fn counters(counter: &Aktor<Counter>) {
+    let n = add(counter, 2).await;
+    assert_eq!(n, Ok(2));
 
-    let n = add(&handle, 2).await;
-    assert_eq!(n, 2);
-
-    let reply = add(&handle, 3).send().await;
+    let reply = add(counter, 3).send().await.unwrap();
 
     // do something else
 
-    let n: u32 = reply.await;
+    let n: u32 = reply.await.unwrap();
     assert_eq!(n, 5);
 
-    clear(&handle).cast().await;
+    clear(counter).cast().await.unwrap();
 
-    let reply = add(&handle, 3).send().await;
-    let n: u32 = reply.await;
+    let reply = add(counter, 3).send().await.unwrap();
+    let n: u32 = reply.await.unwrap();
     assert_eq!(n, 3);
 
-    let mut reply = add(&handle, 3).send().await;
+    let mut reply = add(counter, 3).send().await.unwrap();
     let n = match reply.timeout(Duration::from_millis(20)).await {
         Ok(n) => n,
         Err(_) => reply.await,
     };
-    assert_eq!(n, 6);
+    assert_eq!(n, Ok(6));
 
     let mut local = Counter(0);
     let n: u32 = add(&mut local, 2).await;
     assert_eq!(n, 2);
+}
 
-    drop(handle);
-    let counter = task.await?;
-    assert_eq!(counter.0, 6);
+async fn roles(counter: &Aktor<Counter>) {
+    let main = counter.clone().with_role::<Main>();
+
+    let n = main_count(&main).await;
+    assert_eq!(n, Ok(6));
+}
+
+#[derive(Er)]
+pub struct OpenErr;
+fn open() -> Result<Connection, (OpenErr, String)> {
+    Ok(Connection::open_in_memory().er(())?)
+}
+
+#[derive(Er)]
+pub struct CloseErr;
+fn close(database: Connection) -> Result<(), (CloseErr, String)> {
+    if let Err((_, error)) = database.close() {
+        er_bail!(CloseErr, error);
+    }
 
     Ok(())
 }
 
-async fn lifecycle() -> Result<()> {
-    let cleanup = |db: Connection| db.close().map_err(|(_, error)| error);
-
-    let (database, actor, thread) = spawn(SpawnArgs {
-        name: "sqlite".into(),
-        capacity: 128,
-        failure: FailurePolicy::Abort,
-        setup: Connection::open_in_memory,
-        cleanup,
-    })
-    .await?;
-
-    actor.replace(Connection::open_in_memory).await?;
-
-    actor.pause().await?;
-    // do something while the database is closed
-    actor.resume(Connection::open_in_memory).await?;
-
-    actor.shutdown().await?;
-    thread.join_async().await??;
-    drop(database);
-
-    Ok(())
-}
-
-async fn roles(executor: &tokio::task::LocalSet) -> Result<()> {
-    let (handle, task) = spawn_local(executor, Counter(1), 8)?;
-    let database = handle.with_role::<Main>();
-
-    let n = main_count(&database).await;
-    assert_eq!(n, 1);
-
-    drop(database);
-    task.await?;
-
-    Ok(())
+#[aktor]
+pub async fn sqlite_version(database: &Connection) -> rusqlite::Result<String> {
+    database.query_row("SELECT sqlite_version()", [], |row| row.get(0))
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
-    let executor = tokio::task::LocalSet::new();
-
-    executor
-        .run_until(async {
-            counters(&executor).await?;
-            lifecycle().await?;
-            roles(&executor).await?;
-
-            Ok(())
-        })
+async fn main() -> ErMain {
+    let started = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: (
+            AktorNew {
+                name: "counter".into(),
+                kind: AktorKind::TokioThread,
+                start: AktorInit::Ready(async || Counter(0)),
+                end: (),
+                hooks: AktorHooks::NONE,
+                capacity: NonZeroUsize::new(32).unwrap(),
+                stuck: AktorStuck::Kill,
+            },
+            AktorNew {
+                name: "sqlite".into(),
+                kind: AktorKind::TokioThread,
+                start: AktorInit::Try(async || open()),
+                end: close,
+                hooks: AktorHooks::NONE,
+                capacity: NonZeroUsize::new(32).unwrap(),
+                stuck: AktorStuck::Kill,
+            },
+        ),
+        shutdown: |_| {},
+        grace: Duration::from_secs(5),
+    });
+    started
+        .ready()
         .await
+        .er_val(|(_, report)| ErMainError.er_save("startup", report))?;
+
+    let (counter, database) = started.handles();
+
+    counters(counter).await;
+    roles(counter).await;
+
+    let version = sqlite_version(database).await.er(())?.er(())?;
+    println!("sqlite {version}");
+
+    started.stop().await.into_result().er(())?;
+
+    Ok(())
 }

@@ -9,26 +9,17 @@ impl Parse for Options {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let mut crate_path = None;
         let mut role = None;
-        let mut data = false;
-        let mut serde = false;
+        let mut name: Option<syn::LitStr> = None;
         let mut remote = false;
+        let mut latest = false;
 
         while !input.is_empty() {
             let option = input.call(Ident::parse_any)?;
-            if option == "data" || option == "serde" || option == "remote" {
-                if (option == "data" && serde) || (option == "serde" && data) {
-                    return Err(syn::Error::new(
-                        option.span(),
-                        "choose either `data` or `serde`",
-                    ));
-                }
-
-                let flag = if option == "data" {
-                    &mut data
-                } else if option == "serde" {
-                    &mut serde
-                } else {
+            if option == "remote" || option == "latest" {
+                let flag = if option == "remote" {
                     &mut remote
+                } else {
+                    &mut latest
                 };
 
                 if *flag {
@@ -48,9 +39,35 @@ impl Parse for Options {
                 continue;
             }
 
+            if option == "name" {
+                if name.is_some() {
+                    return Err(syn::Error::new(option.span(), "duplicate `name` option"));
+                }
+
+                input.parse::<syn::Token![=]>()?;
+
+                let written: syn::LitStr = input.parse()?;
+
+                if written.value().is_empty() {
+                    return Err(syn::Error::new(
+                        written.span(),
+                        "the operation name can't be empty",
+                    ));
+                }
+
+                name = Some(written);
+
+                if input.is_empty() {
+                    break;
+                }
+
+                input.parse::<syn::Token![,]>()?;
+                continue;
+            }
+
             let value = match option.to_string().as_str() {
                 "crate" => &mut crate_path,
-                "role" | "actor" => &mut role,
+                "role" => &mut role,
                 _ => {
                     return Err(syn::Error::new(
                         option.span(),
@@ -79,9 +96,9 @@ impl Parse for Options {
         Ok(Self {
             crate_path,
             role,
-            data,
-            serde,
+            name,
             remote,
+            latest,
         })
     }
 }

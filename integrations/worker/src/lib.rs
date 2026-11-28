@@ -1,7 +1,44 @@
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn worker_setup<C: aktor::AktorWorkerContract, A>(
+    name: &str,
+    program: &str,
+    config: C::Config,
+    options: aktor::worker::Options,
+    availability: A,
+) -> aktor::AktorWorkerNew<C, A> {
+    aktor::AktorWorkerNew {
+        name: name.into(),
+        kind: aktor::AktorKind::BrowserWebWorker::<C>(program),
+        config,
+        options,
+        availability,
+        before_shutdown: None,
+        stuck: aktor::AktorStuck::Kill,
+    }
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn group() -> aktor::AktorGroup {
+    let mut group = aktor::AktorGroup::with_grace(std::time::Duration::from_secs(1));
+    group.start().unwrap();
+    group
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn options(build: &str) -> aktor::worker::Options {
+    aktor::worker::Options {
+        build: build.into(),
+        capacity: core::num::NonZeroUsize::new(32).unwrap(),
+        max_outstanding_bytes: core::num::NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
+    }
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod browser;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod group;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod panic;
 pub mod preferences;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod remote;
@@ -11,40 +48,63 @@ mod setup;
 #[cfg(test)]
 mod tests {
     use super::preferences::{StorageError, read::read, write::write};
-    use aktor::listener::spawn_async;
-    use aktor::*;
+    use aktor::{AktorHooks, AktorKind, AktorNew, AktorSetup, AktorStuck, aktor_start};
+    use er::*;
     use rusqlite::Connection;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn preferences() {
-        let (db, actor, thread) = spawn_async(SpawnArgs {
-            name: "preferences".into(),
-            capacity: 2,
-            failure: FailurePolicy::Unwind,
-            setup: async || {
-                let db = Connection::open_in_memory()?;
+        #[derive(Er)]
+        struct OpenErr;
+        #[derive(Er)]
+        struct CloseErr;
 
-                db.execute(
-                    "CREATE TABLE preferences(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-                    [],
-                )?;
+        let start = async || -> Result<_, (OpenErr, String)> {
+            let db = Connection::open_in_memory().er(())?;
 
-                Ok::<_, rusqlite::Error>(db)
+            db.execute(
+                "CREATE TABLE preferences(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                [],
+            )
+            .er(())?;
+
+            Ok(db)
+        };
+        let db = aktor_start(AktorSetup {
+            stuck: aktor::AktorGroupStuck::KeepRunning,
+            actors: AktorNew {
+                name: "preferences".into(),
+                kind: AktorKind::TokioThread,
+                start: aktor::AktorInit::Try(start),
+                end: async |db: Connection| -> Result<(), (CloseErr, String)> {
+                    if let Err((_, error)) = db.close() {
+                        er_bail!(CloseErr, error);
+                    }
+
+                    Ok(())
+                },
+                hooks: AktorHooks::NONE,
+                capacity: core::num::NonZeroUsize::new(2).unwrap(),
+                stuck: AktorStuck::Kill,
             },
-            cleanup: async |db: Connection| db.close().map_err(|(_, error)| error),
-        })
-        .await
-        .unwrap();
+            shutdown: |_| {},
+            grace: Duration::from_secs(5),
+        });
+        db.ready().await.unwrap();
 
-        write(&db, "volume".into(), "0.7".into()).await.unwrap();
-        assert_eq!(read(&db, "volume".into()).await.unwrap(), "0.7");
+        write(db.handles(), "volume".into(), "0.7".into())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            read(&db, "absent".into()).await,
+            read(db.handles(), "volume".into()).await.unwrap().unwrap(),
+            "0.7"
+        );
+        assert_eq!(
+            read(db.handles(), "absent".into()).await.unwrap(),
             Err(StorageError::Missing("absent".into()))
         );
-
-        actor.shutdown().await.unwrap();
-        thread.join_async().await.unwrap().unwrap();
     }
 }
 
@@ -55,12 +115,32 @@ mod wrong_role {
     struct Database;
     struct Session;
 
-    #[aktor(actor = Database)]
+    impl AktorWorkerContract for Session {
+        type State = u32;
+        type Role = Session;
+        type Config = ();
+        type Ready = ();
+        type Error = ();
+    }
+
+    #[aktor(role = Database)]
     async fn read(state: &u32) -> u32 {
         *state
     }
 
-    async fn mismatched(worker: &aktor::worker::Worker<u32, Session>) {
-        read(worker).await;
+    async fn mismatched(group: &mut AktorGroup) {
+        let worker = group
+            .spawn(crate::worker_setup::<Session, _>(
+                "session",
+                "session.js",
+                (),
+                crate::options("session"),
+                Required,
+            ))
+            .ready()
+            .await
+            .unwrap();
+
+        read(&worker).await.unwrap();
     }
 }

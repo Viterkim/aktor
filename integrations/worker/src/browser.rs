@@ -1,6 +1,10 @@
 use crate::preferences::{read::read, write::write};
 use aktor::*;
-use aktor::{dispatch::SerdeCodec, message::CallError};
+use aktor::{
+    data::{DataError, Reader, Writer},
+    message::AktorDeliveryOutcome,
+};
+use core::num::NonZeroUsize;
 use er::*;
 use futures_util::FutureExt;
 use rusqlite::Connection;
@@ -14,7 +18,57 @@ use std::{
     task::{Context, Waker},
 };
 use wasm_bindgen::prelude::*;
-use worker::{Options, Worker, WorkerCause, WorkerError};
+use worker::{Options, Worker, WorkerCause};
+
+fn json(value: &impl serde::Serialize) -> Result<String, JsValue> {
+    #[derive(Er)]
+    struct JsonErr;
+
+    Ok(serde_json::to_string(value).er(|| JsonErr).er_report()?)
+}
+
+fn outcome(outcome: AktorDeliveryOutcome) -> &'static str {
+    match outcome {
+        AktorDeliveryOutcome::NotAdmitted => "NotAdmitted",
+        AktorDeliveryOutcome::Discarded => "Discarded",
+        AktorDeliveryOutcome::OutcomeUnknown => "OutcomeUnknown",
+    }
+}
+
+fn failure(delivery: AktorDeliveryOutcome, cause: WorkerCause) -> serde_json::Value {
+    let outcome = outcome(delivery);
+    let cause = match cause {
+        WorkerCause::Operations { expected, actual } => {
+            serde_json::json!({ "Operations": { "expected": expected, "actual": actual } })
+        }
+        WorkerCause::UnknownOperation(name) => serde_json::json!({ "UnknownOperation": name }),
+        WorkerCause::Closed => "Closed".into(),
+        WorkerCause::Full => "Full".into(),
+        WorkerCause::Codec => "Codec".into(),
+        WorkerCause::Setup => "Setup".into(),
+        WorkerCause::Cleanup => "Cleanup".into(),
+        WorkerCause::Crashed => "Crashed".into(),
+        WorkerCause::Protocol => "Protocol".into(),
+        WorkerCause::Transport => "Transport".into(),
+    };
+
+    serde_json::json!({ "outcome": outcome, "cause": cause })
+}
+
+pub(super) fn startup(
+    result: Result<&(), (&worker::WorkerStartError<impl Sized>, String)>,
+) -> Result<(), (serde_json::Value, String)> {
+    match result {
+        Ok(()) => Ok(()),
+        Err((error, report)) => {
+            let failure_info = error.failure();
+            Err((
+                failure(failure_info.outcome, failure_info.cause.clone()),
+                report,
+            ))
+        }
+    }
+}
 
 #[aktor]
 async fn occupy(_: &Connection, millis: u32) -> u32 {
@@ -27,7 +81,7 @@ async fn occupy(_: &Connection, millis: u32) -> u32 {
     millis
 }
 
-#[aktor(serde)]
+#[aktor]
 async fn pause(db: &Connection, millis: u32) -> u32 {
     timer(db, Rc::new(millis)).await
 }
@@ -39,20 +93,26 @@ async fn timer(_: &Connection, millis: Rc<u32>) -> u32 {
     *millis
 }
 
-#[derive(serde::Deserialize)]
 struct CountInput {
     millis: u32,
-    #[serde(skip)]
     encoded: Rc<Cell<usize>>,
-    #[serde(skip)]
     dropped: Rc<Cell<usize>>,
 }
-impl serde::Serialize for CountInput {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+impl AktorData for CountInput {
+    fn encode_data(&self, writer: &mut Writer) -> Result<(), DataError> {
         self.encoded.set(self.encoded.get() + 1);
-        serde::Serialize::serialize(&(self.millis,), serializer)
+        writer.write(&self.millis)
+    }
+
+    fn decode_data(reader: &mut Reader<'_>) -> Result<Self, DataError> {
+        Ok(Self {
+            millis: reader.read()?,
+            encoded: Rc::default(),
+            dropped: Rc::default(),
+        })
     }
 }
+
 impl Drop for CountInput {
     fn drop(&mut self) {
         self.dropped.set(self.dropped.get() + 1);
@@ -94,49 +154,75 @@ fn close_database(db: Connection, pool: &OpfsSAHPoolUtil) -> ErResult<(), CloseE
     pool.pause_vfs().er_val(CloseErr::storage)
 }
 
-#[wasm_bindgen]
-pub async fn start_worker() -> Result<(), JsValue> {
+#[derive(Er)]
+enum OpenErr {
+    #[er(format = "preferences storage is already open in another tab")]
+    Busy(#[er(source, skip)] OpfsSAHError),
+    Storage(#[er(source, skip)] OpfsSAHError),
+    Database,
+    Schema,
+}
+async fn open_database() -> ErResult<(Connection, OpfsSAHPoolUtil), OpenErr> {
     let pool = sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
         &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
         true,
     )
     .await
-    .map_err(|error| {
-        if let sqlite_wasm_vfs::sahpool::OpfsSAHError::CreateSyncAccessHandle(value) = &error {
+    .er_val(|error| {
+        if let OpfsSAHError::CreateSyncAccessHandle(value) = &error {
             let name = js_sys::Reflect::get(value, &JsValue::from_str("name"))
                 .ok()
                 .and_then(|name| name.as_string());
 
             if name.as_deref() == Some("NoModificationAllowedError") {
-                return JsValue::from_str("preferences storage is already open in another tab");
+                return OpenErr::Busy(error);
             }
         }
 
-        js_error(error)
+        OpenErr::Storage(error)
     })?;
 
-    let db = Connection::open("preferences.sqlite").map_err(js_error)?;
+    let db = Connection::open("preferences.sqlite").er(|| OpenErr::Database)?;
 
     db.execute(
         "CREATE TABLE IF NOT EXISTS preferences(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         [],
     )
-    .map_err(js_error)?;
+    .er(|| OpenErr::Schema)?;
 
-    let cleanup = async move |db: Connection| -> Result<(), AktorCleanupError> {
-        close_database(db, &pool).er_into(|report| report)
-    };
+    Ok((db, pool))
+}
 
-    let options = Options {
-        build: "preferences-v1".into(),
-        ..Options::default()
-    };
+pub(super) struct Database;
+impl AktorWorkerContract for Database {
+    type State = Connection;
+    type Role = ();
+    type Config = ();
+    type Ready = ();
+    type Error = ();
+}
 
-    worker::serve_with(db, cleanup, options)
-        .map_err(js_error)?
-        .wait()
-        .await
-        .map_err(js_error)?;
+#[wasm_bindgen]
+pub async fn start_worker() -> Result<(), JsValue> {
+    worker::serve_setup::<Database>(crate::options("preferences-v1"), |()| {
+        let pool = Rc::new(RefCell::new(None));
+        let opened = pool.clone();
+        AktorServe {
+            start: AktorInit::Try(async move || {
+                let (db, owner) = open_database()
+                    .await
+                    .er_split_with(|(_, report)| ((), report))?;
+                *opened.borrow_mut() = Some(owner);
+                Ok::<_, ((), String)>(db)
+            }),
+            end: move |db: Connection| {
+                close_database(db, &pool.take().unwrap()).er_split_with(|(_, report)| ((), report))
+            },
+            hooks: AktorHooks::NONE,
+        }
+    })
+    .await
+    .er_report()?;
 
     Ok(())
 }
@@ -145,25 +231,37 @@ pub async fn start_worker() -> Result<(), JsValue> {
 pub async fn sqlite_listener_check(url: String) -> Result<bool, JsValue> {
     let mut actors = AktorGroup::new();
     let kill = actors.killswitch();
-    let after = async |_| Ok::<_, AktorCleanupError>(());
-    let closing = actors.start_with(after).map_err(js_error)?;
-    let options = Options {
-        build: "preferences-v1".into(),
-        ..Options::default()
-    };
+    let after = async |_| ();
+    let closing = actors
+        .start_with(after)
+        .map_err(|(_, report)| js_error(report))?;
+    let options = crate::options("preferences-v1");
     let database = actors
-        .worker::<Connection>("preferences", &url, options)
+        .spawn(crate::worker_setup::<Database, _>(
+            "preferences",
+            &url,
+            (),
+            options,
+            aktor::Required,
+        ))
+        .ready()
+        .await
+        .map_err(|(_, report)| js_error(report))?;
+
+    let saved = write(&database, "listener-proof".into(), "0.8".into())
         .await
         .map_err(js_error)?;
-
-    let saved = write(&database, "listener-proof".into(), "0.8".into()).await;
-    let found = read(&database, "listener-proof".into()).await;
-    let missing = read(&database, "listener-missing".into()).await;
+    let found = read(&database, "listener-proof".into())
+        .await
+        .map_err(js_error)?;
+    let missing = read(&database, "listener-missing".into())
+        .await
+        .map_err(js_error)?;
     let stayed_open = !kill.is_stopping();
 
     drop(actors);
 
-    let report = closing.wait().await;
+    let report = closing.wait().await.unwrap();
 
     Ok(saved.as_deref() == Ok("0.8")
         && found.as_deref() == Ok("0.8")
@@ -175,42 +273,43 @@ pub async fn sqlite_listener_check(url: String) -> Result<bool, JsValue> {
 
 #[wasm_bindgen]
 pub struct Client {
-    worker: Worker<Connection>,
+    _group: AktorGroup,
+    worker: Worker<Database>,
     url: String,
 }
 #[wasm_bindgen]
 impl Client {
     #[wasm_bindgen(constructor)]
     pub fn new(url: &str) -> Result<Client, JsValue> {
-        Ok(Self {
-            url: url.into(),
-            worker: Worker::with_options(
-                url,
-                Options {
-                    build: "preferences-v1".into(),
-                    ..Options::default()
-                },
-            )
-            .map_err(js_error)?,
-        })
+        Self::limited(url, 32, 4 * 1024 * 1024)
     }
 
     pub async fn ready(&self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.worker.ready().await).map_err(js_error)
+        json(&startup(self.worker.ready().await))
     }
 
     pub fn limited(url: &str, capacity: usize, bytes: usize) -> Result<Client, JsValue> {
+        let options = Options {
+            capacity: NonZeroUsize::new(capacity)
+                .ok_or_else(|| js_error("capacity must be nonzero"))?,
+            max_outstanding_bytes: core::num::NonZeroUsize::new(bytes).unwrap(),
+            ..crate::options("preferences-v1")
+        };
+        let group = crate::group();
+        let (_, worker) = group
+            .spawn(crate::worker_setup::<Database, _>(
+                "preferences",
+                url,
+                (),
+                options,
+                Required,
+            ))
+            .into_parts()
+            .unwrap();
         Ok(Self {
             url: url.into(),
-            worker: Worker::with_options(
-                url,
-                Options {
-                    build: "preferences-v1".into(),
-                    capacity,
-                    max_outstanding_bytes: bytes,
-                },
-            )
-            .map_err(js_error)?,
+            worker,
+            _group: group,
         })
     }
 
@@ -219,11 +318,11 @@ impl Client {
     }
 
     pub fn outstanding(&self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.worker.outstanding()).map_err(js_error)
+        json(&self.worker.outstanding())
     }
 
     pub fn abandon(&self, value: String) -> bool {
-        write::request(&self.worker, "abandoned".into(), value)
+        write(&self.worker, "abandoned".into(), value)
             .send()
             .now_or_never()
             .map(drop)
@@ -231,7 +330,7 @@ impl Client {
     }
 
     pub async fn queue_pause(&self, millis: u32) {
-        drop(pause::request(&self.worker, millis).send().await);
+        drop(pause(&self.worker, millis).send().await.unwrap());
     }
 
     pub fn observer(&self) -> Observer {
@@ -245,14 +344,15 @@ impl Client {
     }
 
     pub async fn finished(&self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.worker.completion().report().await).map_err(js_error)
+        json(&self.worker.completion().report().await.er_report())
     }
 
     pub async fn latest_sequence(&self) -> Result<String, JsValue> {
-        let running = pause(&self.worker, 150).send().await;
+        let running = pause(&self.worker, 150).send().await.unwrap();
         let writing = write(&self.worker, "volume".into(), "0.9".into())
             .send()
-            .await;
+            .await
+            .unwrap();
         let (panel, mut results) = read(&self.worker, "absent".into()).latest();
         let (other, mut other_results) = read(&self.worker, "absent".into()).latest();
 
@@ -279,13 +379,14 @@ impl Client {
             )));
         }
 
-        running.await;
+        running.await.unwrap();
         writing
             .await
+            .unwrap()
             .map_err(|error| js_error(format!("{error:?}")))?;
 
-        let current = results.next().await;
-        let independent = other_results.next().await;
+        let current = results.next().await.transpose().map_err(js_error)?;
+        let independent = other_results.next().await.transpose().map_err(js_error)?;
 
         let (cancelled, cancelled_results) =
             write(&self.worker, "latest-cancelled".into(), "first".into()).latest();
@@ -295,6 +396,7 @@ impl Client {
 
         let saved = read(&self.worker, "latest-cancelled".into())
             .await
+            .map_err(js_error)?
             .map_err(|error| js_error(format!("{error:?}")))?;
         if saved != "first" {
             return Err(js_error(format!(
@@ -323,18 +425,17 @@ impl Client {
         panel.send("volume".into());
         drop(panel);
 
-        let final_result = results.next().await;
+        let final_result = results.next().await.transpose().map_err(js_error)?;
         let ended = results.next().await.is_none();
 
-        serde_json::to_string(&(current, independent, final_result, ended, bounded))
-            .map_err(js_error)
+        json(&(current, independent, final_result, ended, bounded))
     }
 
     pub async fn reservation(&self) -> Result<String, JsValue> {
-        let running = pause(&self.worker, 150).send().await;
+        let running = pause(&self.worker, 150).send().await.unwrap();
         let writing = write(&self.worker, "oversized".into(), "x".repeat(4096)).send();
         let (reply, ()) = futures_util::future::join(writing, async {
-            running.await;
+            running.await.unwrap();
         })
         .await;
         let counted = self.worker.outstanding();
@@ -343,10 +444,11 @@ impl Client {
             .await;
         let not_admitted = timed.err().is_some_and(|error| !error.admitted);
         let _ = reply
+            .unwrap()
             .await
             .map_err(|error| js_error(format!("{error:?}")))?;
 
-        serde_json::to_string(&(counted, not_admitted)).map_err(js_error)
+        json(&(counted, not_admitted))
     }
 
     pub async fn rejection(&self) -> Result<String, JsValue> {
@@ -359,65 +461,47 @@ impl Client {
                 notification.set(true);
                 let _sent = closed.send(report);
             })
-            .map_err(js_error)?;
-        group.start().map_err(js_error)?;
+            .map_err(|(_, report)| js_error(report))?;
+        group.start().map_err(|(_, report)| js_error(report))?;
         let worker = group
-            .worker::<u32>(
+            .spawn(crate::worker_setup::<crate::group::GroupWorker, _>(
                 "codec failure",
                 &self.url.replace("/worker.js", "/group-worker.js"),
-                Options {
-                    build: "group-v1".into(),
-                    ..Options::default()
-                },
-            )
+                (),
+                crate::options("group-v1"),
+                Required,
+            ))
+            .ready()
             .await
-            .map_err(js_error)?;
-        let completed = worker.completion();
-        let continued = Rc::new(Cell::new(false));
-        let after = continued.clone();
-        let failed = async {
-            worker::WorkerRequest::<u32, u32>::new(
-                &worker,
-                pause::NAME,
-                Err(WorkerError::new(
-                    CallError::NotAdmitted,
-                    WorkerCause::Codec("invalid input".into()),
-                )),
-            )
-            .await;
-            after.set(true);
-        };
-        futures_util::pin_mut!(failed);
-        let report = match futures_util::future::select(failed, closing).await {
-            futures_util::future::Either::Right((report, _)) => report.map_err(js_error)?,
-            futures_util::future::Either::Left(_) => return Err(js_error("failed call continued")),
-        };
-        assert!(!continued.get());
+            .map_err(|(_, report)| js_error(report))?;
+        let codec = Transport::<u32, crate::group::BadInput, u32>::request(
+            &worker,
+            aktor::operation::Operation {
+                name: pause::NAME,
+                caller: core::panic::Location::caller(),
+            },
+            crate::group::BadInput("invalid input"),
+        )
+        .await
+        .unwrap_err();
+        group.killswitch().stop();
+        let report = closing.await.map_err(js_error)?;
         assert!(notified.get());
-        let codec = completed.report().await.unwrap_err();
-        assert!(report.failed());
-        assert!(
-            report
-                .actors
-                .iter()
-                .all(|actor| actor.diagnostics.is_empty())
-        );
-        assert!(report.failure.unwrap().message.contains("invalid input"));
-        assert_eq!(codec.outcome, CallError::NotAdmitted);
+        assert_eq!(codec.failure_id, Some(report.failures[0].id));
 
         let mut admitted = Vec::new();
         for _ in 0..4 {
-            admitted.push(pause(&self.worker, 0).send().await);
+            admitted.push(pause(&self.worker, 0).send().await.unwrap());
         }
         use aktor::{dispatch::Transport, operation::Operation};
         let encoded = Rc::new(Cell::new(0));
         let dropped = Rc::new(Cell::new(0));
-        let mut waiting = <&Worker<Connection> as Transport<
+        let mut waiting = <&Worker<Database> as Transport<
             Connection,
             CountInput,
             u32,
             (),
-            SerdeCodec,
+            dispatch::DataCodec,
         >>::request(
             &self.worker,
             Operation {
@@ -436,30 +520,37 @@ impl Client {
         assert_eq!(encoded.get(), 1);
         assert_eq!(dropped.get(), 1);
         for reply in admitted {
-            assert_eq!(reply.await, 0);
+            assert_eq!(reply.await.unwrap(), 0);
         }
-        assert_eq!(waiting.send().await.await, 0);
+        assert_eq!(waiting.send().await.unwrap().await.unwrap(), 0);
         assert_eq!(encoded.get(), 1);
 
         let full_bytes = write(&self.worker, "diagnostic-budget".into(), "x".repeat(1024))
             .send()
-            .await;
-        let mut waiting = pause::request(&self.worker, 0);
+            .await
+            .unwrap();
+        let mut waiting = pause(&self.worker, 0).into_future();
         assert!((&mut waiting).now_or_never().is_none());
         assert_eq!(self.worker.outstanding(), (1, 1024));
         assert_eq!(
             full_bytes
                 .await
+                .unwrap()
                 .map_err(|error| js_error(format!("{error:?}")))?
                 .len(),
             1024
         );
-        assert_eq!(waiting.send().await.await, 0);
+        assert_eq!(waiting.send().await.unwrap().await.unwrap(), 0);
         assert_eq!(self.worker.outstanding(), (0, 0));
 
-        let healthy = read(&self.worker, "volume".into()).await;
+        let healthy = read(&self.worker, "volume".into())
+            .await
+            .map_err(js_error)?;
 
-        serde_json::to_string(&(codec, healthy)).map_err(js_error)
+        json(&(
+            serde_json::json!({ "outcome": outcome(codec.outcome), "report": codec.report }),
+            healthy,
+        ))
     }
 
     pub async fn large(&self) -> Result<usize, JsValue> {
@@ -469,12 +560,14 @@ impl Client {
         assert_eq!(
             write(&self.worker, "large".into(), text.clone())
                 .await
+                .map_err(js_error)?
                 .map_err(|error| js_error(format!("{error:?}")))?,
             text
         );
         assert_eq!(
             read(&self.worker, "large".into())
                 .await
+                .map_err(js_error)?
                 .map_err(|error| js_error(format!("{error:?}")))?,
             text
         );
@@ -485,17 +578,18 @@ impl Client {
         let result = pause(&self.worker, millis)
             .timeout(core::time::Duration::from_millis(u64::from(timeout)))
             .await
+            .map(|output| output.unwrap())
             .map_err(|error| error.admitted);
 
-        serde_json::to_string(&result).map_err(js_error)
+        json(&result)
     }
 
     pub async fn submitted(&self) -> Result<String, JsValue> {
         let (_idle, mut results) = read(&self.worker, "absent".into()).latest();
 
-        assert!(results.next().await.unwrap().is_err());
+        assert!(results.next().await.unwrap().unwrap().is_err());
 
-        let mut request = pause::request(&self.worker, 0);
+        let mut request = pause(&self.worker, 0).into_future();
         let pending = Pin::new(&mut request)
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending();
@@ -504,41 +598,40 @@ impl Client {
             futures_util::future::join(async { results.next().await.is_none() }, async {
                 drop(self.worker.shutdown());
 
-                let reply = request.send().await;
-                let output = reply.await;
+                let reply = request.send().await.unwrap();
+                let output = reply.await.map_err(js_error)?;
 
-                self.worker.completion().report().await.map_err(js_error)?;
+                self.worker
+                    .completion()
+                    .report()
+                    .await
+                    .map_err(|(_, report)| js_error(report))?;
                 Ok::<_, JsValue>(output)
             })
             .await;
 
-        serde_json::to_string(&(pending, output?, ended)).map_err(js_error)
+        json(&(pending, output?, ended))
     }
 
     pub async fn write(&self, key: String, value: String) -> Result<String, JsValue> {
-        serde_json::to_string(&write(&self.worker, key, value).await).map_err(js_error)
+        json(&write(&self.worker, key, value).await.map_err(js_error)?)
     }
 
     pub async fn read(&self, key: String) -> Result<String, JsValue> {
-        serde_json::to_string(&read(&self.worker, key).await).map_err(js_error)
+        json(&read(&self.worker, key).await.map_err(js_error)?)
     }
 
     pub async fn occupy(&self, millis: u32) -> Result<String, JsValue> {
-        serde_json::to_string(&occupy(&self.worker, millis).await).map_err(js_error)
+        json(&occupy(&self.worker, millis).await.map_err(js_error)?)
     }
 
     pub async fn pause(&self, millis: u32) -> Result<String, JsValue> {
-        serde_json::to_string(&pause(&self.worker, millis).await).map_err(js_error)
+        json(&pause(&self.worker, millis).await.map_err(js_error)?)
     }
 
     pub fn terminate(&self) {
         self.worker.terminate();
     }
-}
-
-#[wasm_bindgen]
-pub fn startup_failed(error: String) -> Result<(), JsValue> {
-    worker::setup_failed(aktor::AktorSetupError::new(error, ())).map_err(js_error)
 }
 
 #[wasm_bindgen]
@@ -548,6 +641,6 @@ pub struct Observer {
 #[wasm_bindgen]
 impl Observer {
     pub async fn finished(&mut self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.completion.report().await).map_err(js_error)
+        json(&self.completion.report().await.er_report())
     }
 }

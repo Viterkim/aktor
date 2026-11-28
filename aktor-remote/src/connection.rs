@@ -1,30 +1,41 @@
-use crate::{CallError, Cause, Error};
+use er::*;
 use std::{
     fmt, io,
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite, BufReader, ReadBuf},
     net::{TcpListener, TcpStream, UnixListener, UnixStream},
 };
 
 #[derive(Clone, Debug)]
-pub enum Address {
-    Unix(PathBuf),
+pub enum Address<U = PathBuf> {
+    Unix(U),
     Tcp(SocketAddr),
     #[cfg(feature = "udp")]
     Udp(SocketAddr),
 }
 
+/// A Unix listener sets the socket and lock file mode when binding.
+#[derive(Clone, Debug)]
+pub struct UnixListenerOptions {
+    pub path: PathBuf,
+    pub permissions: u32,
+}
+
+pub type ListenAddress = Address<UnixListenerOptions>;
+
 pub enum Stream {
     Unix(UnixStream),
     Tcp(TcpStream),
     #[cfg(feature = "udp")]
-    Udp(utp::UtpStream),
+    Udp(crate::udp::Stream),
 }
+
+pub type BufferedStream = BufReader<Stream>;
 
 pub enum Listener {
     Unix(UnixListener),
@@ -58,28 +69,36 @@ impl From<&PathBuf> for Address {
         Self::Unix(path.clone())
     }
 }
-impl From<&str> for Address {
-    fn from(path: &str) -> Self {
-        Self::Unix(path.into())
-    }
-}
-impl From<String> for Address {
-    fn from(path: String) -> Self {
-        Self::Unix(path.into())
-    }
-}
 impl From<SocketAddr> for Address {
     fn from(address: SocketAddr) -> Self {
         Self::Tcp(address)
     }
 }
-impl From<&String> for Address {
-    fn from(path: &String) -> Self {
-        Self::Unix(path.into())
-    }
+
+pub fn finish(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    budget: std::time::Duration,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    // A half close cancels the request while the peer can still finish its last write.
+    runtime.spawn(async move {
+        let close = async {
+            stream.shutdown().await?;
+            tokio::io::copy(&mut stream, &mut tokio::io::sink()).await
+        };
+        let _ = tokio::time::timeout(budget, close).await;
+    });
 }
 
 impl Stream {
+    pub fn buffered(self) -> BufferedStream {
+        BufReader::with_capacity(4 * 1024, self)
+    }
+
     pub fn compresses(&self) -> bool {
         match self {
             Self::Unix(_) => false,
@@ -90,42 +109,115 @@ impl Stream {
             Self::Udp(_) => true,
         }
     }
+}
 
-    pub fn idle(&mut self) -> Result<bool, Error> {
-        let mut byte = [0];
-        let mut buffer = ReadBuf::new(&mut byte);
-        let mut context = Context::from_waker(std::task::Waker::noop());
-        match Pin::new(self).poll_read(&mut context, &mut buffer) {
-            Poll::Pending => Ok(true),
-            Poll::Ready(Err(_)) => Ok(false),
-            Poll::Ready(Ok(())) if buffer.filled().is_empty() => Ok(false),
-            Poll::Ready(Ok(())) => Err(Error::new(
-                CallError::NotAdmitted,
-                Cause::Protocol,
-                "unexpected data on an idle connection",
-            )),
-        }
+#[derive(Er)]
+pub struct IdleDataErr;
+pub fn idle(stream: &mut BufferedStream) -> ErResult<bool, IdleDataErr> {
+    if !stream.buffer().is_empty() {
+        er_bail!(());
+    }
+
+    let mut byte = [0];
+    let result = match stream.get_ref() {
+        Stream::Unix(stream) => Some(stream.try_read(&mut byte)),
+        Stream::Tcp(stream) => Some(stream.try_read(&mut byte)),
+        #[cfg(feature = "udp")]
+        Stream::Udp(_) => None,
+    };
+    if let Some(result) = result {
+        return match result {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+            Err(_) | Ok(0) => Ok(false),
+            Ok(_) => er_bail!(()),
+        };
+    }
+
+    let mut buffer = ReadBuf::new(&mut byte);
+    let mut context = Context::from_waker(Waker::noop());
+
+    match Pin::new(stream).poll_read(&mut context, &mut buffer) {
+        Poll::Pending => Ok(true),
+        Poll::Ready(Err(_)) => Ok(false),
+        Poll::Ready(Ok(())) if buffer.filled().is_empty() => Ok(false),
+        Poll::Ready(Ok(())) => er_bail!(()),
     }
 }
+
+#[derive(Er)]
+pub enum AcceptStreamErr {
+    Retry,
+    Backoff,
+    Fatal,
+}
 impl Listener {
-    pub async fn accept(&self) -> io::Result<Stream> {
+    pub async fn accept(&self) -> ErResult<Stream, AcceptStreamErr> {
         match self {
-            Self::Unix(listener) => listener
-                .accept()
-                .await
-                .map(|(stream, _)| Stream::Unix(stream)),
+            Self::Unix(listener) => {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .er_with(|error| self.accept_error(error))?;
+                Ok(Stream::Unix(stream))
+            }
             Self::Tcp(listener) => {
-                let (stream, _) = listener.accept().await?;
-                stream.set_nodelay(true)?;
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .er_with(|error| self.accept_error(error))?;
+                stream.set_nodelay(true).er(AcceptStreamErr::retry)?;
+
                 Ok(Stream::Tcp(stream))
             }
             #[cfg(feature = "udp")]
-            Self::Udp(listener) => listener
-                .socket
-                .accept()
-                .await
-                .map(Stream::Udp)
-                .map_err(io::Error::other),
+            Self::Udp(listener) => {
+                let stream = listener.accept().await.er(AcceptStreamErr::fatal)?;
+                Ok(Stream::Udp(stream))
+            }
+        }
+    }
+
+    fn accept_error(&self, error: &io::Error) -> AcceptStreamErr {
+        use io::ErrorKind;
+        use rustix::io::Errno;
+
+        let errno = error.raw_os_error().map(Errno::from_raw_os_error);
+        if error.kind() == ErrorKind::OutOfMemory
+            || matches!(
+                errno,
+                Some(Errno::MFILE | Errno::NFILE | Errno::NOMEM | Errno::NOBUFS)
+            )
+        {
+            return AcceptStreamErr::Backoff;
+        }
+
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::Tcp(_))
+            && matches!(
+                errno,
+                Some(
+                    Errno::PROTO
+                        | Errno::NETDOWN
+                        | Errno::NOPROTOOPT
+                        | Errno::HOSTDOWN
+                        | Errno::NONET
+                        | Errno::HOSTUNREACH
+                        | Errno::OPNOTSUPP
+                        | Errno::NETUNREACH
+                )
+            )
+        {
+            // Linux can return a pending connection's network error from accept().
+            return AcceptStreamErr::Retry;
+        }
+
+        match error.kind() {
+            ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::TimedOut => AcceptStreamErr::Retry,
+            _ => AcceptStreamErr::Fatal,
         }
     }
 }
@@ -144,6 +236,15 @@ impl AsyncRead for Stream {
     }
 }
 impl AsyncWrite for Stream {
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Unix(stream) => stream.is_write_vectored(),
+            Self::Tcp(stream) => stream.is_write_vectored(),
+            #[cfg(feature = "udp")]
+            Self::Udp(stream) => stream.is_write_vectored(),
+        }
+    }
+
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -154,6 +255,19 @@ impl AsyncWrite for Stream {
             Self::Tcp(stream) => Pin::new(stream).poll_write(cx, bytes),
             #[cfg(feature = "udp")]
             Self::Udp(stream) => Pin::new(stream).poll_write(cx, bytes),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Unix(stream) => Pin::new(stream).poll_write_vectored(cx, buffers),
+            Self::Tcp(stream) => Pin::new(stream).poll_write_vectored(cx, buffers),
+            #[cfg(feature = "udp")]
+            Self::Udp(stream) => Pin::new(stream).poll_write_vectored(cx, buffers),
         }
     }
 

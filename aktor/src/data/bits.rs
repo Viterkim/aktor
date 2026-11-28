@@ -1,118 +1,85 @@
-use alloc::{vec, vec::Vec};
-use core::fmt;
-use serde::{
-    Deserializer, Serializer,
-    de::{self, SeqAccess, Visitor},
-    ser::SerializeTuple,
-};
+use super::{DataError, Reader, Writer};
+use alloc::vec::Vec;
 
-pub fn serialize_slice<S: Serializer>(values: &[bool], serializer: S) -> Result<S::Ok, S::Error> {
+/// Eight to a byte. The last byte gets one more bit set right after the values, so the
+/// reader knows where they stop without a separate count.
+pub fn encode_slice(values: &[bool], writer: &mut Writer) {
     if values.is_empty() {
-        return serializer.serialize_bytes(&[]);
+        writer.length(0);
+        return;
     }
 
     let length = values.len() / 8 + 1;
-    let mut inline = [0; 32];
-    let mut heap;
-    let bytes = if length <= inline.len() {
-        &mut inline[..length]
-    } else {
-        heap = vec![0; length];
-        &mut heap
+
+    writer.length(length);
+    writer.bytes.reserve(length);
+
+    let (chunks, tail) = values.as_chunks::<8>();
+
+    for chunk in chunks {
+        writer.bytes.push(pack(chunk));
+    }
+
+    writer.bytes.push(pack(tail) | 1 << tail.len());
+}
+
+pub fn decode_vec(reader: &mut Reader<'_>, max: usize) -> Result<Vec<bool>, DataError> {
+    let Some((&last, bytes)) = reader.slice()?.split_last() else {
+        return Ok(Vec::new());
     };
 
-    for (byte, chunk) in bytes.iter_mut().zip(values.chunks(8)) {
-        *byte = pack(chunk);
+    if last == 0 {
+        return Err(DataError::from(super::DataReason::MissingEndBit));
     }
 
-    bytes[length - 1] |= 1 << (values.len() % 8);
-    serializer.serialize_bytes(bytes)
+    let remaining = 7 - last.leading_zeros() as usize;
+
+    if bytes.is_empty() {
+        super::within(remaining, max, "values")?;
+        return Ok((0..remaining).map(|bit| last & (1 << bit) != 0).collect());
+    }
+
+    let count = bytes
+        .len()
+        .checked_mul(8)
+        .and_then(|count| count.checked_add(remaining))
+        .ok_or_else(|| DataError::from(super::DataReason::CountOverflow))?;
+    super::within(count, max, "values")?;
+
+    // with_capacity panics when it can't get the memory, or on 32 bit targets when the count
+    // is past isize::MAX. Both are a refusal here.
+    let mut values = Vec::new();
+    if values.try_reserve_exact(count).is_err() {
+        return Err(DataError::from(super::DataReason::BooleanAllocation));
+    }
+
+    for byte in bytes {
+        values.extend_from_slice(&unpack(*byte));
+    }
+
+    values.extend((0..remaining).map(|bit| last & (1 << bit) != 0));
+    Ok(values)
 }
 
-pub fn deserialize_vec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<bool>, D::Error> {
-    struct Vector;
-    impl<'de> Visitor<'de> for Vector {
-        type Value = Vec<bool>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("packed booleans")
-        }
-
-        fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
-            let Some((&last, bytes)) = bytes.split_last() else {
-                return Ok(Vec::new());
-            };
-
-            if last == 0 {
-                return Err(E::custom("missing boolean end bit"));
-            }
-
-            let remaining = 7 - last.leading_zeros() as usize;
-            let count = bytes
-                .len()
-                .checked_mul(8)
-                .and_then(|count| count.checked_add(remaining))
-                .ok_or_else(|| E::custom("boolean count overflow"))?;
-            let mut values = Vec::with_capacity(count);
-
-            for byte in bytes {
-                values.extend((0..8).map(|bit| byte & (1 << bit) != 0));
-            }
-
-            values.extend((0..remaining).map(|bit| last & (1 << bit) != 0));
-            Ok(values)
-        }
-    }
-
-    deserializer.deserialize_bytes(Vector)
+pub fn encode_array<const N: usize>(values: &[bool; N], writer: &mut Writer) {
+    writer.bytes.extend(values.chunks(8).map(pack));
 }
 
-pub fn serialize_array<S: Serializer, const N: usize>(
-    values: &[bool; N],
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    let mut tuple = serializer.serialize_tuple(N.div_ceil(8))?;
+pub fn decode_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[bool; N], DataError> {
+    let mut values = [false; N];
+    let bytes = reader.take(N.div_ceil(8))?;
 
-    for chunk in values.chunks(8) {
-        tuple.serialize_element(&pack(chunk))?;
-    }
-
-    tuple.end()
-}
-
-pub fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
-    deserializer: D,
-) -> Result<[bool; N], D::Error> {
-    struct Array<const N: usize>;
-    impl<'de, const N: usize> Visitor<'de> for Array<N> {
-        type Value = [bool; N];
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a packed boolean array")
+    for (chunk, byte) in values.chunks_mut(8).zip(bytes) {
+        if chunk.len() < 8 && byte >> chunk.len() != 0 {
+            return Err(DataError::from(super::DataReason::NonzeroPadding));
         }
 
-        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
-            let mut values = [false; N];
-
-            for chunk in values.chunks_mut(8) {
-                let byte = sequence
-                    .next_element::<u8>()?
-                    .ok_or_else(|| de::Error::custom("truncated boolean data"))?;
-
-                if chunk.len() < 8 && byte >> chunk.len() != 0 {
-                    return Err(de::Error::custom("nonzero padding in boolean data"));
-                }
-
-                for (bit, value) in chunk.iter_mut().enumerate() {
-                    *value = byte & (1 << bit) != 0;
-                }
-            }
-
-            Ok(values)
+        for (bit, value) in chunk.iter_mut().enumerate() {
+            *value = byte & (1 << bit) != 0;
         }
     }
 
-    deserializer.deserialize_tuple(N.div_ceil(8), Array)
+    Ok(values)
 }
 
 fn pack(values: &[bool]) -> u8 {
@@ -128,4 +95,11 @@ fn pack(values: &[bool]) -> u8 {
         .iter()
         .enumerate()
         .fold(0_u8, |byte, (bit, value)| byte | (u8::from(*value) << bit))
+}
+
+fn unpack(byte: u8) -> [bool; 8] {
+    let halves = u64::from(byte & 0x0f) | (u64::from(byte >> 4) << 32);
+    // Copy each nibble at bit offsets 0, 7, 14 and 21. The mask keeps one bit from each copy.
+    let bits = (halves * 0x0020_4081) & 0x0101_0101_0101_0101;
+    bits.to_le_bytes().map(|bit| bit != 0)
 }

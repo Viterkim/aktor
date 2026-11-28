@@ -1,7 +1,3 @@
-use super::AktorExecution;
-use crate::{AktorOutcome, KillSwitch};
-use tokio::sync::oneshot;
-
 #[cfg(all(
     feature = "browser_local",
     target_family = "wasm",
@@ -12,11 +8,13 @@ mod impls;
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 mod tokio_local;
 
-pub use impls::start_local;
+pub use impls::{closed_local_handle, launch_local, readiness};
+
+use crate::{AktorKillSwitch, OwnerOutcome};
+use tokio::sync::oneshot;
 
 struct Completion {
     name: String,
-    kind: AktorExecution,
-    kill: KillSwitch,
-    completed: Option<oneshot::Sender<AktorOutcome>>,
+    kill: AktorKillSwitch,
+    completed: Option<oneshot::Sender<OwnerOutcome>>,
 }

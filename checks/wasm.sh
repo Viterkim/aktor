@@ -6,6 +6,9 @@ extras_dir=${AKTOR_EXTRAS:-"$PWD/../aktor-extras"}
 current_toolchain=$(rustup show active-toolchain | cut -d ' ' -f 1)
 
 for toolchain in 1.95.0 "$current_toolchain"; do
+    cargo +"$toolchain" check -p aktor --target wasm32-unknown-unknown --no-default-features \
+        --features macros,wasm_browser_workers
+
     cargo +"$toolchain" test --manifest-path integrations/Cargo.toml -p aktor-wasm-proof
     cargo +"$toolchain" test --manifest-path integrations/Cargo.toml -p aktor-wasm-proof --release
 
@@ -13,7 +16,7 @@ for toolchain in 1.95.0 "$current_toolchain"; do
         cargo +"$toolchain" build --manifest-path integrations/Cargo.toml -p aktor-wasm-proof \
             --target wasm32-unknown-unknown --release --no-default-features --features "$clock"
 
-        wasm_module=integrations/target/wasm32-unknown-unknown/release/aktor_wasm_proof.wasm
+        wasm_module=${CARGO_TARGET_DIR:-integrations/target}/wasm32-unknown-unknown/release/aktor_wasm_proof.wasm
 
         cargo run --quiet --locked --manifest-path "$extras_dir/checks/Cargo.toml" \
             --bin wasm -- "$wasm_module"

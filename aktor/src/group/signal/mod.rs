@@ -6,6 +6,7 @@ use crate::{
     threads::lock::Mutex,
 };
 use portable_atomic_util::Arc;
+use std::sync::MutexGuard;
 
 struct Shared<T> {
     state: Mutex<State<T>>,
@@ -26,4 +27,8 @@ pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
     listener: Listener,
     revision: u64,
+}
+
+pub struct Ref<'a, T> {
+    state: MutexGuard<'a, State<T>>,
 }

@@ -1,83 +1,356 @@
 use super::*;
-#[cfg(any(feature = "tokio", feature = "std_thread"))]
-use crate::{
-    Aktor, AktorDiagnostic, AktorSetupError, FailurePolicy, SpawnArgs,
-    listener::{DedicatedJoinError, DedicatedStartError, StartupJoin},
-    owner::{OwnerFailure, StartError},
+use crate::AktorGroupStuck;
+use er::*;
+
+/// Every stopping group shares one watchdog thread. It cuts a group off at its deadline, and with
+/// `AbortProcess` it prints what's still pending right before the kill.
+struct Watchdog {
+    watched: std::sync::Mutex<Watched>,
+    wake: std::sync::Condvar,
+}
+
+struct Watched {
+    groups: Vec<Watch>,
+    poked: bool,
+    started: bool,
+}
+
+#[derive(Clone)]
+struct Watch {
+    kill: AktorKillSwitch,
+    /// Still has to enforce the deadline.
+    guarding: bool,
+    /// Still has to print what's pending, `AbortProcess` only.
+    reporting: bool,
+}
+
+static WATCHDOG: Watchdog = Watchdog {
+    watched: std::sync::Mutex::new(Watched {
+        groups: Vec::new(),
+        poked: false,
+        started: false,
+    }),
+    wake: std::sync::Condvar::new(),
 };
-#[cfg(any(feature = "tokio", feature = "std_thread"))]
-use crate::{AktorCleanupOutput, AktorExecution, AktorFailure};
 
-pub fn watchdog(kill: &KillSwitch) {
-    let control = kill.control.clone();
-    let deadline = kill.control.lock().deadline.unwrap_or_else(Instant::now);
-    let watchdog = std::thread::Builder::new()
-        .name("aktor shutdown".into())
-        .spawn(move || {
-            let mut state = control.lock();
+fn watched() -> std::sync::MutexGuard<'static, Watched> {
+    WATCHDOG
+        .watched
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
-            loop {
-                if settled(&state) {
-                    return;
-                }
+/// Something about a stopping group changed, the watchdog takes another look.
+pub fn poke() {
+    let mut watched = watched();
 
-                let remaining = deadline.saturating_duration_since(Instant::now());
+    if watched.groups.is_empty() {
+        return;
+    }
 
-                if remaining.is_zero() {
-                    state.report.timed_out = true;
-                    drop(state);
-                    control.wake.notify_all();
-                    terminate();
-                }
+    watched.poked = true;
+    drop(watched);
+    WATCHDOG.wake.notify_all();
+}
 
-                let (next, _) = control
-                    .wake
-                    .wait_timeout(state, remaining)
-                    .unwrap_or_else(|error| error.into_inner());
+#[derive(Er)]
+#[er(format = "could not start the shutdown watchdog")]
+struct StartWatchdogErr;
+fn start_watchdog() -> ErResult<(), StartWatchdogErr> {
+    std::thread::Builder::new()
+        .name("aktor watchdog".into())
+        .spawn(watch)
+        .map(drop)
+        .er(())
+}
 
-                state = next;
-            }
+pub fn watchdog(kill: &AktorKillSwitch) {
+    let started = {
+        let mut watched = watched();
+
+        watched.groups.push(Watch {
+            kill: kill.clone(),
+            guarding: true,
+            reporting: kill.control.shutdown_policy != AktorGroupStuck::KeepRunning,
         });
+        watched.poked = true;
 
-    if watchdog.is_err() {
+        let started = match watched.started {
+            true => Ok(()),
+            false => start_watchdog(),
+        };
+
+        match started {
+            Ok(()) => watched.started = true,
+            Err(_) => drop(watched.groups.pop()),
+        }
+
+        started
+    };
+
+    WATCHDOG.wake.notify_all();
+
+    let Err(error) = started else {
+        return;
+    };
+
+    let (report, abandoned, deadline) = {
+        let mut state = kill.control.lock();
+        state.report.record(AktorFailureInput::new(
+            crate::AktorFailureSource::GroupDriver,
+            error.er_report(),
+        ));
+        let abandoned = state.watchdog_disposal == WatchdogDisposal::Requested;
+        state.watchdog_disposal = WatchdogDisposal::Gone;
+        if abandoned {
+            state.abandon_shutdown_hooks();
+        }
+
+        (state.report.snapshot(), abandoned, state.deadline)
+    };
+
+    if kill.control.shutdown_policy == AktorGroupStuck::AbortProcess(()) {
+        let printed = print_report(move || report.render(None));
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = printed.recv_timeout(remaining.min(super::impls::reserve(kill.control.grace)));
+        }
         terminate();
     }
 
-    let control = kill.control.clone();
-    let reserve = (kill.control.grace / 10).min(Duration::from_millis(100));
+    if abandoned {
+        kill.publish_stopped();
+    } else {
+        kill.control.publish_pending();
+    }
+}
+
+fn watch() {
+    let mut watched = watched();
+
+    loop {
+        // Each group gets looked at under its own lock only, a group waking the watchdog while
+        // holding it can't deadlock against this.
+        watched.poked = false;
+        let groups = watched.groups.clone();
+        drop(watched);
+
+        let mut next: Option<Instant> = None;
+        let mut stepped = Vec::with_capacity(groups.len());
+
+        for mut group in groups {
+            for (active, step) in [
+                (
+                    &mut group.guarding,
+                    guard as fn(&AktorKillSwitch) -> Option<Instant>,
+                ),
+                (&mut group.reporting, report),
+            ] {
+                if !*active {
+                    continue;
+                }
+
+                match step(&group.kill) {
+                    Some(at) => next = Some(next.map_or(at, |next| next.min(at))),
+                    None => *active = false,
+                }
+            }
+
+            stepped.push(group);
+        }
+
+        watched = self::watched();
+        watched.groups.retain_mut(|group| {
+            let done = stepped
+                .iter()
+                .find(|done| Arc::ptr_eq(&done.kill.control, &group.kill.control));
+
+            if let Some(done) = done {
+                group.guarding &= done.guarding;
+                group.reporting &= done.reporting;
+            }
+
+            group.guarding || group.reporting
+        });
+
+        if watched.poked {
+            continue;
+        }
+
+        watched = match next {
+            Some(at) => {
+                let remaining = at.saturating_duration_since(Instant::now());
+
+                WATCHDOG
+                    .wake
+                    .wait_timeout(watched, remaining)
+                    .unwrap_or_else(|error| error.into_inner())
+                    .0
+            }
+            None => WATCHDOG
+                .wake
+                .wait(watched)
+                .unwrap_or_else(|error| error.into_inner()),
+        };
+    }
+}
+
+/// Cuts the group off at its deadline. `None` once there's nothing left to guard.
+fn guard(kill: &AktorKillSwitch) -> Option<Instant> {
+    let control = &kill.control;
+    let mut state = control.lock();
+
+    if settled(&state)
+        || (control.shutdown_policy == AktorGroupStuck::KeepRunning
+            && state.finished
+            && !state.callback_pending())
+    {
+        state.watchdog_disposal = WatchdogDisposal::Gone;
+        return None;
+    }
+
+    if state.watchdog_disposal == WatchdogDisposal::Requested {
+        state.watchdog_disposal = WatchdogDisposal::Gone;
+        drop(state);
+
+        // Only asked for when no thread could be started to drop them. This drop can block the
+        // watchdog, so the report goes out first.
+        control.publish_pending();
+        kill.drop_shutdown_hooks();
+        return None;
+    }
+
+    // Shutdown pulls the deadline in once every actor had its turn.
+    let deadline = state.deadline.unwrap_or_else(Instant::now);
+
+    if Instant::now() < deadline {
+        return Some(deadline);
+    }
+
+    if control.shutdown_policy == AktorGroupStuck::AbortProcess(()) {
+        drop(state);
+        terminate();
+    }
+
+    if state.applications != 0 {
+        state.report.late(crate::AktorLateWork::Application);
+    }
+    if state.callback_pending() {
+        state.report.late(crate::AktorLateWork::ShutdownCallback);
+    }
+    if !state.actors_and_hooks_done {
+        let owner_pending = state
+            .report
+            .actors
+            .iter()
+            .any(|actor| actor.retirement() == Some(crate::AktorRetirement::StillRunning));
+        if !owner_pending && state.applications == 0 && !state.callback_pending() {
+            state.report.late(crate::AktorLateWork::GroupDriver);
+        }
+
+        for actor in &mut state.report.actors {
+            if let Some(owner) = &mut actor.owner
+                && owner.retirement == crate::AktorRetirement::StillRunning
+            {
+                owner.ran_past_grace = true;
+            }
+        }
+    }
+
+    state.watchdog_disposal = WatchdogDisposal::Gone;
+    drop(state);
+    control.publish_pending();
+    None
+}
+
+/// Says what's still pending a little before an `AbortProcess` group gets killed.
+fn report(kill: &AktorKillSwitch) -> Option<Instant> {
+    let reserve = super::impls::reserve(kill.control.grace);
+    let state = kill.control.lock();
+
+    if settled(&state) {
+        return None;
+    }
+
+    let deadline = state.deadline.unwrap_or_else(Instant::now);
     let reporting_at = deadline.checked_sub(reserve / 8).unwrap_or(deadline);
-    let _ = std::thread::Builder::new()
+
+    if Instant::now() < reporting_at {
+        return Some(reporting_at);
+    }
+
+    let report = state.report.snapshot();
+    let application_work = state.applications != 0;
+    let callback_running = state.callback_pending();
+
+    drop(state);
+
+    print_report(move || {
+        let mut pending = ErBranch::from(Pending::Group);
+        let details = report.render(None);
+        if !details.is_empty() {
+            pending = pending.er_save("shutdown report", details);
+        }
+        if application_work {
+            pending = pending.er_add(Pending::Application);
+        }
+        if callback_running {
+            pending = pending.er_add(Pending::Callback);
+        }
+
+        pending.er_report()
+    });
+    None
+}
+
+#[derive(Er)]
+enum Pending {
+    #[er(format = "waiting for the group to finish shutdown")]
+    Group,
+    #[er(format = "waiting for application work")]
+    Application,
+    #[er(format = "waiting for the shutdown callback")]
+    Callback,
+}
+
+fn print_report(render: impl FnOnce() -> String + Send + 'static) -> std::sync::mpsc::Receiver<()> {
+    let (done, printed) = std::sync::mpsc::channel();
+
+    // Someone else can hold stderr. Printing here would keep the watchdog from the kill.
+    let _printing = std::thread::Builder::new()
         .name("aktor shutdown report".into())
         .spawn(move || {
-            let report = {
-                let mut state = control.lock();
-
-                loop {
-                    if settled(&state) {
-                        return;
-                    }
-
-                    let remaining = reporting_at.saturating_duration_since(Instant::now());
-
-                    if remaining.is_zero() {
-                        break state.report.clone();
-                    }
-
-                    let (next, _) = control
-                        .wake
-                        .wait_timeout(state, remaining)
-                        .unwrap_or_else(|error| error.into_inner());
-
-                    state = next;
-                }
-            };
-
-            eprintln!("Shutdown still pending:\n{report}");
+            eprintln!("{}", render());
+            let _ = done.send(());
         });
+
+    printed
 }
 
 fn settled(state: &State) -> bool {
-    state.finished && !state.force_exit && state.running.is_empty()
+    (state.finished || state.actors_and_hooks_done)
+        && !state.callback_pending()
+        && state.applications == 0
+        && state.only_left()
+}
+
+impl Control {
+    fn publish_pending(&self) {
+        self.completed.send_if_modified(|completed| {
+            if completed.is_some() {
+                return false;
+            }
+
+            let report = Arc::new(self.lock().report.snapshot());
+            *completed = Some(Completed {
+                grace: report.clone(),
+                report,
+                collection: Collection::Pending,
+                work_finished: false,
+            });
+            true
+        });
+    }
 }
 
 fn terminate() -> ! {
@@ -91,12 +364,12 @@ fn terminate() -> ! {
     std::process::abort();
 }
 
-impl KillSwitch {
+impl AktorKillSwitch {
     #[doc(hidden)]
-    pub fn track_thread(&self, name: String) -> ThreadLife {
+    pub fn track_thread(&self, name: String, stuck: crate::AktorStuck) -> ThreadLife {
         let name = Arc::new(name);
 
-        self.control.lock().running.push(name.clone());
+        self.control.lock().running.push((name.clone(), stuck));
         ThreadLife {
             control: self.control.clone(),
             name,
@@ -104,581 +377,44 @@ impl KillSwitch {
     }
 }
 
-impl Drop for ThreadLife {
-    fn drop(&mut self) {
-        self.control
-            .lock()
-            .running
-            .retain(|name| !Arc::ptr_eq(name, &self.name));
-        self.control.wake.notify_all();
-        self.control.threads.notify_one();
+#[derive(Er)]
+#[er(format = "the cancelled shutdown closure could not be dropped")]
+struct AbandonedShutdown;
+
+impl State {
+    fn callback_pending(&self) -> bool {
+        self.callback_running || self.callback_workers != 0
+    }
+
+    pub fn abandon_shutdown_hooks(&mut self) {
+        // Both shutdown threads are unavailable. The caller cannot safely run this destructor.
+        std::mem::forget(self.listener_hook.take());
+        std::mem::forget(self.shutdown_hook.take());
+        self.callback_running = false;
+        self.report.record(AktorFailureInput::new(
+            crate::AktorFailureSource::GroupDriver,
+            er_new!(AbandonedShutdown).er_report(),
+        ));
+    }
+
+    /// Every thread still running belongs to an actor shutdown may leave behind.
+    pub fn only_left(&self) -> bool {
+        self.running
+            .iter()
+            .all(|(_, stuck)| *stuck == crate::AktorStuck::Leave)
     }
 }
 
-#[cfg(any(feature = "tokio", feature = "std_thread"))]
-impl AktorGroup {
-    /// Move an existing value into an actor. Cleanup just drops it.
-    pub async fn spawn_value<S: Send + 'static>(
-        &mut self,
-        name: impl Into<String>,
-        value: S,
-    ) -> Result<Aktor<S>, StartError> {
-        let setup = move || Ok::<_, AktorSetupError>(value);
-        let cleanup = |_| Ok::<_, AktorCleanupError>(());
-        self.spawn(AktorArgs::new(name, setup, cleanup)).await
-    }
+impl Drop for ThreadLife {
+    fn drop(&mut self) {
+        let mut state = self.control.lock();
 
-    /// Start an actor in this group.
-    pub async fn spawn<S, Setup, Cleanup, Output>(
-        &mut self,
-        args: AktorArgs<Setup, Cleanup>,
-    ) -> Result<Aktor<S>, StartError>
-    where
-        S: 'static,
-        Output: AktorCleanupOutput,
-        Setup: FnOnce() -> Result<S, crate::AktorSetupError> + Send + 'static,
-        Cleanup: FnMut(S) -> Output + Send + 'static,
-    {
-        let AktorArgs {
-            name,
-            capacity,
-            setup,
-            mut cleanup,
-        } = args;
+        state
+            .running
+            .retain(|(name, _)| !Arc::ptr_eq(name, &self.name));
 
-        self.spawn_async(AktorArgs {
-            name,
-            capacity,
-            setup: move || core::future::ready(setup()),
-            cleanup: move |state| core::future::ready(cleanup(state)),
-        })
-        .await
-    }
-
-    pub async fn spawn_async<S, Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
-        &mut self,
-        args: AktorArgs<Setup, Cleanup>,
-    ) -> Result<Aktor<S>, StartError>
-    where
-        S: 'static,
-        Output: AktorCleanupOutput,
-        Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, crate::AktorSetupError>>,
-        Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
-        CleanupFuture: Future<Output = Output>,
-    {
-        self.spawn_async_with_hooks(args, crate::listener::hooks::AktorHooks::default())
-            .await
-    }
-
-    pub async fn spawn_async_with_hooks<S, Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
-        &mut self,
-        args: AktorArgs<Setup, Cleanup>,
-        hooks: crate::listener::hooks::AktorHooks<S>,
-    ) -> Result<Aktor<S>, StartError>
-    where
-        S: 'static,
-        Output: AktorCleanupOutput,
-        Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, crate::AktorSetupError>>,
-        Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
-        CleanupFuture: Future<Output = Output>,
-    {
-        #[cfg(feature = "std_thread")]
-        let standard = self
-            .control
-            .standard
-            .load(std::sync::atomic::Ordering::Acquire);
-        #[cfg(not(feature = "std_thread"))]
-        let standard = false;
-
-        self.spawn_async_on(args, hooks, standard).await
-    }
-
-    #[doc(hidden)]
-    pub async fn spawn_async_on<S, Setup, SetupFuture, Cleanup, CleanupFuture, Output>(
-        &mut self,
-        args: AktorArgs<Setup, Cleanup>,
-        hooks: crate::listener::hooks::AktorHooks<S>,
-        standard: bool,
-    ) -> Result<Aktor<S>, StartError>
-    where
-        S: 'static,
-        Output: AktorCleanupOutput,
-        Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, crate::AktorSetupError>>,
-        Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
-        CleanupFuture: Future<Output = Output>,
-    {
-        let AktorArgs {
-            name,
-            capacity,
-            setup,
-            mut cleanup,
-        } = args;
-        let kill = self.killswitch();
-        let actor = name.clone();
-        let kind = if standard {
-            AktorExecution::StdThread
-        } else {
-            AktorExecution::TokioThread
-        };
-
-        self.spawn_async_initial_on_reported::<S, _, _, _, _, _>(
-            AktorArgs {
-                name,
-                capacity,
-                setup: move || async move {
-                    match setup().await {
-                        Ok(state) => Ok(state),
-                        Err(error) => Err(kill.startup_error(actor, kind, error)),
-                    }
-                },
-                cleanup: move |state| {
-                    let future = cleanup(state);
-                    async move {
-                        AktorCleanupOutput::into_cleanup(future.await).map_err(AktorFailure::from)
-                    }
-                },
-            },
-            hooks,
-            standard,
-            |error| error.diagnostics.clone(),
-            |error| (error.diagnostics.clone(), error.primary),
-        )
-        .await
-        .map_err(|error| {
-            let mut error = StartError::from(error);
-
-            if let Some(report) = self.completion().try_report()
-                && report.failed()
-            {
-                error.diagnostics = Some(AktorDiagnostic::new(
-                    "actor startup failed",
-                    report.to_string(),
-                ));
-            }
-
-            error
-        })
-    }
-
-    #[doc(hidden)]
-    pub async fn spawn_async_initial_on_reported<
-        S,
-        Initial,
-        Setup,
-        SetupFuture,
-        Cleanup,
-        CleanupFuture,
-    >(
-        &mut self,
-        args: AktorArgs<Setup, Cleanup>,
-        hooks: crate::listener::hooks::AktorHooks<S>,
-        standard: bool,
-        describe_cleanup: fn(&AktorFailure) -> String,
-        describe_initial: fn(&Initial) -> (String, bool),
-    ) -> Result<Aktor<S>, DedicatedStartError<Initial>>
-    where
-        S: 'static,
-        Initial: Send + 'static,
-        Setup: FnOnce() -> SetupFuture + Send + 'static,
-        SetupFuture: Future<Output = Result<S, Initial>>,
-        Cleanup: FnMut(S) -> CleanupFuture + Send + 'static,
-        CleanupFuture: Future<Output = Result<(), AktorFailure>>,
-    {
-        let kind = if standard {
-            AktorExecution::StdThread
-        } else {
-            AktorExecution::TokioThread
-        };
-
-        let AktorArgs {
-            name,
-            capacity,
-            setup,
-            cleanup,
-        } = args;
-
-        let kill = self.killswitch();
-
-        if kill.is_stopping() {
-            self.completion().wait().await;
-            return Err(DedicatedStartError::Closed);
-        }
-
-        if !self.control.lock().listening {
-            return Err(DedicatedStartError::NotStarted);
-        }
-
-        let runtime = match self.spawner(standard) {
-            Ok(runtime) => runtime,
-            Err(_) => {
-                let error = DedicatedStartError::NoRuntime;
-
-                kill.fail_startup(AktorFailureReport {
-                    kind: None,
-                    actor: name,
-                    phase: "setup".into(),
-                    message: error.to_string(),
-                });
-
-                self.completion().wait().await;
-                return Err(error);
-            }
-        };
-
-        let (started, ready) = tokio::sync::oneshot::channel();
-        let (completed, outcome) = tokio::sync::oneshot::channel();
-        let (closing, mut closed) = watch::channel(false);
-        let (forcing, mut forced) = watch::channel(false);
-        let label = name.clone();
-
-        // Keep startup owned even if the application stops awaiting it.
-        let registered = {
-            let mut entries = self
-                .actors
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-
-            if kill.is_stopping() {
-                false
-            } else {
-                kill.control.lock().kinds.push((name.clone(), kind));
-                entries.push(Entry {
-                    kind,
-                    name: name.clone(),
-                    start: Box::new(move || {
-                        closing.send_replace(true);
-                    }),
-                    cancel: Box::new(move || {
-                        forcing.send_replace(true);
-                    }),
-                    outcome: Box::pin(async move {
-                        outcome.await.unwrap_or_else(|_| AktorOutcome {
-                            retirement: crate::RetirementStatus::Unconfirmed,
-                            kind: None,
-                            actor: label,
-                            diagnostics: vec![AktorCleanupError::new(
-                                "startup observer stopped",
-                                (),
-                            )],
-                            timed_out: false,
-                        })
-                    }),
-                });
-
-                true
-            }
-        };
-
-        if !registered {
-            self.completion().wait().await;
-            return Err(DedicatedStartError::Closed);
-        }
-
-        let actor_name = name.clone();
-
-        let scheduled = runtime.spawn_named("aktor supervisor", async move {
-            let (owner, observing) = match Aktor::<S>::spawn_observed(
-                SpawnArgs {
-                    name: name.clone(),
-                    capacity,
-                    failure: FailurePolicy::Group(kill.clone()),
-                    setup,
-                    cleanup,
-                },
-                hooks,
-                standard,
-            )
-            .await
-            {
-                Ok(owner) => owner,
-                Err(error) => {
-                    let join_failed = matches!(
-                        &error,
-                        DedicatedStartError::Startup {
-                            join: StartupJoin::Failed(_),
-                            ..
-                        }
-                    );
-                    if !join_failed
-                        && matches!(error.primary(), DedicatedStartError::Closed)
-                        && kill.is_stopping()
-                    {
-                        kill.control.lock().report.timed_out = true;
-
-                        let sent = started.send(Err(error));
-                        super::shutdown::contain_drop(sent, &kill, "startup reply drop");
-                        let _sent = completed.send(AktorOutcome {
-                            retirement: crate::RetirementStatus::Unconfirmed,
-                            kind: None,
-                            actor: name,
-                            diagnostics: Vec::new(),
-                            timed_out: true,
-                        });
-
-                        return;
-                    }
-
-                    let first = kill.fail_startup(AktorFailureReport {
-                        kind: None,
-                        actor: name.clone(),
-                        phase: "setup".into(),
-                        message: "actor initialization failed".into(),
-                    });
-
-                    let (diagnostics, primary) = match error.primary() {
-                        DedicatedStartError::Startup { .. } => (error.to_string(), false),
-                        DedicatedStartError::Observer { cause, .. } => (cause.to_string(), false),
-                        DedicatedStartError::Init(error) => describe_initial(error),
-                        DedicatedStartError::NotStarted => {
-                            ("actor group has not started".into(), false)
-                        }
-                        DedicatedStartError::Closed => {
-                            ("actor group closed during startup".into(), false)
-                        }
-                        DedicatedStartError::NoRuntime => ("no actor runtime".into(), false),
-                        DedicatedStartError::InvalidCapacity => {
-                            ("invalid actor capacity".into(), false)
-                        }
-                        DedicatedStartError::ThreadNotCreated(error)
-                        | DedicatedStartError::Thread(error) => (error.to_string(), false),
-                        DedicatedStartError::Panicked { actor, cause } => {
-                            (format!("actor {actor} startup panicked: {cause}"), false)
-                        }
-                    };
-
-                    let join_diagnostics = if let DedicatedStartError::Startup {
-                        join: StartupJoin::Failed(cause),
-                        ..
-                    } = &error
-                    {
-                        Some(format!("Startup join failed: {cause}"))
-                    } else {
-                        None
-                    };
-                    let diagnostics = match &join_diagnostics {
-                        Some(join) => format!("{diagnostics}\n{join}"),
-                        None => diagnostics,
-                    };
-                    if first && let Some(failure) = &mut kill.control.lock().report.failure {
-                        failure.message = diagnostics.clone();
-                    }
-
-                    let retirement = if join_failed {
-                        crate::RetirementStatus::Unconfirmed
-                    } else {
-                        match error.primary() {
-                            DedicatedStartError::Startup { .. }
-                            | DedicatedStartError::Observer { .. }
-                            | DedicatedStartError::Panicked { .. }
-                            | DedicatedStartError::Closed => crate::RetirementStatus::Unconfirmed,
-                            DedicatedStartError::Init(_)
-                            | DedicatedStartError::NotStarted
-                            | DedicatedStartError::NoRuntime
-                            | DedicatedStartError::InvalidCapacity
-                            | DedicatedStartError::ThreadNotCreated(_)
-                            | DedicatedStartError::Thread(_) => crate::RetirementStatus::Confirmed,
-                        }
-                    };
-                    let diagnostics = if first {
-                        Vec::new()
-                    } else if let Some(join) = join_diagnostics {
-                        vec![AktorError::new(join, ())]
-                    } else if primary {
-                        Vec::new()
-                    } else {
-                        vec![AktorError::new(diagnostics, ())]
-                    };
-                    let sent = started.send(Err(error));
-                    super::shutdown::contain_drop(sent, &kill, "startup reply drop");
-                    let _sent = completed.send(AktorOutcome {
-                        retirement,
-                        kind: None,
-                        actor: name,
-                        diagnostics,
-                        timed_out: false,
-                    });
-
-                    return;
-                }
-            };
-
-            let mut observing = core::pin::pin!(observing);
-            let mut joined = false;
-            let actor = owner.control.new_controller();
-            let completion = owner.completion();
-            let alive = owner.new_handle();
-            let _sent = started.send(Ok(owner));
-            let mut stopping = false;
-            let mut cancelling = false;
-
-            let result = loop {
-                if !stopping && *closed.borrow_and_update() {
-                    stopping = true;
-                    super::shutdown::contain(|| actor.request_shutdown(), &kill, "shutdown notification");
-                }
-
-                if !cancelling && *forced.borrow_and_update() {
-                    cancelling = true;
-                    super::shutdown::contain(|| actor.cancel(), &kill, "cancellation notification");
-                }
-
-                tokio::select! {
-                    result = completion.wait() => break result,
-                    _ = &mut observing, if !joined => joined = true,
-                    changed = closed.changed(), if !stopping => {
-                        if changed.is_err() {
-                            stopping = true;
-                            super::shutdown::contain(|| actor.request_shutdown(), &kill, "shutdown notification");
-                        }
-                    },
-                    changed = forced.changed(), if !cancelling => {
-                        if changed.is_err() {
-                            cancelling = true;
-                            super::shutdown::contain(|| actor.cancel(), &kill, "cancellation notification");
-                        }
-                    },
-                }
-            };
-
-            drop(alive);
-
-            let mut outcome = AktorOutcome {
-                retirement: if actor.cleanup_completed() {
-                    crate::RetirementStatus::Confirmed
-                } else {
-                    crate::RetirementStatus::Unconfirmed
-                },
-                kind: None,
-                actor: name,
-                diagnostics: Vec::new(),
-                timed_out: actor.is_cancelled(),
-            };
-
-            if let Err(error) = result {
-                let forced = matches!(&error.error, OwnerFailure::Cancelled) && kill.is_stopping();
-
-                let mut first = false;
-
-                if !forced {
-                    let (phase, message) = match &error.error {
-                        OwnerFailure::Cleanup(errors) => (
-                            "cleanup",
-                            format!(
-                                "actor cleanup failed {} time(s)",
-                                errors.errors.len() + errors.diagnostics.len()
-                            ),
-                        ),
-                        OwnerFailure::Panicked(cause)
-                        | OwnerFailure::PanickedWithCleanup { cause, .. } => {
-                            ("completion", format!("actor thread failed: {cause}"))
-                        }
-                        OwnerFailure::Cancelled | OwnerFailure::RuntimeStopped => {
-                            ("completion", error.to_string())
-                        }
-                    };
-
-                    first = kill.fail(AktorFailureReport {
-                        kind: None,
-                        actor: outcome.actor.clone(),
-                        phase: phase.into(),
-                        message,
-                    });
-                }
-
-                match &error.error {
-                    OwnerFailure::Cleanup(errors) => {
-                        outcome.diagnostics.extend(
-                            errors
-                                .errors
-                                .iter()
-                                .map(|error| AktorError::new(describe_cleanup(error), ())),
-                        );
-                        outcome
-                            .diagnostics
-                            .extend(errors.diagnostics.iter().cloned());
-                    }
-                    OwnerFailure::PanickedWithCleanup { cause, cleanup } => {
-                        if !first && !actor.group_primary() {
-                            outcome
-                                .diagnostics
-                                .push(AktorError::new(format!("panic: {cause}"), ()));
-                        }
-                        outcome.diagnostics.extend(
-                            cleanup
-                                .errors
-                                .iter()
-                                .map(|error| AktorError::new(describe_cleanup(error), ())),
-                        );
-                        outcome
-                            .diagnostics
-                            .extend(cleanup.diagnostics.iter().cloned());
-                    }
-                    OwnerFailure::Panicked(cause) => {
-                        if !first && !actor.group_primary() {
-                            outcome
-                                .diagnostics
-                                .push(AktorError::new(format!("panic: {cause}"), ()));
-                        }
-                    }
-                    OwnerFailure::Cancelled | OwnerFailure::RuntimeStopped => {
-                        outcome.timed_out = true
-                    }
-                }
-            }
-
-            let _sent = completed.send(outcome);
-        });
-
-        if let Err(error) = scheduled {
-            let kill = self.killswitch();
-
-            kill.fail_startup(AktorFailureReport {
-                kind: Some(kind),
-                actor: actor_name.clone(),
-                phase: "setup".into(),
-                message: error.to_string(),
-            });
-
-            self.completion().wait().await;
-            return Err(DedicatedStartError::ThreadNotCreated(error));
-        }
-
-        let result = ready.await.unwrap_or_else(|_| {
-            Err(DedicatedStartError::Panicked {
-                actor: actor_name.clone(),
-                cause: DedicatedJoinError {
-                    physically_joined: false,
-                    payload: parking_lot::Mutex::new(Box::new("startup observer stopped")),
-                },
-            })
-        });
-
-        if let Err(error) = &result {
-            let cancelled = matches!(error.primary(), DedicatedStartError::Closed)
-                && !matches!(
-                    error,
-                    DedicatedStartError::Startup {
-                        join: StartupJoin::Failed(_),
-                        ..
-                    }
-                )
-                && self.killswitch().is_stopping();
-
-            if !cancelled {
-                self.killswitch().fail_startup(AktorFailureReport {
-                    kind: None,
-                    actor: actor_name,
-                    phase: "setup".into(),
-                    message: error.to_string(),
-                });
-            }
-
-            self.completion().wait().await;
-        }
-
-        result
+        drop(state);
+        poke();
+        self.control.threads.notify_one();
     }
 }

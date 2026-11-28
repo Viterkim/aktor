@@ -1,4 +1,8 @@
-use crate::message::Message;
+mod impls;
+
+pub use impls::channel;
+
+use core::task::Waker;
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
@@ -7,28 +11,43 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::{Notify, Semaphore, SemaphorePermit, mpsc};
+use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 
-mod impls;
-pub use impls::channel;
-
-struct Queue<S> {
-    entries: Mutex<Entries<S>>,
-    permits: Semaphore,
-    ready: Notify,
+struct Queue<M> {
+    entries: Mutex<Entries<M>>,
+    permits: Arc<Semaphore>,
     senders_closed: AtomicBool,
 }
 
-struct Entries<S> {
+struct Entries<M> {
     receiving: bool,
-    messages: VecDeque<Message<S>>,
+    /// Each with whether it holds a queue slot, calls do and services don't.
+    messages: VecDeque<(M, bool)>,
+    /// The owner waiting for a message. Kept with the messages, so one lock pops or registers.
+    waiting: Option<Waker>,
+    /// Something besides a message wants the owner's attention, like a stop or a force.
+    nudged: bool,
+    /// The owner in the middle of a call, waiting only for a nudge.
+    watching: Option<Waker>,
 }
 
-pub struct Sender<S>(Arc<Queue<S>>);
+/// What the owner finds in its mailbox.
+pub enum Received<M> {
+    Message(M),
+    Closed,
+    /// A stop or a force, the owner looks at those again.
+    Nudged,
+}
 
-pub struct Receiver<S>(Arc<Queue<S>>);
+/// Wakes the owner once the lock that pushed the message is gone.
+#[must_use]
+pub struct Ready(Option<Waker>);
 
-pub struct Permit<'a, S> {
-    queue: &'a Queue<S>,
+pub struct Sender<M>(Arc<Queue<M>>);
+
+pub struct Receiver<M>(Arc<Queue<M>>);
+
+pub struct Permit<'a, M> {
+    queue: &'a Queue<M>,
     permit: SemaphorePermit<'a>,
 }

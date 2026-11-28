@@ -1,5 +1,5 @@
-# Local actors in WASM
+# Local actors in Wasm
 
-The example runs local actors in Wasmi, with no browser or WASI imports. Values stay in the instance. Your host drives the futures and supplies any timers you need.
+Running local `aktor` actors inside Wasmi without any browser or WASI imports, where everything stays in the Wasm instance and the host drives the futures and timers. The host calls `aktor_producer` with a fresh random identity for each instance before driving its actors.
 
 [Example](src/lib.rs)

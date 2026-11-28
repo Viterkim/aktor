@@ -1,50 +1,47 @@
-use super::WorkerError;
-#[cfg(feature = "serde")]
-use super::{decode, encode};
-#[cfg(feature = "serde")]
-use crate::dispatch::SerdeCodec;
 use crate::{
-    data::{self, AktorData},
+    data::{self, AktorData, DataError},
     dispatch::DataCodec,
-    message::CallError,
 };
-#[cfg(feature = "serde")]
-use serde::{Serialize, de::DeserializeOwned};
+use er::*;
+
+pub(super) fn codec<T, E: core::error::Error + 'static>(
+    result: Result<T, (DataError, String)>,
+    context: impl FnOnce() -> E,
+) -> ErResult<T, E> {
+    match result {
+        Ok(value) => Ok(value),
+        Err((cause, report)) if report.is_empty() => er_bail!(context(), cause),
+        Err((_, report)) => er_bail!(context().er_save("codec", report)),
+    }
+}
 
 pub trait Codec<T> {
     const NAME: &'static str;
 
-    fn encode(value: &T) -> Result<Vec<u8>, WorkerError>;
-    fn decode(bytes: &[u8]) -> Result<T, WorkerError>;
-
-    fn decode_output(bytes: &[u8]) -> Result<T, WorkerError> {
-        Self::decode(bytes).map_err(|mut error| {
-            error.outcome = CallError::OutcomeUnknown;
-            error
-        })
-    }
+    fn encode(value: &T) -> Result<Vec<u8>, (DataError, String)>;
+    fn decode(bytes: &[u8]) -> Result<T, (DataError, String)>;
 }
-#[cfg(feature = "serde")]
-impl<T: Serialize + DeserializeOwned> Codec<T> for SerdeCodec {
-    const NAME: &'static str = "";
+// Same bytes and same handshake name as the codec it wraps.
+impl<T, C: Codec<T>> Codec<T> for crate::dispatch::RemoteCodec<C> {
+    const NAME: &'static str = C::NAME;
 
-    fn encode(value: &T) -> Result<Vec<u8>, WorkerError> {
-        encode(value)
+    fn encode(value: &T) -> Result<Vec<u8>, (DataError, String)> {
+        C::encode(value)
     }
 
-    fn decode(bytes: &[u8]) -> Result<T, WorkerError> {
-        decode(bytes)
+    fn decode(bytes: &[u8]) -> Result<T, (DataError, String)> {
+        C::decode(bytes)
     }
 }
 
 impl<T: AktorData> Codec<T> for DataCodec {
     const NAME: &'static str = " [aktor-data]";
 
-    fn encode(value: &T) -> Result<Vec<u8>, WorkerError> {
+    fn encode(value: &T) -> Result<Vec<u8>, (DataError, String)> {
         data::encode(value)
     }
 
-    fn decode(bytes: &[u8]) -> Result<T, WorkerError> {
+    fn decode(bytes: &[u8]) -> Result<T, (DataError, String)> {
         data::decode(bytes)
     }
 }

@@ -1,30 +1,16 @@
+#![cfg(feature = "testing")]
 use super::*;
-use aktor::message::CallError;
+use core::num::NonZeroUsize;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::oneshot;
 
-#[tokio::test]
-async fn saved_error() {
-    let (handle, mut listener) = channel::<()>(1).unwrap();
-    let mut reply = call(&handle, |_, ()| (), ()).admit().await.unwrap();
-
-    drop(listener.recv().await.unwrap());
-    let _output = reply.try_take();
-
-    let outcome = tokio::time::timeout(Duration::from_secs(1), reply.receive_settled())
-        .await
-        .unwrap();
-
-    assert_eq!(outcome, Err(CallError::Discarded));
-}
-
-struct Notice(Arc<Semaphore>, bool);
+struct Notice(Arc<AtomicUsize>, bool);
 impl Drop for Notice {
     fn drop(&mut self) {
-        self.0.add_permits(1);
+        self.0.fetch_add(1, Ordering::SeqCst);
 
         if self.1 {
             panic!("queued destructor");
@@ -34,123 +20,107 @@ impl Drop for Notice {
 
 #[tokio::test]
 async fn settle_before_cleanup() {
-    let dropped = Arc::new(Semaphore::new(0));
-    let cleanup = dropped.clone();
-    let mut group = AktorGroup::new();
-
-    group.start().unwrap();
-
-    let owner = group
-        .spawn_async(AktorArgs::new(
-            "settlement",
-            async || Ok::<_, AktorSetupError>(()),
-            move |_| {
-                let cleanup = cleanup.clone();
-
-                async move {
-                    let _permit =
-                        tokio::time::timeout(Duration::from_secs(1), cleanup.acquire_many(2))
-                            .await
-                            .map_err(|_| AktorCleanupError::new("queued calls still alive", ()))?;
-
-                    Ok::<_, AktorCleanupError>(())
-                }
+    for force in [false, true] {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let count = dropped.clone();
+        let (end, cleaned) = oneshot::channel();
+        let actors = aktor_start(AktorSetup {
+            stuck: aktor::AktorGroupStuck::KeepRunning,
+            actors: AktorNew {
+                name: "settlement".into(),
+                kind: AktorKind::TokioThread,
+                start: aktor::AktorInit::Ready(async || ()),
+                end: move |_| end.send(count.load(Ordering::SeqCst)).unwrap(),
+                hooks: AktorHooks::NONE,
+                capacity: NonZeroUsize::new(2).unwrap(),
+                stuck: AktorStuck::Kill,
             },
-        ))
+            shutdown: |_| {},
+            grace: Duration::from_millis(100),
+        });
+        actors.ready().await.unwrap();
+
+        let (entered, entering) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        call(actors.handles(), async move |_| {
+            entered.send(()).unwrap();
+            released.await.unwrap();
+            panic!("operation failed");
+        })
+        .cast()
         .await
         .unwrap();
+        entering.await.unwrap();
 
-    let (entered, entering) = oneshot::channel();
-    let (release, released) = std::sync::mpsc::channel();
+        let first = Notice(dropped.clone(), true);
+        call(actors.handles(), async move |_| drop(first))
+            .cast()
+            .await
+            .unwrap();
+        let second = Notice(dropped, false);
+        let mut discarded = call(actors.handles(), async move |_| drop(second))
+            .send()
+            .await
+            .unwrap();
 
-    call(
-        &owner.handle,
-        move |_, ()| {
-            entered.send(()).unwrap();
-            released.recv().unwrap();
-            panic!("operation failed");
-        },
-        (),
-    )
-    .cast()
-    .await;
+        if force {
+            actors.killswitch().stop();
+        } else {
+            release.send(()).unwrap();
+        }
+        let _ = actors.completion().await.unwrap();
 
-    entering.await.unwrap();
+        assert_eq!(cleaned.await.unwrap(), 2);
 
-    for broken in [true, false] {
-        call(
-            &owner.handle,
-            |_, notice| drop(notice),
-            Notice(dropped.clone(), broken),
-        )
-        .cast()
-        .await;
-    }
-
-    release.send(()).unwrap();
-    let report = group.completion().await;
-
-    assert!(
-        !report.to_string().contains("queued calls still alive"),
-        "{report}"
-    );
-}
-
-struct StateDrop {
-    dropped: Arc<Semaphore>,
-    settled: Arc<AtomicBool>,
-}
-impl Drop for StateDrop {
-    fn drop(&mut self) {
-        self.settled
-            .store(self.dropped.available_permits() == 2, Ordering::SeqCst);
+        assert!(matches!(
+            discarded.try_take().unwrap(),
+            Err(aktor::AktorDeliveryError {
+                outcome: message::AktorDeliveryOutcome::Discarded,
+                ..
+            })
+        ));
     }
 }
 
 #[tokio::test]
-async fn generic_teardown() {
-    for mode in 0..3 {
-        let (handle, listener) = channel::<StateDrop>(3).unwrap();
-        let dropped = Arc::new(Semaphore::new(0));
-        let settled = Arc::new(AtomicBool::new(false));
-        let state = StateDrop {
-            dropped: dropped.clone(),
-            settled: settled.clone(),
-        };
+async fn discarded_call_leaves_end_failure_unread() {
+    let actors = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: AktorNew {
+            name: "retiring".into(),
+            kind: AktorKind::TokioThread,
+            start: AktorInit::Ready(async || ()),
+            end: async |_| Err(((), String::from("end failed"))),
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::MIN,
+            stuck: AktorStuck::Kill,
+        },
+        shutdown: |_| {},
+        grace: Duration::from_secs(1),
+    });
+    actors.ready().await.unwrap();
+    let (entered, running) = oneshot::channel();
+    let (release, released) = oneshot::channel();
 
-        call(
-            &handle,
-            |_, ()| -> () {
-                panic!("operation failed");
-            },
-            (),
-        )
-        .cast()
-        .await;
+    call(actors.handles(), async move |_| {
+        entered.send(()).unwrap();
+        released.await.unwrap();
+        aktor_retire();
+    })
+    .cast()
+    .await
+    .unwrap();
+    running.await.unwrap();
 
-        for broken in [true, false] {
-            call(
-                &handle,
-                |_, notice| drop(notice),
-                Notice(dropped.clone(), broken),
-            )
-            .cast()
-            .await;
-        }
+    let queued = call(actors.handles(), async |_| ()).send().await.unwrap();
+    release.send(()).unwrap();
+    let report = actors
+        .completion()
+        .wait_retired()
+        .await
+        .unwrap()
+        .into_report();
 
-        match mode {
-            0 => {
-                let _result = AssertUnwindSafe(listener.run(state)).catch_unwind().await;
-            }
-            1 => {
-                let _result =
-                    std::panic::catch_unwind(AssertUnwindSafe(|| drop(listener.run(state))));
-            }
-            _ => {
-                let _result = std::thread::spawn(move || listener.run_blocking(state)).join();
-            }
-        }
-
-        assert!(settled.load(Ordering::SeqCst));
-    }
+    assert_eq!(queued.await.unwrap_err().failure_id, None);
+    assert!(!report.failures[0].delivered());
 }

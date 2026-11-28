@@ -1,110 +1,58 @@
 use super::super::*;
-use crate::AktorError;
 
-impl<E> OwnerFailure<E> {
-    fn summary(&self) -> (&str, Option<&str>) {
+impl<E> OwnerError<E> {
+    pub fn without_data(&self) -> OwnerError {
         match self {
-            Self::Setup(err) => ("actor setup failed", Some(&err.diagnostics)),
-            Self::SetupDiagnostic(err, _) => ("actor setup failed", Some(&err.diagnostics)),
-            Self::SetupPanic(err) => ("actor setup panicked", Some(&err.diagnostics)),
-            Self::Cleanup(err) => ("actor cleanup failed", Some(&err.diagnostics)),
-            Self::CleanupFailure(err) => ("actor cleanup failed", Some(&err.diagnostics)),
-            Self::Runner(err) => ("actor runner failed", Some(&err.diagnostics)),
-            Self::Cancelled => ("actor owner stopped before cleanup completed", None),
+            Self::Setup(_) => OwnerError::Setup(()),
+            Self::SetupDiagnostic { id } => OwnerError::SetupDiagnostic { id: *id },
+            Self::SetupPanic => OwnerError::SetupPanic,
+            Self::Cleanup(_) => OwnerError::Cleanup(()),
+            Self::CleanupFailure { id } => OwnerError::CleanupFailure { id: *id },
+            Self::CleanupUnconfirmed => OwnerError::CleanupUnconfirmed,
+            Self::Runner => OwnerError::Runner,
+            Self::Cancelled => OwnerError::Cancelled,
         }
     }
 
-    #[doc(hidden)]
-    pub fn fmt_display(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.summary().0)
+    pub(in crate::local) fn observed(self) -> Observed<E> {
+        self.with_report(String::new())
     }
 
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let (context, source) = self.summary();
-        f.write_str(context)?;
+    pub(in crate::local) fn with_report(self, report: String) -> Observed<E> {
+        let (_, report) = crate::report::with_report(self.without_data(), report);
 
-        if let Some(err) = source
-            && !err.is_empty()
-        {
-            write!(f, ": {err}")?;
-        }
-
-        Ok(())
-    }
-
-    /// Copy the diagnostic, leaving the original typed data available to observers.
-    pub fn without_data(&self) -> OwnerFailure {
-        match self {
-            Self::Setup(error) => {
-                OwnerFailure::Setup(AktorError::new(error.diagnostics.clone(), ()))
-            }
-            Self::SetupDiagnostic(error, primary) => {
-                OwnerFailure::SetupDiagnostic(error.clone(), *primary)
-            }
-            Self::SetupPanic(error) => OwnerFailure::SetupPanic(error.clone()),
-            Self::Cleanup(error) => {
-                OwnerFailure::Cleanup(AktorError::new(error.diagnostics.clone(), ()))
-            }
-            Self::CleanupFailure(error) => OwnerFailure::CleanupFailure(error.clone()),
-            Self::Runner(error) => OwnerFailure::Runner(error.clone()),
-            Self::Cancelled => OwnerFailure::Cancelled,
-        }
+        (Rc::new(self), report)
     }
 }
 
 impl<E> Clone for SharedOwnerError<E> {
     fn clone(&self) -> Self {
         Self {
-            error: self.error.clone(),
-            diagnostics: self.diagnostics.clone(),
+            cause: self.cause.clone(),
         }
     }
 }
 impl<E> SharedOwnerError<E> {
-    #[doc(hidden)]
-    pub fn fmt_display(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.error)
-    }
+    pub(in crate::local) fn from_failure(
+        (error, report): Observed<E>,
+        secondary: &[String],
+    ) -> (Self, String) {
+        let report = match secondary {
+            [] => report,
+            _ => {
+                let mut tree = error.without_data().er_save("owner", report);
+                for report in secondary {
+                    tree = tree
+                        .er_add(crate::report::DuringTeardown.er_save("report", report.clone()));
+                }
+                tree.er_report()
+            }
+        };
 
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.diagnostics.report)
-    }
-}
-
-impl<E> From<OwnerFailure<E>> for OwnerError<E> {
-    fn from(error: OwnerFailure<E>) -> Self {
-        let diagnostics =
-            crate::AktorDiagnostic::new(alloc::format!("{error}"), alloc::format!("{error:#}"));
-
-        Self { error, diagnostics }
-    }
-}
-impl<E> OwnerError<E> {
-    #[doc(hidden)]
-    pub fn fmt_details(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.diagnostics.report)
-    }
-}
-impl<E> SharedOwnerError<E> {
-    pub fn from_failure(error: Rc<OwnerFailure<E>>, secondary: &[AktorError]) -> Self {
-        let mut report = alloc::format!("{error:#}");
-
-        for failure in secondary {
-            report.push('\n');
-            report.push_str(&failure.diagnostics);
-        }
-
-        let diagnostics = crate::AktorDiagnostic::new(alloc::format!("{error}"), report);
-
-        Self { error, diagnostics }
+        (Self { cause: error }, report)
     }
 
     pub fn without_data(self) -> OwnerError {
-        OwnerError {
-            error: self.error.without_data(),
-            diagnostics: self.diagnostics,
-        }
+        self.cause.without_data()
     }
 }

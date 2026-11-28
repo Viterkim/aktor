@@ -1,89 +1,62 @@
 use super::super::*;
 use core::{
-    future::poll_fn,
     pin::Pin,
     task::{Context, Poll, ready},
 };
 
+#[derive(Er)]
+enum AdmitErr {
+    Closed,
+    IdExhausted,
+    NoInput,
+}
+impl AdmitErr {
+    fn worker_error(&self) -> WorkerError {
+        WorkerError::new(AktorDeliveryOutcome::NotAdmitted, WorkerCause::Closed)
+    }
+}
 impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
-    pub fn new(
-        worker: &'a Worker<S, Role, impl Sized>,
-        operation: &str,
-        input: Result<Vec<u8>, WorkerError>,
-    ) -> Self
-    where
-        O: DeserializeOwned,
-    {
-        Self::with_decoder(worker, operation, input, codec::decode_output)
-    }
-
-    pub fn with_decoder(
-        worker: &'a Worker<S, Role, impl Sized>,
-        operation: &str,
-        input: Result<Vec<u8>, WorkerError>,
-        decoder: fn(&[u8]) -> Result<O, WorkerError>,
-    ) -> Self {
-        Self {
-            inner: &worker.inner,
-            state: PhantomData,
-            operation: operation.into(),
-            input: Some(input.map_err(|error| error.without_data())),
-            encoder: None,
-            decoder,
-            admission: None,
-            reply: None,
-            parked: false,
-        }
-    }
-
-    fn size(&mut self) -> Result<usize, WireError> {
+    fn size(&mut self) -> Result<usize, WireFailure> {
         if let Some(encoder) = self.encoder.take() {
-            self.input = Some(encoder());
+            self.input = Some(encoder()?);
         }
-
         let input = self
             .input
             .as_ref()
-            .ok_or_else(|| WireError::new(CallError::NotAdmitted, WorkerCause::Closed))?
-            .as_ref()
-            .map_err(Clone::clone)?;
+            .er(|| WorkerError::new(AktorDeliveryOutcome::NotAdmitted, WorkerCause::Closed))?;
 
-        let bytes = input.len().saturating_add(self.operation.len());
+        let bytes = input.len().saturating_add(self.operation.name.len());
 
-        Ok(bytes.min(self.inner.options.max_outstanding_bytes))
+        Ok(bytes.min(self.inner.options.max_outstanding_bytes.get()))
     }
 
     fn submit(
         &mut self,
         count: OwnedSemaphorePermit,
         bytes: OwnedSemaphorePermit,
-    ) -> Result<(), WireError> {
+    ) -> ErResult<(), AdmitErr> {
         let inner = self.inner;
-
         if inner.closed.get() {
-            return Err(WireError::new(CallError::NotAdmitted, WorkerCause::Closed));
+            er_bail!(AdmitErr::Closed);
         }
 
         let id = inner.next.get();
+        inner
+            .next
+            .set(id.checked_add(1).er(|| AdmitErr::IdExhausted)?);
 
-        inner.next.set(
-            id.checked_add(1)
-                .ok_or_else(|| WireError::new(CallError::NotAdmitted, WorkerCause::Closed))?,
-        );
-
-        let input = self
-            .input
-            .take()
-            .ok_or_else(|| WireError::new(CallError::NotAdmitted, WorkerCause::Closed))??;
+        let input = self.input.take().er(|| AdmitErr::NoInput)?;
         let (answer, response) = oneshot::channel();
         let decoder = self.decoder;
-        let answer: Answer = Box::new(move |output| {
+        let answer: Answer = Box::new(move |output, record| {
             if answer.is_closed() {
-                return output.err();
+                return output.err().map(record);
             }
 
-            let output =
-                output.and_then(|bytes| decoder(&bytes).map_err(|error| error.without_data()));
+            let output = match output.and_then(|bytes| Ok(decoder(&bytes)?)) {
+                Ok(output) => Ok(output),
+                Err(error) => Err(record(error)),
+            };
             let failure = output.as_ref().err().cloned();
 
             let _sent = answer.send(output);
@@ -93,10 +66,11 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
         inner.outstanding.borrow_mut().insert(
             id,
             Work {
+                operation: self.operation,
                 answer: Some(answer),
                 input: Some(Incoming::Call {
                     id,
-                    operation: self.operation.clone(),
+                    operation: self.operation.name.into(),
                     input,
                 }),
                 service: None,
@@ -111,20 +85,36 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
         self.reply = Some(WorkerReply {
             response,
             inner: Rc::downgrade(inner),
-            group: inner.group.borrow().clone(),
+            group: inner.group.clone(),
             id,
-            parked: false,
             taken: false,
-            error: None,
         });
 
         Ok(())
     }
 
-    pub(in crate::worker::browser) fn poll_submit(
+    pub(in crate::worker::browser) fn poll_checked(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), WireError>> {
+    ) -> Poll<Result<(), WireFailure>> {
+        let Err(mut error) = ready!(self.poll_submit(cx)) else {
+            return Poll::Ready(Ok(()));
+        };
+
+        if error.error.cause == WorkerCause::Closed
+            && error.error.failure_id.is_none()
+            && let Some(failure) = self
+                .inner
+                .recorded_failure(AktorDeliveryOutcome::NotAdmitted)
+        {
+            error = failure;
+        }
+
+        deliver(error.error.failure_id, &self.inner.group);
+        Poll::Ready(Err(error))
+    }
+
+    fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WireFailure>> {
         if let Some(reply) = &self.reply {
             if reply.taken {
                 crate::message::consumed();
@@ -133,26 +123,33 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
         }
 
         if self.admission.is_none() {
-            let size = self.size()?;
+            let size = match self.size() {
+                Ok(size) => size,
+                Err(mut error) => {
+                    let id =
+                        self.inner
+                            .record_occurrence(self.operation.phase(), &error.report, false);
+                    error.error.failure_id = Some(id);
+                    return Poll::Ready(Err(error));
+                }
+            };
             let inner = self.inner;
 
             self.admission = Some(Box::pin(async move {
-                observe(inner.ready.subscribe()).await?;
+                if let Err(failure) = observe(inner.ready.subscribe()).await {
+                    return Err(failure.error);
+                }
 
-                let closed = || WireError::new(CallError::NotAdmitted, WorkerCause::Closed);
-                let count = inner
-                    .count
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| closed())?;
+                let closed =
+                    || WorkerError::new(AktorDeliveryOutcome::NotAdmitted, WorkerCause::Closed);
+                let count = inner.count.clone().acquire_owned().await.er(closed)?;
 
                 let bytes = inner
                     .bytes
                     .clone()
                     .acquire_many_owned(size as u32)
                     .await
-                    .map_err(|_| closed())?;
+                    .er(closed)?;
 
                 Ok((count, bytes))
             }));
@@ -165,98 +162,34 @@ impl<'a, S, O: 'static, Role> WorkerRequest<'a, S, O, Role> {
         match admission.as_mut().poll(cx) {
             Poll::Ready(Ok((count, bytes))) => {
                 self.admission = None;
-                Poll::Ready(self.submit(count, bytes))
+                self.submit(count, bytes).er_with(AdmitErr::worker_error)?;
+                Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(error)) => {
                 self.admission = None;
-
-                Poll::Ready(Err(WireError {
-                    outcome: CallError::NotAdmitted,
-                    ..error
-                }))
+                Poll::Ready(Err(error.with_outcome(AktorDeliveryOutcome::NotAdmitted)))
             }
             Poll::Pending => Poll::Pending,
         }
     }
 
-    fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.parked {
-            return Poll::Pending;
-        }
-
-        match self.poll_submit(cx) {
-            Poll::Ready(Err(error)) => {
-                self.parked = true;
-                self.admission = None;
-
-                if self.inner.failed.get() {
-                    return self.inner.park(error);
-                }
-
-                if error.outcome == CallError::NotAdmitted
-                    && error.cause == WorkerCause::Closed
-                    && self.inner.closed.get()
-                {
-                    let stopping = self
-                        .inner
-                        .group
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|(_, group)| group.is_stopping());
-                    if stopping {
-                        Poll::Pending
-                    } else {
-                        self.inner.lost(error)
-                    }
-                } else {
-                    self.inner.lost(error)
-                }
-            }
-            Poll::Ready(Ok(())) => Poll::Ready(()),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    pub fn timeout(self, duration: core::time::Duration) -> crate::Timeout<Self> {
-        crate::Timeout::browser(self, duration, |request| crate::timeout::WaitStatus {
+    pub fn timeout(self, duration: core::time::Duration) -> crate::AktorTimeout<Self> {
+        crate::AktorTimeout::browser(self, duration, |request| crate::timeout::WaitStatus {
             admitted: request.reply.is_some(),
         })
     }
 
-    /// Wait for admission and return a refusal without waiting for cleanup.
-    pub async fn admit(mut self) -> Result<WorkerReply<O>, WorkerError> {
-        poll_fn(|cx| self.poll_submit(cx))
-            .await
-            .map_err(WireError::without_data)?;
-
-        self.reply
-            .take()
-            .ok_or_else(|| WorkerError::new(CallError::NotAdmitted, WorkerCause::Closed))
-    }
-
-    pub async fn send(mut self) -> WorkerReply<O> {
-        poll_fn(|cx| self.poll_send(cx)).await;
-
-        match self.reply.take() {
-            Some(reply) => reply,
-            None => {
-                core::future::pending::<()>().await;
-                fatal(WireError::new(CallError::NotAdmitted, WorkerCause::Closed))
-            }
-        }
+    pub fn send(self) -> WorkerRequestSend<'a, S, O, Role> {
+        WorkerRequestSend(self)
     }
 }
 impl<S, O: 'static, Role> Future for WorkerRequest<'_, S, O, Role> {
-    type Output = O;
+    type Output = Result<O, crate::AktorDeliveryError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        if this.parked {
-            return Poll::Pending;
-        }
-
-        ready!(this.poll_send(cx));
+        ready!(this.poll_checked(cx))?;
 
         match this.reply.as_mut() {
             Some(reply) => Pin::new(reply).poll(cx),
@@ -264,8 +197,37 @@ impl<S, O: 'static, Role> Future for WorkerRequest<'_, S, O, Role> {
         }
     }
 }
-impl<S, Role> WorkerRequest<'_, S, (), Role> {
-    pub async fn cast(self) {
-        drop(self.send().await);
+impl<'a, S, Role> WorkerRequest<'a, S, (), Role> {
+    pub fn cast(self) -> WorkerRequestCast<'a, S, Role> {
+        WorkerRequestCast(self.send())
+    }
+}
+
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct WorkerRequestSend<'a, S, O, Role = ()>(WorkerRequest<'a, S, O, Role>);
+impl<S, O, Role> Unpin for WorkerRequestSend<'_, S, O, Role> {}
+impl<S, O: 'static, Role> Future for WorkerRequestSend<'_, S, O, Role> {
+    type Output = Result<WorkerReply<O>, crate::AktorDeliveryError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let request = &mut self.get_mut().0;
+        if let Err(error) = ready!(request.poll_checked(cx)) {
+            return Poll::Ready(Err(error.into()));
+        }
+
+        Poll::Ready(request.reply.take().ok_or_else(|| {
+            WireFailure::new(AktorDeliveryOutcome::NotAdmitted, WorkerCause::Closed).into()
+        }))
+    }
+}
+
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct WorkerRequestCast<'a, S, Role = ()>(WorkerRequestSend<'a, S, (), Role>);
+impl<S, Role> Unpin for WorkerRequestCast<'_, S, Role> {}
+impl<S, Role> Future for WorkerRequestCast<'_, S, Role> {
+    type Output = Result<(), crate::AktorDeliveryError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx).map_ok(drop)
     }
 }

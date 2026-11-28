@@ -1,4 +1,4 @@
-use aktor::{AktorCleanupError, AktorData, AktorSetupError, aktor};
+use aktor::{AktorData, aktor};
 
 pub const WIRE_REVISION: &str = "power-v2";
 
@@ -9,16 +9,15 @@ pub struct PowerManager {
     target: i32,
 }
 impl PowerManager {
-    pub fn open() -> Result<Self, AktorSetupError> {
-        Ok(Self {
+    pub fn open() -> Self {
+        Self {
             cycles: 0,
             target: 0,
-        })
+        }
     }
 
-    pub fn close(self) -> Result<(), AktorCleanupError> {
+    pub fn close(self) {
         println!("power manager closed after {} cycles", self.cycles);
-        Ok(())
     }
 }
 
@@ -41,7 +40,7 @@ pub async fn get_state(power: &PowerManager) -> PowerState {
     }
 }
 
-#[aktor(remote, role = PowerRemote)]
+#[aktor(remote, role = PowerRemote, latest)]
 pub async fn set_target(power: &mut PowerManager, target: i32) -> i32 {
     power.target = target;
     target

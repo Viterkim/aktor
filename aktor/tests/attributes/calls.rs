@@ -1,5 +1,7 @@
 #![deny(deprecated)]
-use aktor::aktor;
+use aktor::{
+    Aktor, AktorGroup, AktorHooks, AktorKind, AktorNew, AktorSetup, AktorStuck, aktor, aktor_start,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static VISITS: AtomicUsize = AtomicUsize::new(0);
@@ -51,6 +53,36 @@ async fn also_absent(_: &Missing) -> Missing {
     missing()
 }
 
+fn counter() -> (
+    Aktor<u32>,
+    aktor::AktorStarted<(), AktorGroup>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (release, gate) = std::sync::mpsc::channel();
+    let started = aktor_start(AktorSetup {
+        stuck: aktor::AktorGroupStuck::KeepRunning,
+        actors: AktorNew {
+            name: "attribute probe".into(),
+            kind: AktorKind::TokioThread,
+            start: aktor::AktorInit::Ready(async move || {
+                gate.recv().unwrap();
+                0
+            }),
+            end: (),
+            hooks: AktorHooks::NONE,
+            capacity: core::num::NonZeroUsize::MIN,
+            stuck: AktorStuck::Kill,
+        },
+        shutdown: |_| {},
+        grace: std::time::Duration::from_secs(5),
+    });
+
+    {
+        let (group, handle) = started.into_parts();
+        (handle, group, release)
+    }
+}
+
 #[test]
 fn composition() {
     aktor::executor::block_on(async {
@@ -60,11 +92,11 @@ fn composition() {
                 assert_eq!($function(&mut 0 $(, $input)?).await, 1);
                 assert_eq!(VISITS.swap(0, Ordering::Relaxed), 1, "direct {}", stringify!($function));
 
-                let (handle, mut listener) = aktor::listener::channel::<u32>(1).unwrap();
-                let reply = $function(&handle $(, $input)?).send().await;
+                let (handle, _group, release) = counter();
+                let reply = $function(&handle $(, $input)?).send().await.unwrap();
                 assert_eq!(VISITS.load(Ordering::Relaxed), 0, "hook ran on submission");
-                listener.recv().await.unwrap().run(&mut 0).await;
-                assert_eq!(reply.await, 1);
+                release.send(()).unwrap();
+                assert_eq!(reply.await.unwrap(), 1);
                 assert_eq!(VISITS.swap(0, Ordering::Relaxed), 1, "queued {}", stringify!($function));
             };
         }
@@ -73,11 +105,11 @@ fn composition() {
         {
             assert_eq!(old(&mut 0).await, 1);
 
-            let (handle, mut listener) = aktor::listener::channel::<u32>(1).unwrap();
-            let reply = old_generic(&handle, ()).send().await;
+            let (handle, _group, release) = counter();
+            let reply = old_generic(&handle, ()).send().await.unwrap();
 
-            listener.recv().await.unwrap().run(&mut 0).await;
-            assert_eq!(reply.await, 1);
+            release.send(()).unwrap();
+            assert_eq!(reply.await.unwrap(), 1);
         }
 
         check!(outer);

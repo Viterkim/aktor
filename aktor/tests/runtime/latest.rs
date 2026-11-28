@@ -1,5 +1,5 @@
 use super::*;
-use std::convert::Infallible;
+use core::num::NonZeroUsize;
 
 #[tokio::test]
 async fn registrations() {
@@ -23,7 +23,7 @@ async fn registrations() {
         name: "registration",
         caller: std::panic::Location::caller(),
     };
-    let (handle, mut listener) = channel::<usize>(1).unwrap();
+    let (handle, _group) = thread_actor(0usize, 1).await;
     let (_input, mut output) =
         (&handle).session(operation, async |_: &mut usize, input: usize| input);
 
@@ -40,12 +40,12 @@ async fn registrations() {
     }
 
     assert_eq!(wake.0.load(Ordering::Relaxed), 0);
-    listener.close();
-    assert_eq!(wake.0.swap(0, Ordering::Relaxed), 1);
+    handle.shutdown().await.unwrap();
+    assert!(wake.0.swap(0, Ordering::Relaxed) > 0);
 
     #[cfg(feature = "local")]
     {
-        let (handle, _owner) = local::channel::<usize, 1, ()>().unwrap();
+        let (handle, _owner) = local::channel::<usize, ()>(NonZeroUsize::MIN);
         let (_input, mut output) =
             (&handle).session(operation, async |_: &mut usize, input: usize| input);
 
@@ -66,8 +66,10 @@ async fn registrations() {
         assert_eq!(wake.0.load(Ordering::Relaxed), 1);
     }
 }
-use aktor::message::call_async;
-use std::sync::{Arc, Mutex};
+use std::{
+    panic::AssertUnwindSafe,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::Notify;
 
 struct Rows(u32, std::marker::PhantomPinned);
@@ -78,7 +80,7 @@ struct Database {
     calls: Arc<Mutex<Vec<u32>>>,
 }
 
-#[aktor]
+#[aktor(latest)]
 async fn search(db: &mut Database, query: u32) -> Result<Rows, QueryError> {
     db.calls.lock().unwrap().push(query);
 
@@ -94,71 +96,99 @@ async fn search(db: &mut Database, query: u32) -> Result<Rows, QueryError> {
     }
 }
 
+#[aktor]
+async fn ordinary(_: &Database) -> usize {
+    17
+}
+
 #[tokio::test]
 async fn current_results() {
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let (handle, listener) = channel::<Database>(1).unwrap();
+    let (handle, _group) = thread_actor(
+        Database {
+            started: started.clone(),
+            release: release.clone(),
+            calls: calls.clone(),
+        },
+        1,
+    )
+    .await;
     let (input, mut output) = search(&handle, 1).latest();
-    let owner = listener.run(Database {
-        started: started.clone(),
-        release: release.clone(),
-        calls: calls.clone(),
-    });
+    started.notified().await;
 
-    let client = async move {
-        started.notified().await;
+    for query in 2..=1000 {
+        input.send(query);
+    }
 
-        for query in 2..=1000 {
-            input.send(query);
-        }
+    let ordinary = ordinary(&handle).send().await.unwrap();
 
-        let ordinary = call(&handle, |_, ()| 17, ()).send().await;
+    release.notify_one();
+    assert_eq!(ordinary.await, Ok(17));
 
-        release.notify_one();
-        assert_eq!(ordinary.await, 17);
-
-        let Some(Ok(rows)) = output.next().await else {
-            panic!("latest output missing");
-        };
-
-        assert_eq!(rows.0, 1000);
-        assert_eq!(*calls.lock().unwrap(), [1, 1000]);
-
-        input.send(0);
-
-        let Some(Err(error)) = output.next().await else {
-            panic!("ordinary error missing");
-        };
-
-        assert_eq!(error.0, 0);
-        input.send(7);
-        drop(input);
-
-        let Some(Ok(rows)) = output.next().await else {
-            panic!("final output missing");
-        };
-
-        assert_eq!(rows.0, 7);
-        assert!(output.next().await.is_none());
-        drop(output);
-        drop(handle);
+    let Some(Ok(Ok(rows))) = output.next().await else {
+        panic!("latest output missing");
     };
 
-    tokio::join!(owner, client);
+    assert_eq!(rows.0, 1000);
+    assert_eq!(*calls.lock().unwrap(), [1, 1000]);
 
-    let (handle, listener) = channel::<Database>(1).unwrap();
-    let (input, mut output) = search::latest(&handle);
+    input.send(0);
 
-    drop(listener);
-    input.send(9);
+    let Some(Ok(Err(error))) = output.next().await else {
+        panic!("ordinary error missing");
+    };
+
+    assert_eq!(error.0, 0);
+    input.send(7);
+    drop(input);
+
+    let Some(Ok(Ok(rows))) = output.next().await else {
+        panic!("final output missing");
+    };
+
+    assert_eq!(rows.0, 7);
+    assert!(output.next().await.is_none());
+}
+
+#[tokio::test]
+async fn grouped_stop_in_flight() {
+    let entered = Arc::new(Notify::new());
+    let actors = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: support::thread_actor(
+            Database {
+                started: entered.clone(),
+                release: Arc::new(Notify::new()),
+                calls: Arc::default(),
+            },
+            1,
+        ),
+        shutdown: |_| {},
+        grace: Duration::from_millis(20),
+    });
+    actors.ready().await.unwrap();
+
+    let (input, mut output) = search(actors.handles(), 1).latest();
+    entered.notified().await;
+    let mut next = Box::pin(output.next());
+    assert!(poll(next.as_mut()).is_pending());
+
+    let report = actors.stop().await;
+    let item = tokio::time::timeout(Duration::from_secs(1), next)
+        .await
+        .expect("latest parked after the actor stopped");
+    let error = item.unwrap().err().unwrap();
+    assert_eq!(error.outcome, aktor::AktorDeliveryOutcome::OutcomeUnknown);
     assert!(
-        std::panic::AssertUnwindSafe(output.next())
-            .catch_unwind()
-            .await
-            .is_err()
+        report
+            .failure(error.failure_id.unwrap())
+            .unwrap()
+            .delivered()
     );
+    assert!(output.next().await.is_none());
+    drop(input);
 }
 
 #[tokio::test]
@@ -176,8 +206,8 @@ async fn idle_close() {
         }
     }
 
-    let (handle, listener) = channel::<Database>(1).unwrap();
-    let (input, mut output) = search::latest(&handle);
+    let (actor, _group) = thread_actor(0usize, 1).await;
+    let (_input, mut output) = latest_value::latest(&actor);
     let wake = Arc::new(IdleWake(AtomicBool::new(false)));
     let waker = Waker::from(wake.clone());
     let mut next = Box::pin(output.next());
@@ -188,231 +218,33 @@ async fn idle_close() {
             .is_pending()
     );
 
-    drop(listener);
-    handle.closed().await;
+    actor.shutdown().await.unwrap();
     assert!(wake.0.load(Ordering::Acquire));
-
-    let failure = tokio::time::timeout(
-        Duration::from_millis(200),
-        AssertUnwindSafe(next).catch_unwind(),
-    )
-    .await
-    .expect("idle latest results did not observe listener destruction");
-
-    assert!(failure.is_err());
-    drop(input);
+    assert_eq!(next.await, None);
 }
 
 #[tokio::test]
-async fn pause_and_shutdown() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let observed = calls.clone();
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let entered = started.clone();
-    let finish = release.clone();
-    let (handle, actor, owner) = spawn(SpawnArgs {
-        name: "latest search".into(),
-        capacity: 1,
-        failure: FailurePolicy::Unwind,
-        setup: move || {
-            Ok::<_, Infallible>(Database {
-                started: entered,
-                release: finish,
-                calls: observed,
-            })
-        },
-        cleanup: |_| Ok::<_, ()>(()),
-    })
-    .await
-    .unwrap();
-
-    let ordinary = call_async(
-        &handle,
-        async |state, ()| {
-            state.calls.lock().unwrap().push(1);
-            state.started.notify_one();
-            state.release.notified().await;
-        },
-        (),
-    )
-    .send()
-    .await;
-
-    started.notified().await;
-
-    let (input, mut output) = search::latest(&handle);
-
-    input.send(2);
-
-    let pause = actor.pause();
-
-    tokio::pin!(pause);
-
-    let waiting = pause.as_mut().now_or_never().is_none();
-
-    release.notify_one();
-    assert!(waiting);
-    ordinary.await;
-    pause.await.unwrap();
-    assert_eq!(*calls.lock().unwrap(), [1]);
-    assert!(output.next().now_or_never().is_none());
-
-    let observed = calls.clone();
-
-    actor
-        .resume(move || {
-            Ok(Database {
-                started: Arc::new(Notify::new()),
-                release: Arc::new(Notify::new()),
-                calls: observed,
-            })
-        })
-        .await
+async fn idle_job_failure() {
+    let (actor, _group) = thread_actor(0usize, 1).await;
+    let (_input, mut output) = latest_value::latest(&actor);
+    let job = actor
+        .spawn(
+            async { Err::<(), _>(((), String::from("write failed"))) },
+            AktorJob::FinishBeforeEnd,
+        )
         .unwrap();
 
-    let Some(Ok(rows)) = output.next().await else {
-        panic!("queued latest input missing after resume");
+    let error = output.next().await.unwrap().unwrap_err();
+    let (AktorJobError::Failed(id), _) = job.await.unwrap_err() else {
+        panic!("missing job failure");
     };
-
-    assert_eq!(rows.0, 2);
-
-    actor.pause().await.unwrap();
-    input.send(2);
-    input.send(3);
-    assert!(output.next().now_or_never().is_none());
-
-    let observed = calls.clone();
-
-    actor
-        .resume(move || {
-            Ok(Database {
-                started: Arc::new(Notify::new()),
-                release: Arc::new(Notify::new()),
-                calls: observed,
-            })
-        })
-        .await
-        .unwrap();
-
-    let Some(Ok(rows)) = output.next().await else {
-        panic!("resumed output missing");
-    };
-
-    assert_eq!(rows.0, 3);
-
-    input.send(4);
-    actor.shutdown().await.unwrap();
-
-    let Some(Ok(rows)) = output.next().await else {
-        panic!("shutdown lost its accepted input");
-    };
-
-    assert_eq!(rows.0, 4);
+    assert_eq!(error.failure_id, Some(id));
     assert!(output.next().await.is_none());
-    assert_eq!(*calls.lock().unwrap(), [1, 2, 3, 4]);
-    owner.join_async().await.unwrap().unwrap();
 }
 
-struct LatestWake {
-    sender: aktor::message::LatestSender<usize>,
-    entered: std::sync::atomic::AtomicBool,
-}
-impl std::task::Wake for LatestWake {
-    fn wake(self: Arc<Self>) {
-        if !self.entered.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            aktor::latest::SendLatest::send(&self.sender, 2);
-        }
-    }
-}
-
-#[test]
-fn callbacks_can_reenter() {
-    if std::env::var_os("AKTOR_CHILD").is_some() {
-        use aktor::latest::{SendLatest, Session};
-        use std::{
-            future::Future,
-            task::{Context, Waker},
-        };
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let (handle, mut listener) = channel::<usize>(1).unwrap();
-                let (sender, mut output) = (&handle).session(
-                    aktor::operation::Operation {
-                        name: "callback",
-                        caller: std::panic::Location::caller(),
-                    },
-                    async |state, input: usize| {
-                        *state = input;
-                        input
-                    },
-                );
-
-                let wake = Arc::new(LatestWake {
-                    sender: sender.clone(),
-                    entered: std::sync::atomic::AtomicBool::new(false),
-                });
-                let waker = Waker::from(wake.clone());
-                let mut receiver = Box::pin(listener.recv());
-
-                assert!(
-                    receiver
-                        .as_mut()
-                        .poll(&mut Context::from_waker(&waker))
-                        .is_pending()
-                );
-
-                sender.send(1);
-                drop(receiver);
-
-                let mut state = 0;
-
-                listener.try_recv().unwrap().run(&mut state).await;
-                assert_eq!(output.next().await, Some(2));
-                assert!(listener.try_recv().is_err());
-
-                let waker = Waker::from(Arc::new(LatestWake {
-                    sender: sender.clone(),
-                    entered: std::sync::atomic::AtomicBool::new(true),
-                }));
-                let mut next = Box::pin(output.next());
-
-                assert!(
-                    next.as_mut()
-                        .poll(&mut Context::from_waker(&waker))
-                        .is_pending()
-                );
-                drop(waker);
-                assert!(
-                    next.as_mut()
-                        .poll(&mut Context::from_waker(Waker::noop()))
-                        .is_pending()
-                );
-                drop(next);
-                drop(listener);
-                sender.send(3);
-                assert!(
-                    AssertUnwindSafe(output.next())
-                        .catch_unwind()
-                        .await
-                        .is_err()
-                );
-            });
-
-        return;
-    }
-
-    let output = support::child("latest::callbacks_can_reenter", "latest");
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+#[aktor(latest)]
+async fn latest_value(state: &usize, input: usize) -> usize {
+    *state + input
 }
 
 #[tokio::test]
@@ -428,7 +260,7 @@ async fn replacement_drop() {
         }
     }
 
-    let (handle, mut listener) = channel::<usize>(1).unwrap();
+    let (handle, _group) = thread_actor(0usize, 1).await;
     let (input, mut output) = (&handle).session(
         aktor::operation::Operation {
             name: "replacement",
@@ -438,14 +270,9 @@ async fn replacement_drop() {
     );
 
     input.send(1);
-    listener.try_recv().unwrap().run(&mut 0).await;
+    latest_value(&handle, 0).await.unwrap();
     assert!(std::panic::catch_unwind(AssertUnwindSafe(|| input.send(2))).is_err());
-    listener
-        .try_recv()
-        .expect("new input stranded after replaced output panicked")
-        .run(&mut 0)
-        .await;
-    assert_eq!(output.next().await.unwrap().0, 2);
+    assert_eq!(output.next().await.unwrap().unwrap().0, 2);
 }
 
 #[cfg(feature = "local")]
@@ -466,7 +293,7 @@ async fn local_replacement_drop() {
         }
     }
 
-    let (handle, owner) = local::channel::<usize, 1, ()>().unwrap();
+    let (handle, owner) = local::channel::<usize, ()>(NonZeroUsize::MIN);
     let (input, mut output) = (&handle).session(
         aktor::operation::Operation {
             name: "replacement",
@@ -497,7 +324,7 @@ async fn local_replacement_drop() {
         .expect("new input stranded")
         .unwrap();
 
-    assert_eq!(value.0, 2);
+    assert_eq!(value.unwrap().0, 2);
     drop(handle.shutdown());
     running.await.unwrap();
 }
@@ -520,7 +347,7 @@ async fn cross_core_publication() {
         }
     }
 
-    let (handle, owner) = aktor::cross_core::channel::<()>(1).unwrap();
+    let (handle, owner) = aktor::cross_core::channel::<()>(NonZeroUsize::MIN);
     let mut running = Box::pin(owner.run_with(async || Ok(()), async |_| Ok(())));
     let wake = Arc::new(crate::support::CountWake::default());
     let waker = Waker::from(wake.clone());
@@ -553,8 +380,7 @@ async fn cross_core_publication() {
         _ => panic!("replacement did not execute"),
     };
 
-    assert_eq!(value.0, 2);
-    drop(value);
+    assert_eq!(value.unwrap().0, 2);
 
     let completion = handle.shutdown();
 

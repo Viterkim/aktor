@@ -1,5 +1,5 @@
 use super::*;
-use crate::local::{Reply, Request};
+use crate::local::{Reply, Request, RequestCast, RequestSend};
 #[cfg(any(
     feature = "tokio",
     all(feature = "std_thread", not(target_family = "wasm")),
@@ -8,13 +8,12 @@ use crate::local::{Reply, Request};
 ))]
 use core::time::Duration;
 
-impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock> SendRequest
-    for Request<'a, S, N, E, O, Role, Clock>
-{
+impl<'a, S: 'static, O: 'static, Role, Clock> SendRequest for Request<'a, S, O, Role, Clock> {
     type Reply = Reply<O, Clock>;
+    type Send = RequestSend<'a, S, O, Role, Clock>;
 
-    async fn send(self) -> Self::Reply {
-        self.send().await
+    fn send(self) -> Self::Send {
+        self.send()
     }
 }
 #[cfg(any(
@@ -23,23 +22,21 @@ impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock> SendRequest
     feature = "embassy",
     feature = "browser_local"
 ))]
-impl<'a, S: 'static, const N: usize, E, O: 'static, Role, Clock> TimeoutRequest
-    for Request<'a, S, N, E, O, Role, Clock>
+impl<'a, S: 'static, O: 'static, Role, Clock> TimeoutRequest for Request<'a, S, O, Role, Clock>
 where
     Clock: crate::local::clock::AktorClock,
 {
-    type Timed = crate::Timeout<Self>;
+    type Timed = crate::AktorTimeout<Self>;
 
     fn timeout(self, duration: Duration) -> Self::Timed {
         self.timeout(duration)
     }
 }
-impl<'a, S: 'static, const N: usize, E, Role, Clock> CastRequest
-    for Request<'a, S, N, E, (), Role, Clock>
-{
-    type Output = ();
+impl<'a, S: 'static, Role, Clock> CastRequest for Request<'a, S, (), Role, Clock> {
+    type Output = Result<(), crate::AktorDeliveryError>;
+    type Cast = RequestCast<'a, S, Role, Clock>;
 
-    async fn cast(self) {
-        self.cast().await;
+    fn cast(self) -> Self::Cast {
+        self.cast()
     }
 }

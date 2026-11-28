@@ -17,7 +17,7 @@ metadata = json.loads(subprocess.check_output([
     '--manifest-path', str(manifest),
 ]))
 binary = Path(metadata['target_directory']) / 'debug'
-children = []
+processes = []
 
 
 def start(name, socket):
@@ -25,7 +25,7 @@ def start(name, socket):
         [str(binary / name), str(socket)], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
-    children.append(process)
+    processes.append(process)
     return process
 
 
@@ -68,9 +68,9 @@ try:
         assert replacement.returncode == 0, output
         assert output.count('power manager closed after 1 cycles') == 1, output
         assert not socket.exists()
-        print('Remote: retained handle and latest sender, replacement owner and SIGTERM cleanup passed.')
+        print('Remote: retained client, replacement latest session and SIGTERM cleanup passed.')
 finally:
-    for process in children:
+    for process in processes:
         if process.poll() is None:
             process.kill()
         process.wait(timeout=10)

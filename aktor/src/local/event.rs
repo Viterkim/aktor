@@ -7,6 +7,20 @@ use core::{
     task::{Context, Waker},
 };
 
+pub(crate) fn wake(waker: Waker) {
+    #[cfg(feature = "std")]
+    if std::thread::panicking() {
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()))
+        {
+            crate::panic::dispose_secondary(payload);
+        }
+        return;
+    }
+
+    waker.wake();
+}
+
 #[derive(Default)]
 pub struct Event {
     waiters: RefCell<Vec<Weak<RefCell<Option<Waker>>>>>,
@@ -21,17 +35,25 @@ impl Event {
     }
 
     pub fn notify(&self) {
-        let wakers: Vec<_> = self
-            .waiters
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter_map(|waiter| waiter.borrow_mut().take())
-            .collect();
+        let (first, rest) = {
+            let waiters = self.waiters.borrow();
+            let mut ready = waiters
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter_map(|waiter| waiter.borrow_mut().take());
+
+            (ready.next(), ready.collect::<Vec<_>>())
+        };
+        let wakers = first.into_iter().chain(rest);
 
         #[cfg(feature = "std")]
         if let Some(payload) = super::panic::capture_each(wakers, Waker::wake, |_| {}) {
-            std::panic::resume_unwind(payload);
+            // Drop impls notify too, a second panic while unwinding would abort.
+            if std::thread::panicking() {
+                crate::panic::dispose_secondary(payload);
+            } else {
+                std::panic::resume_unwind(payload);
+            }
         }
         #[cfg(not(feature = "std"))]
         for waker in wakers {
@@ -46,8 +68,7 @@ pub struct Listener<'a> {
 }
 impl Listener<'_> {
     pub fn register(&self, context: &Context<'_>) {
-        let old = self.waker.replace(Some(context.waker().clone()));
-        drop(old);
+        register(&self.waker, context.waker());
     }
 }
 impl Drop for Listener<'_> {
@@ -59,4 +80,18 @@ impl Drop for Listener<'_> {
             .borrow_mut()
             .retain(|waiter| !waiter.ptr_eq(&weak));
     }
+}
+
+pub fn register(slot: &RefCell<Option<Waker>>, wake: &Waker) -> bool {
+    if slot
+        .borrow()
+        .as_ref()
+        .is_some_and(|old| old.will_wake(wake))
+    {
+        return false;
+    }
+
+    let old = slot.replace(Some(wake.clone()));
+    drop(old);
+    true
 }

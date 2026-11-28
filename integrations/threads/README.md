@@ -1,6 +1,6 @@
-# Browser threads
+# Browser threads (shared Wasm memory)
 
-A worker can share your app's Rust heap. Send a Vec and the allocation moves over, no encoding or copying the bytes.
+Browser actors running on shared Wasm memory (`SharedArrayBuffer`), so a worker shares your app's Rust heap and you can send a `Vec` straight across without serializing or copying bytes.
 
 ```rust
 #[aktor]
@@ -8,24 +8,20 @@ async fn process(state: &mut Processor, bytes: Vec<u8>) -> Vec<u8> {
     state.process(bytes)
 }
 
-let bytes = process(&actors.handles, bytes).await;
+let bytes = process(&processor, bytes).await;
 ```
 
-Enable wasm_threads and use AktorKind::BrowserThread("/pkg/app.js") in your setup, pointing to your app's wasm-bindgen module. Arguments, results and setup closures need Send. The state can hold Rc and JavaScript resources created on the worker.
+With the `wasm_threads` feature you can point `AktorKind::BrowserThread("/pkg/app.js")` at your `wasm-bindgen` module. Args, results and setup closures need `Send`, while the actor's own state can still hold `Rc` and JS objects created on that worker.
 
-The workers run concurrently and share library globals too. SQLite built with threading disabled breaks here, even with one connection per actor. Use BrowserWebWorker for its own memory.
+Because workers share globals too, stuff like single threaded SQLite will break here even with one connection per actor (you can use `BrowserWebWorker` when a worker needs its own memory).
 
 ## Build
 
-Use nightly with rust-src and wasm-bindgen-cli matching Cargo.lock. [build.sh](build.sh) has the atomics flags and rebuilds std.
-
-Serve the app with these headers:
+You'll need the nightly toolchain from [build.sh](build.sh) with `rust-src` (for rebuilding `std` with atomics) and `wasm-bindgen-cli` matching `integrations/Cargo.lock`, and the page needs COOP/COEP headers for `SharedArrayBuffer`:
 
 ```text
 Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: require-corp
 ```
 
-The browser needs SharedArrayBuffer and permission to start workers from blob URLs.
-
-Keep resources in actor state so shutdown can close them. wasm-bindgen skips thread local destructors. Stuck synchronous work can outlive the shutdown deadline, and a Wasm trap can leak allocations until the page reloads.
+Resources should live inside the actor state so shutdown can close them (`wasm-bindgen` skips thread local destructors, and stuck synchronous code or a Wasm trap can't be cleaned up until reload).

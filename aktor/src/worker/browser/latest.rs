@@ -1,5 +1,5 @@
 use super::*;
-use crate::latest::{SendLatest, Session};
+use crate::latest::{SendLatest, Session, WorkerSession};
 use core::{
     future::poll_fn,
     ops::AsyncFnOnce,
@@ -33,14 +33,17 @@ pub struct LatestResults<O> {
     output: Rc<dyn Output<O>>,
 }
 impl<O> LatestResults<O> {
-    pub async fn next(&mut self) -> Option<O> {
+    pub async fn next(&mut self) -> Option<Result<O, crate::AktorDeliveryError>> {
         poll_fn(|cx| self.output.poll(cx)).await
     }
 }
 impl<O> futures_util::Stream for LatestResults<O> {
-    type Item = O;
+    type Item = Result<O, crate::AktorDeliveryError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<O>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<O, crate::AktorDeliveryError>>> {
         self.output.poll(cx)
     }
 }
@@ -56,13 +59,21 @@ trait Input<I> {
     fn close_sender(&self);
 }
 trait Output<O> {
-    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>>;
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<Result<O, crate::AktorDeliveryError>>>;
     fn close_receiver(&self);
 }
-pub trait Service {
+#[derive(Er)]
+pub(super) struct EncodeLatestErr {
+    pub(super) cause: WorkerCause,
+}
+pub(super) trait Service {
     fn operation(&self) -> &str;
-    fn take(&self) -> Result<Option<Vec<u8>>, WireError>;
-    fn answer(&self, output: Result<Vec<u8>, WireError>) -> Option<WireError>;
+    fn take(&self) -> ErResult<Option<Vec<u8>>, EncodeLatestErr>;
+    fn answer(
+        &self,
+        output: Result<Vec<u8>, WireFailure>,
+        record: &dyn Fn(WireFailure) -> WireFailure,
+    ) -> Option<WireFailure>;
 }
 
 struct Shared<I, O> {
@@ -71,8 +82,8 @@ struct Shared<I, O> {
     slot: RefCell<Slot<I, O>>,
     this: Weak<Self>,
     wake_callback: Rc<dyn Fn() -> bool>,
-    encoder: fn(&I) -> Result<Vec<u8>, WorkerError>,
-    decoder: fn(&[u8]) -> Result<O, WorkerError>,
+    encoder: Encoder<I>,
+    decoder: Decoder<O>,
 }
 
 struct Slot<I, O> {
@@ -83,7 +94,7 @@ struct Slot<I, O> {
     scheduled: Option<u64>,
     senders: usize,
     receiver: bool,
-    failed: Option<WireError>,
+    failed: Option<WireFailure>,
     wake: Option<Waker>,
 }
 
@@ -118,6 +129,7 @@ impl<I: 'static, O: 'static> Shared<I, O> {
         self.inner.outstanding.borrow_mut().insert(
             id,
             Work {
+                operation: self.operation,
                 answer: None,
                 input: None,
                 service: Some(Box::new(ServiceCall(this))),
@@ -145,7 +157,7 @@ impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
         self.0.operation.name
     }
 
-    fn take(&self) -> Result<Option<Vec<u8>>, WireError> {
+    fn take(&self) -> ErResult<Option<Vec<u8>>, EncodeLatestErr> {
         let input = {
             let mut slot = self.0.slot.borrow_mut();
 
@@ -163,23 +175,40 @@ impl<I: 'static, O: 'static> Service for ServiceCall<I, O> {
             input
         };
 
-        (self.0.encoder)(&input)
-            .map(Some)
-            .map_err(|error| error.without_data())
+        let bytes = crate::worker::wire::codec((self.0.encoder)(&input), || EncodeLatestErr {
+            cause: WorkerCause::Codec,
+        })?;
+        Ok(Some(bytes))
     }
 
-    fn answer(&self, output: Result<Vec<u8>, WireError>) -> Option<WireError> {
-        let output =
-            output.and_then(|bytes| (self.0.decoder)(&bytes).map_err(|error| error.without_data()));
+    fn answer(
+        &self,
+        output: Result<Vec<u8>, WireFailure>,
+        record: &dyn Fn(WireFailure) -> WireFailure,
+    ) -> Option<WireFailure> {
+        let output = output.and_then(|bytes| {
+            {
+                let slot = self.0.slot.borrow();
+                if !slot.receiver || slot.running != Some(slot.revision) {
+                    return Ok(None);
+                }
+            }
+
+            Ok(Some((self.0.decoder)(&bytes)?))
+        });
+        let output = match output {
+            Ok(value) => Ok(value),
+            Err(error) => Err(record(error)),
+        };
         let (discarded, pending) = {
             let mut slot = self.0.slot.borrow_mut();
             let revision = slot.running.take();
 
             match output {
-                Ok(output) if slot.receiver && revision == Some(slot.revision) => {
+                Ok(Some(output)) if slot.receiver && revision == Some(slot.revision) => {
                     (slot.output.replace(output), None)
                 }
-                Ok(output) => (Some(output), None),
+                Ok(output) => (output, None),
                 Err(error) => {
                     slot.failed = Some(error);
                     slot.scheduled = None;
@@ -230,37 +259,36 @@ impl<I: 'static, O: 'static> Input<I> for Shared<I, O> {
     }
 }
 impl<I, O> Output<O> for Shared<I, O> {
-    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<O>> {
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<Result<O, crate::AktorDeliveryError>>> {
         let replacement = cx.waker().clone();
         let mut slot = self.slot.borrow_mut();
 
-        if let Some(output) = slot.output.take() {
-            return Poll::Ready(Some(output));
+        if !slot.receiver {
+            return Poll::Ready(None);
         }
 
-        if let Some(error) = slot.failed.clone() {
+        if slot.failed.is_none()
+            && let Some(output) = slot.output.take()
+        {
+            return Poll::Ready(Some(Ok(output)));
+        }
+
+        if let Some(error) = slot.failed.take().or_else(|| {
+            self.inner
+                .recorded_failure(AktorDeliveryOutcome::OutcomeUnknown)
+        }) {
+            slot.receiver = false;
             drop(slot);
-            return self.inner.park(error);
+            deliver(error.error.failure_id, &self.inner.group);
+            return Poll::Ready(Some(Err(error.into())));
         }
 
-        let terminal = self
-            .inner
-            .finished
-            .borrow()
-            .as_ref()
-            .and_then(|result| result.as_ref().err())
-            .cloned();
-
-        if let Some(error) = terminal {
-            drop(slot);
-            return self.inner.park(error);
-        }
-
-        if (slot.senders == 0 || self.inner.closed.get())
+        if (slot.senders == 0 || self.inner.finished.borrow().is_some())
             && slot.scheduled.is_none()
             && slot.running.is_none()
             && slot.pending.is_none()
         {
+            slot.receiver = false;
             return Poll::Ready(None);
         }
 
@@ -290,7 +318,8 @@ impl<I, O> Output<O> for Shared<I, O> {
         drop(wake);
     }
 }
-impl<S, I: 'static, O: 'static, Role, E, C> Session<S, I, O, Role, C> for &Worker<S, Role, E>
+impl<S, I: 'static, O: 'static, Role, W: AktorWorkerContract<State = S, Role = Role>, C>
+    Session<S, I, O, Role, C> for &Worker<W>
 where
     C: Codec<I> + Codec<O>,
 {
@@ -301,13 +330,26 @@ where
     where
         F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
     {
+        <Self as WorkerSession<S, I, O, Role, C>>::open_session(self, operation)
+    }
+}
+
+impl<S, I: 'static, O: 'static, Role, W: AktorWorkerContract<State = S, Role = Role>, C>
+    WorkerSession<S, I, O, Role, C> for &Worker<W>
+where
+    C: Codec<I> + Codec<O>,
+{
+    type Sender = LatestSender<I>;
+    type Results = LatestResults<O>;
+
+    fn open_session(self, operation: Operation) -> (Self::Sender, Self::Results) {
         self.inner.handles.set(self.inner.handles.get() + 1);
 
         let shared = Rc::new_cyclic(|this: &Weak<Shared<I, O>>| Shared {
             inner: self.inner.clone(),
             operation,
             encoder: <C as Codec<I>>::encode,
-            decoder: <C as Codec<O>>::decode_output,
+            decoder: decode_output::<C, O>,
             this: this.clone(),
             wake_callback: Rc::new({
                 let weak = this.clone();
@@ -354,8 +396,8 @@ impl<I, O> Drop for Shared<I, O> {
     }
 }
 
-impl<S, I, O, Lease, Role, E, C> crate::latest::TypedSession<S, I, O, Lease, Role, C>
-    for &Worker<S, Role, E>
+impl<S, I, O, Lease, Role, W: AktorWorkerContract<State = S, Role = Role>, C>
+    crate::latest::TypedSession<S, I, O, Lease, Role, C> for &Worker<W>
 where
     Self: crate::latest::Session<S, I, O, Role, C>,
 {
@@ -374,4 +416,96 @@ where
     {
         <Self as crate::latest::Session<S, I, O, Role, C>>::session(self, operation, function)
     }
+}
+
+impl<S, I: 'static, O: 'static, Role, W: AktorWorkerContract<State = S, Role = Role>, C>
+    Session<S, I, O, Role, C> for &super::optional::OptionalWorker<W>
+where
+    C: Codec<I> + Codec<O>,
+{
+    type Sender = LatestSender<I>;
+    type Results = LatestResults<O>;
+
+    fn session<F>(self, operation: Operation, _function: F) -> (Self::Sender, Self::Results)
+    where
+        F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
+    {
+        <Self as WorkerSession<S, I, O, Role, C>>::open_session(self, operation)
+    }
+}
+
+impl<S, I, O, Lease, Role, W: AktorWorkerContract<State = S, Role = Role>, C>
+    crate::latest::TypedSession<S, I, O, Lease, Role, C> for &super::optional::OptionalWorker<W>
+where
+    Self: crate::latest::Session<S, I, O, Role, C>,
+{
+    type Sender<Fut> = <Self as crate::latest::Session<S, I, O, Role, C>>::Sender;
+    type Results = <Self as crate::latest::Session<S, I, O, Role, C>>::Results;
+
+    fn session<F, Fut>(
+        self,
+        operation: Operation,
+        function: F,
+        _: fn(Lease, I) -> Fut,
+    ) -> (Self::Sender<Fut>, Self::Results)
+    where
+        F: for<'s> AsyncFnOnce(&'s mut S, I) -> O + Clone + Send + 'static,
+        Fut: core::future::Future<Output = (Lease, O)>,
+    {
+        <Self as crate::latest::Session<S, I, O, Role, C>>::session(self, operation, function)
+    }
+}
+
+impl<S, I: 'static, O: 'static, Role, W: AktorWorkerContract<State = S, Role = Role>, C>
+    WorkerSession<S, I, O, Role, C> for &super::optional::OptionalWorker<W>
+where
+    C: Codec<I> + Codec<O>,
+{
+    type Sender = LatestSender<I>;
+    type Results = LatestResults<O>;
+
+    fn open_session(self, operation: Operation) -> (Self::Sender, Self::Results) {
+        match self.session_worker() {
+            Ok(worker) => {
+                <&Worker<W> as WorkerSession<S, I, O, Role, C>>::open_session(worker, operation)
+            }
+            Err((group, failure)) => (
+                LatestSender {
+                    input: Rc::new(ClosedInput),
+                },
+                LatestResults {
+                    output: Rc::new(UnavailableOutput {
+                        group,
+                        failure: RefCell::new(Some(
+                            failure.with_outcome(AktorDeliveryOutcome::NotAdmitted),
+                        )),
+                    }),
+                },
+            ),
+        }
+    }
+}
+
+struct ClosedInput;
+
+impl<I> Input<I> for ClosedInput {
+    fn send(&self, _: I) {}
+    fn clone_sender(&self) {}
+    fn close_sender(&self) {}
+}
+
+struct UnavailableOutput {
+    group: crate::AktorKillSwitch,
+    failure: RefCell<Option<WireFailure>>,
+}
+
+impl<O> Output<O> for UnavailableOutput {
+    fn poll(&self, _: &mut Context<'_>) -> Poll<Option<Result<O, crate::AktorDeliveryError>>> {
+        Poll::Ready(self.failure.borrow_mut().take().map(|failure| {
+            deliver(failure.error.failure_id, &self.group);
+            Err(failure.into())
+        }))
+    }
+
+    fn close_receiver(&self) {}
 }

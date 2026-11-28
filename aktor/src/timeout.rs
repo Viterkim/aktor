@@ -5,9 +5,11 @@ use core::{
     task::{Context, Poll},
     time::Duration,
 };
+use er::*;
 
-/// Timing out after admission stops waiting, the operation still belongs to Aktor.
-#[derive(er::Er, Clone, Copy, PartialEq, Eq)]
+/// After admission, a timeout stops the caller from waiting. Aktor still owns the operation.
+#[derive(Er, Clone, Copy, PartialEq, Eq)]
+
 pub struct AktorTimeoutError {
     pub duration: Duration,
     pub admitted: bool,
@@ -15,7 +17,7 @@ pub struct AktorTimeoutError {
 
 #[cfg(not(target_family = "wasm"))]
 type Timer = Pin<Box<dyn Future<Output = ()> + Send>>;
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 type Timer = Pin<Box<dyn Future<Output = ()>>>;
 
 #[doc(hidden)]
@@ -23,24 +25,24 @@ pub struct WaitStatus {
     pub admitted: bool,
 }
 
-/// The duration starts when you begin awaiting it.
-pub struct Timeout<F> {
+/// The timer starts when you begin awaiting this future.
+pub struct AktorTimeout<F> {
     future: Pin<Box<F>>,
     duration: Duration,
     timer: Option<Timer>,
     clock: fn(Duration) -> Timer,
     status: fn(&F) -> WaitStatus,
 }
-impl<F> Timeout<F> {
+impl<F> AktorTimeout<F> {
     #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
     #[doc(hidden)]
     pub fn standard(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Self {
-        Self::new(future, duration, status, |duration| {
-            let deadline = crate::group::shutdown_deadline(std::time::Instant::now(), duration);
-            Box::pin(crate::executor::sleep_until(deadline))
-        })
+        Self::new(future, duration, status, standard_clock)
     }
 
+    /// A call to a StdThread actor times out on the standard clock, like the actor itself.
+    /// Anything else picks its clock where it gets awaited: Tokio's when Tokio runs there, so
+    /// `tokio::time::pause` works in tests, and the standard clock everywhere else.
     #[cfg(any(
         feature = "tokio",
         all(feature = "std_thread", not(target_family = "wasm"))
@@ -52,21 +54,22 @@ impl<F> Timeout<F> {
         status: fn(&F) -> WaitStatus,
         standard: bool,
     ) -> Self {
-        #[cfg(all(feature = "std_thread", not(target_family = "wasm")))]
-        if standard {
-            return Self::standard(future, duration, status);
-        }
-
-        let _ = standard;
-
-        #[cfg(feature = "tokio")]
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
         {
+            let _ = standard;
             Self::native(future, duration, status)
         }
-        #[cfg(not(feature = "tokio"))]
-        {
-            Self::standard(future, duration, status)
-        }
+
+        #[cfg(not(target_family = "wasm"))]
+        Self::new(
+            future,
+            duration,
+            status,
+            match standard {
+                true => standard_clock,
+                false => caller_clock,
+            },
+        )
     }
 
     #[cfg(feature = "tokio")]
@@ -78,7 +81,7 @@ impl<F> Timeout<F> {
                 Box::pin(tokio::time::sleep(duration))
             })
         }
-        #[cfg(target_family = "wasm")]
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
         {
             Self::browser(future, duration, status)
         }
@@ -90,7 +93,8 @@ impl<F> Timeout<F> {
             feature = "wasm_browser_workers",
             feature = "browser_local"
         ),
-        target_family = "wasm"
+        target_family = "wasm",
+        target_os = "unknown"
     ))]
     #[doc(hidden)]
     pub fn browser(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Self {
@@ -103,10 +107,10 @@ impl<F> Timeout<F> {
     #[doc(hidden)]
     pub fn local(future: F, duration: Duration, status: fn(&F) -> WaitStatus) -> Self {
         Self::new(future, duration, status, |duration| {
-            Box::pin(async move {
-                let deadline = embassy_deadline(embassy_time::Instant::now(), duration);
-                embassy_time::Timer::at(deadline).await;
-            })
+            // Read the clock before the first poll of the wrapped future, its work counts too.
+            let deadline = embassy_deadline(embassy_time::Instant::now(), duration);
+
+            Box::pin(embassy_time::Timer::at(deadline))
         })
     }
 
@@ -116,7 +120,7 @@ impl<F> Timeout<F> {
             all(feature = "std_thread", not(target_family = "wasm"))
         ),
         feature = "embassy",
-        target_family = "wasm"
+        all(target_family = "wasm", target_os = "unknown")
     ))]
     fn new(
         future: F,
@@ -133,7 +137,7 @@ impl<F> Timeout<F> {
         }
     }
 }
-impl<F: Future> Future for Timeout<F> {
+impl<F: Future> Future for AktorTimeout<F> {
     type Output = Result<F::Output, AktorTimeoutError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -159,9 +163,35 @@ impl<F: Future> Future for Timeout<F> {
     }
 }
 
+#[cfg(all(
+    any(feature = "tokio", feature = "std_thread"),
+    not(target_family = "wasm")
+))]
+fn standard_clock(duration: Duration) -> Timer {
+    let deadline = crate::group::shutdown_deadline(std::time::Instant::now(), duration);
+
+    Box::pin(crate::executor::sleep_until(deadline))
+}
+
+/// Runs at the first poll, so a timeout built inside `rt.enter()` and awaited somewhere
+/// else still looks where it's awaited.
+#[cfg(all(
+    any(feature = "tokio", feature = "std_thread"),
+    not(target_family = "wasm")
+))]
+fn caller_clock(duration: Duration) -> Timer {
+    #[cfg(feature = "tokio")]
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Box::pin(tokio::time::sleep(duration));
+    }
+
+    standard_clock(duration)
+}
+
 #[cfg(any(
     all(
         target_family = "wasm",
+        target_os = "unknown",
         any(
             feature = "tokio",
             feature = "wasm_browser_workers",
@@ -170,7 +200,7 @@ impl<F: Future> Future for Timeout<F> {
     ),
     all(test, feature = "tokio")
 ))]
-pub fn browser_millis(duration: Duration) -> u32 {
+pub(crate) fn browser_millis(duration: Duration) -> u32 {
     let millis = duration.as_nanos().div_ceil(1_000_000);
     millis.min(i32::MAX as u128) as u32
 }
@@ -178,6 +208,7 @@ pub fn browser_millis(duration: Duration) -> u32 {
 #[cfg(any(
     all(
         target_family = "wasm",
+        target_os = "unknown",
         any(
             feature = "tokio",
             feature = "wasm_browser_workers",
@@ -186,20 +217,27 @@ pub fn browser_millis(duration: Duration) -> u32 {
     ),
     all(test, feature = "tokio")
 ))]
-async fn browser_timer<F: Future<Output = ()>>(
+fn browser_timer<F: Future<Output = ()>>(
     duration: Duration,
     mut schedule: impl FnMut(u32) -> F,
-) {
+) -> impl Future<Output = ()> {
+    // The first timer is armed right here, so the wait counts from this call and not from
+    // whenever the returned future first gets polled.
     let mut remaining = duration;
+    let mut chunk = browser_millis(remaining);
+    let mut timer = schedule(chunk);
 
-    loop {
-        let chunk = browser_millis(remaining);
+    async move {
+        loop {
+            timer.await;
+            remaining = remaining.saturating_sub(Duration::from_millis(u64::from(chunk)));
 
-        schedule(chunk).await;
-        remaining = remaining.saturating_sub(Duration::from_millis(u64::from(chunk)));
+            if remaining.is_zero() {
+                return;
+            }
 
-        if remaining.is_zero() {
-            return;
+            chunk = browser_millis(remaining);
+            timer = schedule(chunk);
         }
     }
 }
@@ -275,6 +313,7 @@ mod embassy_tests {
 
 #[cfg(all(
     target_family = "wasm",
+    target_os = "unknown",
     any(
         feature = "tokio",
         feature = "wasm_browser_workers",
@@ -282,6 +321,6 @@ mod embassy_tests {
     )
 ))]
 #[doc(hidden)]
-pub async fn browser_sleep(duration: Duration) {
-    browser_timer(duration, gloo_timers::future::TimeoutFuture::new).await;
+pub fn browser_sleep(duration: Duration) -> impl Future<Output = ()> {
+    browser_timer(duration, gloo_timers::future::TimeoutFuture::new)
 }

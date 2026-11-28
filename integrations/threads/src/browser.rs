@@ -1,4 +1,5 @@
 use aktor::*;
+use core::num::NonZeroUsize;
 use core::{
     future::{Ready, ready},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -90,10 +91,10 @@ async fn instance(_: &State) -> bool {
 
 #[aktor]
 async fn forward(_: &State, other: cross_core::Handle<State>, input: Payload) -> Payload {
-    echo(&other, input).await
+    echo(&other, input).await.unwrap()
 }
 
-#[aktor]
+#[aktor(latest)]
 async fn set(state: &mut State, value: u32) -> u32 {
     state.0.set(value);
     value
@@ -109,14 +110,29 @@ async fn hold(_: &State, entered: Arc<AtomicBool>, release: Arc<AtomicBool>) {
 }
 
 #[aktor]
-async fn stop(_: &State, kill: KillSwitch, fail: bool) {
+async fn park(_: &State, entered: Arc<AtomicBool>) {
+    entered.store(true, Ordering::Release);
+    core::future::pending().await
+}
+
+#[aktor]
+async fn block(_: &State, entered: Arc<AtomicBool>, release: Arc<AtomicBool>) {
+    entered.store(true, Ordering::Release);
+
+    while !release.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+}
+
+#[aktor]
+async fn stop(_: &State, kill: AktorKillSwitch, fail: bool) {
     if fail {
-        kill.fail(AktorFailureReport {
-            actor: "worker control".into(),
-            kind: Some(AktorExecution::BrowserThread),
-            phase: "call".into(),
-            message: "worker requested failure".into(),
-        });
+        kill.fail(AktorFailureInput::actor(
+            "worker control".into(),
+            AktorExecution::BrowserThread,
+            aktor::AktorPhase::Runner,
+            "worker requested failure".into(),
+        ));
     } else {
         kill.stop();
     }
@@ -125,9 +141,9 @@ async fn stop(_: &State, kill: KillSwitch, fail: bool) {
 }
 
 #[aktor]
-async fn observe(_: &State, completion: GroupCompletion) -> (bool, bool) {
-    let report = completion.wait().await;
-    (report.failed(), report.timed_out)
+async fn observe(_: &State, completion: AktorGroupCompletion) -> (bool, bool) {
+    let report = completion.wait().await.unwrap();
+    (report.failed(), report.ran_past_grace())
 }
 
 #[aktor]
@@ -146,37 +162,30 @@ async fn parallel(_: &State, entered: Arc<AtomicUsize>) -> Result<(), String> {
     Ok(())
 }
 
-fn open() -> Ready<Result<State, AktorSetupError>> {
+fn open() -> Ready<Result<State, (std::io::Error, String)>> {
     ready(Ok(State(Rc::new(Cell::new(0)))))
 }
 
-fn close(state: State) -> Result<(), AktorCleanupError> {
+fn close(state: State) -> Result<(), (std::io::Error, String)> {
     CLEANED.fetch_add(1, Ordering::SeqCst);
     drop(state);
     Ok(())
 }
 
-type Setup = AktorNew<
-    State,
-    fn() -> Ready<Result<State, AktorSetupError>>,
-    AktorKind::BrowserThread,
-    (),
-    fn(State) -> Result<(), AktorCleanupError>,
->;
-
-fn setup(program: &str, name: &str) -> Setup {
+fn setup(
+    program: &str,
+    name: &str,
+    start: fn() -> Ready<Result<State, (std::io::Error, String)>>,
+    end: fn(State) -> Result<(), (std::io::Error, String)>,
+) -> impl AktorDefinition<cross_core::Handle<State>, std::io::Error> {
     AktorNew {
-        name: AktorName::new(name),
-        role: AktorNoRole,
+        name: name.into(),
         kind: AktorKind::BrowserThread(program),
-        closures: AktorClosures {
-            start: open,
-            end: close,
-            intervals: vec![],
-            before_each: None,
-            after_each: None,
-        },
-        options: AktorNewOptions { capacity: 1 },
+        start: AktorInit::Try(start),
+        end,
+        hooks: AktorHooks::NONE,
+        capacity: NonZeroUsize::MIN,
+        stuck: AktorStuck::Kill,
     }
 }
 
@@ -184,14 +193,20 @@ fn setup(program: &str, name: &str) -> Setup {
 pub async fn check(program: String) -> Result<String, JsValue> {
     let before = CLEANED.load(Ordering::SeqCst);
     let actors = aktor_start(AktorSetup {
-        actors: (setup(&program, "first"), setup(&program, "second")),
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: (
+            setup(&program, "first", open, close),
+            setup(&program, "second", open, close),
+        ),
         shutdown: |_| {},
-        options: AktorOptions::default(),
-    })
-    .await
-    .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
-    let (first, second) = &actors.handles;
-    if !instance(first).await {
+        grace: std::time::Duration::from_secs(5),
+    });
+    actors
+        .ready()
+        .await
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
+    let (first, second) = actors.handles();
+    if !instance(first).await.unwrap() {
         return Err(JsValue::from_str("worker lost its WebAssembly.Instance"));
     }
 
@@ -201,16 +216,16 @@ pub async fn check(program: String) -> Result<String, JsValue> {
         drops: drops.clone(),
     };
     let pointer = value.bytes.as_ptr();
-    let mut value = forward(first, second.new_handle(), value).await;
+    let mut value = forward(first, second.clone(), value).await.unwrap();
 
     for _ in 0..16 {
-        value = echo(first, value).await;
+        value = echo(first, value).await.unwrap();
     }
 
     let started = clock();
 
     for _ in 0..512 {
-        value = echo(first, value).await;
+        value = echo(first, value).await.unwrap();
     }
 
     let micros = (clock() - started) * 1000.0 / 512.0;
@@ -228,21 +243,28 @@ pub async fn check(program: String) -> Result<String, JsValue> {
     }
 
     let entered = Arc::new(AtomicUsize::new(0));
-    let (left, right) =
-        futures_util::future::join(parallel(first, entered.clone()), parallel(second, entered))
-            .await;
-    left.and(right).map_err(|error| JsValue::from_str(&error))?;
+    let (left, right) = futures_util::future::join(
+        parallel(first, entered.clone()).into_future(),
+        parallel(second, entered).into_future(),
+    )
+    .await;
+    left.unwrap()
+        .and(right.unwrap())
+        .map_err(|error| JsValue::from_str(&error))?;
 
     let entered = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
-    let mut running = hold(first, entered.clone(), release.clone()).send().await;
+    let mut running = hold(first, entered.clone(), release.clone())
+        .send()
+        .await
+        .unwrap();
 
     while !entered.load(Ordering::Acquire) {
         gloo_timers::future::TimeoutFuture::new(1).await;
     }
 
     let admitted = running.timeout(std::time::Duration::from_millis(1)).await;
-    let queued = set(first, 77).send().await;
+    let queued = set(first, 77).send().await.unwrap();
     let pending = set(first, 88)
         .timeout(std::time::Duration::from_millis(1))
         .await;
@@ -266,12 +288,12 @@ pub async fn check(program: String) -> Result<String, JsValue> {
     }
 
     drop(sender);
-    let closing = actors.shutdown();
+    let closing = actors.stop();
     release.store(true, Ordering::Release);
-    running.await;
-    queued.await;
+    running.await.unwrap();
+    queued.await.unwrap();
 
-    if results.next().await != Some(1000) || results.next().await.is_some() {
+    if results.next().await != Some(Ok(1000)) || results.next().await.is_some() {
         return Err(JsValue::from_str(
             "shared latest lost its final replacement during shutdown",
         ));
@@ -288,13 +310,19 @@ pub async fn check(program: String) -> Result<String, JsValue> {
     ))
 }
 
-fn refused() -> Ready<Result<State, AktorSetupError>> {
-    ready(Err(AktorSetupError::new("shared startup refused", ())))
+fn refused() -> Ready<Result<State, (std::io::Error, String)>> {
+    ready(Err((
+        std::io::Error::other("shared startup refused"),
+        "shared startup refused".into(),
+    )))
 }
 
-fn bad_cleanup(state: State) -> Result<(), AktorCleanupError> {
+fn bad_cleanup(state: State) -> Result<(), (std::io::Error, String)> {
     drop(state);
-    Err(AktorCleanupError::new("shared cleanup refused", ()))
+    Err((
+        std::io::Error::other("shared cleanup refused"),
+        "shared cleanup refused".into(),
+    ))
 }
 
 #[aktor]
@@ -304,21 +332,25 @@ async fn crash(_: &State) {
 
 #[wasm_bindgen]
 pub async fn failures(program: String) -> Result<(), JsValue> {
-    let mut refused = setup(&program, "refused");
-    refused.closures.start = self::refused;
-    let startup = aktor_start(AktorSetup {
+    let refused = setup(&program, "refused", refused, close);
+    let attempt = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
         actors: refused,
         shutdown: |_| {},
-        options: AktorOptions::default(),
-    })
-    .await;
+        grace: std::time::Duration::from_secs(5),
+    });
+    let startup = attempt.ready().await;
 
     match startup {
-        Err(error)
-            if error
-                .report
-                .as_ref()
-                .is_some_and(|report| report.failed() && !report.timed_out) => {}
+        Err((error, _))
+            if matches!(error, aktor::AktorStartError::Initializer { error: e, .. } if e.to_string() == "shared startup refused")
+                && error
+                    .startup()
+                    .and_then(|s| s.report.as_ref().ok())
+                    .is_some_and(|report| {
+                        !report.ran_past_grace()
+                            && report.to_string().matches("shared startup refused").count() == 1
+                    }) => {}
         _ => {
             return Err(JsValue::from_str(
                 "shared startup did not report completed rollback",
@@ -326,65 +358,111 @@ pub async fn failures(program: String) -> Result<(), JsValue> {
         }
     }
 
-    for mode in 0..4 {
-        let mut owner = setup(&program, "failure");
+    let bad_program = "data:text/javascript,throw new Error('shared worker import refused')";
+    let attempt = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: setup(bad_program, "bootstrap error", open, close),
+        shutdown: |_| {},
+        grace: std::time::Duration::from_secs(5),
+    });
+    let startup = attempt.ready().await;
 
-        if mode == 0 {
-            owner.closures.end = bad_cleanup;
+    match startup {
+        Err((error, report))
+            if error.reason() == AktorStartReason::InvalidSetup
+                && matches!(error, aktor::AktorStartError::Failed { .. })
+                && report.contains("shared worker import refused") => {}
+        _ => {
+            return Err(JsValue::from_str("shared worker lost its bootstrap error"));
         }
+    }
+
+    for mode in 0..4 {
+        let cleaned = CLEANED.load(Ordering::SeqCst);
+        let end = if mode == 0 { bad_cleanup } else { close };
+        let owner = setup(&program, "failure", open, end);
 
         if mode == 3 {
             track_thread();
         }
 
         let actors = aktor_start(AktorSetup {
+            stuck: AktorGroupStuck::KeepRunning,
             actors: owner,
             shutdown: |_| {},
-            options: AktorOptions {
-                shutdown_grace: std::time::Duration::from_millis(300),
-            },
-        })
-        .await;
+            grace: std::time::Duration::from_millis(300),
+        });
+        let ready = actors.ready().await;
 
         if mode == 3 {
             restore_worker();
         }
 
-        let actors = actors.map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
+        ready.map_err(|(_, report)| JsValue::from_str(&report))?;
         let mut abandoned = None;
         let release = Arc::new(AtomicBool::new(false));
 
         if mode == 1 {
-            crash(&actors.handles).cast().await;
-        } else if mode >= 2 {
+            crash(actors.handles()).cast().await.unwrap();
+        } else if mode == 2 {
             let entered = Arc::new(AtomicBool::new(false));
             abandoned = Some(
-                hold(&actors.handles, entered.clone(), release.clone())
+                park(actors.handles(), entered.clone())
                     .send()
-                    .await,
+                    .await
+                    .unwrap(),
             );
 
-            if mode == 3 {
-                while !entered.load(Ordering::Acquire) {
-                    gloo_timers::future::TimeoutFuture::new(1).await;
-                }
-
-                fail_thread();
+            while !entered.load(Ordering::Acquire) {
+                gloo_timers::future::TimeoutFuture::new(1).await;
             }
+        } else if mode == 3 {
+            let entered = Arc::new(AtomicBool::new(false));
+            abandoned = Some(
+                hold(actors.handles(), entered.clone(), release.clone())
+                    .send()
+                    .await
+                    .unwrap(),
+            );
+
+            while !entered.load(Ordering::Acquire) {
+                gloo_timers::future::TimeoutFuture::new(1).await;
+            }
+
+            fail_thread();
         }
 
-        let report = actors.shutdown().await;
+        let report = actors.stop().await;
+
+        if mode == 0
+            && (report.to_string().matches("shared cleanup refused").count() != 1
+                || report.failures.first().is_none_or(|failure| {
+                    !matches!(
+                        failure.source,
+                        aktor::AktorFailureSource::Actor {
+                            phase: aktor::AktorPhase::End,
+                            ..
+                        }
+                    ) || !failure.error.contains("shared cleanup refused")
+                }))
+        {
+            return Err(JsValue::from_str(&format!(
+                "shared cleanup returned: {report}"
+            )));
+        }
+
+        let expected = match mode {
+            0 | 2 => AktorRetirement::Released,
+            _ => AktorRetirement::StillRunning,
+        };
         release.store(true, Ordering::Release);
 
-        let expected = if mode == 0 {
-            RetirementStatus::Confirmed
-        } else {
-            RetirementStatus::Unconfirmed
-        };
-
         if !report.failed()
-            || report.timed_out != (mode == 2)
-            || report.actors[0].retirement != expected
+            || report.ran_past_grace() != (mode == 2)
+            || report.actors[0].retirement() != Some(expected)
+            || (mode == 2
+                && (CLEANED.load(Ordering::SeqCst) != cleaned + 1
+                    || report.stop_cause != aktor::StopCause::Requested))
         {
             return Err(JsValue::from_str(&format!(
                 "shared failure mode {mode}: {report}"
@@ -392,6 +470,66 @@ pub async fn failures(program: String) -> Result<(), JsValue> {
         }
 
         drop(abandoned);
+    }
+
+    stuck_calls(&program).await
+}
+
+async fn stuck_calls(program: &str) -> Result<(), JsValue> {
+    for stuck in [AktorStuck::Kill, AktorStuck::Leave] {
+        let actors = aktor_start(AktorSetup {
+            stuck: AktorGroupStuck::KeepRunning,
+            actors: AktorNew {
+                name: "stuck call".into(),
+                kind: AktorKind::BrowserThread(program),
+                start: AktorInit::Try(open),
+                end: (),
+                hooks: AktorHooks::NONE,
+                capacity: NonZeroUsize::MIN,
+                stuck,
+            },
+            shutdown: |_| {},
+            grace: std::time::Duration::from_millis(100),
+        });
+        actors
+            .ready()
+            .await
+            .map_err(|(_, report)| JsValue::from_str(&report))?;
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let reply = match stuck {
+            AktorStuck::Kill => block(actors.handles(), entered.clone(), release.clone())
+                .send()
+                .await
+                .unwrap(),
+            AktorStuck::Leave => hold(actors.handles(), entered.clone(), release.clone())
+                .send()
+                .await
+                .unwrap(),
+        };
+
+        while !entered.load(Ordering::Acquire) {
+            gloo_timers::future::TimeoutFuture::new(1).await;
+        }
+
+        let stopped = actors.stop().await;
+        let report = &stopped;
+        release.store(true, Ordering::Release);
+
+        if report.actors[0].retirement() != Some(AktorRetirement::StillRunning) {
+            return Err(JsValue::from_str(&format!(
+                "stuck call retired early: {report}"
+            )));
+        }
+
+        if stuck == AktorStuck::Leave {
+            reply.await.unwrap();
+        }
+
+        let _ = actors
+            .stop_released()
+            .await
+            .map_err(|(_, report)| JsValue::from_str(&report))?;
     }
 
     Ok(())
@@ -410,28 +548,27 @@ async fn cannot_transfer(handle: &threads::Handle<State>) {
 
 #[wasm_bindgen]
 pub async fn bootstrap(program: String) -> Result<(), JsValue> {
-    let startup = aktor_start(AktorSetup {
-        actors: setup(&program, "cancelled bootstrap"),
+    let started = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: setup(&program, "cancelled bootstrap", open, close),
         shutdown: |_| {},
-        options: AktorOptions {
-            shutdown_grace: std::time::Duration::from_millis(300),
-        },
+        grace: std::time::Duration::from_millis(300),
     });
-    let kill = startup.killswitch();
-    let (result, ()) = futures_util::future::join(startup, async move {
+    let kill = started.killswitch();
+    let (result, ()) = futures_util::future::join(started.ready(), async move {
         gloo_timers::future::TimeoutFuture::new(10).await;
         kill.stop();
     })
     .await;
 
     match result {
-        Err(error)
+        Err((error, _))
             if error
-                .report
-                .as_ref()
-                .is_some_and(|report| !report.timed_out) =>
+                .startup()
+                .and_then(|s| s.report.as_ref().ok())
+                .is_some_and(|report| !report.failed()) =>
         {
-            Ok(())
+            dropped_startup(&program).await
         }
         _ => Err(JsValue::from_str(
             "unstarted shared worker did not cancel before its deadline",
@@ -442,12 +579,15 @@ pub async fn bootstrap(program: String) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub async fn controls(program: String) -> Result<(), JsValue> {
     let observer = aktor_start(AktorSetup {
-        actors: setup(&program, "observer"),
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: setup(&program, "observer", open, close),
         shutdown: |_| {},
-        options: AktorOptions::default(),
-    })
-    .await
-    .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
+        grace: std::time::Duration::from_secs(5),
+    });
+    observer
+        .ready()
+        .await
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
 
     gloo_timers::future::TimeoutFuture::new(500).await;
 
@@ -455,36 +595,51 @@ pub async fn controls(program: String) -> Result<(), JsValue> {
         let cleaned = Arc::new(AtomicBool::new(false));
         let finished = cleaned.clone();
         let actors = aktor_start(AktorSetup {
+            stuck: AktorGroupStuck::KeepRunning,
             actors: AktorNew {
-                name: AktorName::new("control"),
-                role: AktorNoRole,
+                name: "control".into(),
                 kind: AktorKind::BrowserThread(&program),
-                closures: AktorClosures {
-                    start: open,
-                    end: async move |state| {
-                        gloo_timers::future::TimeoutFuture::new(delay).await;
-                        drop(state);
-                        finished.store(true, Ordering::Release);
-                    },
-                    intervals: vec![],
-                    before_each: None,
-                    after_each: None,
+                start: AktorInit::Try(open),
+                end: async move |state| {
+                    gloo_timers::future::TimeoutFuture::new(delay).await;
+                    drop(state);
+                    finished.store(true, Ordering::Release);
                 },
-                options: AktorNewOptions { capacity: 1 },
+                hooks: AktorHooks::NONE,
+                capacity: NonZeroUsize::MIN,
+                stuck: AktorStuck::Kill,
             },
             shutdown: |_| {},
-            options: AktorOptions {
-                shutdown_grace: std::time::Duration::from_millis(300),
-            },
-        })
-        .await
-        .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
-        let completion = actors.group.completion();
-        let observed = observe(&observer.handles, completion.clone()).send().await;
-        stop(&actors.handles, actors.group.killswitch(), fail).await;
-        let report = completion.wait().await;
-        let observed = observed.await;
+            grace: std::time::Duration::from_millis(300),
+        });
+        actors
+            .ready()
+            .await
+            .map_err(|(_, report)| JsValue::from_str(&report))?;
+        let completion = actors.group().completion();
+        let observed = observe(observer.handles(), completion.clone())
+            .send()
+            .await
+            .unwrap();
+        stop(actors.handles(), actors.group().killswitch(), fail)
+            .await
+            .unwrap();
+        let report = completion.wait().await.unwrap();
+        let observed = observed.await.unwrap();
         let overdue = delay == 1000;
+
+        if overdue {
+            let late = completion
+                .wait_retired()
+                .await
+                .map_err(|(_, report)| JsValue::from_str(&report))?
+                .into_report();
+            if late.actors[0].retirement() != Some(AktorRetirement::Terminated) {
+                return Err(JsValue::from_str(&format!(
+                    "overdue cleanup retired: {late}"
+                )));
+            }
+        }
 
         if observed != (fail || overdue, overdue) || cleaned.load(Ordering::Acquire) == overdue {
             return Err(JsValue::from_str(&format!(
@@ -493,9 +648,56 @@ pub async fn controls(program: String) -> Result<(), JsValue> {
         }
     }
 
-    let report = observer.shutdown().await;
+    let report = observer.stop().await;
     if report.failed() {
         return Err(JsValue::from_str(&format!("observer cleanup: {report}")));
+    }
+
+    Ok(())
+}
+
+async fn dropped_startup(program: &str) -> Result<(), JsValue> {
+    let entered = Arc::new(AtomicBool::new(false));
+    let starting = entered.clone();
+    let started = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
+        actors: AktorNew {
+            name: "dropped startup".into(),
+            kind: AktorKind::BrowserThread(program),
+            start: AktorInit::Try(async move || {
+                starting.store(true, Ordering::Release);
+                open().await
+            }),
+            end: close,
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::MIN,
+            stuck: AktorStuck::Leave,
+        },
+        shutdown: |_| {},
+        grace: std::time::Duration::from_secs(5),
+    });
+    let completion = started.completion();
+
+    let deadline = clock() + 5000.0;
+    while !entered.load(Ordering::Acquire) && clock() < deadline {
+        gloo_timers::future::TimeoutFuture::new(1).await;
+    }
+
+    drop(started);
+
+    if !entered.load(Ordering::Acquire) {
+        return Err(JsValue::from_str("shared initializer did not enter"));
+    }
+
+    let report = completion
+        .wait_retired()
+        .await
+        .map_err(|(_, report)| JsValue::from_str(&report))?
+        .into_report();
+    if report.actors[0].retirement() != Some(AktorRetirement::Released) {
+        return Err(JsValue::from_str(&format!(
+            "dropped shared startup: {report}"
+        )));
     }
 
     Ok(())
@@ -508,34 +710,33 @@ pub async fn teardown_probe(program: String) -> Result<(), JsValue> {
     let markers = Arc::new([AtomicU32::new(0), AtomicU32::new(0)]);
     let retained = markers.clone();
     let actors = aktor_start(AktorSetup {
+        stuck: AktorGroupStuck::KeepRunning,
         actors: AktorNew {
-            name: AktorName::new("teardown probe"),
-            role: AktorNoRole,
+            name: "teardown probe".into(),
             kind: AktorKind::BrowserThread(&program),
-            closures: AktorClosures {
-                start: open,
-                end: move |state| {
-                    drop(state);
-                    let retained = retained.clone();
-                    let address = retained.as_ptr() as u32;
-                    let pending = delayed_probe(wasm_bindgen::memory(), address);
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let _ = wasm_bindgen_futures::JsFuture::from(pending).await;
-                        drop(retained);
-                    });
-                },
-                intervals: vec![],
-                before_each: None,
-                after_each: None,
+            start: AktorInit::Try(open),
+            end: move |state| {
+                drop(state);
+                let retained = retained.clone();
+                let address = retained.as_ptr() as u32;
+                let pending = delayed_probe(wasm_bindgen::memory(), address);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = wasm_bindgen_futures::JsFuture::from(pending).await;
+                    drop(retained);
+                });
             },
-            options: AktorNewOptions { capacity: 1 },
+            hooks: AktorHooks::NONE,
+            capacity: NonZeroUsize::MIN,
+            stuck: AktorStuck::Kill,
         },
         shutdown: |_| {},
-        options: AktorOptions::default(),
-    })
-    .await
-    .map_err(|error| JsValue::from_str(&format!("{error:#}")))?;
-    let report = actors.shutdown().await;
+        grace: std::time::Duration::from_secs(5),
+    });
+    actors
+        .ready()
+        .await
+        .map_err(|(_, report)| JsValue::from_str(&report))?;
+    let report = actors.stop().await;
     let deadline = clock() + 1000.0;
 
     while (markers[0].load(Ordering::Acquire) == 0 || markers[1].load(Ordering::Acquire) == 0)

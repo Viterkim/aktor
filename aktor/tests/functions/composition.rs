@@ -60,11 +60,11 @@ async fn local() {
 
 #[tokio::test]
 async fn remote() {
-    let (db, task) = spawn_thread(open().unwrap(), 1).unwrap();
+    let (db, _group) = thread_actor(open().unwrap());
 
-    transaction(&db, "actor".into(), true).await.unwrap();
-    assert_eq!(queries::name(&db, 1).await.unwrap(), "actor");
-
-    drop(db);
-    task.join_async().await.unwrap();
+    transaction(&db, "actor".into(), true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(queries::name(&db, 1).await.unwrap().unwrap(), "actor");
 }

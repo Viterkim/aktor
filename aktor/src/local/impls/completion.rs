@@ -14,40 +14,54 @@ impl<E> Completion<E> {
         self.inner.cleanup_completed.get()
     }
 
-    #[doc(hidden)]
-    pub fn panic_reported(&self) -> bool {
-        self.inner.panic_reported.get()
+    pub fn init(&self) -> crate::AktorInitEvidence {
+        self.inner.init.get()
     }
 
+    /// Shutdown cut its calls or its `end`, so it ran past its grace.
     #[doc(hidden)]
-    pub fn diagnostics(&self) -> alloc::vec::Vec<crate::AktorError> {
-        self.inner.diagnostics.borrow().clone()
-    }
-
-    pub fn new_observer(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
+    pub fn ran_past_grace(&self) -> bool {
+        self.inner.cut_call.get() || self.inner.ran_out.get()
     }
 
     /// Wait for the owner to finish, returning a diagnostic on failure.
-    pub async fn wait(&self) -> Result<(), OwnerError> {
-        self.wait_with_data()
-            .await
-            .map_err(SharedOwnerError::without_data)
+    pub async fn wait(&self) -> Result<(), (OwnerError, String)> {
+        match self.observe().await {
+            Ok(()) => Ok(()),
+            Err((error, report)) => {
+                self.receive();
+                Err((error.without_data(), report))
+            }
+        }
     }
 
     /// Wait for the owner to finish and get the error with its application data.
-    pub async fn wait_with_data(&self) -> Result<(), SharedOwnerError<E>> {
+    pub async fn wait_with_data(&self) -> Result<(), (SharedOwnerError<E>, String)> {
+        let result = self.observe().await;
+        if result.is_err() {
+            self.receive();
+        }
+        result
+    }
+
+    pub(super) fn receive(&self) {
+        for receipt in self.inner.returned.borrow().iter() {
+            receipt.receive();
+        }
+    }
+
+    pub(crate) async fn observe(&self) -> Result<(), (SharedOwnerError<E>, String)> {
         let changed = self.inner.changed.listen();
 
         poll_fn(|context| {
             changed.register(context);
 
-            match self.inner.result.borrow().clone() {
-                Some(result) => Poll::Ready(result.map_err(|error| {
-                    SharedOwnerError::from_failure(error, &self.inner.diagnostics.borrow())
-                })),
+            match self.result.borrow().clone() {
+                Some(Ok(())) => Poll::Ready(Ok(())),
+                Some(Err(error)) => Poll::Ready(Err(SharedOwnerError::from_failure(
+                    error,
+                    &self.inner.diagnostics.borrow(),
+                ))),
                 None => Poll::Pending,
             }
         })
@@ -55,7 +69,7 @@ impl<E> Completion<E> {
     }
 }
 impl<E: 'static> IntoFuture for Completion<E> {
-    type Output = Result<(), OwnerError>;
+    type Output = Result<(), (OwnerError, String)>;
     type IntoFuture = LocalFuture<'static, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -63,10 +77,18 @@ impl<E: 'static> IntoFuture for Completion<E> {
     }
 }
 impl<'a, E: 'a> IntoFuture for &'a Completion<E> {
-    type Output = Result<(), OwnerError>;
+    type Output = Result<(), (OwnerError, String)>;
     type IntoFuture = LocalFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.wait())
+    }
+}
+impl<E> Clone for Completion<E> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            result: self.result.clone(),
+        }
     }
 }

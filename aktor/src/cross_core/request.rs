@@ -1,10 +1,7 @@
 use super::*;
-use crate::{
-    Timeout,
-    message::{consumed, stopped},
-};
+use crate::{AktorTimeout, message::consumed};
 use core::{
-    future::{Future, poll_fn},
+    future::Future,
     ops::AsyncFnOnce,
     pin::Pin,
     task::{Context, Poll, ready},
@@ -35,14 +32,16 @@ where
     }
 }
 
-pub type Pending<S, I, O> = Box<(I, Box<dyn Body<S, I, O> + Send>)>;
-
 pub enum Unsent<S, I, O> {
-    Body(Pending<S, I, O>),
+    // Opaque dispatch builds the call before it can apply the job's Send bounds.
+    Call(Box<Call<S, I, O>>),
     Job(Box<dyn Job<S>>),
 }
 
-struct Call<S, I, O> {
+type Pending<S, I, O> = (I, Box<dyn Body<S, I, O> + Send>);
+
+pub struct Call<S, I, O> {
+    status: Arc<Status>,
     pending: Option<Pending<S, I, O>>,
     answer: Arc<Answer<O>>,
 }
@@ -50,14 +49,13 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static> Job<S> for Call<S, I, O> 
     fn run<'a>(
         &'a mut self,
         state: &'a mut S,
-        hooks: &'a mut AktorHooks<S>,
+        hooks: &'a mut CallHooks<S>,
         operation: Operation,
     ) -> LocalFuture<'a, ()> {
         Box::pin(async move {
-            let Some(pending) = self.pending.take() else {
+            let Some((input, body)) = self.pending.take() else {
                 consumed()
             };
-            let (input, body) = *pending;
 
             hooks.before(state, operation);
 
@@ -70,32 +68,34 @@ impl<S: 'static, I: Send + 'static, O: Send + 'static> Job<S> for Call<S, I, O> 
 }
 impl<S, I, O> Drop for Call<S, I, O> {
     fn drop(&mut self) {
-        self.answer.finish(Err(if self.pending.is_some() {
-            CallError::Discarded
-        } else {
-            CallError::OutcomeUnknown
-        }));
+        self.answer.finish(Err(crate::CallLoss(
+            if self.pending.is_some() {
+                AktorDeliveryOutcome::Discarded
+            } else {
+                AktorDeliveryOutcome::OutcomeUnknown
+            },
+            self.status.state.lock(|s| s.borrow().lost.clone()),
+        )));
     }
 }
 
 impl<O> Answer<O> {
-    pub fn finish(&self, output: Result<O, CallError>) {
-        let mut output = Some(output);
+    pub fn finish(&self, output: Result<O, crate::CallLoss>) {
         let previous = self.result.lock(|result| {
             let mut result = result.borrow_mut();
-
-            if matches!(*result, AnswerState::Waiting) {
-                output
-                    .take()
-                    .map(|output| core::mem::replace(&mut *result, AnswerState::Ready(output)))
-            } else {
-                None
+            match *result {
+                AnswerState::Waiting(_) => {
+                    Ok(core::mem::replace(&mut *result, AnswerState::Ready(output)))
+                }
+                AnswerState::Ready(_) | AnswerState::Abandoned | AnswerState::Consumed => {
+                    Err(output)
+                }
             }
         });
 
-        drop(previous);
-        drop(output);
-        self.changed.notify();
+        if let Ok(AnswerState::Waiting(Some(waker))) = previous {
+            crate::local::wake(waker);
+        }
     }
 }
 
@@ -107,24 +107,25 @@ impl<'a, S, I, O, Role> Request<'a, S, I, O, Role> {
         input: I,
     ) -> Self {
         let answer = Arc::new(Answer {
-            result: Mutex::new(RefCell::new(AnswerState::Waiting)),
-            changed: Arc::new(Event::default()),
+            result: Mutex::new(RefCell::new(AnswerState::Waiting(None))),
         });
 
         Self {
             handle,
             operation,
-            pending: Some(Unsent::Body(Box::new((input, body)))),
-            changed: Event::listen(&handle.inner.changed),
+            pending: Some(Unsent::Call(Box::new(Call {
+                pending: Some((input, body)),
+                status: handle.inner.status.clone(),
+                answer: answer.clone(),
+            }))),
+            changed: None,
             reply: Reply {
-                changed: Event::listen(&answer.changed),
                 answer,
                 status: handle.inner.status.clone(),
-                parked: false,
+                closed: None,
                 taken: false,
             },
             submitted: false,
-            parked: false,
         }
     }
 }
@@ -134,10 +135,7 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Request<'a, S, 
             consumed()
         };
         let job = match pending {
-            Unsent::Body(pending) => Box::new(Call {
-                pending: Some(pending),
-                answer: self.reply.answer.clone(),
-            }) as Box<dyn Job<S>>,
+            Unsent::Call(call) => call,
             Unsent::Job(job) => job,
         };
 
@@ -147,133 +145,195 @@ impl<'a, S: 'static, I: Send + 'static, O: Send + 'static, Role> Request<'a, S, 
         }
     }
 
-    fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_admit(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
         if self.reply.taken {
             consumed();
         }
-        if self.parked {
-            return Poll::Pending;
-        }
-
         if self.submitted {
-            return Poll::Ready(());
+            return Poll::Ready(true);
         }
 
-        self.changed.register(cx);
+        if self.changed.is_none() {
+            let admitted = self.try_admit();
+            if admitted.is_ready() {
+                return admitted;
+            }
+        }
 
+        self.changed
+            .get_or_insert_with(|| Event::listen(&self.handle.inner.changed))
+            .register(cx);
+        self.try_admit()
+    }
+
+    fn try_admit(&mut self) -> Poll<bool> {
         let message = self.take_message();
 
-        match self.handle.inner.commit(message, false) {
+        match self.handle.inner.commit(message) {
             Ok(()) => {
                 self.submitted = true;
                 self.handle.inner.changed.notify();
-                Poll::Ready(())
+                self.changed = None;
+                Poll::Ready(true)
             }
-            Err(message) => {
+            Err(Refused::Full(message)) => {
                 self.pending = Some(Unsent::Job(message.job));
-
-                let open = self.handle.inner.queue.lock(|queue| queue.borrow().open);
-
-                if !open {
-                    if self.handle.inner.status.managed() {
-                        self.parked = true;
-                        return Poll::Pending;
-                    }
-
-                    stopped();
-                }
-
                 Poll::Pending
             }
+            Err(Refused::Closed(message)) => {
+                self.pending = Some(Unsent::Job(message.job));
+                self.changed = None;
+                Poll::Ready(false)
+            }
         }
     }
 
-    pub async fn send(mut self) -> Reply<O> {
-        if self.reply.taken {
-            consumed();
-        }
-
-        poll_fn(|cx| self.poll_submit(cx)).await;
-        self.reply
+    pub fn send(self) -> RequestSend<'a, S, I, O, Role> {
+        RequestSend(Some(self))
     }
 
-    pub fn timeout(self, duration: Duration) -> Timeout<Self> {
+    pub fn timeout(self, duration: Duration) -> AktorTimeout<Self> {
         clock_timeout(self, duration, |request| crate::timeout::WaitStatus {
             admitted: request.submitted,
         })
     }
 }
 impl<S: 'static, I: Send + 'static, O: Send + 'static, Role> Future for Request<'_, S, I, O, Role> {
-    type Output = O;
+    type Output = Result<O, crate::AktorDeliveryError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        ready!(this.poll_submit(cx));
+        if !ready!(this.poll_admit(cx)) {
+            return Poll::Ready(Err(this.reply.error(AktorDeliveryOutcome::NotAdmitted)));
+        }
         Pin::new(&mut this.reply).poll(cx)
     }
 }
-impl<S: 'static, I: Send + 'static, Role> Request<'_, S, I, (), Role> {
-    pub async fn cast(self) {
-        drop(self.send().await);
+impl<'a, S: 'static, I: Send + 'static, Role> Request<'a, S, I, (), Role> {
+    pub fn cast(self) -> RequestCast<'a, S, I, Role> {
+        RequestCast(self.send())
+    }
+}
+
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct RequestSend<'a, S, I, O, Role = ()>(Option<Request<'a, S, I, O, Role>>);
+impl<S, I, O, Role> Unpin for RequestSend<'_, S, I, O, Role> {}
+impl<S: 'static, I: Send + 'static, O: Send + 'static, Role> Future
+    for RequestSend<'_, S, I, O, Role>
+{
+    type Output = Result<Reply<O>, crate::AktorDeliveryError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let Some(request) = &mut this.0 else {
+            consumed();
+        };
+
+        let admitted = ready!(request.poll_admit(cx));
+        let Some(request) = this.0.take() else {
+            consumed();
+        };
+
+        if admitted {
+            Poll::Ready(Ok(request.reply))
+        } else {
+            Poll::Ready(Err(request.reply.error(AktorDeliveryOutcome::NotAdmitted)))
+        }
+    }
+}
+
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct RequestCast<'a, S, I, Role = ()>(RequestSend<'a, S, I, (), Role>);
+impl<S, I, Role> Unpin for RequestCast<'_, S, I, Role> {}
+impl<S: 'static, I: Send + 'static, Role> Future for RequestCast<'_, S, I, Role> {
+    type Output = Result<(), crate::AktorDeliveryError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx).map_ok(drop)
     }
 }
 
 impl<O> Reply<O> {
-    pub fn try_take(&mut self) -> Option<O> {
-        if self.taken || self.parked {
-            return None;
-        }
-
-        self.take()
+    fn error(&self, outcome: AktorDeliveryOutcome) -> crate::AktorDeliveryError {
+        self.status.state.lock(|state| {
+            let state = state.borrow();
+            let cause = if outcome == AktorDeliveryOutcome::NotAdmitted {
+                &state.refused
+            } else {
+                &state.lost
+            };
+            crate::Delivery::error(outcome, cause.as_ref())
+        })
     }
 
-    fn take(&mut self) -> Option<O> {
+    pub fn try_take(&mut self) -> Option<Result<O, crate::AktorDeliveryError>> {
+        if self.taken {
+            return None;
+        }
+        self.take(None)
+    }
+
+    fn take(&mut self, mut waker: Option<Waker>) -> Option<Result<O, crate::AktorDeliveryError>> {
         let result = self.answer.result.lock(|result| {
             let mut result = result.borrow_mut();
 
-            if matches!(*result, AnswerState::Waiting) {
+            if let AnswerState::Waiting(waiter) = &mut *result {
+                if waker.is_some() {
+                    core::mem::swap(waiter, &mut waker);
+                }
                 return None;
             }
 
             Some(core::mem::replace(&mut *result, AnswerState::Consumed))
         });
 
-        match result? {
-            AnswerState::Ready(Ok(output)) => {
+        let Some(result) = result else {
+            if self.status.state.lock(|state| {
+                state
+                    .borrow()
+                    .completed
+                    .as_ref()
+                    .is_some_and(Result::is_err)
+            }) {
                 self.taken = true;
-                Some(output)
+                return Some(Err(self.error(AktorDeliveryOutcome::OutcomeUnknown)));
             }
-            AnswerState::Ready(Err(_)) => {
-                if self.status.managed() {
-                    self.parked = true;
-                    None
-                } else {
-                    stopped()
-                }
+            return None;
+        };
+        match result {
+            AnswerState::Ready(output) => {
+                self.taken = true;
+                Some(match output {
+                    Ok(value) => Ok(value),
+                    Err(outcome) => Err(outcome.error(true)),
+                })
             }
             _ => consumed(),
         }
     }
 
-    pub fn timeout(&mut self, duration: Duration) -> Timeout<&mut Self> {
+    pub fn timeout(&mut self, duration: Duration) -> AktorTimeout<&mut Self> {
         clock_timeout(self, duration, |_| crate::timeout::WaitStatus {
             admitted: true,
         })
     }
 }
 impl<O> Future for Reply<O> {
-    type Output = O;
+    type Output = Result<O, crate::AktorDeliveryError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        if this.parked {
-            return Poll::Pending;
+        if this.taken {
+            consumed();
         }
-
-        this.changed.register(cx);
-
-        match this.take() {
+        if let Some(output) = this.try_take() {
+            return Poll::Ready(output);
+        }
+        this.closed
+            .get_or_insert_with(|| Event::listen(&this.status.changed))
+            .register(cx);
+        match this.take(Some(cx.waker().clone())) {
             Some(output) => Poll::Ready(output),
             None => Poll::Pending,
         }
@@ -294,14 +354,14 @@ fn clock_timeout<F>(
     future: F,
     duration: Duration,
     status: fn(&F) -> crate::timeout::WaitStatus,
-) -> Timeout<F> {
+) -> AktorTimeout<F> {
     #[cfg(all(
         feature = "wasm_threads",
         target_family = "wasm",
         target_feature = "atomics"
     ))]
     {
-        Timeout::browser(future, duration, status)
+        AktorTimeout::browser(future, duration, status)
     }
     #[cfg(not(all(
         feature = "wasm_threads",
@@ -309,6 +369,6 @@ fn clock_timeout<F>(
         target_feature = "atomics"
     )))]
     {
-        Timeout::local(future, duration, status)
+        AktorTimeout::local(future, duration, status)
     }
 }

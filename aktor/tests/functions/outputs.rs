@@ -1,7 +1,8 @@
 use super::*;
+use core::num::NonZeroUsize;
 use std::rc::Rc;
 
-#[aktor]
+#[aktor(latest)]
 async fn local_value(state: &Rc<u32>, value: Rc<u32>) -> Rc<u32> {
     Rc::new(**state + *value)
 }
@@ -26,15 +27,15 @@ async fn local_results() {
 
     #[cfg(feature = "local")]
     {
-        let (handle, owner) = aktor::local::channel::<Rc<u32>, 2, ()>().unwrap();
+        let (handle, owner) = aktor::local::channel::<Rc<u32>, ()>(NonZeroUsize::new(2).unwrap());
         let client = async {
-            assert_eq!(*local_value(&handle, Rc::new(5)).await, 90);
-            assert_eq!(*opaque_local_value(&handle).await, 85);
+            assert_eq!(*local_value(&handle, Rc::new(5)).await.unwrap(), 90);
+            assert_eq!(*opaque_local_value(&handle).await.unwrap(), 85);
 
             let (sender, mut results) = local_value::latest(&handle);
 
             sender.send(Rc::new(10));
-            assert_eq!(*results.next().await.unwrap(), 95);
+            assert_eq!(*results.next().await.unwrap().unwrap(), 95);
             drop(sender);
             drop(results);
             handle.shutdown();
@@ -74,9 +75,47 @@ async fn precise<'a>(state: &'a usize) -> impl Iterator<Item = usize> + Send + u
 }
 
 #[aktor]
+#[track_caller]
+async fn precise_borrowed(
+    _: &usize,
+    text: impl AsRef<str>,
+) -> impl Iterator<Item = usize> + Send + use<> {
+    0..text.as_ref().len()
+}
+
+#[aktor]
+async fn precise_input<T>(
+    _: &usize,
+    text: impl AsRef<str>,
+) -> impl Iterator<Item = usize> + Send + use<T> {
+    0..text.as_ref().len() + core::mem::size_of::<T>()
+}
+
+#[aktor]
 async fn named<'a>(state: &'a usize) -> impl Iterator<Item = usize> + Send {
     let count: &'a usize = state;
     0..*count
+}
+
+#[tokio::test]
+async fn direct_output() {
+    let items = {
+        let values = [1, 2];
+        supplied(&values.len(), values.iter().copied()).await
+    };
+
+    assert!(items.eq([1, 2]));
+    let items = {
+        let text = String::from("hi");
+        precise_borrowed(&0, text.as_str()).await
+    };
+    assert!(items.eq([0, 1]));
+
+    let items = {
+        let text = String::from("hi");
+        precise_input::<u8, _, _>(&0, text.as_str()).await
+    };
+    assert!(items.eq([0, 1, 2]));
 }
 
 #[tokio::test]
@@ -88,69 +127,63 @@ async fn replies() {
 
     assert_eq!(task.await.unwrap(), [0, 1, 2]);
 
-    let executor = tokio::task::LocalSet::new();
+    let owned = {
+        let values = [1, 2];
+        supplied(&0, values.iter().copied()).await
+    };
 
-    executor
-        .run_until(async {
-            let owned = {
-                let values = [1, 2];
-                supplied(&0, values.iter().copied()).await
-            };
+    assert_eq!(owned.collect::<Vec<_>>(), [1, 2]);
 
-            assert_eq!(owned.collect::<Vec<_>>(), [1, 2]);
+    let nested_owned = {
+        let names = [String::from("Haandboldfuglen")];
+        lengths(&0, &names).await
+    };
 
-            let nested_owned = {
-                let names = [String::from("Haandboldfuglen")];
-                lengths(&0, &names).await
-            };
+    assert_eq!(nested_owned.collect::<Vec<_>>(), [15]);
 
-            assert_eq!(nested_owned.collect::<Vec<_>>(), [15]);
-
-            let (handle, task) = spawn_local(&executor, 3, 4).unwrap();
-            let plain = indices::request(&handle).send().await;
-            let nested = fallible::request(&handle).send().await;
-            let generic = supplied::request(&handle, vec!["a", "b"]).send().await;
-            let captured = precise::request(&handle).send().await;
-            let named = named::request(&handle).send().await;
-            let nested_inputs = lengths::request(&handle, vec![String::from("Haandboldfuglen")])
-                .send()
-                .await;
-
-            drop(handle);
-
-            assert_eq!(
-                tokio::spawn(async move { plain.await.collect::<Vec<_>>() })
-                    .await
-                    .unwrap(),
-                [0, 1, 2]
-            );
-
-            assert_eq!(
-                tokio::spawn(async move { nested.await.unwrap().collect::<Vec<_>>() })
-                    .await
-                    .unwrap(),
-                [0, 1, 2]
-            );
-
-            assert_eq!(
-                tokio::spawn(async move { generic.await.collect::<Vec<_>>() })
-                    .await
-                    .unwrap(),
-                ["a", "b"]
-            );
-
-            assert_eq!(
-                tokio::spawn(async move { captured.await.collect::<Vec<_>>() })
-                    .await
-                    .unwrap(),
-                [0, 1, 2]
-            );
-
-            assert_eq!(nested_inputs.await.collect::<Vec<_>>(), [15]);
-            assert_eq!(named.await.collect::<Vec<_>>(), [0, 1, 2]);
-            task.await.unwrap();
-        })
+    let (handle, _group) = thread_actor(3usize);
+    let plain = indices(&handle).send().await.unwrap();
+    let nested = fallible(&handle).send().await.unwrap();
+    let generic = supplied(&handle, vec!["a", "b"]).send().await.unwrap();
+    let captured = precise(&handle).send().await.unwrap();
+    let named = named(&handle).send().await.unwrap();
+    let nested_inputs = lengths(&handle, vec![String::from("Haandboldfuglen")])
+        .send()
         .await
+        .unwrap();
+
+    drop(handle);
+
+    assert_eq!(
+        tokio::spawn(async move { plain.await.unwrap().collect::<Vec<_>>() })
+            .await
+            .unwrap(),
+        [0, 1, 2]
+    );
+
+    assert_eq!(
+        tokio::spawn(async move { nested.await.unwrap().unwrap().collect::<Vec<_>>() })
+            .await
+            .unwrap(),
+        [0, 1, 2]
+    );
+
+    assert_eq!(
+        tokio::spawn(async move { generic.await.unwrap().collect::<Vec<_>>() })
+            .await
+            .unwrap(),
+        ["a", "b"]
+    );
+
+    assert_eq!(
+        tokio::spawn(async move { captured.await.unwrap().collect::<Vec<_>>() })
+            .await
+            .unwrap(),
+        [0, 1, 2]
+    );
+
+    assert_eq!(nested_inputs.await.unwrap().collect::<Vec<_>>(), [15]);
+    assert_eq!(named.await.unwrap().collect::<Vec<_>>(), [0, 1, 2]);
 }
 
 #[aktor]

@@ -1,5 +1,4 @@
 use super::*;
-use futures_util::FutureExt;
 
 #[aktor]
 async fn explode(_: &()) {
@@ -8,35 +7,17 @@ async fn explode(_: &()) {
 
 #[tokio::test]
 async fn caller() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let (db, mut listener) = channel(1).unwrap();
-            let (reported, report) = std::sync::mpsc::channel();
+    let (db, _group) = thread_actor(());
+    let completion = db.group_completion();
+    let expected = line!() + 1;
+    drop(explode(&db).send().await.unwrap());
 
-            listener.failure = FailurePolicy::shutdown(move |failure| {
-                let FailureKind::Operation(operation) = failure.kind else {
-                    panic!("lost operation");
-                };
+    let report = completion.wait().await.unwrap();
+    let aktor::AktorFailureSource::Actor { phase, .. } = &report.failures[0].source else {
+        panic!("expected actor failure")
+    };
+    let phase = phase.to_string();
 
-                reported
-                    .send((operation.name, operation.caller.line()))
-                    .unwrap();
-            });
-
-            let task = tokio::task::spawn_local(listener.run(()));
-            let expected = line!() + 1;
-            let failed = std::panic::AssertUnwindSafe(explode(&db))
-                .catch_unwind()
-                .await;
-
-            assert!(failed.is_err());
-
-            assert!(matches!(task.await, Err(error) if error.is_panic()));
-
-            let (name, line) = report.try_recv().unwrap();
-
-            assert!(name.ends_with("::explode"));
-            assert_eq!(line, expected);
-        })
-        .await
+    assert!(phase.contains("::explode @ "), "{phase}");
+    assert!(phase.contains(&format!(":{expected}:")), "{phase}");
 }

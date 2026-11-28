@@ -1,33 +1,67 @@
-#[cfg(all(
-    any(feature = "tokio", feature = "std_thread"),
-    not(target_family = "wasm")
-))]
-use crate::listener::DedicatedStartError;
-use crate::{AktorNoRole, AktorSetupError};
-use alloc::{boxed::Box, string::String, vec::Vec};
-use core::{future::Future, pin::Pin, time::Duration};
-use er::Er;
+// Rebuild an `AktorNew` whose `start` returns anything that turns into `(E, String)` into one whose
+// `start` returns the pair, for the launch code underneath. A macro, because a method returning
+// `impl AsyncFnOnce` would also capture `Kind`, and a kind with a lifetime then isn't `'static`.
+macro_rules! pair_start {
+    ($setup:expr, $convert:path, $end:ty) => {{
+        let crate::AktorNew {
+            name,
+            kind,
+            start,
+            end,
+            hooks,
+            capacity,
+            stuck,
+        } = $setup;
+
+        crate::AktorNew::<_, _, _, _, $end, _, _> {
+            name,
+            kind,
+            start: $convert(start.0),
+            end,
+            hooks: crate::AktorHooks {
+                intervals: hooks.intervals,
+                before_each: crate::setup::closures::EachHook::boxed(hooks.before_each),
+                after_each: crate::setup::closures::EachHook::boxed(hooks.after_each),
+            },
+            capacity,
+            stuck,
+        }
+    }};
+}
+
+pub mod closures;
+#[doc(hidden)]
+pub mod group;
+#[doc(hidden)]
+pub mod initial;
+pub mod kind;
+#[cfg(feature = "local")]
+pub(crate) mod ready;
+pub mod shutdown;
 
 #[cfg(feature = "bevy")]
 mod bevy;
-pub mod closures;
 #[cfg(feature = "embassy_cross_core")]
 mod cross_core;
 #[cfg(feature = "local")]
 mod custom;
-#[cfg(all(
-    any(feature = "tokio", feature = "std_thread"),
-    not(target_family = "wasm")
+#[cfg(any(
+    all(
+        any(feature = "tokio", feature = "std_thread"),
+        not(target_family = "wasm")
+    ),
+    all(
+        any(feature = "browser_local", feature = "wasm_browser_workers"),
+        target_family = "wasm",
+        target_os = "unknown"
+    )
 ))]
-mod definition;
+pub(crate) mod definition;
 #[cfg(feature = "local")]
 mod driven;
-#[doc(hidden)]
-pub mod group;
 mod impls;
 #[cfg(feature = "local")]
 mod intervals;
-pub mod kind;
 #[cfg(all(
     feature = "local",
     any(
@@ -40,10 +74,7 @@ pub mod kind;
     )
 ))]
 mod local;
-#[cfg(feature = "local")]
-pub mod ready;
-pub mod shutdown;
-mod startup;
+pub(crate) mod receipt;
 #[cfg(all(feature = "tokio", not(target_family = "wasm")))]
 mod task;
 #[cfg(all(
@@ -58,115 +89,167 @@ mod tuple;
     target_os = "unknown"
 ))]
 mod worker;
-#[doc(hidden)]
-pub use tuple::AktorTupleStartup;
+
+pub use crate::types::{
+    AktorHooks, AktorInterval, AktorNew, AktorSetup, AktorSpawned, AktorStarted,
+};
+pub use closures::{AktorClosure, AktorIntervalLogic};
+#[cfg(any(
+    all(
+        any(feature = "tokio", feature = "std_thread"),
+        not(target_family = "wasm")
+    ),
+    all(
+        any(feature = "browser_local", feature = "wasm_browser_workers"),
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
+pub use definition::AktorDefinition;
+pub use impls::aktor_start;
+pub(crate) use impls::validation_error;
+pub use initial::{AktorBranch, AktorInit};
+#[cfg(all(
+    feature = "wasm_browser_worker_server",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+pub(crate) use initial::{ReadyState, TryState};
+/// Choose where the actor runs.
+pub use kind as AktorKind;
+pub use kind::{AktorExecution, AktorMode};
 #[cfg(all(
     feature = "wasm_browser_workers",
     target_family = "wasm",
     target_os = "unknown"
 ))]
-pub use worker::{AktorOptionalWorkerNew, AktorWorkerNew, AktorWorkerOptions};
+pub use worker::{AktorWorkerNew, Optional, Required};
 
-pub use closures::{AktorClosure, AktorIntervalLogic};
-#[cfg(all(
-    any(feature = "tokio", feature = "std_thread"),
-    not(target_family = "wasm")
-))]
-pub use definition::AktorDefinition;
+use crate::AktorGroupError;
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::{future::Future, pin::Pin, time::Duration};
+use er::*;
 use group::AktorSetupGroup;
-pub use impls::{aktor_start, aktor_start_in};
-#[doc(hidden)]
-pub use impls::{start_diagnostics, validation_error};
-/// Choose where the worker runs.
-pub use kind as AktorKind;
-pub use kind::{AktorExecution, AktorMode};
 
-pub use crate::types::{
-    AktorClosures, AktorInterval, AktorName, AktorNew, AktorNewOptions, AktorOptions, AktorSetup,
-    AktorStarted,
-};
-
-#[must_use = "await startup to get the actor handles"]
-pub struct AktorStartup<Setup: AktorStart<Mode>, Mode = ()> {
-    mode: core::marker::PhantomData<fn() -> Mode>,
-    pub killswitch: <Setup::Group as AktorSetupGroup>::KillSwitch,
-    pub completion: <Setup::Group as AktorSetupGroup>::Completion,
-    begin: bool,
-    group: Option<Setup::Group>,
-    setup: Option<Box<Setup>>,
-    starting: Option<Pin<Box<Setup::Startup>>>,
-    failure: Option<Box<AktorStartError>>,
-    shutdown: Option<Pin<Box<<Setup::Group as AktorSetupGroup>::Closing>>>,
+/// Every launched actor has initialization evidence and a rollback outcome.
+#[derive(Er)]
+pub enum AktorStartError<E = core::convert::Infallible> {
+    #[er(format = "actor startup refused: {reason}")]
+    Refused { reason: AktorStartReason },
+    #[er(format = "actor startup failed")]
+    Initializer {
+        #[er(skip)]
+        error: E,
+        #[er(skip)]
+        startup: AktorStartRollback,
+    },
+    #[er(format = "actor startup failed: {reason}")]
+    Failed {
+        reason: AktorStartReason,
+        #[er(skip)]
+        startup: AktorStartRollback,
+    },
 }
 
-/// A startup error and the shutdown report from rolling back.
-/// report is None when startup is rejected before it begins.
-#[derive(Er)]
-#[er(no_constructors, format = "actor startup failed", display_alt = Self::fmt_details)]
-pub struct AktorStartupError {
-    pub error: AktorStartError,
-    #[er(source, skip)]
-    pub diagnostics: Box<crate::AktorDiagnostic>,
-    pub report: Option<Box<crate::ShutdownReport>>,
-    /// The startup diagnostic represents the group's first failure.
-    pub source_is_failure: bool,
+impl<E> AktorStartError<E> {
+    pub fn startup(&self) -> Option<&AktorStartRollback> {
+        match self {
+            Self::Refused { .. } => None,
+            Self::Initializer { startup, .. } | Self::Failed { startup, .. } => Some(startup),
+        }
+    }
+
+    pub fn reason(&self) -> AktorStartReason {
+        match self {
+            Self::Refused { reason } | Self::Failed { reason, .. } => *reason,
+            Self::Initializer { .. } => AktorStartReason::Init,
+        }
+    }
 }
 
-#[derive(Er)]
-pub enum AktorStartError<E: 'static = crate::AktorFailure> {
-    Init(#[er(source, skip)] E),
-    Setup(#[er(source, skip)] AktorSetupError),
-    #[cfg(feature = "local")]
-    Local(#[er(source, skip)] crate::local::OwnerError),
-    #[cfg(all(
-        any(feature = "tokio", feature = "std_thread"),
-        not(target_family = "wasm")
-    ))]
-    Thread(#[er(source, skip)] DedicatedStartError<core::convert::Infallible>),
-    #[cfg(all(
-        any(feature = "tokio", feature = "std_thread"),
-        not(target_family = "wasm")
-    ))]
-    Startup(#[er(source, skip)] Box<crate::owner::StartError>),
+#[derive(Debug)]
+pub struct AktorStartRollback {
+    pub actors: Vec<crate::AktorActorInit>,
+    pub failure_id: Option<crate::FailureId>,
+    pub report: Result<Box<crate::AktorShutdownReport>, crate::AktorPublicationLost>,
 }
 
 #[doc(hidden)]
-pub trait AktorStart<Mode = ()>: Sized {
+#[derive(Er)]
+#[er(format = "actor startup failed")]
+#[non_exhaustive]
+pub struct LaunchError<E = core::convert::Infallible> {
+    /// The initializer error is shared by every waiter.
+    #[er(skip)]
+    pub init: Option<E>,
+    pub reason: AktorStartReason,
+    /// The failure in the group report that this startup receipt describes.
+    #[er(skip)]
+    pub failure_id: Option<crate::FailureId>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Er)]
+pub enum AktorStartReason {
+    Init,
+    Stopping,
+    InvalidSetup,
+}
+
+#[doc(hidden)]
+pub type StartFailure<E = core::convert::Infallible> = (LaunchError<E>, String);
+
+/// Use an [`AktorNew`], a native `AktorLoop`, a browser worker or a tuple of them in `actors`.
+pub trait AktorStart: Sized {
     type Group: AktorSetupGroup;
     type Handles;
-    type Startup: Future<Output = Result<Self::Handles, AktorStartError>>;
+    type Error: 'static;
 
-    fn source_is_setup(error: &AktorStartError) -> bool {
-        error.source_is_setup()
+    #[doc(hidden)]
+    fn needs_tokio_group(&self) -> bool {
+        false
     }
 
-    fn diagnostics(error: &AktorStartError) -> String {
-        impls::start_diagnostics(error)
+    #[doc(hidden)]
+    fn actor_name(&self) -> &str;
+    #[doc(hidden)]
+    fn begin(&self, group: &mut Self::Group) -> Result<(), (AktorStartReason, String)>;
+
+    /// Handles for an actor that never launched, every call on them finds it gone.
+    #[doc(hidden)]
+    fn closed(name: &str, group: &Self::Group) -> Self::Handles;
+
+    #[doc(hidden)]
+    fn fallback(&self) -> impl FnOnce(&Self::Group) -> Self::Handles + use<Self> {
+        let name = String::from(self.actor_name());
+        move |group| Self::closed(&name, group)
     }
 
-    fn begin(&self, group: &mut Self::Group) -> Result<(), AktorSetupError>;
-    fn start_in(self, context: AktorStartContext<Self::Group>) -> Self::Startup;
+    #[doc(hidden)]
+    fn launch(self, context: AktorStartContext<Self::Group>) -> AktorLaunch<Self>;
 }
+
+#[cfg(feature = "local")]
+#[derive(Er)]
+enum LocalSetupErr {
+    Stopped,
+}
+
+pub(crate) type AktorReady<Group, E> = <Group as AktorSetupGroup>::Ready<E>;
+
+pub type AktorLaunch<Setup> = Result<
+    (
+        <Setup as AktorStart>::Handles,
+        AktorReady<<Setup as AktorStart>::Group, <Setup as AktorStart>::Error>,
+    ),
+    StartFailure<<Setup as AktorStart>::Error>,
+>;
 
 #[doc(hidden)]
 pub struct AktorStartContext<Group: AktorSetupGroup> {
-    group: Group,
+    pub group: Group,
 }
 
-pub type AktorDiagnostics = String;
-
 pub type AktorThreadFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
-#[cfg(all(
-    any(feature = "tokio", feature = "std_thread"),
-    not(target_family = "wasm")
-))]
-type AktorClosingFuture = AktorThreadFuture<crate::ShutdownReport>;
-#[cfg(all(
-    any(feature = "browser_local", feature = "wasm_browser_workers"),
-    target_family = "wasm"
-))]
-type AktorClosingFuture = crate::message::LocalFuture<'static, crate::ShutdownReport>;
 
 #[cfg(all(
     feature = "wasm_threads",
@@ -175,3 +258,13 @@ type AktorClosingFuture = crate::message::LocalFuture<'static, crate::ShutdownRe
     target_feature = "atomics"
 ))]
 mod shared;
+
+pub(crate) type Prepared<S, Start, Kind, End, Signature> = AktorNew<
+    S,
+    Start,
+    Kind,
+    End,
+    Signature,
+    Option<Box<<Kind as AktorMode>::Each<S>>>,
+    Option<Box<<Kind as AktorMode>::Each<S>>>,
+>;
